@@ -8,3 +8,5 @@ High-level ideas being explored, not promises, committed scope, or detailed requ
 - **Smarter indexer selection:** choose which indexers to search instead of broadcasting every search to all of them, with optional influence from user instructions.
 - **Agentic media discovery and management:** explore an agentic workflow that discovers/manages media and adds metadata tagging sufficient for Jellyfin. It is undecided whether this belongs in Media Scout or a separate service so Scout can remain search-focused.
 - **MCP search endpoint:** let other agentic applications invoke general-purpose smart searches. Build on the existing stdio MCP tools; the endpoint's transport and scope are still open.
+- **UI poll timer:** show when the next monitoring poll is scheduled, such as a countdown, along with whether polling is enabled.
+- **Manual poll button:** let users trigger a monitoring poll from the UI without waiting for the next scheduled cycle, respecting existing dry-run and safety settings.

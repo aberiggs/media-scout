@@ -1,0 +1,11 @@
+# Standalone published-image alternative. The default docker-compose.yml builds
+# from source; this file intentionally has no build section.
+services:
+  media-agent:
+    image: ${MEDIA_AGENT_IMAGE:?Set MEDIA_AGENT_IMAGE in .env to the published GHCR image}
+    env_file: .env
+    ports:
+      - "127.0.0.1:${HTTP_PORT:-7877}:${HTTP_PORT:-7877}"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

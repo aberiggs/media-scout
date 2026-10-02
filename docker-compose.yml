@@ -1,0 +1,25 @@
+# Runs ONLY the media-agent sidecar. Prowlarr/qBittorrent/Sonarr/Radarr live in
+# the user's existing stack; this compose file does not manage them.
+services:
+  media-agent:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    # Full config surface lives in .env (zod-validated in src/config.ts) —
+    # nothing is duplicated here.
+    env_file: .env
+    ports:
+      # Daemon HTTP surface: GET /health + POST /cycle on HTTP_PORT (default 7877).
+      # ${HTTP_PORT:-7877} on both sides keeps daemon listener, HEALTHCHECK, and this
+      # mapping in sync (compose interpolates .env). Loopback-only by default: POST /cycle
+      # is unauthenticated (paid LLM cycles + Prowlarr searches) — to reach it from the
+      # LAN, change this binding consciously. See README Troubleshooting.
+      - "127.0.0.1:${HTTP_PORT:-7877}:${HTTP_PORT:-7877}"
+    volumes:
+      # SQLite state (DB_PATH default data/media-agent.db) survives rebuilds.
+      # Bind mount keeps the DB inspectable/back-up-able from the host.
+      # The image pre-creates /app/data owned by UID 1000 (node); on Linux, pre-create
+      # the host dir too (`mkdir -p data`) or Docker creates it root-owned and the
+      # daemon exits on the DB permission error — see README Troubleshooting.
+      - ./data:/app/data
+    restart: unless-stopped

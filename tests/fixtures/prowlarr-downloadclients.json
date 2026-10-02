@@ -1,0 +1,36 @@
+[
+  {
+    "id": 1,
+    "name": "qBit-TV",
+    "fields": [],
+    "implementationName": "qBittorrent",
+    "implementation": "QBittorrent",
+    "configContract": "QBittorrentSettings",
+    "infoLink": "https://wiki.servarr.com/prowlarr",
+    "message": null,
+    "tags": [],
+    "presets": [],
+    "enable": true,
+    "protocol": "torrent",
+    "priority": 1,
+    "categories": [{ "clientCategory": "tv-sonarr", "categories": [5000] }],
+    "supportsCategories": true
+  },
+  {
+    "id": 2,
+    "name": "qBit-Movies",
+    "fields": [],
+    "implementationName": "qBittorrent",
+    "implementation": "QBittorrent",
+    "configContract": "QBittorrentSettings",
+    "infoLink": "https://wiki.servarr.com/prowlarr",
+    "message": null,
+    "tags": [],
+    "presets": [],
+    "enable": true,
+    "protocol": "torrent",
+    "priority": 1,
+    "categories": [{ "clientCategory": "radarr", "categories": [2000] }],
+    "supportsCategories": true
+  }
+]

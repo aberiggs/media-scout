@@ -1,0 +1,31 @@
+{
+  "name": "media-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "LLM sidecar for Sonarr/Radarr/Prowlarr/Jellyseerr homelab — replaces *arr search/pick only",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.31.0",
+    "@openrouter/sdk": "^1.4.8",
+    "better-sqlite3": "^13.0.3",
+    "fastify": "^5.12.5",
+    "pino": "^10.3.1",
+    "tsx": "^4.23.15",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.6.3",
+    "nock": "^14.0.17",
+    "typescript": "^7.0.2",
+    "vitest": "^3.2.7"
+  }
+}

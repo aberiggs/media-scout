@@ -1,0 +1,34 @@
+[
+  {
+    "id": 101,
+    "seriesId": 1,
+    "seasonNumber": 1,
+    "episodeNumber": 7,
+    "absoluteEpisodeNumber": 7,
+    "title": "Like a Fairy Tale",
+    "airDate": "2023-10-20",
+    "monitored": true,
+    "hasFile": false
+  },
+  {
+    "id": 102,
+    "seriesId": 1,
+    "seasonNumber": 1,
+    "episodeNumber": 8,
+    "absoluteEpisodeNumber": 8,
+    "title": "Frieren the Slayer",
+    "airDate": "2023-10-27",
+    "monitored": true,
+    "hasFile": true
+  },
+  {
+    "id": 103,
+    "seriesId": 1,
+    "seasonNumber": 1,
+    "episodeNumber": 9,
+    "title": "A Meeting of Old Friends",
+    "airDate": null,
+    "monitored": true,
+    "hasFile": false
+  }
+]

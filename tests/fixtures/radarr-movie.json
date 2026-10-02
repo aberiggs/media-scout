@@ -1,0 +1,13 @@
+{
+  "id": 3,
+  "tmdbId": 671,
+  "title": "Harry Potter and the Philosopher's Stone",
+  "titleSlug": "671",
+  "year": 2001,
+  "monitored": true,
+  "hasFile": false,
+  "isAvailable": true,
+  "sizeOnDisk": 0,
+  "qualityProfileId": 1,
+  "tags": []
+}

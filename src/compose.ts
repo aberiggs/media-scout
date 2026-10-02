@@ -13,6 +13,8 @@ import { State } from './core/state';
 import { OperatorActions } from './core/operator-actions';
 import { Watcher } from './core/watcher';
 import type { Config } from './config';
+import { configWithSettings } from './config';
+import type { Settings } from './settings';
 
 const SAFE_WATCHER_ERROR_NAMES = new Set([
   'ApiError',
@@ -38,6 +40,7 @@ export interface Stack {
   runner: Runner;
   operatorActions: OperatorActions;
   logger: pino.Logger;
+  createSnapshot(settings: Settings): Stack;
 }
 
 export interface BuildStackDeps {
@@ -47,6 +50,7 @@ export interface BuildStackDeps {
   /** Test seam: inject a FakeLLM; production uses OpenRouterLLM. */
   llm?: LLMClient;
   now?: () => Date;
+  state?: State;
 }
 
 /** Composition root: the single place the full object graph is wired (DI, no singletons). */
@@ -59,7 +63,7 @@ export function buildStack(deps: BuildStackDeps): Stack {
   const sonarr = new SonarrClient(http(config.SONARR_URL, config.SONARR_API_KEY));
   const radarr = new RadarrClient(http(config.RADARR_URL, config.RADARR_API_KEY));
   const prowlarr = new ProwlarrClient(http(config.PROWLARR_URL, config.PROWLARR_API_KEY));
-  const state = State.open(config.DB_PATH);
+  const state = deps.state ?? State.open(config.DB_PATH);
 
   const watcherLogger = logger.child({ component: 'watcher' });
   const watcher = new Watcher({
@@ -108,7 +112,10 @@ export function buildStack(deps: BuildStackDeps): Stack {
 
   const operatorActions = new OperatorActions({ enabled: config.ALLOW_OPERATOR_ACTIONS, config, state, watcher, sonarr, radarr, now });
 
-  return { config, state, watcher, sonarr, radarr, prowlarr, llm, planner, picker, runner, operatorActions, logger };
+  const stack: Stack = { config, state, watcher, sonarr, radarr, prowlarr, llm, planner, picker, runner, operatorActions, logger,
+    createSnapshot: (settings) => buildStack({ config: configWithSettings(config, settings), logger, now, state, ...(deps.llm ? { llm: deps.llm } : {}) }),
+  };
+  return stack;
 }
 
 /** Watcher errors can include authenticated upstream URLs and bodies; logs keep only safe diagnostics. */

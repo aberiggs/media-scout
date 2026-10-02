@@ -1,135 +1,145 @@
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { LogController, type FastifyInstance } from 'fastify';
+import fastifyStatic from '@fastify/static';
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { Logger } from 'pino';
 import { buildStack, type Stack } from './compose';
 import { loadConfig } from './config';
-import type { CycleSummary, Runner } from './core/runner';
+import { missingSettings, settingsSchema, type Settings } from './settings';
+import type { CycleSummary } from './core/runner';
 
-/** Outcome of one guarded cycle attempt — mapped to HTTP status codes by the route. */
-type CycleAttempt =
-  | { ok: true; summary: CycleSummary }
-  | { ok: false; conflict: true }
-  | { ok: false; error: string };
-
-interface CycleGate {
-  run(): Promise<CycleAttempt>;
-  /** Resolves once any in-flight cycle finishes (best-effort shutdown barrier). */
-  settled(): Promise<void>;
-}
-
-/** Shared one-at-a-time guard so HTTP POST /cycle and the interval timer never overlap a cycle. */
-function createCycleGate(runner: Runner): CycleGate {
+type CycleAttempt = { ok: true; summary: CycleSummary } | { ok: false; conflict: true } | { ok: false; error: unknown };
+interface CycleGate { run(): Promise<CycleAttempt>; settled(): Promise<void>; isRunning(): boolean }
+function createCycleGate(runCycle: () => Promise<CycleSummary>): CycleGate {
   let running = false;
   let inFlight: Promise<unknown> | null = null;
   return {
-    async run(): Promise<CycleAttempt> {
+    async run() {
       if (running) return { ok: false, conflict: true };
       running = true;
-      try {
-        const cycle = runner.cycle();
-        inFlight = cycle;
-        return { ok: true, summary: await cycle };
-      } catch (err) {
-        return { ok: false, error: err instanceof Error ? err.message : String(err) };
-      } finally {
-        running = false;
-        inFlight = null;
-      }
+      try { const cycle = runCycle(); inFlight = cycle; return { ok: true, summary: await cycle }; }
+      catch (error) { return { ok: false, error }; }
+      finally { running = false; inFlight = null; }
     },
-    async settled(): Promise<void> {
-      await inFlight?.catch(() => {});
-    },
+    async settled() { await inFlight?.catch(() => {}); },
+    isRunning: () => running,
   };
 }
-
-// The gate is shared between the HTTP route and startDaemon's interval timer, so it rides on the app instance.
 declare module 'fastify' {
-  interface FastifyInstance {
-    cycleGate: CycleGate;
-  }
+  interface FastifyInstance { cycleGate: CycleGate; refreshScheduler?: () => void }
 }
 
-/** Builds the Fastify app with /health and /cycle wired to the stack (inject-based tests use this). */
-export async function buildApp(stack: Stack): Promise<FastifyInstance> {
-  // Fastify 5: a pre-built pino instance goes through loggerInstance (logger takes only a config object).
-  const app = Fastify({ loggerInstance: stack.logger.child({ component: 'daemon' }) });
-  const gate = createCycleGate(stack.runner);
+function envelope(settings: Settings, cycleRunning: boolean) {
+  const missing = missingSettings(settings);
+  return { settings, status: { ready: missing.length === 0, missing, monitoringEnabled: settings.monitoring.enabled, cycleRunning } };
+}
+function mutationAllowed(request: { headers: Record<string, string | string[] | undefined> }): boolean {
+  const fetchSiteHeader = request.headers['sec-fetch-site'];
+  const fetchSite = Array.isArray(fetchSiteHeader) ? fetchSiteHeader[0] : fetchSiteHeader;
+  if (typeof fetchSite === 'string' && fetchSite.toLowerCase() === 'cross-site') return false;
+  const origin = request.headers.origin;
+  if (typeof origin === 'string') {
+    const hostHeader = request.headers.host;
+    const host = Array.isArray(hostHeader) ? hostHeader[0] : hostHeader;
+    try { return !!host && new URL(origin).host.toLowerCase() === host.toLowerCase(); } catch { return false; }
+  }
+  return true;
+}
+
+export async function buildApp(stack: Stack, options: { webRoot?: string } = {}): Promise<FastifyInstance> {
+  // Fastify's default request serializer logs full URLs (including query strings).
+  // These local settings routes carry secrets in bodies, so do not log request records.
+  const app = Fastify({ loggerInstance: stack.logger.child({ component: 'daemon' }), logController: new LogController({ disableRequestLogging: true }) });
+  const gate = createCycleGate(async () => {
+    const settings = stack.state.getSettings();
+    const missing = missingSettings(settings);
+    if (missing.length) throw new Error('settings-incomplete');
+    const runtime = stack.createSnapshot(settings);
+    return runtime.runner.cycle();
+  });
   app.decorate('cycleGate', gate);
 
-  app.get('/health', async () => ({
-    status: 'ok',
-    dryRun: stack.config.DRY_RUN,
-    model: stack.config.LLM_MODEL,
-  }));
-
-  app.post('/cycle', async (_request, reply) => {
+  app.get('/health', async () => { const settings = stack.state.getSettings(); return { status: 'ok', dryRun: settings.safety.dryRun, model: settings.ai.model }; });
+  app.get('/api/settings', async () => envelope(stack.state.getSettings(), gate.isRunning()));
+  app.put('/api/settings', async (request, reply) => {
+    if (!mutationAllowed(request)) return reply.code(403).send({ error: 'cross-origin mutation rejected' });
+    const parsed = settingsSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid settings', issues: parsed.error.issues.map(({ path, message, code }) => ({ path, message, code })) });
+    stack.state.saveSettings(parsed.data);
+    app.refreshScheduler?.();
+    return envelope(parsed.data, gate.isRunning());
+  });
+  app.post('/cycle', async (request, reply) => {
+    if (!mutationAllowed(request)) return reply.code(403).send({ error: 'cross-origin mutation rejected' });
     const attempt = await gate.run();
     if (attempt.ok) return attempt.summary;
     if ('conflict' in attempt) return reply.code(409).send({ error: 'cycle already running' });
-    // ApiError messages can carry upstream URLs (with keys) — the public body stays a constant; the log gets the truth.
-    app.log.error({ error: attempt.error }, 'cycle failed');
-    return reply.code(500).send({ error: 'cycle failed; see server logs' });
+    app.log.error({ errorType: attempt.error instanceof Error ? attempt.error.name : 'UnknownError' }, 'cycle failed');
+    return reply.code(503).send({ error: 'cycle unavailable; check settings and server logs' });
   });
 
-  // pino's concrete Logger is stricter than FastifyBaseLogger (msgPrefix); the instance is behaviorally identical.
+  const webRoot = options.webRoot ?? resolve(process.cwd(), 'web/dist');
+  if (existsSync(resolve(webRoot, 'index.html'))) {
+    await app.register(fastifyStatic, { root: webRoot, prefix: '/' });
+    app.setNotFoundHandler(async (request, reply) => {
+      const pathname = new URL(request.url, 'http://localhost').pathname;
+      if (pathname === '/api' || pathname.startsWith('/api/') || pathname === '/cycle' || pathname.startsWith('/cycle/') || pathname === '/health' || pathname.startsWith('/health/')) return reply.code(404).send({ error: 'not found' });
+      if (request.method !== 'GET' && request.method !== 'HEAD') return reply.code(404).send({ error: 'not found' });
+      return reply.type('text/html').sendFile('index.html');
+    });
+  }
   return app as unknown as FastifyInstance;
 }
 
-/** Entry: interval loop + signal handling. Thin glue, exercised live at P7. */
 export async function startDaemon(stack: Stack): Promise<void> {
   const app = await buildApp(stack);
   const logger: Logger = stack.logger.child({ component: 'daemon' });
+  await app.listen({ port: stack.config.HTTP_PORT, host: stack.config.HTTP_HOST ?? '0.0.0.0' });
 
-  await app.listen({ port: stack.config.HTTP_PORT, host: '0.0.0.0' });
-
-  const timer = setInterval(
-    () => {
-      void app.cycleGate.run().then((attempt) => {
-        if (attempt.ok) logger.info(attempt.summary, 'scheduled cycle finished');
-        else if ('conflict' in attempt) logger.info('skipped: cycle already in progress');
-        else logger.error({ error: attempt.error }, 'scheduled cycle failed');
-      });
-    },
-    stack.config.CYCLE_INTERVAL_MIN * 60_000,
-  );
-
-  // Persistent listeners + one idempotent drain: repeated signals re-enter the same drain, never default termination.
-  const drain = createShutdown({
-    stopTimer: () => clearInterval(timer),
-    awaitSettled: () => app.cycleGate.settled(),
-    close: () => app.close(),
-    exit: (code) => process.exit(code),
+  const scheduler = createMonitorScheduler(() => stack.state.getSettings(), async () => {
+    const attempt = await app.cycleGate.run();
+    if (attempt.ok) logger.info(attempt.summary, 'scheduled cycle finished');
+    else if ('conflict' in attempt) logger.info('skipped: cycle already in progress');
+    else logger.error({ errorType: attempt.error instanceof Error ? attempt.error.name : 'UnknownError' }, 'scheduled cycle failed');
   });
+  app.refreshScheduler = scheduler.refresh;
+  scheduler.refresh();
+  const drain = createShutdown({ stopTimer: scheduler.stop, awaitSettled: () => app.cycleGate.settled(), close: () => app.close(), exit: (code) => process.exit(code) });
   process.on('SIGINT', () => drain('SIGINT'));
   process.on('SIGTERM', () => drain('SIGTERM'));
 }
 
-interface ShutdownDeps {
-  stopTimer: () => void;
-  /** Resolves once any in-flight cycle has finished. */
-  awaitSettled: () => Promise<void>;
-  close: () => Promise<void>;
-  exit: (code: number) => void;
+export function createMonitorScheduler(
+  getSettings: () => Settings,
+  run: () => Promise<void>,
+  timers: { set: typeof setTimeout; clear: typeof clearTimeout } = { set: setTimeout, clear: clearTimeout },
+): { refresh: () => void; stop: () => void } {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let stopped = false;
+  const refresh = () => {
+    if (timer) timers.clear(timer);
+    timer = undefined;
+    const settings = getSettings();
+    if (stopped || !settings.monitoring.enabled) return;
+    timer = timers.set(() => {
+      timer = undefined;
+      if (!getSettings().monitoring.enabled) { refresh(); return; }
+      void run().finally(refresh);
+    }, settings.monitoring.intervalMinutes * 60_000);
+  };
+  const stop = () => { stopped = true; if (timer) timers.clear(timer); timer = undefined; };
+  return { refresh, stop };
 }
 
-/** Idempotent drain: first signal stops the timer, waits out the in-flight cycle, closes, exits; later signals no-op. */
+interface ShutdownDeps { stopTimer: () => void; awaitSettled: () => Promise<void>; close: () => Promise<void>; exit: (code: number) => void }
 export function createShutdown(deps: ShutdownDeps): (signal: string) => void {
   let draining = false;
-  return (_signal: string) => {
-    if (draining) return;
-    draining = true;
-    void (async () => {
-      deps.stopTimer();
-      await deps.awaitSettled();
-      await deps.close();
-      deps.exit(0);
-    })();
-  };
+  return (_signal: string) => { if (draining) return; draining = true; void (async () => { deps.stopTimer(); await deps.awaitSettled(); await deps.close(); deps.exit(0); })(); };
 }
 
-// Sanctioned direct-run entry: no-default-export exception; env is read here (via loadConfig) only.
-// argv[1] guard: `node -e`/REPL imports have no entry script, so pathToFileURL would throw.
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const stack = buildStack({ config: loadConfig() });
-  await startDaemon(stack);
+  const config = loadConfig();
+  const stack = buildStack({ config });
+  startDaemon(stack).catch((error: unknown) => { console.error(error instanceof Error ? error.name : 'StartupError'); process.exitCode = 1; });
 }

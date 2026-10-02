@@ -10,9 +10,14 @@
   },
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "web:install": "npm --prefix web ci",
+    "web:build": "npm --prefix web run build",
+    "web:dev": "npm --prefix web run dev",
+    "build": "npm run web:build"
   },
   "dependencies": {
+    "@fastify/static": "^10.1.5",
     "@modelcontextprotocol/sdk": "^1.31.0",
     "@openrouter/sdk": "^1.4.8",
     "better-sqlite3": "^13.0.3",

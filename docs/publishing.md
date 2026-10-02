@@ -34,7 +34,7 @@ Both `dev` and `sha-<full-commit-sha>` are mutable tags and can be overwritten b
 
 The first successful publication creates the package. GitHub Container Registry packages are **private by default**, even if the source repository is public. If anonymous image pulls are intended, the maintainer must open the package settings in GitHub and explicitly change package visibility to public, then verify anonymous pull access. Otherwise, users must authenticate to `ghcr.io` using an appropriately scoped token; do not put that token in `.env`, Compose YAML, or shell history.
 
-The published-image Compose file requires an image reference from `.env`:
+The published-image Compose file requires `MEDIA_AGENT_IMAGE`, supplied either in the shell environment or an optional `.env` file. `.env` is optional for bootstrap defaults; when present, it can contain bootstrap overrides and the Compose image reference. Integration, monitoring, and safety values are stored in SQLite instead. Compose v2.24 or later supports the optional env-file declaration used by these Compose files. For example, an operator may select the currently published dev image in `.env`:
 
 ```dotenv
 MEDIA_AGENT_IMAGE=ghcr.io/aberiggs/media-scout:dev
@@ -47,7 +47,9 @@ docker compose -f docker-compose.ghcr.yml pull
 docker compose -f docker-compose.ghcr.yml up -d
 ```
 
-This is a standalone alternative to `docker-compose.yml`; it uses the same `.env`, loopback-only port binding, persistent `./data` mount, and runtime defaults, but does not build an image. The image must exist locally or be pullable. It runs the normal daemon service (Compose service name `media-agent`), so scheduled cycles can still call the LLM and Prowlarr even when `DRY_RUN=true`; that flag only prevents grabs.
+This is a standalone alternative to `docker-compose.yml`; it accepts the same optional bootstrap `.env` overrides, loopback-only port binding, persistent `./data` mount, and runtime defaults, but does not build an image. The image must exist locally or be pullable. It runs the normal daemon service (Compose service name `media-agent`), so scheduled cycles can call the LLM and Prowlarr when monitoring is enabled, even in dry-run mode; dry-run prevents grabs, not searches or model calls.
+
+Integration, monitoring, and safety settings—including **Safety → Dry-run mode** and whether monitoring is enabled—are stored in the SQLite database under `./data`. They survive container and image replacement; setting `DRY_RUN=true` in a shell or `.env` does not override an existing database setting. Before upgrading or testing an image, explicitly check the UI settings. Keep monitoring disabled during the rollout, and confirm **Dry-run mode** is enabled before any test that could perform searches or grabs. Do not assume an image upgrade resets saved settings.
 
 ## 5. Maintainer publish checklist
 
@@ -57,7 +59,7 @@ Before merging a publishing change or using the published image:
 2. Run the project-required tests, typecheck, and Docker build. Confirm the PR workflows pass and use their actual check-context names in branch protection.
 3. Merge through the protected PR path. Check that the main-branch image workflow publishes only `dev` and the `sha-<full-commit-sha>` tag, with no `latest`, release-tag trigger, or deployment step.
 4. Confirm both image tags refer to the expected commit. If anonymous pulls are desired, explicitly set and verify public GHCR visibility.
-5. Record the full commit and/or image digest used for the controlled rollout. Keep `DRY_RUN=true` until an operator separately authorizes a reviewed live-grab transition.
+5. Record the full commit and/or image digest used for the controlled rollout. Before testing the upgraded image, check the persisted UI settings, keep monitoring disabled, and confirm **Safety → Dry-run mode** is enabled. Only disable dry-run in the UI after an operator separately authorizes a reviewed live-grab transition; a `DRY_RUN=true` environment value does not replace this check.
 
 The Node package version is not, by itself, a published-release signal. No semver/version-bump policy is defined yet; maintainers may decide one separately before creating formal releases.
 

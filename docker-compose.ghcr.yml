@@ -2,8 +2,15 @@
 # from source; this file intentionally has no build section.
 services:
   media-agent:
-    image: ${MEDIA_AGENT_IMAGE:?Set MEDIA_AGENT_IMAGE in .env to the published GHCR image}
-    env_file: .env
+    image: ${MEDIA_AGENT_IMAGE:?Set MEDIA_AGENT_IMAGE in the shell environment or optional .env file}
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DB_PATH: ${DB_PATH:-data/media-agent.db}
+      HTTP_PORT: ${HTTP_PORT:-7877}
+      HTTP_HOST: 0.0.0.0
+      LOG_LEVEL: ${LOG_LEVEL:-info}
     ports:
       - "127.0.0.1:${HTTP_PORT:-7877}:${HTTP_PORT:-7877}"
     volumes:

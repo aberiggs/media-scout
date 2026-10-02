@@ -134,7 +134,7 @@ export class OperatorActions {
   }
 
   private assertEnabled(): void {
-    if (!this.deps.enabled) throw new Error('Operator actions are disabled; set ALLOW_OPERATOR_ACTIONS=true to opt in');
+    if (!this.deps.enabled) throw new Error('Operator actions are disabled; enable allowOperatorActions in the web settings first');
   }
 
   private clock(): Date { return (this.deps.now ?? (() => new Date()))(); }

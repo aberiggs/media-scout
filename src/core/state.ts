@@ -4,6 +4,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { GrabIntent, IntentCoverage, IntentStatus, WorkItem, WorkQueueStatus, WorkStatus, ClaimSet } from './work-queue-types';
 import type { AssociationCacheEntry, AssociationDecision, AssociationRequest, ParsedReleaseCoverage } from './group-types';
+import { defaultSettings, settingsSchema, type Settings } from '../settings';
 
 
 export interface DecisionRecord {
@@ -177,6 +178,12 @@ CREATE TABLE IF NOT EXISTS operator_audit (
   note TEXT NOT NULL,
   occurred_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS app_settings (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  version INTEGER NOT NULL,
+  document_json TEXT NOT NULL CHECK (json_valid(document_json)),
+  updated_at TEXT NOT NULL
+);
 `;
 
 const WORK_STATUSES: readonly WorkStatus[] = ['ready', 'waiting-release', 'searching', 'cooldown', 'backoff', 'manual', 'fulfilled', 'inactive'];
@@ -296,6 +303,25 @@ export class State {
       if (parent !== '' && parent !== '.') mkdirSync(parent, { recursive: true });
     }
     return new State(new Database(path));
+  }
+
+  close(): void { this.db.close(); }
+
+  getSettings(): Settings {
+    const row = this.db.prepare('SELECT document_json FROM app_settings WHERE id=1').get() as { document_json: string } | undefined;
+    if (!row) return structuredClone(defaultSettings);
+    let raw: unknown;
+    try { raw = JSON.parse(row.document_json) as unknown; } catch { throw new Error('Stored settings are corrupt'); }
+    const parsed = settingsSchema.safeParse(raw);
+    if (!parsed.success) throw new Error('Stored settings are invalid');
+    return parsed.data;
+  }
+
+  saveSettings(settings: Settings): void {
+    const validated = settingsSchema.parse(settings);
+    this.db.prepare(`INSERT INTO app_settings(id,version,document_json,updated_at) VALUES(1,?,?,?)
+      ON CONFLICT(id) DO UPDATE SET version=excluded.version,document_json=excluded.document_json,updated_at=excluded.updated_at`)
+      .run(validated.version, JSON.stringify(validated), new Date().toISOString());
   }
 
   hasHash(infoHash: string): boolean {

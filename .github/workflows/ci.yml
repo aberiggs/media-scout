@@ -33,9 +33,24 @@ jobs:
         with:
           node-version: 22
           cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
 
       - name: Install locked dependencies
         run: npm ci
+
+      - name: Install locked frontend dependencies
+        run: npm run web:install
+
+      - name: Frontend typecheck
+        run: npm --prefix web run typecheck
+
+      - name: Frontend tests
+        run: npm --prefix web test
+
+      - name: Build frontend bundle
+        run: npm run build
 
       - name: Typecheck
         run: npm run typecheck

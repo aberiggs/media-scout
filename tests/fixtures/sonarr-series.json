@@ -1,0 +1,29 @@
+{
+  "id": 1,
+  "tvdbId": 368013,
+  "title": "Frieren: Beyond Journey's End",
+  "titleSlug": "frieren-beyond-journeys-end",
+  "seriesType": "anime",
+  "monitored": true,
+  "qualityProfileId": 7,
+  "tags": [4],
+  "alternateTitles": [{ "title": "Sousou no Frieren", "seasonNumber": -1 }],
+  "seasons": [
+    {
+      "seasonNumber": 1,
+      "monitored": true,
+      "statistics": {
+        "episodeFileCount": 6,
+        "totalEpisodeCount": 28,
+        "sizeOnDisk": 8123671040,
+        "percentOfEpisodes": 21.4
+      }
+    }
+  ],
+  "statistics": {
+    "episodeFileCount": 6,
+    "totalEpisodeCount": 28,
+    "sizeOnDisk": 8123671040,
+    "percentOfEpisodes": 21.4
+  }
+}

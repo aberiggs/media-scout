@@ -1,0 +1,5 @@
+[
+  { "id": 5, "name": "Nyaa.si", "enable": true },
+  { "id": 6, "name": "PrivateTracker", "enable": false },
+  { "id": 7, "name": "AnimeTosho", "enable": true }
+]

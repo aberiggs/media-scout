@@ -1,0 +1,13 @@
+# Keep the build context small — the image only needs package.json,
+# package-lock.json, and src/.
+node_modules
+data
+.env
+.env.*
+!.env.example
+.git
+tests
+docs
+.opencode
+.omp
+.slim

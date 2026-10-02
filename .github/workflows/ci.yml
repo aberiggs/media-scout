@@ -16,6 +16,72 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+    steps:
+      - name: Check out source and history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify changed paths
+        id: classify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          fail_closed() {
+            echo 'docs_only=false' >> "$GITHUB_OUTPUT"
+          }
+
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            base_sha="$PR_BASE_SHA"
+            head_sha="$PR_HEAD_SHA"
+          elif [[ "$EVENT_NAME" == push ]]; then
+            base_sha="$PUSH_BEFORE_SHA"
+            head_sha="$CURRENT_SHA"
+          else
+            base_sha=""
+            head_sha=""
+          fi
+
+          # Compare only event-provided commit IDs with built-in git. Invalid,
+          # unavailable, or empty diffs conservatively require a container build.
+          if [[ ! "$base_sha" =~ ^[0-9a-f]{40}$ || ! "$head_sha" =~ ^[0-9a-f]{40}$ || "$base_sha" =~ ^0+$ || "$head_sha" =~ ^0+$ ]]; then
+            fail_closed
+            exit 0
+          fi
+          if ! git cat-file -e "$base_sha^{commit}" 2>/dev/null || ! git cat-file -e "$head_sha^{commit}" 2>/dev/null; then
+            fail_closed
+            exit 0
+          fi
+
+          changed_paths="$(mktemp)"
+          trap 'rm -f "$changed_paths"' EXIT
+          if ! git diff --name-only --no-renames -z "$base_sha" "$head_sha" > "$changed_paths" || [[ ! -s "$changed_paths" ]]; then
+            fail_closed
+            exit 0
+          fi
+
+          docs_only=true
+          while IFS= read -r -d '' path; do
+            case "$path" in
+              docs/*|*.md) ;;
+              *) docs_only=false ;;
+            esac
+          done < "$changed_paths"
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+
   checks:
     name: checks
     runs-on: ubuntu-latest
@@ -60,7 +126,8 @@ jobs:
 
   container-build-matrix:
     name: container-build / ${{ matrix.platform }}
-    needs: checks
+    needs: [checks, changes]
+    if: always() && needs.checks.result == 'success' && (needs.changes.result != 'success' || needs.changes.outputs.docs_only != 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -113,21 +180,33 @@ jobs:
   container-build:
     name: container-build
     if: always()
-    needs: [checks, container-build-matrix]
+    needs: [checks, changes, container-build-matrix]
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - name: Require checks and every platform smoke test to pass
+      - name: Require checks, detection, and the appropriate build outcome
         env:
           CHECKS_RESULT: ${{ needs.checks.result }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
           MATRIX_RESULT: ${{ needs.container-build-matrix.result }}
-        run: test "$CHECKS_RESULT" = success && test "$MATRIX_RESULT" = success
+        run: |
+          set -euo pipefail
+          test "$CHECKS_RESULT" = success
+          test "$CHANGES_RESULT" = success
+          if [[ "$DOCS_ONLY" == true ]]; then
+            test "$MATRIX_RESULT" = skipped
+          else
+            test "$DOCS_ONLY" = false
+            test "$MATRIX_RESULT" = success
+          fi
+        shell: bash
 
   publish-dev:
     name: publish-dev
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [checks, container-build-matrix, container-build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.result == 'success' && needs.changes.outputs.docs_only == 'false' && needs.checks.result == 'success' && needs.container-build-matrix.result == 'success' && needs.container-build.result == 'success'
+    needs: [checks, changes, container-build-matrix, container-build]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:

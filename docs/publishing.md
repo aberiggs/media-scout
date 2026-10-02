@@ -21,7 +21,7 @@ For a single-maintainer repository, do not require an approving review that the 
 
 ## 3. Dev image publication contract
 
-CI runs the existing `checks` job on every pull request and main push. The container matrix is skipped only when change detection confirms a non-empty diff containing exclusively `docs/**` paths and Markdown files (`*.md`). `LICENSE` is a Docker build input, so it is not treated as docs-only. Missing/invalid/empty diffs and any other path require the container build. The `container-build` aggregate required check remains present: it passes only when checks and detection succeed and either the runtime-change matrix succeeds or the docs-only matrix was intentionally skipped. Main-branch dev publishing is likewise skipped for confirmed docs-only pushes.
+CI runs the existing `checks` job on every pull request and main push. The container matrix is skipped only when change detection confirms a non-empty diff containing exclusively `docs/**` paths and Markdown files (`*.md`). `LICENSE` is a Docker build input, so it is not treated as docs-only. Missing/invalid/empty diffs and any other path require the container build. The `container-build` aggregate required check remains present: it passes only when checks and detection succeed and either the runtime-change matrix succeeds or the docs-only matrix was intentionally skipped. Main-branch dev publishing additionally requires a known runtime path in the diff; uncertain/empty diffs build but do not publish.
 
 Coordinate with the GitHub Actions/workflow owner before relying on registry behavior. The dev-only publication contract is:
 

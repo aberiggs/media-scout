@@ -1,65 +1,43 @@
 import { z } from 'zod';
+import { defaultSettings, settingsSchema, type Settings } from './settings';
 
-/** Env vars must be http(s) URLs — *arr/Prowlarr never speak anything else on a homelab. */
-const httpUrl = z.string().regex(/^https?:\/\//, 'must be an http(s) URL');
-
-/**
- * Env booleans arrive as strings; only explicit true/false/1/0 are accepted so a
- * typo can never silently flip DRY_RUN.
- */
-const boolFromEnv = z
-  .preprocess((value) => {
-    if (typeof value === 'string') {
-      const s = value.trim().toLowerCase();
-      if (s === 'true' || s === '1') return true;
-      if (s === 'false' || s === '0') return false;
-      return Symbol.for('invalid-bool');
-    }
-    return value;
-  }, z.boolean({ error: 'must be "true" or "false"' }))
-  .default(true);
-
-const configSchema = z.object({
-  PROWLARR_URL: httpUrl,
-  PROWLARR_API_KEY: z.string().min(1),
-  SONARR_URL: httpUrl,
-  SONARR_API_KEY: z.string().min(1),
-  RADARR_URL: httpUrl,
-  RADARR_API_KEY: z.string().min(1),
-  PROWLARR_CLIENT_TV: z.string().min(1),
-  PROWLARR_CLIENT_MOVIE: z.string().min(1),
-  LLM_BASE_URL: httpUrl.default('https://openrouter.ai/api/v1'),
-  LLM_API_KEY: z.string().min(1),
-  LLM_MODEL: z.string().min(1).default('z-ai/glm-5.3-flash'),
-  MEDIA_PREFERENCES: z.string().trim().max(4000).default(''),
-  CYCLE_INTERVAL_MIN: z.coerce.number().int().min(1).default(5),
-  MIN_RETRY_HOURS: z.coerce.number().int().min(1).default(6),
-  FAILURE_BACKOFF_MIN: z.coerce.number().int().min(1).default(5),
-  FAILURE_BACKOFF_MAX_MIN: z.coerce.number().int().min(1).default(60),
-  QUEUE_GRACE_MIN: z.coerce.number().int().min(1).default(30),
-  DRY_RUN: boolFromEnv,
-  ALLOW_OPERATOR_ACTIONS: boolFromEnv.default(false),
+const bootstrapSchema = z.object({
   DB_PATH: z.string().min(1).default('data/media-agent.db'),
   HTTP_PORT: z.coerce.number().int().min(1).max(65535).default(7877),
+  HTTP_HOST: z.string().min(1).default('0.0.0.0'),
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
-}).refine(
-  (config) => config.FAILURE_BACKOFF_MAX_MIN >= config.FAILURE_BACKOFF_MIN,
-  {
-    path: ['FAILURE_BACKOFF_MAX_MIN'],
-    message: 'FAILURE_BACKOFF_MAX_MIN must be at least FAILURE_BACKOFF_MIN',
-  },
-);
+});
 
-export type Config = z.infer<typeof configSchema>;
+/** Legacy aliases keep the core services small; these values always come from one validated DB snapshot. */
+export type Config = z.infer<typeof bootstrapSchema> & {
+  settings: Settings;
+  PROWLARR_URL: string; PROWLARR_API_KEY: string; SONARR_URL: string; SONARR_API_KEY: string;
+  RADARR_URL: string; RADARR_API_KEY: string; PROWLARR_CLIENT_TV: string; PROWLARR_CLIENT_MOVIE: string;
+  LLM_BASE_URL: string; LLM_API_KEY: string; LLM_MODEL: string; MEDIA_PREFERENCES: string;
+  CYCLE_INTERVAL_MIN: number; MIN_RETRY_HOURS: number; FAILURE_BACKOFF_MIN: number;
+  FAILURE_BACKOFF_MAX_MIN: number; QUEUE_GRACE_MIN: number; DRY_RUN: boolean; ALLOW_OPERATOR_ACTIONS: boolean;
+};
 
-/** Single source of env truth — no other module reads process.env. */
-export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
-  const parsed = configSchema.safeParse(env);
-  if (!parsed.success) {
-    const issues = parsed.error.issues
-      .map((i) => `  ${i.path.join('.') || '(root)'}: ${i.message}`)
-      .join('\n');
-    throw new Error(`Invalid configuration:\n${issues}`);
-  }
-  return parsed.data;
+export function configWithSettings(bootstrap: Pick<Config, 'DB_PATH' | 'HTTP_PORT' | 'HTTP_HOST' | 'LOG_LEVEL'>, settings: Settings): Config {
+  return {
+    ...bootstrap, settings,
+    PROWLARR_URL: settings.integrations.prowlarr.url, PROWLARR_API_KEY: settings.integrations.prowlarr.apiKey,
+    PROWLARR_CLIENT_TV: settings.integrations.prowlarr.tvClient, PROWLARR_CLIENT_MOVIE: settings.integrations.prowlarr.movieClient,
+    SONARR_URL: settings.integrations.sonarr.url, SONARR_API_KEY: settings.integrations.sonarr.apiKey,
+    RADARR_URL: settings.integrations.radarr.url, RADARR_API_KEY: settings.integrations.radarr.apiKey,
+    LLM_BASE_URL: settings.ai.baseUrl, LLM_API_KEY: settings.ai.apiKey, LLM_MODEL: settings.ai.model,
+    MEDIA_PREFERENCES: settings.ai.preferences, CYCLE_INTERVAL_MIN: settings.monitoring.intervalMinutes,
+    MIN_RETRY_HOURS: settings.monitoring.minRetryHours, FAILURE_BACKOFF_MIN: settings.monitoring.failureBackoffMinMinutes,
+    FAILURE_BACKOFF_MAX_MIN: settings.monitoring.failureBackoffMaxMinutes, QUEUE_GRACE_MIN: settings.monitoring.queueGraceMinutes,
+    DRY_RUN: settings.safety.dryRun, ALLOW_OPERATOR_ACTIONS: settings.safety.allowOperatorActions,
+  };
 }
+
+/** Only process/bootstrap values are read here; integrations are managed in SQLite. */
+export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
+  const parsed = bootstrapSchema.safeParse(env);
+  if (!parsed.success) throw new Error(`Invalid bootstrap configuration: ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}`);
+  return configWithSettings(parsed.data, defaultSettings);
+}
+
+export function parseSettings(input: unknown) { return settingsSchema.safeParse(input); }

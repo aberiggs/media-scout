@@ -7,7 +7,8 @@ import { pickVerdictSchema, Picker } from '../src/core/picker';
 import type { EpisodeCoverage } from '../src/core/guardrails';
 import type { WorkUnit } from '../src/core/watcher';
 import { buildStack } from '../src/compose';
-import { loadConfig } from '../src/config';
+import { configWithSettings, loadConfig } from '../src/config';
+import { defaultSettings } from '../src/settings';
 
 type JsonCall = {
   system: string;
@@ -279,13 +280,10 @@ describe('Picker', () => {
 
   it('production composition passes validated MEDIA_PREFERENCES into the picker', async () => {
     const fake = new FakeLLM([() => ({ verdict: 'skip', releaseIndex: null, reason: 'no plausible title' })]);
-    const config = loadConfig({
-      PROWLARR_URL: 'http://prowlarr.test', PROWLARR_API_KEY: 'test-key',
-      SONARR_URL: 'http://sonarr.test', SONARR_API_KEY: 'test-key',
-      RADARR_URL: 'http://radarr.test', RADARR_API_KEY: 'test-key',
-      PROWLARR_CLIENT_TV: 'TV', PROWLARR_CLIENT_MOVIE: 'Movies', LLM_API_KEY: 'test-key',
-      MEDIA_PREFERENCES: 'Prefer 1080p over 4K.', DB_PATH: ':memory:',
-    });
+    const config = configWithSettings(loadConfig({ DB_PATH: ':memory:' }), { ...defaultSettings, ai: { ...defaultSettings.ai, apiKey: 'test-key', preferences: 'Prefer 1080p over 4K.' }, integrations: {
+      prowlarr: { url: 'http://prowlarr.test', apiKey: 'test-key', tvClient: 'TV', movieClient: 'Movies' },
+      sonarr: { url: 'http://sonarr.test', apiKey: 'test-key' }, radarr: { url: 'http://radarr.test', apiKey: 'test-key' },
+    } });
     const stack = buildStack({ config, llm: fake });
     try {
       await stack.picker.pick({ unit: tvUnit, candidates: candidates([{ release: {}, covered: [1] }]) });

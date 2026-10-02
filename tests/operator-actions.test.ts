@@ -4,6 +4,7 @@ import { OperatorActions } from '../src/core/operator-actions';
 import { State } from '../src/core/state';
 import type { WorkItem } from '../src/core/work-queue-types';
 import type { Config } from '../src/config';
+import { defaultSettings } from '../src/settings';
 import type { LibrarySnapshot } from '../src/core/watcher';
 
 const NOW = '2026-01-01T00:00:00.000Z';
@@ -24,7 +25,8 @@ function config(enabled: boolean): Config {
     RADARR_URL: 'http://radarr.test', RADARR_API_KEY: 'r-key', PROWLARR_CLIENT_TV: 'tv', PROWLARR_CLIENT_MOVIE: 'movie',
     LLM_BASE_URL: 'http://llm.test', LLM_API_KEY: 'llm-key', LLM_MODEL: 'model', MEDIA_PREFERENCES: '', CYCLE_INTERVAL_MIN: 5,
     MIN_RETRY_HOURS: 6, FAILURE_BACKOFF_MIN: 5, FAILURE_BACKOFF_MAX_MIN: 60, QUEUE_GRACE_MIN: 30, DRY_RUN: true,
-    ALLOW_OPERATOR_ACTIONS: enabled, DB_PATH: ':memory:', HTTP_PORT: 7877, LOG_LEVEL: 'info',
+    ALLOW_OPERATOR_ACTIONS: enabled, DB_PATH: ':memory:', HTTP_PORT: 7877, HTTP_HOST: '127.0.0.1', LOG_LEVEL: 'info',
+    settings: { ...defaultSettings, safety: { ...defaultSettings.safety, allowOperatorActions: enabled } },
   };
 }
 
@@ -70,6 +72,24 @@ describe('isolated operator action service', () => {
     expect(state.listGrabIntents()[0]?.status).toBe('uncertain');
     expect(state.listGrabIntents()[0]?.releasedAt).toBe(REVIEW_TIME);
     expect(radarr.getQueue).toHaveBeenCalledTimes(3);
+  });
+
+  it('rejects committing a prepared operator action through a fresh stack after integration credentials change', async () => {
+    const { service, state, watcher, sonarr, radarr, reviewId } = setup([[], []]);
+    const prepared = await service.prepareReviewAction({ reviewId, operation: 'release_intent_hold' });
+    const changedService = new OperatorActions({
+      enabled: true,
+      config: { ...config(true), SONARR_API_KEY: 'updated-sonarr-key' },
+      state,
+      watcher: watcher as never,
+      sonarr: sonarr as never,
+      radarr: radarr as never,
+      now: () => new Date(REVIEW_TIME),
+    });
+
+    await expect(changedService.releaseIntentHold({ reviewId, token: prepared.token, challengeResponse: ACK, note: 'credential changed during prompt' }))
+      .rejects.toThrow(/changed since prepare/i);
+    expect(state.listGrabIntents()[0]?.releasedAt).toBeUndefined();
   });
 
   it('prepares an index-bounded human association and re-reads material before its audited commit', async () => {

@@ -19,6 +19,13 @@ RUN apt-get update \
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
+# The isolated Vite package builds the static UI served by Fastify.
+COPY web/package.json web/package-lock.json ./web/
+RUN cd web && npm ci
+COPY web/index.html web/postcss.config.js web/tailwind.config.js web/vite.config.ts web/tsconfig.json ./web/
+COPY web/src ./web/src
+RUN npm --prefix web run build
+
 COPY src ./src
 
 # ── Stage 2: runtime ──
@@ -30,6 +37,7 @@ ENV NODE_ENV=production
 COPY --from=builder --chown=node:node /app/node_modules ./node_modules
 COPY --from=builder --chown=node:node /app/package.json ./package.json
 COPY --from=builder --chown=node:node /app/src ./src
+COPY --from=builder --chown=node:node /app/web/dist ./web/dist
 COPY LICENSE ./LICENSE
 
 # DB_PATH defaults to data/media-agent.db (relative to /app); compose

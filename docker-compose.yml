@@ -5,13 +5,20 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
-    # Full config surface lives in .env (zod-validated in src/config.ts) —
-    # nothing is duplicated here.
-    env_file: .env
+    # Optional bootstrap overrides; integration settings are stored in SQLite.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DB_PATH: ${DB_PATH:-data/media-agent.db}
+      HTTP_PORT: ${HTTP_PORT:-7877}
+      HTTP_HOST: 0.0.0.0
+      LOG_LEVEL: ${LOG_LEVEL:-info}
     ports:
-      # Daemon HTTP surface: GET /health + POST /cycle on HTTP_PORT (default 7877).
-      # ${HTTP_PORT:-7877} on both sides keeps daemon listener, HEALTHCHECK, and this
-      # mapping in sync (compose interpolates .env). Loopback-only by default: POST /cycle
+      # Web UI, GET /health, settings API, and POST /cycle on HTTP_PORT (default 7877).
+      # The explicit container HTTP_PORT and this mapping share the same Compose
+      # interpolation, keeping listener, HEALTHCHECK, and host port in sync. Loopback-only
+      # by default: POST /cycle
       # is unauthenticated (paid LLM cycles + Prowlarr searches) — to reach it from the
       # LAN, change this binding consciously. See README Troubleshooting.
       - "127.0.0.1:${HTTP_PORT:-7877}:${HTTP_PORT:-7877}"

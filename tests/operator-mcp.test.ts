@@ -3,6 +3,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createMcpServer } from '../src/mcp/server';
 import type { Stack } from '../src/compose';
+import { defaultSettings } from '../src/settings';
 
 let client: Client | undefined;
 let serverTransport: InMemoryTransport | undefined;
@@ -16,12 +17,14 @@ afterEach(async () => {
 
 async function connect(allowOperatorActions: boolean) {
   const prepareReviewAction = vi.fn(async () => ({ token: 'prepared-secret', challenge: 'challenge' }));
+  const settings = { ...defaultSettings, safety: { ...defaultSettings.safety, allowOperatorActions } };
   const stack = {
-    config: { ALLOW_OPERATOR_ACTIONS: allowOperatorActions, DRY_RUN: true, LLM_MODEL: 'test', CYCLE_INTERVAL_MIN: 5 },
-    state: { resolveManualReview: vi.fn(() => true) },
+    config: { ALLOW_OPERATOR_ACTIONS: allowOperatorActions, DRY_RUN: true, LLM_MODEL: 'test', CYCLE_INTERVAL_MIN: 5, settings },
+    state: { resolveManualReview: vi.fn(() => true), getSettings: () => settings },
     runner: {}, prowlarr: {},
     operatorActions: { prepareReviewAction, associateQueue: vi.fn(), releaseIntentHold: vi.fn() },
   } as unknown as Stack;
+  stack.createSnapshot = () => stack;
   const server = createMcpServer(stack);
   const [clientTransport, serverSide] = InMemoryTransport.createLinkedPair();
   serverTransport = serverSide;

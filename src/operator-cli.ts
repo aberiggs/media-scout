@@ -5,8 +5,9 @@ import { loadConfig } from './config';
 import type { PreparedOperatorAction } from './core/operator-actions';
 
 export async function runOperatorCli(stack: ReturnType<typeof buildStack>): Promise<void> {
+  stack = stack.createSnapshot(stack.state.getSettings());
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error('Operator CLI requires an interactive TTY');
-  if (!stack.config.ALLOW_OPERATOR_ACTIONS) throw new Error('Operator actions are disabled; set ALLOW_OPERATOR_ACTIONS=true to opt in');
+  if (!stack.config.ALLOW_OPERATOR_ACTIONS) throw new Error('Operator actions are disabled; enable allowOperatorActions in the web settings first');
   const prompt = createInterface({ input: process.stdin, output: process.stdout });
   try {
     const reviews = stack.state.listManualReview(false);
@@ -22,7 +23,7 @@ export async function runOperatorCli(stack: ReturnType<typeof buildStack>): Prom
     const operationIndex = await chooseNumber(prompt, 'Action number (or cancel): ', operations.length);
     if (operationIndex === null) return;
     const operation = operations[operationIndex]!.value;
-    const prepared = await stack.operatorActions.prepareReviewAction({ reviewId: review.id, operation });
+    const prepared = await withFreshOperatorActions(stack, (actions) => actions.prepareReviewAction({ reviewId: review.id, operation }));
     printPrepared(prepared);
     let result: unknown;
     if (operation === 'associate_queue') {
@@ -35,16 +36,26 @@ export async function runOperatorCli(stack: ReturnType<typeof buildStack>): Prom
       if (selectedTargets === null) return;
       const challengeResponse = await prompt.question('Type the exact challenge text to authorize: ');
       const note = await prompt.question('Audit note (3-500 printable characters): ');
-      result = await stack.operatorActions.associateQueue({ reviewId: review.id, token: prepared.token, proposedAssociation: { mediaIndex, targetIndices: selectedTargets }, challengeResponse, note });
+      result = await withFreshOperatorActions(stack, (actions) => actions.associateQueue({ reviewId: review.id, token: prepared.token, proposedAssociation: { mediaIndex, targetIndices: selectedTargets }, challengeResponse, note }));
     } else {
       const challengeResponse = await prompt.question('Type the exact challenge text to authorize: ');
       const note = await prompt.question('Audit note (3-500 printable characters): ');
-      result = await stack.operatorActions.releaseIntentHold({ reviewId: review.id, token: prepared.token, challengeResponse, note });
+      result = await withFreshOperatorActions(stack, (actions) => actions.releaseIntentHold({ reviewId: review.id, token: prepared.token, challengeResponse, note }));
     }
     console.log(JSON.stringify(result, null, 2));
   } finally {
     prompt.close();
   }
+}
+
+/** Take one coherent DB settings snapshot immediately before each operator service call. */
+export async function withFreshOperatorActions<T>(
+  stack: ReturnType<typeof buildStack>,
+  action: (actions: ReturnType<typeof buildStack>['operatorActions']) => Promise<T>,
+): Promise<T> {
+  const current = stack.createSnapshot(stack.state.getSettings());
+  if (!current.config.ALLOW_OPERATOR_ACTIONS) throw new Error('Operator actions are disabled; enable allowOperatorActions in the web settings first');
+  return action(current.operatorActions);
 }
 
 function printPrepared(prepared: PreparedOperatorAction): void {

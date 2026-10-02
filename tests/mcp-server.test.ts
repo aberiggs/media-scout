@@ -12,8 +12,11 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { buildStack, type Stack } from '../src/compose';
-import { loadConfig } from '../src/config';
+import { configWithSettings, loadConfig } from '../src/config';
+import { defaultSettings } from '../src/settings';
+import { State } from '../src/core/state';
 import { createMcpServer } from '../src/mcp/server';
+import { ApiError } from '../src/http';
 import type { LLMClient } from '../src/clients/llm';
 import type { ZodType } from 'zod';
 import { plannedQueriesSchema, type PlannedQuery } from '../src/core/planner';
@@ -123,7 +126,24 @@ class FakeLLM implements LLMClient {
   }
 }
 
-const testConfig = loadConfig({
+function testConfigFromEnv(env: Record<string, string>) {
+  const defaults = defaultSettings;
+  const n = (key: string, fallback: number) => Number(env[key] ?? fallback);
+  const config = configWithSettings(loadConfig({ DB_PATH: env.DB_PATH }), {
+    ...defaults,
+    integrations: {
+      prowlarr: { url: env.PROWLARR_URL ?? PROWLARR, apiKey: env.PROWLARR_API_KEY ?? 'prowlarr-key', tvClient: env.PROWLARR_CLIENT_TV ?? 'qBit-TV', movieClient: env.PROWLARR_CLIENT_MOVIE ?? 'qBit-Movies' },
+      sonarr: { url: env.SONARR_URL ?? SONARR, apiKey: env.SONARR_API_KEY ?? 'sonarr-key' },
+      radarr: { url: env.RADARR_URL ?? RADARR, apiKey: env.RADARR_API_KEY ?? 'radarr-key' },
+    },
+    ai: { apiKey: env.LLM_API_KEY ?? 'llm-key', model: env.LLM_MODEL ?? defaults.ai.model, baseUrl: env.LLM_BASE_URL ?? defaults.ai.baseUrl, preferences: env.MEDIA_PREFERENCES ?? '' },
+    monitoring: { ...defaults.monitoring, intervalMinutes: n('CYCLE_INTERVAL_MIN', 5), minRetryHours: n('MIN_RETRY_HOURS', 6), failureBackoffMinMinutes: n('FAILURE_BACKOFF_MIN', 5), failureBackoffMaxMinutes: n('FAILURE_BACKOFF_MAX_MIN', 60), queueGraceMinutes: n('QUEUE_GRACE_MIN', 30) },
+    safety: { dryRun: env.DRY_RUN !== 'false', allowOperatorActions: env.ALLOW_OPERATOR_ACTIONS === 'true' },
+  });
+  return config;
+}
+
+const testConfig = testConfigFromEnv({
   PROWLARR_URL: PROWLARR,
   PROWLARR_API_KEY: 'prowlarr-key',
   SONARR_URL: SONARR,
@@ -195,6 +215,7 @@ afterEach(async () => {
 /** Connects a fresh in-memory client to a fresh server over a live compose stack. */
 async function connect(llm: FakeLLM): Promise<Client> {
   stack = buildStack({ config: testConfig, llm, now: () => NOW, logger: pino({ level: 'silent' }) });
+  stack.state.saveSettings(testConfig.settings);
   const server = createMcpServer(stack);
   const [clientTransport, serverT] = InMemoryTransport.createLinkedPair();
   serverTransport = serverT;
@@ -241,6 +262,8 @@ describe('mcp server tools', () => {
       dryRun: false,
       model: testConfig.LLM_MODEL,
       cycleIntervalMin: testConfig.CYCLE_INTERVAL_MIN,
+      ready: true,
+      missing: [],
       openManualReviews: 1,
       workQueue: {
         items: [],
@@ -336,7 +359,7 @@ describe('mcp server tools', () => {
   });
 
   it('buildStack wires its real queue clients and validated queue controls into Runner', () => {
-    const config = loadConfig({
+    const config = testConfigFromEnv({
       PROWLARR_URL: PROWLARR, PROWLARR_API_KEY: 'prowlarr-key',
       SONARR_URL: SONARR, SONARR_API_KEY: 'sonarr-key',
       RADARR_URL: RADARR, RADARR_API_KEY: 'radarr-key',
@@ -371,7 +394,7 @@ describe('mcp server tools', () => {
       child() { return this; },
       warn(fields: Record<string, unknown>) { events.push(fields); },
     } as unknown as Logger;
-    const config = loadConfig({
+    const config = testConfigFromEnv({
       PROWLARR_URL: PROWLARR, PROWLARR_API_KEY: 'prowlarr-key',
       SONARR_URL: SONARR, SONARR_API_KEY: 'sonarr-key',
       RADARR_URL: RADARR, RADARR_API_KEY: 'radarr-key',
@@ -490,6 +513,24 @@ describe('mcp server tools', () => {
     expect(raw).not.toContain('downloadUrl');
     expect(raw).not.toContain('http');
     expect(raw).not.toContain('apikey');
+  });
+
+  it('MCP upstream failures retain HTTP status but never expose credential URLs or response bodies', async () => {
+    await connect(new FakeLLM());
+    const createSnapshot = stack.createSnapshot;
+    stack.createSnapshot = (settings) => {
+      const current = createSnapshot(settings);
+      return {
+        ...current,
+        prowlarr: { search: async () => { throw new ApiError(503, 'https://prowlarr.test/api?apikey=credential-SECRET', 'upstream body contains credential-SECRET'); } },
+      } as unknown as Stack;
+    };
+
+    const message = await callErrorText('ma_search', { query: 'test' });
+    expect(message).toContain('HTTP 503');
+    expect(message).not.toContain('prowlarr.test');
+    expect(message).not.toContain('credential-SECRET');
+    expect(message).not.toContain('upstream body');
   });
 
   it('ma_pick grabs a chosen release, preserves out-of-range errors, and holds submitted coverage', async () => {
@@ -685,6 +726,13 @@ describe('stdio entry e2e (spawned process)', () => {
     });
 
     const dbDir = mkdtempSync(join(tmpdir(), 'mcp-e2e-'));
+    const dbPath = join(dbDir, 'state.db');
+    const seed = State.open(dbPath);
+    seed.saveSettings({ ...defaultSettings, integrations: {
+      prowlarr: { url: prowlarr.url, apiKey: 'prowlarr-key', tvClient: 'qBit-TV', movieClient: 'qBit-Movies' },
+      sonarr: { url: sonarr.url, apiKey: 'sonarr-key' }, radarr: { url: radarr.url, apiKey: 'radarr-key' },
+    }, ai: { ...defaultSettings.ai, apiKey: 'llm-key', baseUrl: llm.url, model: 'stub-model' } });
+    seed.close();
     const transport = new StdioClientTransport({
       command: 'npx',
       args: ['tsx', 'src/mcp/server.ts'],
@@ -704,7 +752,7 @@ describe('stdio entry e2e (spawned process)', () => {
         LLM_API_KEY: 'llm-key',
         LLM_MODEL: 'stub-model',
         DRY_RUN: 'true',
-        DB_PATH: join(dbDir, 'state.db'),
+        DB_PATH: dbPath,
         LOG_LEVEL: 'info', // the DRY_RUN grab-intent line MUST fire — it is the corruption probe
       },
     });

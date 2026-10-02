@@ -5,6 +5,8 @@ import { z } from 'zod';
 import pino from 'pino';
 import { buildStack, type Stack } from '../compose';
 import { loadConfig } from '../config';
+import { missingSettings } from '../settings';
+import { ApiError } from '../http';
 import type { Release } from '../types/prowlarr';
 
 /**
@@ -13,7 +15,8 @@ import type { Release } from '../types/prowlarr';
  */
 export function createMcpServer(stack: Stack): McpServer {
   const server = new McpServer({ name: 'media-agent', version: '0.1.0' });
-  const { config, state, runner, prowlarr } = stack;
+  const { state } = stack;
+  const snapshot = () => stack.createSnapshot(state.getSettings());
 
   // I4: the SDK dispatches tool calls concurrently, but ma_cycle and ma_pick share the runner's
   // decision/hash write path — a promise-chain mutex makes it impossible to run both at once.
@@ -27,19 +30,37 @@ export function createMcpServer(stack: Stack): McpServer {
   const jsonResult = (payload: unknown) => ({
     content: [{ type: 'text' as const, text: JSON.stringify(payload, null, 2) }],
   });
+  const withSafeUpstreamErrors = async <T>(call: () => Promise<T>): Promise<T> => {
+    try { return await call(); }
+    catch (error) {
+      if (error instanceof ApiError) {
+        const detail = error.status > 0 ? `HTTP ${error.status}` : 'network or timeout failure';
+        const retry = error.retryAfter === undefined ? '' : `; retry after ${error.retryAfter}s`;
+        throw new Error(`Upstream request failed (${detail}${retry})`);
+      }
+      if (error instanceof z.ZodError) throw new Error('Upstream response was invalid');
+      if (error instanceof Error && ['AbortError', 'TimeoutError', 'TypeError', 'OpenRouterError'].includes(error.name)) {
+        throw new Error('Upstream request failed');
+      }
+      if (error instanceof Error && error.message.startsWith('LLM ')) throw new Error('LLM request failed');
+      throw error;
+    }
+  };
 
   server.registerTool('ma_status', { description: 'Config snapshot, open manual-review count, and safe queue-work status.' }, async () =>
-    jsonResult({
-      dryRun: config.DRY_RUN,
-      model: config.LLM_MODEL,
-      cycleIntervalMin: config.CYCLE_INTERVAL_MIN,
+    jsonResult((() => { const current = snapshot(); return {
+      dryRun: current.config.DRY_RUN,
+      model: current.config.LLM_MODEL,
+      cycleIntervalMin: current.config.CYCLE_INTERVAL_MIN,
+      ready: missingSettings(current.config.settings).length === 0,
+      missing: missingSettings(current.config.settings),
       openManualReviews: state.listManualReview(false).length,
       workQueue: state.getWorkQueueStatus(),
-    }),
+    }; })()),
   );
 
   server.registerTool('ma_cycle', { description: 'Run one full watch/search/decide cycle now.' }, async () =>
-    exclusive(async () => jsonResult(await runner.cycle())),
+    exclusive(async () => { const current = snapshot(); if (missingSettings(current.config.settings).length) throw new Error('Settings are incomplete'); return jsonResult(await withSafeUpstreamErrors(() => current.runner.cycle())); }),
   );
 
   server.registerTool(
@@ -65,10 +86,11 @@ export function createMcpServer(stack: Stack): McpServer {
         if (!state.resolveManualReview(input.id)) throw new Error(`review row not found or already resolved: id ${input.id}`);
         return jsonResult({ resolved: true });
       }
-      if (!config.ALLOW_OPERATOR_ACTIONS) throw new Error('Operator actions are disabled; set ALLOW_OPERATOR_ACTIONS=true to opt in');
-      if (input.action === 'prepare') return jsonResult(await stack.operatorActions.prepareReviewAction({ reviewId: input.id, operation: input.operation }));
-      if (input.action === 'associate_queue') return jsonResult(await stack.operatorActions.associateQueue({ reviewId: input.id, token: input.token, proposedAssociation: input.proposedAssociation, challengeResponse: input.challengeResponse, note: input.note }));
-      return jsonResult(await stack.operatorActions.releaseIntentHold({ reviewId: input.id, token: input.token, challengeResponse: input.challengeResponse, note: input.note }));
+      const current = snapshot();
+      if (!current.config.ALLOW_OPERATOR_ACTIONS) throw new Error('Operator actions are disabled');
+       if (input.action === 'prepare') return jsonResult(await withSafeUpstreamErrors(() => current.operatorActions.prepareReviewAction({ reviewId: input.id, operation: input.operation })));
+       if (input.action === 'associate_queue') return jsonResult(await withSafeUpstreamErrors(() => current.operatorActions.associateQueue({ reviewId: input.id, token: input.token, proposedAssociation: input.proposedAssociation, challengeResponse: input.challengeResponse, note: input.note })));
+       return jsonResult(await withSafeUpstreamErrors(() => current.operatorActions.releaseIntentHold({ reviewId: input.id, token: input.token, challengeResponse: input.challengeResponse, note: input.note })));
     },
   );
 
@@ -91,7 +113,9 @@ export function createMcpServer(stack: Stack): McpServer {
       inputSchema: z.object({ query: z.string().min(1), limit: z.number().int().positive().max(500).default(100) }),
     },
     async ({ query, limit }) => {
-      const releases = await prowlarr.search({ query, categories: [], limit });
+      const current = snapshot();
+      if (missingSettings(current.config.settings).length) throw new Error('Settings are incomplete');
+      const releases = await withSafeUpstreamErrors(() => current.prowlarr.search({ query, categories: [], limit }));
       return jsonResult({ releases: releases.map(toPublicRelease) });
     },
   );
@@ -102,7 +126,7 @@ export function createMcpServer(stack: Stack): McpServer {
       description: 'Manually grab the chosen candidate (sorted by seeders) for a work unit now.',
       inputSchema: z.object({ workKey: z.string().min(1), releaseIndex: z.number().int().min(0) }),
     },
-    ({ workKey, releaseIndex }) => exclusive(async () => jsonResult(await runner.manualPick(workKey, releaseIndex))),
+    ({ workKey, releaseIndex }) => exclusive(async () => { const current = snapshot(); if (missingSettings(current.config.settings).length) throw new Error('Settings are incomplete'); return jsonResult(await withSafeUpstreamErrors(() => current.runner.manualPick(workKey, releaseIndex))); }),
   );
 
   return server;

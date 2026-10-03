@@ -195,7 +195,7 @@ class TerminalAfterAcceptedState extends State {
       ...prior,
       status: 'fulfilled',
       missingFingerprint: JSON.stringify([prior.contentIdentity, []]),
-      unit: { ...prior.unit, season: { seasonNumber: prior.unit.season.seasonNumber, missing: [] } },
+      unit: { ...prior.unit, season: { ...prior.unit.season } },
       lastObservedAt: input.now,
     };
     this.applyWorkReconciliation({ key: prior.workKey, token: intent.ownerToken, work: terminal, intentUpdates: [{ id: intent.id, status: 'fulfilled' }] });
@@ -418,7 +418,7 @@ describe('Runner.cycle', () => {
     expect(rejectedLaterGrab.isDone()).toBe(false);
     expect(summary.grabbed).toBe(1);
     expect(state.workBeforeFailure).toMatchObject({ status: 'fulfilled' });
-    expect(state.getWorkItem('sonarr:1:s1'), JSON.stringify(warns)).toMatchObject({ status: 'fulfilled', unit: { season: { missing: [] } } });
+    expect(state.getWorkItem('sonarr:1:s1'), JSON.stringify(warns)).toMatchObject({ status: 'fulfilled', unit: { season: { missing: [{ episodeId: 101 }] } } });
     expect(state.getWorkItem('sonarr:1:s2')).toMatchObject({ status: 'backoff', failCount: 1 });
     expect(state.listWorkItems()).toHaveLength(2); // both terminal and nonterminal rows remain decodable
     expect(state.listGrabIntents()).toMatchObject([{ status: 'fulfilled', coverage: [{ workKey: 'sonarr:1:s1', episodeIds: [101] }] }]);
@@ -1572,6 +1572,8 @@ describe('Runner.cycle', () => {
       [{ workKey: 'sonarr:1:s1', episodeIds: [101], basis: 'explicit-episodes' }],
       [{ workKey: 'sonarr:1:s2', episodeIds: [201], basis: 'explicit-episodes' }],
     ]);
+    expect(state.listSearchActivity().find(({ query }) => query === 'Show S01')).toMatchObject({ media: [{ workKey: 'sonarr:1:s1' }] });
+    expect(state.listSearchActivity().find(({ query }) => query === 'Show S02')).toMatchObject({ media: [{ workKey: 'sonarr:1:s2' }] });
   });
 
   it('keeps the first accepted group release when the second is rejected and never reserves the third', async () => {
@@ -1880,6 +1882,18 @@ describe('Runner.manualPick', () => {
     expect(result.releaseTitle).toContain('SubsPlease');
     expect(decisionRow(state, 'sonarr:1:s1')).toMatchObject({ verdict: 'grab', grabbed: 1 });
     expect(state.hasHash('FIXTUREHASH0000000000000000000000000')).toBe(true);
+    expect(state.listSearchActivity()).toMatchObject([{ source: 'manual', query: 'Frieren', resultCount: 2, outcome: 'success', media: [{ workKey: 'sonarr:1:s1' }] }]);
+  });
+
+  it('records manualPick search failures as bounded manual activity without changing the failure behavior', async () => {
+    const llm = new FakeLLM();
+    llm.planner.set('sonarr:1:s1', [{ query: 'Frieren', categories: [5070] }]);
+    mockDiscovery({ series: [tvSeries(1, 'Show', 11, 'standard')] });
+    mockSearch({ status: 503 });
+    const { runner, state } = buildStack(llm, { dryRun: false });
+
+    await expect(runner.manualPick('sonarr:1:s1', 0)).rejects.toThrow();
+    expect(state.listSearchActivity()).toMatchObject([{ source: 'manual', query: 'Frieren', resultCount: null, outcome: 'error', errorCode: 'http-503' }]);
   });
 
   it('DRY_RUN manual pick logs intent without grabbing (I3 applies to human picks too)', async () => {

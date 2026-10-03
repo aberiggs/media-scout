@@ -221,6 +221,7 @@ const WORK_STATUSES: readonly WorkStatus[] = ['ready', 'waiting-release', 'searc
 const INTENT_STATUSES: readonly IntentStatus[] = ['submitting', 'awaiting-queue', 'active', 'fulfilled', 'import-blocked', 'uncertain', 'failed'];
 const OPEN_INTENT_STATUSES: readonly IntentStatus[] = ['submitting', 'awaiting-queue', 'active', 'import-blocked', 'uncertain'];
 const ORDINARY_REVIEW_REASONS = ['picker-manual', 'no-suitable-release', 'repeated-operation-failure', 'missing-download-client', 'reverify-failed', 'unparseable-title'] as const;
+export const WORK_OBSERVATION_STALE_AFTER_MS = 24 * 60 * 60_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -507,8 +508,9 @@ export class State {
     this.pruneSearchActivity(input.now);
   }
 
-  listSearchActivity(): ActivityRecord[] {
-    const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60_000).toISOString();
+  listSearchActivity(now: string = new Date().toISOString()): ActivityRecord[] {
+    validIso(now, 'activity read');
+    const cutoff = new Date(Date.parse(now) - 7 * 24 * 60 * 60_000).toISOString();
     return (this.db.prepare('SELECT * FROM search_activity WHERE started_at>=? ORDER BY started_at DESC,id DESC LIMIT 2000').all(cutoff) as Record<string, unknown>[]).map((row) => {
       let media: unknown;
       try { media = JSON.parse(String(row.media_json)) as unknown; } catch { throw new Error('Corrupt search activity media'); }
@@ -535,7 +537,11 @@ export class State {
     if (work.lastOutcome === 'rate-limited' && work.nextSearchAt !== null && Date.parse(work.nextSearchAt) > Date.parse(now)) return 'rate-limited';
     if (work.blockedReason !== null && work.blockedReason !== 'manual-review') return 'work-held';
     if (!work.queueObservationKnown || work.lastQueueObservedAt === null) return 'queue-observation-unknown';
-    if (Date.parse(now) - Date.parse(work.lastQueueObservedAt) > 24 * 60 * 60_000 || Date.parse(now) - Date.parse(work.lastObservedAt) > 24 * 60 * 60_000) return 'queue-observation-stale';
+    const nowMs = Date.parse(now);
+    const libraryAt = Date.parse(work.lastObservedAt);
+    const queueAt = Date.parse(work.lastQueueObservedAt);
+    if (![nowMs, libraryAt, queueAt].every(Number.isFinite) || libraryAt > nowMs || queueAt > nowMs) return 'queue-observation-unknown';
+    if (nowMs - queueAt > WORK_OBSERVATION_STALE_AFTER_MS || nowMs - libraryAt > WORK_OBSERVATION_STALE_AFTER_MS) return 'queue-observation-stale';
     const allOpenReviews = this.db.prepare('SELECT work_key,reason FROM manual_review WHERE resolved_at IS NULL').all() as Array<{ work_key: string; reason: string }>;
     const reviews = allOpenReviews.filter(({ work_key: key }) => key === workKey);
     if (allOpenReviews.some(({ work_key: key, reason }) => relatedKey(key) && !(ORDINARY_REVIEW_REASONS as readonly string[]).includes(reason))) return 'review-not-eligible';

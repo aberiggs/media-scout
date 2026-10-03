@@ -88,9 +88,13 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
     if (!page) return reply.code(400).send({ error: 'invalid query parameters', code: 'invalid-query' });
     const status = query.status === '' ? undefined : query.status;
     if (status !== undefined && (typeof status !== 'string' || !['ready','waiting-release','searching','cooldown','backoff','manual','fulfilled','inactive'].includes(status))) return reply.code(400).send({ error: 'invalid status filter', code: 'invalid-query' });
+    const scope = query.scope === '' ? undefined : query.scope;
+    if (scope !== undefined && (scope !== 'active' && scope !== 'all')) return reply.code(400).send({ error: 'invalid scope filter', code: 'invalid-query' });
     const q = parseSearch(query.q);
     if (q === null) return reply.code(400).send({ error: 'invalid search filter', code: 'invalid-query' });
-    return operations.work({ ...page, ...(typeof status === 'string' ? { status } : {}), ...(q ? { q } : {}) });
+    const settings = stack.state.getSettings();
+    const now = new Date();
+    return operations.work({ ...page, ...(typeof status === 'string' ? { status } : {}), ...(typeof scope === 'string' ? { scope } : {}), ...(q ? { q } : {}) }, settings.safety.allowOperatorActions, now);
   });
   app.get('/api/operations/reviews', async (request, reply) => {
     const query = request.query as Record<string, unknown>;
@@ -100,7 +104,8 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
     if (resolved === null) return reply.code(400).send({ error: 'invalid resolved filter', code: 'invalid-query' });
     const q = parseSearch(query.q);
     if (q === null) return reply.code(400).send({ error: 'invalid search filter', code: 'invalid-query' });
-    return operations.reviews({ ...page, resolved, ...(q ? { q } : {}) }, stack.state.getSettings().safety.allowOperatorActions);
+    const settings = stack.state.getSettings();
+    return operations.reviews({ ...page, resolved, ...(q ? { q } : {}) }, settings.safety.allowOperatorActions, new Date());
   });
   app.get('/api/operations/activity', async (request, reply) => {
     const query = request.query as Record<string, unknown>;
@@ -110,8 +115,9 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
     if (q === null) return reply.code(400).send({ error: 'invalid search filter', code: 'invalid-query' });
     const outcome = query.outcome === '' ? undefined : query.outcome;
     if (outcome !== undefined && (typeof outcome !== 'string' || !['running','success','error'].includes(outcome))) return reply.code(400).send({ error: 'invalid outcome filter', code: 'invalid-query' });
-    const items = stack.state.listSearchActivity().filter((item) => (!q || `${item.query} ${item.media.map(({ title, workKey }) => `${title} ${workKey}`).join(' ')}`.toLocaleLowerCase().includes(q.toLocaleLowerCase())) && (!outcome || item.outcome === outcome));
-    return { items: items.slice(page.offset, page.offset + page.limit), total: items.length, generatedAt: new Date().toISOString(), retention: { days: 7, maxEntries: 2000 } };
+    const now = new Date().toISOString();
+    const items = stack.state.listSearchActivity(now).filter((item) => (!q || `${item.query} ${item.media.map(({ title, workKey }) => `${title} ${workKey}`).join(' ')}`.toLocaleLowerCase().includes(q.toLocaleLowerCase())) && (!outcome || item.outcome === outcome));
+    return { items: items.slice(page.offset, page.offset + page.limit), total: items.length, generatedAt: now, retention: { days: 7, maxEntries: 2000 } };
   });
   app.post('/api/operations/work/action', async (request, reply) => {
     if (!mutationAllowed(request)) return reply.code(403).send({ error: 'cross-origin mutation rejected', code: 'origin-rejected' });

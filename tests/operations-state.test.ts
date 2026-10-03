@@ -140,4 +140,47 @@ describe('operational work actions', () => {
     leaseState.releaseClaim(activeSibling.workKey, siblingOwner);
     leaseState.close();
   });
+
+  it('rejects future library/queue timestamps at both eligibility and transactional mutation boundaries', () => {
+    const futureAt = '2026-10-01T00:00:01.000Z';
+    for (const source of ['library', 'queue'] as const) {
+      const state = State.open(':memory:');
+      seed(state);
+      const current = state.getWorkItem('sonarr:4:s1')!;
+      const owner = state.claimUnit(current.workKey, new Date(source === 'library' ? futureAt : NOW))!;
+      if (source === 'library') {
+        state.applyWorkReconciliation({ key: current.workKey, token: owner, work: { ...current, lastObservedAt: futureAt }, intentUpdates: [] });
+      } else {
+        state.applyWorkQueueObservation({ key: current.workKey, token: owner, observedAt: futureAt, known: true, coverage: [] });
+      }
+      state.releaseClaim(current.workKey, owner);
+      expect(state.getWorkActionEligibility(current.workKey, NOW).reset).toMatchObject({ allowed: false, reason: 'queue-observation-unknown' });
+      const before = state.getWorkItem(current.workKey)!;
+      const reviewsBefore = state.listManualReview(false);
+      const actionLease = state.claimUnits({ keys: [current.workKey, 'group:sonarr:4'], now: new Date(NOW) })!;
+      expect(() => state.applyWorkAction({ workKey: current.workKey, action: 'reset', ownerToken: actionLease.ownerToken, claimKeys: actionLease.keys, now: NOW })).toThrow(/queue-observation-unknown/);
+      state.releaseClaims({ keys: actionLease.keys, ownerToken: actionLease.ownerToken });
+      expect(state.getWorkItem(current.workKey)).toEqual(before);
+      expect(state.listManualReview(false)).toEqual(reviewsBefore);
+      state.close();
+    }
+  });
+
+  it('rejects invalid persisted observation timestamps without scheduling or resolving reviews', () => {
+    for (const timestampColumn of ['last_observed_at', 'queue_observed_at']) {
+      const state = State.open(':memory:');
+      seed(state);
+      const db = (state as unknown as { db: { prepare: (sql: string) => { get: (...values: unknown[]) => unknown; run: (...values: unknown[]) => void } } }).db;
+      const before = db.prepare('SELECT status,last_search_at,next_search_at,fail_count,last_outcome FROM work_items WHERE work_key=?').get('sonarr:4:s1');
+      db.prepare(`UPDATE work_items SET ${timestampColumn}='not-a-timestamp' WHERE work_key=?`).run('sonarr:4:s1');
+      const reviewsBefore = state.listManualReview(false);
+      const lease = state.claimUnits({ keys: ['sonarr:4:s1', 'group:sonarr:4'], now: new Date(NOW) })!;
+      expect(() => state.getWorkActionEligibility('sonarr:4:s1', NOW)).toThrow(/ISO timestamp/);
+      expect(() => state.applyWorkAction({ workKey: 'sonarr:4:s1', action: 'reset', ownerToken: lease.ownerToken, claimKeys: lease.keys, now: NOW })).toThrow(/ISO timestamp/);
+      state.releaseClaims({ keys: lease.keys, ownerToken: lease.ownerToken });
+      expect(db.prepare('SELECT status,last_search_at,next_search_at,fail_count,last_outcome FROM work_items WHERE work_key=?').get('sonarr:4:s1')).toEqual(before);
+      expect(state.listManualReview(false)).toEqual(reviewsBefore);
+      state.close();
+    }
+  });
 });

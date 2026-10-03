@@ -253,10 +253,10 @@ export class Runner {
     return eligibleWorkUnits(snapshot).some((unit) => unit.key === workKey);
   }
 
-  private async recordedSearch(query: string, categories: number[], indexerIds: number[], units: WorkUnit[]): Promise<Release[]> {
+  private async recordedSearch(query: string, categories: number[], indexerIds: number[], units: WorkUnit[], source: 'cycle' | 'manual' = 'cycle'): Promise<Release[]> {
     let activityId: number | undefined;
     try {
-      activityId = this.deps.state.startSearchActivity({ source: 'cycle', query, media: units.map(({ key, title }) => ({ workKey: key, title })), now: this.now().toISOString() });
+      activityId = this.deps.state.startSearchActivity({ source, query, media: units.map(({ key, title }) => ({ workKey: key, title })), now: this.now().toISOString() });
     } catch { /* Activity is an independent bounded projection and never gates a decision. */ }
     try {
       const releases = await this.deps.prowlarr.search({ query, categories, indexerIds });
@@ -389,7 +389,17 @@ export class Runner {
       const releases: Release[] = [];
       stage = 'search';
       try {
-        for (const query of planned) releases.push(...await this.recordedSearch(query.query, query.categories, allowlist, currentGroup.targets));
+        for (const query of planned) {
+          const seenTargets = new Set<number>();
+          const queryTargets = query.targetIndices.map((index) => {
+            if (!Number.isSafeInteger(index) || index < 0 || index >= currentGroup.targets.length || seenTargets.has(index)) throw new Error('planner group query has invalid target attribution');
+            seenTargets.add(index);
+            const target = currentGroup.targets[index];
+            if (!target) throw new Error('planner group query has invalid target attribution');
+            return target;
+          });
+          releases.push(...await this.recordedSearch(query.query, query.categories, allowlist, queryTargets));
+        }
       } catch (error) {
         await this.finishGroupBackoff(currentGroup, startedKeys, claims.ownerToken, error, summary, error instanceof ApiError ? error.retryAfter : undefined, 'search');
         startedKeys = [];
@@ -884,7 +894,7 @@ export class Runner {
       const unit = freshRow.eligibleUnit;
       const queries = await this.deps.planner.plan(unit);
       const releases: Release[] = [];
-      for (const planned of queries) releases.push(...await this.deps.prowlarr.search({ query: planned.query, categories: planned.categories, indexerIds: allowlist }));
+       for (const planned of queries) releases.push(...await this.recordedSearch(planned.query, planned.categories, allowlist, [unit], 'manual'));
       const candidates = this.admitCandidates(freshRow.work.unit, unit, this.buildCandidates(freshRow.work.unit, releases, this.emptySummary()), freshRow.activeCoverage);
       const judged = this.orderCandidates(candidates, unit.key);
       const candidate = judged[releaseIndex];

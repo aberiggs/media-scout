@@ -3,6 +3,8 @@ import pino from 'pino';
 import { buildApp } from '../src/daemon';
 import type { Stack } from '../src/compose';
 import { State } from '../src/core/state';
+import { WORK_OBSERVATION_STALE_AFTER_MS } from '../src/core/state';
+import { OperationsDashboard } from '../src/core/operations';
 import type { WorkItem } from '../src/core/work-queue-types';
 import type { CycleSummary } from '../src/core/runner';
 import { defaultSettings } from '../src/settings';
@@ -51,6 +53,100 @@ describe('operational dashboard API', () => {
     expect(activity.json()).toHaveProperty('generatedAt');
     expect((await app.inject({ method: 'GET', url: '/api/operations/work?status=not-a-status&q=&limit=50&offset=0' })).statusCode).toBe(400);
     expect((await app.inject({ method: 'GET', url: '/api/operations/activity?q=&outcome=not-an-outcome&limit=50&offset=0' })).statusCode).toBe(400);
+  });
+
+  it('filters terminal history before pagination and reports the effective count scope', async () => {
+    const { app, state } = await makeApp();
+    const observedAt = new Date().toISOString();
+    const addRow = (workKey: string, status: 'ready' | 'fulfilled' | 'inactive', movie = false) => {
+      const unit: WorkItem['unit'] = movie
+        ? { key: workKey, kind: 'movie', arr: 'radarr', serviceId: 8, externalId: 88, title: 'Movie', year: 2020, altTitles: [] }
+        : { key: workKey, kind: 'tv', arr: 'sonarr', serviceId: 4, externalId: 44, title: 'Show', altTitles: [], season: { seasonNumber: Number(workKey.slice(-1)), missing: status === 'ready' ? [{ episodeId: 201, episodeNumber: 1, absoluteEpisodeNumber: null, title: 'Episode' }] : [] } };
+      const item: WorkItem = { workKey, contentIdentity: `identity-${workKey}`, missingFingerprint: `fingerprint-${workKey}`, unit, status,
+        lastSearchAt: null, nextSearchAt: null, failCount: 0, lastOutcome: null, lastObservedAt: observedAt, lastQueueObservedAt: observedAt,
+        queueObservationKnown: true, blockedReason: null };
+      const owner = state.claimUnit(workKey, new Date(observedAt))!;
+      state.applyWorkReconciliation({ key: workKey, token: owner, work: item, intentUpdates: [] });
+      state.applyWorkQueueObservation({ key: workKey, token: owner, observedAt, known: true, coverage: [] });
+      state.releaseClaim(workKey, owner);
+    };
+    addRow('radarr:8', 'ready', true);
+    addRow('sonarr:4:s2', 'fulfilled');
+    addRow('sonarr:4:s3', 'inactive');
+
+    const firstActivePage = await app.inject({ method: 'GET', url: '/api/operations/work?limit=1&offset=0' });
+    const secondActivePage = await app.inject({ method: 'GET', url: '/api/operations/work?limit=1&offset=1' });
+    expect(firstActivePage.json()).toMatchObject({ scope: 'active', countScope: 'active', total: 2, counts: { fulfilled: 0, inactive: 0 } });
+    expect(secondActivePage.json().total).toBe(2);
+    expect(secondActivePage.json().items).toHaveLength(1);
+
+    const historyPage = await app.inject({ method: 'GET', url: '/api/operations/work?scope=all&limit=2&offset=1' });
+    expect(historyPage.json()).toMatchObject({ scope: 'all', countScope: 'all', total: 4, counts: { backoff: 1, ready: 1, fulfilled: 1, inactive: 1 } });
+    expect(historyPage.json().items.map((item: { status: string }) => item.status)).toEqual(['backoff', 'fulfilled']);
+    const lastHistoryPage = await app.inject({ method: 'GET', url: '/api/operations/work?scope=all&limit=1&offset=3' });
+    expect(lastHistoryPage.json().items.map((item: { status: string }) => item.status)).toEqual(['inactive']);
+    const explicitTerminal = await app.inject({ method: 'GET', url: '/api/operations/work?status=fulfilled&limit=50&offset=0' });
+    expect(explicitTerminal.json()).toMatchObject({ scope: 'active', countScope: 'all', total: 1, items: [{ status: 'fulfilled' }] });
+    expect((await app.inject({ method: 'GET', url: '/api/operations/work?scope=bad' })).statusCode).toBe(400);
+  });
+
+  it('uses one explicit freshness time, disables every mutation projection when opted out, and exposes season-scoped reviews', async () => {
+    const { app, state } = await makeApp();
+    const now = new Date('2026-10-10T00:00:00.000Z');
+    const base = new Date(now.getTime() - WORK_OBSERVATION_STALE_AFTER_MS).toISOString();
+    const setObservation = (lastObservedAt: string, lastQueueObservedAt: string | null, known: boolean) => {
+      const current = state.getWorkItem('sonarr:4:s1')!;
+      const owner = state.claimUnit(current.workKey, now)!;
+      state.applyWorkReconciliation({ key: current.workKey, token: owner, work: { ...current, lastObservedAt, lastQueueObservedAt, queueObservationKnown: known }, intentUpdates: [] });
+      state.applyWorkQueueObservation({ key: current.workKey, token: owner, observedAt: lastQueueObservedAt ?? lastObservedAt, known, coverage: [] });
+      state.releaseClaim(current.workKey, owner);
+    };
+    let injectedClockReads = 0;
+    const dashboard = new OperationsDashboard(state, () => { injectedClockReads += 1; return now; });
+    setObservation(base, base, true);
+    const oneMillisecondFresh = dashboard.work({ limit: 50, offset: 0 }, true, new Date(now.getTime() - 1));
+    expect(oneMillisecondFresh.items[0]?.observationState).toBe('known');
+    expect(oneMillisecondFresh.items[0]?.actions.reset.allowed).toBe(true);
+    expect(oneMillisecondFresh.generatedAt).toBe(new Date(now.getTime() - 1).toISOString());
+    expect(oneMillisecondFresh.freshness).toEqual({ staleAfterHours: 24 });
+    const exactCutoff = dashboard.work({ limit: 50, offset: 0 }, true);
+    expect(exactCutoff.items[0]?.observationState).toBe('known');
+    expect(injectedClockReads).toBe(1);
+    const oneMillisecondStale = dashboard.work({ limit: 50, offset: 0 }, true, new Date(now.getTime() + 1));
+    expect(oneMillisecondStale.items[0]).toMatchObject({ observationState: 'stale', actions: { reset: { allowed: false, reason: 'queue-observation-stale' } } });
+
+    setObservation(base, now.toISOString(), true);
+    expect(dashboard.work({ limit: 50, offset: 0 }, true, new Date(now.getTime() + 1)).items[0]?.observationState).toBe('stale'); // old library, fresh queue
+    setObservation(now.toISOString(), base, true);
+    expect(dashboard.work({ limit: 50, offset: 0 }, true, new Date(now.getTime() + 1)).items[0]?.observationState).toBe('stale'); // fresh library, old queue
+    const futureAt = new Date(now.getTime() + 1).toISOString();
+    setObservation(futureAt, now.toISOString(), true);
+    expect(dashboard.work({ limit: 50, offset: 0 }, true, now).items[0]).toMatchObject({ observationState: 'unknown', actions: { reset: { allowed: false, reason: 'queue-observation-unknown' } } });
+    setObservation(now.toISOString(), futureAt, true);
+    expect(dashboard.work({ limit: 50, offset: 0 }, true, now).items[0]).toMatchObject({ observationState: 'unknown', actions: { retry: { allowed: false, reason: 'queue-observation-unknown' } } });
+    setObservation(now.toISOString(), null, true);
+    const db = (state as unknown as { db: { prepare: (sql: string) => { run: (...values: unknown[]) => void } } }).db;
+    db.prepare('UPDATE work_items SET queue_observed_at=NULL,queue_known=1 WHERE work_key=?').run('sonarr:4:s1');
+    expect(dashboard.work({ limit: 50, offset: 0 }, true, now).items[0]).toMatchObject({ observationState: 'unknown', queueObservationKnown: true, queueObservedAt: null });
+
+    const secondItem: WorkItem = {
+      workKey: 'sonarr:4:s2', contentIdentity: 'identity-s2', missingFingerprint: 'fingerprint-s2',
+      unit: { key: 'sonarr:4:s2', kind: 'tv', arr: 'sonarr', serviceId: 4, externalId: 44, title: 'Show', altTitles: [], season: { seasonNumber: 2, missing: [{ episodeId: 201, episodeNumber: 1, absoluteEpisodeNumber: null, title: 'Second season' }] } },
+      status: 'backoff', lastSearchAt: null, nextSearchAt: null, failCount: 1, lastOutcome: 'operation-failure', lastObservedAt: new Date().toISOString(), lastQueueObservedAt: new Date().toISOString(), queueObservationKnown: true, blockedReason: null,
+    };
+    const secondOwner = state.claimUnit(secondItem.workKey, new Date(secondItem.lastObservedAt))!;
+    state.applyWorkReconciliation({ key: secondItem.workKey, token: secondOwner, work: secondItem, intentUpdates: [] });
+    state.applyWorkQueueObservation({ key: secondItem.workKey, token: secondOwner, observedAt: secondItem.lastQueueObservedAt!, known: true, coverage: [] });
+    state.flagManualReview(secondItem.workKey, 'no-suitable-release', undefined, new Date());
+    state.releaseClaim(secondItem.workKey, secondOwner);
+
+    const disabledSettings = { ...state.getSettings(), safety: { ...state.getSettings().safety, allowOperatorActions: false } };
+    state.saveSettings(disabledSettings);
+    const disabledWork = await app.inject({ method: 'GET', url: '/api/operations/work' });
+    expect(disabledWork.json().items[0].actions).toEqual({ retry: { allowed: false, reason: 'operator-actions-disabled' }, reset: { allowed: false, reason: 'operator-actions-disabled' } });
+    const disabledReview = await app.inject({ method: 'GET', url: '/api/operations/reviews' });
+    expect(disabledReview.json().items.map((item: { mediaType: string; season?: number }) => [item.mediaType, item.season]).sort((left: Array<string | number | undefined>, right: Array<string | number | undefined>) => Number(left[1]) - Number(right[1]))).toEqual([['tv', 1], ['tv', 2]]);
+    for (const review of disabledReview.json().items) expect(review.actions).toEqual({ retry: { allowed: false, reason: 'operator-actions-disabled' }, reset: { allowed: false, reason: 'operator-actions-disabled' }, associate: { allowed: false, reason: 'operator-actions-disabled' }, release: { allowed: false, reason: 'operator-actions-disabled' } });
   });
 
   it('serves paginated allowlisted work/review rows without raw review details and enforces validation/origin guards', async () => {

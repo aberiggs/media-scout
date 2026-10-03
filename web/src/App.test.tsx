@@ -39,7 +39,7 @@ const workItem = {
 }
 const reviewItem = {
   id: 7, workKey: workItem.workKey, title: 'North Shore', reason: 'queue-review', summary: 'Scout needs a human to check this work.',
-  createdAt: '2026-09-29T12:00:00.000Z', resolvedAt: null,
+  createdAt: '2026-09-29T12:00:00.000Z', resolvedAt: null, mediaType: 'tv' as const, season: 1,
   actions: { retry: { allowed: false, reason: 'Resolve the queue review first.' }, reset: { allowed: true }, associate: { allowed: true }, release: { allowed: true } },
 }
 const activityItem = {
@@ -49,7 +49,7 @@ const activityItem = {
 
 function defaultOperationResponse(input: RequestInfo | URL): Response {
   const url = new URL(String(input), 'http://localhost')
-  if (url.pathname === '/api/operations/work') return jsonResponse({ items: [workItem], total: 1, counts: { manual: 1, ready: 0 }, openReviewCount: 1, generatedAt: '2026-09-29T12:01:00.000Z' })
+  if (url.pathname === '/api/operations/work') return workResponse({ items: [workItem], total: 1, counts: { manual: 1, ready: 0, fulfilled: 0, inactive: 0 }, openReviewCount: 1, generatedAt: '2026-09-29T12:01:00.000Z', scope: url.searchParams.get('scope') === 'all' ? 'all' : 'active' })
   if (url.pathname === '/api/operations/reviews') return jsonResponse({ items: [reviewItem], total: 1, generatedAt: '2026-09-29T12:01:00.000Z' })
   if (url.pathname === '/api/operations/activity') return jsonResponse({ items: [activityItem], total: 1, generatedAt: '2026-09-29T12:01:00.000Z', retention: { days: 7, maxEntries: 2000 } })
   if (url.pathname.endsWith('/prepare')) return jsonResponse({ token: 'token-value', challenge: 'I approve this action.', expiresAt: '2099-01-01T00:00:00.000Z', summary: 'Fresh queue evidence is ready.', choices: [{ workKey: workItem.workKey, title: workItem.title }], mediaChoices: [{ mediaIndex: 0, title: workItem.title }], targetChoices: [{ workKey: workItem.workKey, title: 'Season 1 · all missing episodes', targetIndex: 0 }], requiresClientInspection: url.pathname.includes('release') })
@@ -59,11 +59,15 @@ function defaultOperationResponse(input: RequestInfo | URL): Response {
 
 function renderSettings() {
   render(<App />)
-  fireEvent.click(screen.getByRole('link', { name: 'Settings' }))
+  fireEvent.click(within(screen.getByRole('navigation', { name: 'Workspace' })).getByRole('link', { name: 'Settings' }))
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+}
+
+function workResponse(input: { items: unknown[]; total: number; counts: Record<string, number>; openReviewCount: number; generatedAt: string; scope?: 'active' | 'all'; countScope?: 'active' | 'all'; staleAfterHours?: number }): Response {
+  return jsonResponse({ ...input, scope: input.scope ?? 'active', countScope: input.countScope ?? input.scope ?? 'active', freshness: { staleAfterHours: input.staleAfterHours ?? 24 } })
 }
 
 function envelopeWithModel(model: string): SettingsEnvelope {
@@ -95,7 +99,7 @@ describe('settings experience', () => {
         return jsonResponse(envelope)
       }
       operationRequests.push({ input, init })
-      return defaultOperationResponse(input)
+      return Promise.resolve(defaultOperationResponse(input))
     }
   })
 
@@ -137,7 +141,7 @@ describe('settings experience', () => {
       return new Promise((resolve) => deferred.push({ resolve, signal: init?.signal as AbortSignal | undefined }))
     }
     render(<StrictMode><App /></StrictMode>)
-    fireEvent.click(screen.getByRole('link', { name: 'Settings' }))
+    fireEvent.click(within(screen.getByRole('navigation', { name: 'Workspace' })).getByRole('link', { name: 'Settings' }))
     await waitFor(() => assert.equal(deferred.length, 2))
     assert.equal(deferred[0].signal?.aborted, true)
 
@@ -164,7 +168,7 @@ describe('settings experience', () => {
       return new Promise((resolve, reject) => deferred.push({ resolve, reject }))
     }
     render(<StrictMode><App /></StrictMode>)
-    fireEvent.click(screen.getByRole('link', { name: 'Settings' }))
+    fireEvent.click(within(screen.getByRole('navigation', { name: 'Workspace' })).getByRole('link', { name: 'Settings' }))
     await waitFor(() => assert.equal(deferred.length, 2))
 
     await act(async () => {
@@ -255,19 +259,85 @@ describe('operations dashboard', () => {
     await screen.findByRole('heading', { name: 'Tracked media' })
     assert.ok(screen.getByRole('heading', { name: /Queue/ }))
     assert.ok(screen.getByText(/Scout work queue/))
-    assert.ok(screen.getByText('Observation is stale'))
-    assert.ok(screen.getByText(/Queue observed/))
+    assert.ok(screen.getByText('Stale observations'))
+    assert.ok(screen.getByText(/Library \+ queue/))
     assert.ok(screen.getByText('Coverage: 1 observed · 2 reserved'))
     const navigation = screen.getByRole('navigation', { name: 'Workspace' })
     for (const label of ['Queue', 'Reviews', 'Search history', 'Settings']) assert.ok(within(navigation).getByRole('link', { name: label }))
     assert.equal(screen.getByRole('link', { name: 'Queue' }).getAttribute('aria-current'), 'page')
   })
 
+  it('shows the initial loading state until the first queue response arrives', async () => {
+    let resolveQueue!: (response: Response) => void
+    globalThis.fetch = (input, init) => {
+      if (String(input) === '/api/settings') return Promise.resolve(jsonResponse(envelope))
+      operationRequests.push({ input, init })
+      if (String(input).startsWith('/api/operations/work')) return new Promise((resolve) => { resolveQueue = resolve })
+      return Promise.resolve(defaultOperationResponse(input))
+    }
+    render(<App />)
+    await screen.findByText('Loading Scout’s work queue…')
+    assert.equal(screen.queryByRole('heading', { name: 'Nothing in the queue yet' }), null)
+    resolveQueue(workResponse({ items: [workItem], total: 1, counts: { manual: 1 }, openReviewCount: 0, generatedAt: '2026-10-02T00:00:00.000Z' }))
+    await screen.findByRole('heading', { name: 'Tracked media' })
+    assert.ok(screen.getByRole('heading', { name: 'North Shore' }))
+  })
+
+  it('does not leave open reviews visible under the resolved filter after that request fails', async () => {
+    globalThis.fetch = async (input, init) => {
+      if (String(input) === '/api/settings') return jsonResponse(envelope)
+      operationRequests.push({ input, init })
+      const url = new URL(String(input), 'http://localhost')
+      if (url.pathname === '/api/operations/reviews' && url.searchParams.get('resolved') === 'true') return jsonResponse({ error: 'Synthetic resolved-filter failure' }, 503)
+      return defaultOperationResponse(input)
+    }
+    render(<App />)
+    fireEvent.click(screen.getByRole('link', { name: 'Reviews' }))
+    await screen.findByRole('button', { name: 'Review details' })
+    assert.ok(screen.getByText('Scout needs a human to check this work.'))
+    fireEvent.click(screen.getByRole('button', { name: 'Resolved' }))
+    await screen.findByText('Synthetic resolved-filter failure')
+    assert.ok(screen.getByRole('heading', { name: 'Resolved reviews' }))
+    assert.equal(screen.queryByText('Scout needs a human to check this work.'), null)
+    assert.equal(screen.queryByRole('button', { name: 'Review details' }), null)
+  })
+
+  it('clamps a shrunken second queue page back to the last available page after an action', async () => {
+    let total = 51
+    const rowAt = (number: number) => ({ ...workItem, workKey: `radarr:${number}`, title: `Work ${number}`, mediaType: 'movie' as const, season: undefined, status: 'cooldown', holdReason: null, missingCount: 1, nextSearchAt: null, lastSearchAt: '2026-09-29T12:00:00.000Z', actions: { retry: { allowed: true }, reset: { allowed: true } } })
+    const rowsFor = (offset: number, limit: number) => Array.from({ length: Math.max(0, Math.min(limit, total - offset)) }, (_, index) => rowAt(offset + index + 1))
+    globalThis.fetch = async (input, init) => {
+      if (String(input) === '/api/settings') return jsonResponse(envelope)
+      operationRequests.push({ input, init })
+      if (String(input).startsWith('/api/operations/work?')) {
+        const url = new URL(String(input), 'http://localhost')
+        const offset = Number(url.searchParams.get('offset') ?? 0)
+        const limit = Number(url.searchParams.get('limit') ?? 50)
+        return workResponse({ items: rowsFor(offset, limit), total, counts: { cooldown: total, fulfilled: 0, inactive: 0 }, openReviewCount: 0, generatedAt: '2026-10-02T00:00:00.000Z' })
+      }
+      if (String(input).endsWith('/work/action') && init?.method === 'POST') { total = 50; return jsonResponse({ ok: true, message: 'Tracking reset.' }) }
+      return defaultOperationResponse(input)
+    }
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Work 1' })
+    await screen.findByText('Page 1 of 2')
+    fireEvent.click(screen.getByRole('button', { name: /Next/ }))
+    await screen.findByRole('heading', { name: 'Work 51' })
+    fireEvent.click(screen.getByRole('button', { name: 'Reset tracking' }))
+    const confirmation = screen.getByRole('dialog', { name: 'Reset tracking?' })
+    fireEvent.click(within(confirmation).getByRole('button', { name: 'Reset tracking' }))
+    await screen.findByRole('heading', { name: 'Work 1' })
+    assert.ok(operationRequests.some(({ input }) => new URL(String(input), 'http://localhost').searchParams.get('offset') === '0' && new URL(String(input), 'http://localhost').searchParams.get('limit') === '50'))
+    assert.equal(screen.queryByRole('heading', { name: 'Nothing in the queue yet' }), null)
+    assert.equal(screen.queryByRole('heading', { name: 'Work 51' }), null)
+    assert.ok(screen.getByText('Tracking reset.'))
+  })
+
   it('shows an explicit empty state instead of treating unknown data as an empty queue', async () => {
     globalThis.fetch = async (input, init) => {
       if (String(input) === '/api/settings') return jsonResponse(envelope)
       operationRequests.push({ input, init })
-      if (String(input).startsWith('/api/operations/work')) return jsonResponse({ items: [], total: 0, counts: {}, openReviewCount: 0, generatedAt: '2026-09-29T12:01:00.000Z' })
+      if (String(input).startsWith('/api/operations/work')) return workResponse({ items: [], total: 0, counts: {}, openReviewCount: 0, generatedAt: '2026-09-29T12:01:00.000Z' })
       return defaultOperationResponse(input)
     }
     render(<App />)
@@ -279,21 +349,117 @@ describe('operations dashboard', () => {
     globalThis.fetch = async (input, init) => {
       if (String(input) === '/api/settings') return jsonResponse(envelope)
       operationRequests.push({ input, init })
-      if (String(input).startsWith('/api/operations/work')) return jsonResponse({ items: [{ ...workItem, observationState: 'unknown', observedAt: null, queueObservationKnown: false, queueObservedAt: null }], total: 1, counts: { manual: 1 }, openReviewCount: 0, generatedAt: '2026-09-29T12:01:00.000Z' })
+      if (String(input).startsWith('/api/operations/work')) return workResponse({ items: [{ ...workItem, observationState: 'unknown', observedAt: null, queueObservationKnown: false, queueObservedAt: '2026-09-28T12:00:00.000Z' }], total: 1, counts: { manual: 1 }, openReviewCount: 0, generatedAt: '2026-09-29T12:01:00.000Z' })
       return defaultOperationResponse(input)
     }
     render(<App />)
-    await screen.findByText('Observation unknown')
-    assert.ok(screen.getByText('Queue observation unknown'))
+    await screen.findByText('Observation status unknown')
+    assert.ok(screen.getByText(/Queue unknown · last complete observation/))
     assert.ok(screen.getByText('North Shore'))
     assert.equal(screen.queryByText('Nothing in the queue yet'), null)
+  })
+
+  it('removes duplicate wait reasons and equal observation times from a stale waiting-release row', async () => {
+    const observedAt = '2026-10-01T23:04:00.000Z'
+    const odyssey = {
+      ...workItem, workKey: 'radarr:315', title: 'The Odyssey', mediaType: 'movie' as const, season: undefined,
+      status: 'waiting-release', holdReason: 'waiting-release', missingCount: 1, nextSearchAt: null, lastSearchAt: null,
+      observedAt, queueObservationKnown: true, queueObservedAt: observedAt, observationState: 'stale' as const,
+      actions: { retry: { allowed: false, reason: 'queue-observation-stale' }, reset: { allowed: false, reason: 'queue-observation-stale' } },
+    }
+    globalThis.fetch = async (input, init) => {
+      if (String(input) === '/api/settings') return jsonResponse(envelope)
+      operationRequests.push({ input, init })
+      if (String(input).startsWith('/api/operations/work')) return workResponse({ items: [odyssey], total: 1, counts: { 'waiting-release': 1 }, openReviewCount: 0, generatedAt: '2026-10-02T00:00:00.000Z' })
+      return defaultOperationResponse(input)
+    }
+    render(<App />)
+    await screen.findByRole('heading', { name: 'The Odyssey' })
+    assert.equal(screen.getByText('Waiting for queue').textContent, 'Waiting for queue')
+    assert.equal(screen.queryByText(/Waiting for the submitted release to appear/), null)
+    const sourceLine = document.querySelector('.ops-observation-sources')
+    assert.ok(sourceLine?.textContent?.includes('Library + queue'))
+    assert.equal((sourceLine?.textContent?.match(/Oct 1/gu) ?? []).length, 1)
+    assert.equal(screen.queryByText(/Next eligible pass|Last search/u), null)
+    assert.equal(screen.getAllByRole('button', { name: 'Retry' }).length, 1)
+    assert.equal((screen.getByRole('button', { name: 'Retry' }) as HTMLButtonElement).disabled, true)
+    assert.equal((screen.getByRole('button', { name: 'Reset tracking' }) as HTMLButtonElement).disabled, true)
+    assert.equal(screen.queryByText(/queue-observation-stale|waiting-release/), null)
+    assert.equal(document.querySelectorAll('.ops-action-reason').length, 0)
+    assert.ok(screen.getByText(/Refresh view reloads saved status; it does not start a poll/))
+    assert.equal(screen.getByText(/Refresh view reloads saved status; it does not start a poll/).textContent?.includes('24 hours'), true)
+  })
+
+  it('keeps terminal work visible but removes ineligible retry/reset controls', async () => {
+    const fulfilled = { ...workItem, workKey: 'radarr:42', title: "Kiki's Delivery Service", mediaType: 'movie' as const, status: 'fulfilled', missingCount: 0, nextSearchAt: null, holdReason: null, actions: { retry: { allowed: false, reason: 'work-not-retryable' }, reset: { allowed: false, reason: 'work-not-resettable' } } }
+    const inactive = { ...workItem, workKey: 'sonarr:9:season:4', title: 'The Boys', status: 'inactive', missingCount: 0, nextSearchAt: null, holdReason: null, actions: { retry: { allowed: false, reason: 'work-not-retryable' }, reset: { allowed: false, reason: 'work-not-resettable' } } }
+    globalThis.fetch = async (input, init) => {
+      if (String(input) === '/api/settings') return jsonResponse(envelope)
+      operationRequests.push({ input, init })
+      if (String(input).startsWith('/api/operations/work')) {
+        const scope = new URL(String(input), 'http://localhost').searchParams.get('scope')
+        return scope === 'all'
+          ? workResponse({ items: [fulfilled, inactive], total: 2, counts: { fulfilled: 1, inactive: 1 }, openReviewCount: 0, generatedAt: '2026-10-02T00:00:00.000Z', scope: 'all', countScope: 'all' })
+          : workResponse({ items: [], total: 0, counts: { fulfilled: 0, inactive: 0 }, openReviewCount: 0, generatedAt: '2026-10-02T00:00:00.000Z', scope: 'active', countScope: 'active' })
+      }
+      return defaultOperationResponse(input)
+    }
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Nothing in the queue yet' })
+    assert.ok(operationRequests.some(({ input }) => new URL(String(input), 'http://localhost').searchParams.get('scope') === 'active'))
+    fireEvent.click(screen.getByRole('button', { name: 'All work' }))
+    await screen.findByRole('heading', { name: "Kiki's Delivery Service" })
+    assert.ok(screen.getByRole('heading', { name: 'The Boys' }))
+    assert.ok(operationRequests.some(({ input }) => new URL(String(input), 'http://localhost').searchParams.get('scope') === 'all'))
+    assert.ok(screen.getByText(/all work, including completed and inactive items/))
+    assert.equal(document.querySelectorAll('.ops-work-row').length, 2)
+    assert.equal(screen.queryByRole('button', { name: 'Retry' }), null)
+    assert.equal(screen.queryByRole('button', { name: 'Reset tracking' }), null)
+    fireEvent.click(screen.getByRole('button', { name: 'Active work' }))
+    await screen.findByRole('heading', { name: 'Nothing in the queue yet' })
+    assert.equal(screen.queryByRole('heading', { name: "Kiki's Delivery Service" }), null)
+  })
+
+  it('labels distinct, invalid, null, and future timestamps without placeholder dashes', async () => {
+    const row = { ...workItem, observedAt: 'not-a-date', queueObservationKnown: true, queueObservedAt: null, lastSearchAt: 'not-a-date', nextSearchAt: null }
+    const future = { ...workItem, workKey: 'radarr:900', title: 'Far Future', mediaType: 'movie' as const, status: 'ready', holdReason: null, observationState: 'known' as const, observedAt: '2099-06-01T12:00:00.000Z', queueObservationKnown: true, queueObservedAt: '2099-06-01T12:00:00.000Z', nextSearchAt: null, lastSearchAt: null }
+    globalThis.fetch = async (input, init) => {
+      if (String(input) === '/api/settings') return jsonResponse(envelope)
+      operationRequests.push({ input, init })
+      if (String(input).startsWith('/api/operations/work')) return workResponse({ items: [row, future], total: 2, counts: { manual: 1, ready: 1 }, openReviewCount: 0, generatedAt: '2026-10-02T00:00:00.000Z' })
+      return defaultOperationResponse(input)
+    }
+    render(<App />)
+    await screen.findByRole('heading', { name: 'North Shore' })
+    assert.ok(screen.getByText(/Library · Time unavailable/))
+    assert.ok(screen.getByText(/Queue · time unavailable/))
+    assert.ok(screen.getByText('Last search · Time unavailable'))
+    assert.ok(screen.getByText('Far Future'))
+    assert.ok(screen.getByText(/clock ahead/))
+    assert.equal(screen.queryByText(/—/), null)
+  })
+
+  it('shows separate library and queue observation times when they differ', async () => {
+    const row = { ...workItem, observedAt: '2026-10-01T23:04:00.000Z', queueObservationKnown: true, queueObservedAt: '2026-10-02T00:04:00.000Z' }
+    globalThis.fetch = async (input, init) => {
+      if (String(input) === '/api/settings') return jsonResponse(envelope)
+      operationRequests.push({ input, init })
+      if (String(input).startsWith('/api/operations/work')) return workResponse({ items: [row], total: 1, counts: { manual: 1 }, openReviewCount: 0, generatedAt: '2026-10-02T01:00:00.000Z' })
+      return defaultOperationResponse(input)
+    }
+    render(<App />)
+    await screen.findByRole('heading', { name: 'North Shore' })
+    const sourceLine = document.querySelector('.ops-observation-sources')
+    assert.ok(sourceLine?.textContent?.includes('Library ·'))
+    assert.ok(sourceLine?.textContent?.includes('Queue ·'))
+    assert.equal(sourceLine?.textContent?.includes('Library + queue'), false)
   })
 
   it('sends status and search filters and paginates large queue results', async () => {
     globalThis.fetch = async (input, init) => {
       if (String(input) === '/api/settings') return jsonResponse(envelope)
       operationRequests.push({ input, init })
-      if (String(input).startsWith('/api/operations/work')) return jsonResponse({ items: [workItem], total: 51, counts: { manual: 1, ready: 50 }, openReviewCount: 1, generatedAt: '2026-09-29T12:01:00.000Z' })
+      if (String(input).startsWith('/api/operations/work')) return workResponse({ items: [workItem], total: 51, counts: { manual: 1, ready: 50, fulfilled: 0, inactive: 0 }, openReviewCount: 1, generatedAt: '2026-09-29T12:01:00.000Z' })
       return defaultOperationResponse(input)
     }
     render(<App />)
@@ -307,6 +473,84 @@ describe('operations dashboard', () => {
     await waitFor(() => assert.ok(operationRequests.some(({ input }) => new URL(String(input), 'http://localhost').searchParams.get('offset') === '50')))
   })
 
+  it('aborts and ignores a late queue response from an earlier filter', async () => {
+    let resolveManual!: (response: Response) => void
+    let manualSignal: AbortSignal | undefined
+    const readyRow = { ...workItem, title: 'Ready Result', status: 'ready', holdReason: null, nextSearchAt: null, actions: { retry: { allowed: true }, reset: { allowed: true } } }
+    const manualRow = { ...workItem, title: 'Stale Manual Result' }
+    globalThis.fetch = (input, init) => {
+      if (String(input) === '/api/settings') return Promise.resolve(jsonResponse(envelope))
+      operationRequests.push({ input, init })
+      const url = new URL(String(input), 'http://localhost')
+      if (url.pathname === '/api/operations/work' && url.searchParams.get('status') === 'manual') {
+        manualSignal = init?.signal as AbortSignal | undefined
+        return new Promise((resolve) => { resolveManual = resolve })
+      }
+      if (url.pathname === '/api/operations/work' && url.searchParams.get('status') === 'ready') return Promise.resolve(workResponse({ items: [readyRow], total: 1, counts: { ready: 1 }, openReviewCount: 0, generatedAt: '2026-10-02T00:00:00.000Z' }))
+      return Promise.resolve(defaultOperationResponse(input))
+    }
+    render(<App />)
+    await screen.findByText('North Shore')
+    fireEvent.change(screen.getByLabelText('Filter by status'), { target: { value: 'manual' } })
+    await waitFor(() => assert.ok(resolveManual))
+    fireEvent.change(screen.getByLabelText('Filter by status'), { target: { value: 'ready' } })
+    await screen.findByRole('heading', { name: 'Ready Result' })
+    assert.equal(manualSignal?.aborted, true)
+    await act(async () => { resolveManual(workResponse({ items: [manualRow], total: 1, counts: { manual: 1 }, openReviewCount: 0, generatedAt: '2026-10-02T00:00:00.000Z' })) })
+    await new Promise<void>((resolve) => setTimeout(resolve, 0))
+    assert.ok(screen.getByRole('heading', { name: 'Ready Result' }))
+    assert.equal(screen.queryByRole('heading', { name: 'Stale Manual Result' }), null)
+  })
+
+  it('does not show the prior queue rows under a changed status after the request fails', async () => {
+    globalThis.fetch = async (input, init) => {
+      if (String(input) === '/api/settings') return jsonResponse(envelope)
+      operationRequests.push({ input, init })
+      const url = new URL(String(input), 'http://localhost')
+      if (url.pathname === '/api/operations/work' && url.searchParams.get('status') === 'ready') return jsonResponse({ error: 'Synthetic ready-filter failure' }, 503)
+      return defaultOperationResponse(input)
+    }
+    render(<App />)
+    await screen.findByRole('heading', { name: 'North Shore' })
+    fireEvent.change(screen.getByLabelText('Filter by status'), { target: { value: 'ready' } })
+    await screen.findByText('Synthetic ready-filter failure')
+    assert.equal((screen.getByLabelText('Filter by status') as HTMLSelectElement).value, 'ready')
+    assert.equal(screen.queryByRole('heading', { name: 'North Shore' }), null)
+    assert.ok(screen.getByRole('heading', { name: 'This queue view couldn’t load' }))
+    assert.ok(screen.getByText(/Previous rows are hidden because they don’t match/))
+  })
+
+  it('clamps a shrunken second queue page back to the last available page after an action', async () => {
+    let total = 51
+    const rowAt = (number: number) => ({ ...workItem, workKey: `radarr:${number}`, title: `Work ${number}`, mediaType: 'movie' as const, season: undefined, status: 'cooldown', holdReason: null, missingCount: 1, nextSearchAt: null, lastSearchAt: '2026-09-29T12:00:00.000Z', actions: { retry: { allowed: true }, reset: { allowed: true } } })
+    const rowsFor = (offset: number, limit: number) => Array.from({ length: Math.max(0, Math.min(limit, total - offset)) }, (_, index) => rowAt(offset + index + 1))
+    globalThis.fetch = async (input, init) => {
+      if (String(input) === '/api/settings') return jsonResponse(envelope)
+      operationRequests.push({ input, init })
+      if (String(input).startsWith('/api/operations/work?')) {
+        const url = new URL(String(input), 'http://localhost')
+        const offset = Number(url.searchParams.get('offset') ?? 0)
+        const limit = Number(url.searchParams.get('limit') ?? 50)
+        return workResponse({ items: rowsFor(offset, limit), total, counts: { cooldown: total }, openReviewCount: 0, generatedAt: '2026-10-02T00:00:00.000Z' })
+      }
+      if (String(input).endsWith('/work/action') && init?.method === 'POST') { total = 50; return jsonResponse({ ok: true, message: 'Tracking reset.' }) }
+      return defaultOperationResponse(input)
+    }
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Work 1' })
+    await screen.findByText('Page 1 of 2')
+    fireEvent.click(screen.getByRole('button', { name: /Next/ }))
+    await screen.findByRole('heading', { name: 'Work 51' })
+    fireEvent.click(screen.getByRole('button', { name: 'Reset tracking' }))
+    const confirmation = screen.getByRole('dialog', { name: 'Reset tracking?' })
+    fireEvent.click(within(confirmation).getByRole('button', { name: 'Reset tracking' }))
+    await screen.findByRole('heading', { name: 'Work 1' })
+    assert.ok(operationRequests.some(({ input }) => new URL(String(input), 'http://localhost').searchParams.get('offset') === '0' && new URL(String(input), 'http://localhost').searchParams.get('limit') === '50'))
+    assert.equal(screen.queryByRole('heading', { name: 'Nothing in the queue yet' }), null)
+    assert.equal(screen.queryByRole('heading', { name: 'Work 51' }), null)
+    assert.ok(screen.getByText('Tracking reset.'))
+  })
+
   it('retains the last queue rows when refresh fails and labels the error', async () => {
     render(<App />)
     await screen.findByText('North Shore')
@@ -317,7 +561,7 @@ describe('operations dashboard', () => {
       if (fail && String(input).startsWith('/api/operations/work')) throw new TypeError('offline')
       return defaultOperationResponse(input)
     }
-    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh view' }))
     await screen.findByRole('alert')
     assert.ok(screen.getByText('North Shore'))
     assert.ok(screen.getByRole('button', { name: 'Try again' }))
@@ -367,6 +611,10 @@ describe('operations dashboard', () => {
     assert.ok(screen.getByRole('heading', { name: /Search history/ }))
     assert.ok(screen.getByText('North Shore'))
     assert.ok(screen.getByText('12 results'))
+    assert.ok(screen.getByText(/Finished in 2 seconds/))
+    assert.equal(screen.queryByText(/Finished Sep/), null)
+    assert.ok(screen.getByText('Scout cycle'))
+    assert.equal(screen.queryByText('Scheduled cycle'), null)
     assert.ok(screen.getByText('Retained 7 days · up to 2,000 entries'))
     const request = operationRequests.find(({ input }) => String(input).startsWith('/api/operations/activity'))
     assert.ok(request)
@@ -398,6 +646,45 @@ describe('operations dashboard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Resolved' }))
     await screen.findByText(/Resolved Sep/)
     assert.ok(operationRequests.some(({ input }) => new URL(String(input), 'http://localhost').searchParams.get('resolved') === 'true'))
+  })
+
+  it('shows media type and season for same-title reviews in the list and detail', async () => {
+    globalThis.fetch = async (input, init) => {
+      if (String(input) === '/api/settings') return jsonResponse(envelope)
+      operationRequests.push({ input, init })
+      if (String(input).startsWith('/api/operations/reviews')) return jsonResponse({ items: [
+        { ...reviewItem, id: 11, workKey: 'sonarr:18:season:1', mediaType: 'tv', season: 1 },
+        { ...reviewItem, id: 12, workKey: 'sonarr:18:season:2', mediaType: 'tv', season: 2 },
+      ], total: 2, generatedAt: '2026-09-29T12:01:00.000Z' })
+      return defaultOperationResponse(input)
+    }
+    render(<App />)
+    fireEvent.click(screen.getByRole('link', { name: 'Reviews' }))
+    await screen.findByRole('heading', { name: 'Open reviews' })
+    await screen.findByText('TV · Season 1')
+    assert.ok(screen.getByText('TV · Season 2'))
+    const firstRow = document.querySelectorAll('.ops-review-row')[0] as HTMLElement
+    fireEvent.click(within(firstRow).getByRole('button', { name: 'Review details' }))
+    const firstDialog = screen.getByRole('dialog', { name: 'North Shore' })
+    assert.ok(within(firstDialog).getByText('TV · Season 1'))
+    fireEvent.click(within(firstDialog).getByRole('button', { name: 'Close review details' }))
+    const secondRow = document.querySelectorAll('.ops-review-row')[1] as HTMLElement
+    fireEvent.click(within(secondRow).getByRole('button', { name: 'Review details' }))
+    assert.ok(within(screen.getByRole('dialog', { name: 'North Shore' })).getByText('TV · Season 2'))
+  })
+
+  it('does not call a persisted running search a live operation', async () => {
+    globalThis.fetch = async (input, init) => {
+      if (String(input) === '/api/settings') return jsonResponse(envelope)
+      operationRequests.push({ input, init })
+      if (String(input).startsWith('/api/operations/activity')) return jsonResponse({ items: [{ ...activityItem, outcome: 'running', finishedAt: null, resultCount: null }], total: 1, generatedAt: '2026-09-29T12:01:00.000Z', retention: { days: 7, maxEntries: 2000 } })
+      return defaultOperationResponse(input)
+    }
+    render(<App />)
+    fireEvent.click(screen.getByRole('link', { name: 'Search history' }))
+    await screen.findByText('Completion not recorded')
+    assert.equal(document.querySelector('.ops-activity-row .ops-status')?.textContent, 'Completion not recorded')
+    assert.ok(screen.getByText('Scout cycle'))
   })
 
   it('prepares a release and requires inspection, exact challenge, and note before commit', async () => {
@@ -487,6 +774,34 @@ describe('operations dashboard', () => {
     assert.deepEqual(JSON.parse(String(request.init?.body)), { workKey: workItem.workKey, action: 'reset' })
   })
 
+  it('keeps nested confirmation and its parent inert while a work action is in flight', async () => {
+    let resolveAction!: (response: Response) => void
+    globalThis.fetch = (input, init) => {
+      if (String(input) === '/api/settings') return Promise.resolve(jsonResponse(envelope))
+      operationRequests.push({ input, init })
+      if (String(input).endsWith('/work/action') && init?.method === 'POST') return new Promise((resolve) => { resolveAction = resolve })
+      return Promise.resolve(defaultOperationResponse(input))
+    }
+    render(<App />)
+    fireEvent.click(screen.getByRole('link', { name: 'Reviews' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Review details' }))
+    const parentDialog = document.querySelector('[aria-labelledby="review-dialog-title"]') as HTMLElement
+    fireEvent.click(screen.getByRole('button', { name: 'Reset tracking' }))
+    const confirmDialog = screen.getByRole('dialog', { name: 'Reset tracking?' })
+    fireEvent.click(within(confirmDialog).getByRole('button', { name: 'Reset tracking' }))
+    await waitFor(() => assert.ok(resolveAction))
+    assert.equal(parentDialog.getAttribute('inert'), '')
+    assert.equal(parentDialog.getAttribute('aria-hidden'), 'true')
+    assert.equal((within(confirmDialog).getByRole('button', { name: 'Close dialog' }) as HTMLButtonElement).disabled, true)
+    fireEvent.keyDown(document, { key: 'Escape' })
+    assert.ok(screen.getByRole('dialog', { name: 'Reset tracking?' }))
+    assert.equal(parentDialog.isConnected, true)
+    assert.equal(parentDialog.getAttribute('inert'), '')
+    await act(async () => { resolveAction(jsonResponse({ ok: true, message: 'Work action completed.' })) })
+    await screen.findByText('Work action completed.')
+    await waitFor(() => assert.equal(screen.queryByRole('dialog'), null))
+  })
+
   it('blocks expired recovery previews and offers a fresh prepare step', async () => {
     let prepares = 0
     globalThis.fetch = async (input, init) => {
@@ -509,6 +824,38 @@ describe('operations dashboard', () => {
     fireEvent.click(refresh)
     await waitFor(() => assert.equal(prepares, 2))
     assert.ok(screen.getByText('Associate this queue item.'))
+  })
+
+  it('expires an idle prepared action without waiting for another input change', async () => {
+    globalThis.fetch = async (input, init) => {
+      if (String(input) === '/api/settings') return jsonResponse(envelope)
+      operationRequests.push({ input, init })
+      const url = new URL(String(input), 'http://localhost')
+      if (url.pathname.endsWith('/prepare')) return jsonResponse({
+        token: 'short-lived-token', challenge: 'Confirm this exact queue association.', expiresAt: new Date(Date.now() + 700).toISOString(),
+        summary: 'Fresh evidence expires shortly.', choices: [{ workKey: workItem.workKey, title: workItem.title }],
+        mediaChoices: [{ mediaIndex: 0, title: 'North Shore (2024)' }],
+        targetChoices: [{ workKey: workItem.workKey, title: 'Season 1 · episodes 1–4', targetIndex: 2 }],
+        requiresClientInspection: false,
+      })
+      if (url.pathname.endsWith('/commit')) return jsonResponse({ ok: true, message: 'Should not commit expired evidence.' })
+      return defaultOperationResponse(input)
+    }
+    render(<App />)
+    fireEvent.click(screen.getByRole('link', { name: 'Reviews' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Review details' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Associate queue' }))
+    const dialog = await screen.findByRole('dialog', { name: 'North Shore' })
+    const scoped = within(dialog)
+    fireEvent.click(scoped.getByRole('radio', { name: /North Shore \(2024\)/ }))
+    fireEvent.click(scoped.getByRole('checkbox', { name: /episodes 1–4/ }))
+    fireEvent.change(scoped.getByLabelText('Type the exact approval text'), { target: { value: 'Confirm this exact queue association.' } })
+    fireEvent.change(scoped.getByLabelText(/Audit note/), { target: { value: 'Prepared while the evidence was fresh.' } })
+    assert.equal((scoped.getByRole('button', { name: 'Confirm action' }) as HTMLButtonElement).disabled, false)
+    await screen.findByText('Preview expired · prepare again')
+    assert.equal((scoped.getByRole('button', { name: 'Confirm action' }) as HTMLButtonElement).disabled, true)
+    assert.ok(scoped.getByRole('button', { name: 'Prepare a fresh preview' }))
+    assert.equal(operationRequests.some(({ input, init }) => String(input).endsWith('/commit') && init?.method === 'POST'), false)
   })
 
   it('does not offer an action when the backend says it is unavailable', async () => {

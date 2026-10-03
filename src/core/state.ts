@@ -64,6 +64,19 @@ export interface PersistedQueueObservation {
   known: boolean;
 }
 
+export type WorkAction = 'retry' | 'reset';
+export interface ActivityRecord {
+  id: number;
+  source: 'cycle' | 'manual';
+  startedAt: string;
+  finishedAt: string | null;
+  query: string;
+  media: Array<{ workKey: string; title: string }>;
+  resultCount: number | null;
+  outcome: 'running' | 'success' | 'error';
+  errorCode?: string;
+}
+
 const DDL = `
 CREATE TABLE IF NOT EXISTS seen_hashes (
   info_hash TEXT PRIMARY KEY,
@@ -113,6 +126,7 @@ CREATE TABLE IF NOT EXISTS work_items (
   last_outcome TEXT,
   last_observed_at TEXT NOT NULL,
   blocked_reason TEXT,
+  reset_pending_at TEXT,
   queue_coverage_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(queue_coverage_json)),
   queue_observed_at TEXT,
   queue_known INTEGER NOT NULL DEFAULT 0 CHECK (queue_known IN (0,1)),
@@ -178,6 +192,23 @@ CREATE TABLE IF NOT EXISTS operator_audit (
   note TEXT NOT NULL,
   occurred_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS work_action_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  work_key TEXT NOT NULL,
+  action TEXT NOT NULL CHECK (action IN ('retry','reset')),
+  occurred_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS search_activity (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source TEXT NOT NULL CHECK (source IN ('cycle','manual')),
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  query TEXT NOT NULL,
+  media_json TEXT NOT NULL CHECK (json_valid(media_json)),
+  result_count INTEGER,
+  outcome TEXT NOT NULL CHECK (outcome IN ('running','success','error')),
+  error_code TEXT
+);
 CREATE TABLE IF NOT EXISTS app_settings (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   version INTEGER NOT NULL,
@@ -189,6 +220,7 @@ CREATE TABLE IF NOT EXISTS app_settings (
 const WORK_STATUSES: readonly WorkStatus[] = ['ready', 'waiting-release', 'searching', 'cooldown', 'backoff', 'manual', 'fulfilled', 'inactive'];
 const INTENT_STATUSES: readonly IntentStatus[] = ['submitting', 'awaiting-queue', 'active', 'fulfilled', 'import-blocked', 'uncertain', 'failed'];
 const OPEN_INTENT_STATUSES: readonly IntentStatus[] = ['submitting', 'awaiting-queue', 'active', 'import-blocked', 'uncertain'];
+const ORDINARY_REVIEW_REASONS = ['picker-manual', 'no-suitable-release', 'repeated-operation-failure', 'missing-download-client', 'reverify-failed', 'unparseable-title'] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -272,6 +304,7 @@ function validateWorkItem(value: unknown): asserts value is WorkItem {
   nonnegativeFinite(value.failCount, 'failCount');
   if (value.lastOutcome !== null && typeof value.lastOutcome !== 'string') throw new Error('Invalid lastOutcome');
   if (value.blockedReason !== null && typeof value.blockedReason !== 'string') throw new Error('Invalid blockedReason');
+  if (value.resetPendingAt !== undefined && value.resetPendingAt !== null) validIso(value.resetPendingAt, 'resetPendingAt');
   const unit = value.unit;
   if (!isRecord(unit) || unit.key !== value.workKey || (unit.kind !== 'tv' && unit.kind !== 'movie') || (unit.arr !== 'sonarr' && unit.arr !== 'radarr') || typeof unit.serviceId !== 'number' || !Number.isFinite(unit.serviceId) || unit.serviceId < 0 || typeof unit.externalId !== 'number' || !Number.isFinite(unit.externalId) || unit.externalId < 0 || typeof unit.title !== 'string' || !Array.isArray(unit.altTitles) || !unit.altTitles.every((title) => typeof title === 'string')) throw new Error('Invalid work unit');
   if (unit.kind === 'movie') {
@@ -291,6 +324,7 @@ export class State {
   constructor(private readonly db: Database.Database) {
     db.exec(DDL);
     this.ensureQueueObservationColumns();
+    this.ensureOperationsColumns();
     this.ensureGroupAssociationColumns();
     this.ensureOperatorColumns();
   }
@@ -410,6 +444,129 @@ export class State {
       ...((r.subject_kind ?? null) === null ? {} : { subjectKind: r.subject_kind as 'intent' | 'queue' }),
       ...((r.subject_key ?? null) === null ? {} : { subjectKey: r.subject_key as string }),
     }));
+  }
+
+  /** Read-only eligibility shared by dashboard projections and the transactional action command. */
+  getWorkActionEligibility(workKey: string, now: string = new Date().toISOString()): { retry: { allowed: boolean; reason?: string }; reset: { allowed: boolean; reason?: string } } {
+    validIso(now, 'now');
+    const retryReason = this.workActionBlockReason(workKey, 'retry', now);
+    const resetReason = this.workActionBlockReason(workKey, 'reset', now);
+    return {
+      retry: retryReason ? { allowed: false, reason: retryReason } : { allowed: true },
+      reset: resetReason ? { allowed: false, reason: resetReason } : { allowed: true },
+    };
+  }
+
+  /**
+   * Claim-checked operator scheduling action. Only ordinary scheduling/review state changes;
+   * durable queue coverage, reservations, identity, receipts, decisions and source markers survive.
+   */
+  applyWorkAction(input: { workKey: string; action: WorkAction; ownerToken: string; claimKeys: string[]; now: string }): void {
+    validIso(input.now, 'now');
+    if (!['retry', 'reset'].includes(input.action)) throw new Error('Invalid work action');
+    const keys = normalizeClaimKeys(input.claimKeys);
+    if (!keys.includes(input.workKey)) throw new Error('Work action claim is incomplete');
+    this.db.transaction(() => {
+      for (const key of keys) this.assertClaim(key, input.ownerToken, input.now);
+      const work = this.getWorkItem(input.workKey);
+      if (!work) throw new Error('Unknown work item');
+      if (work.unit.kind === 'tv' && !keys.includes(`group:sonarr:${work.unit.serviceId}`)) throw new Error('TV work action requires the same-series group claim');
+      const reason = this.workActionBlockReason(input.workKey, input.action, input.now, input.ownerToken);
+      if (reason) throw new Error(`Work action is not eligible: ${reason}`);
+      const result = this.db.prepare(`UPDATE work_items SET status='ready',next_search_at=NULL,fail_count=0,last_outcome=NULL,
+        last_search_at=CASE WHEN ?='reset' THEN NULL ELSE last_search_at END,
+        reset_pending_at=CASE WHEN ?='reset' THEN ? ELSE reset_pending_at END WHERE work_key=?`)
+        .run(input.action, input.action, input.action === 'reset' ? input.now : null, input.workKey);
+      if (result.changes !== 1) throw new Error('Work action raced with another update');
+      this.db.prepare('UPDATE manual_review SET resolved_at=? WHERE work_key=? AND resolved_at IS NULL AND reason IN (?,?,?,?,?,?)')
+        .run(input.now, input.workKey, ...ORDINARY_REVIEW_REASONS);
+      this.db.prepare('INSERT INTO work_action_audit(work_key,action,occurred_at) VALUES(?,?,?)').run(input.workKey, input.action, input.now);
+    })();
+  }
+
+  /** Append one bounded search event, independent of the decision/review history. */
+  startSearchActivity(input: { source: 'cycle' | 'manual'; query: string; media: Array<{ workKey: string; title: string }>; now: string }): number {
+    validIso(input.now, 'activity start');
+    if ((input.source !== 'cycle' && input.source !== 'manual') || typeof input.query !== 'string' || !input.query.trim()) throw new Error('Invalid search activity');
+    const query = safeActivityText(input.query, 500);
+    const media = input.media.slice(0, 20).map(({ workKey, title }) => ({ workKey: safeActivityText(String(workKey), 160), title: safeActivityText(String(title), 120) }));
+    const inserted = this.db.prepare(`INSERT INTO search_activity(source,started_at,query,media_json,outcome) VALUES(?,?,?,?, 'running')`)
+      .run(input.source, input.now, query, JSON.stringify(media));
+    const id = Number(inserted.lastInsertRowid);
+    this.pruneSearchActivity(input.now);
+    return id;
+  }
+
+  finishSearchActivity(input: { id: number; now: string; resultCount: number | null; errorCode?: string }): void {
+    validIso(input.now, 'activity finish');
+    if (!Number.isSafeInteger(input.id) || input.id < 1 || (input.resultCount !== null && (!Number.isSafeInteger(input.resultCount) || input.resultCount < 0))) throw new Error('Invalid search activity result');
+    const code = input.errorCode?.replace(/[^a-z0-9-]/giu, '').slice(0, 40);
+    const result = this.db.prepare(`UPDATE search_activity SET finished_at=?,result_count=?,outcome=?,error_code=? WHERE id=? AND outcome='running'`)
+      .run(input.now, input.resultCount, input.errorCode ? 'error' : 'success', input.errorCode ? code || 'operation-failed' : null, input.id);
+    if (result.changes !== 1) throw new Error('Search activity is missing or already completed');
+    this.pruneSearchActivity(input.now);
+  }
+
+  listSearchActivity(): ActivityRecord[] {
+    const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60_000).toISOString();
+    return (this.db.prepare('SELECT * FROM search_activity WHERE started_at>=? ORDER BY started_at DESC,id DESC LIMIT 2000').all(cutoff) as Record<string, unknown>[]).map((row) => {
+      let media: unknown;
+      try { media = JSON.parse(String(row.media_json)) as unknown; } catch { throw new Error('Corrupt search activity media'); }
+      if (!Array.isArray(media) || !media.every((entry) => isRecord(entry) && typeof entry.workKey === 'string' && typeof entry.title === 'string')) throw new Error('Corrupt search activity media');
+      return {
+        id: Number(row.id), source: row.source as 'cycle' | 'manual', startedAt: String(row.started_at),
+        finishedAt: row.finished_at === null ? null : String(row.finished_at), query: String(row.query), media: media as ActivityRecord['media'],
+        resultCount: row.result_count === null ? null : Number(row.result_count), outcome: row.outcome as ActivityRecord['outcome'],
+        ...(row.error_code === null ? {} : { errorCode: String(row.error_code) }),
+      };
+    });
+  }
+
+  private pruneSearchActivity(now: string): void {
+    const cutoff = new Date(Date.parse(now) - 7 * 24 * 60 * 60_000).toISOString();
+    this.db.prepare('DELETE FROM search_activity WHERE started_at < ?').run(cutoff);
+    this.db.prepare('DELETE FROM search_activity WHERE id NOT IN (SELECT id FROM search_activity ORDER BY started_at DESC,id DESC LIMIT 2000)').run();
+  }
+
+  private workActionBlockReason(workKey: string, action: WorkAction, now: string, ownerToken?: string): string | null {
+    const work = this.getWorkItem(workKey);
+    if (!work) return 'work-not-found';
+    const relatedKey = (key: string): boolean => key === workKey || (work.unit.kind === 'tv' && key.startsWith(`sonarr:${work.unit.serviceId}:s`));
+    if (work.lastOutcome === 'rate-limited' && work.nextSearchAt !== null && Date.parse(work.nextSearchAt) > Date.parse(now)) return 'rate-limited';
+    if (work.blockedReason !== null && work.blockedReason !== 'manual-review') return 'work-held';
+    if (!work.queueObservationKnown || work.lastQueueObservedAt === null) return 'queue-observation-unknown';
+    if (Date.parse(now) - Date.parse(work.lastQueueObservedAt) > 24 * 60 * 60_000 || Date.parse(now) - Date.parse(work.lastObservedAt) > 24 * 60 * 60_000) return 'queue-observation-stale';
+    const allOpenReviews = this.db.prepare('SELECT work_key,reason FROM manual_review WHERE resolved_at IS NULL').all() as Array<{ work_key: string; reason: string }>;
+    const reviews = allOpenReviews.filter(({ work_key: key }) => key === workKey);
+    if (allOpenReviews.some(({ work_key: key, reason }) => relatedKey(key) && !(ORDINARY_REVIEW_REASONS as readonly string[]).includes(reason))) return 'review-not-eligible';
+    const ordinaryReview = work.status === 'manual' && reviews.length > 0;
+    const eligibleStatus = action === 'retry'
+      ? ['cooldown', 'backoff'].includes(work.status) || ordinaryReview
+      : ['ready', 'cooldown', 'backoff'].includes(work.status) || ordinaryReview;
+    if (!eligibleStatus) return action === 'retry' ? 'work-not-retryable' : 'work-not-resettable';
+
+    const works = this.listWorkItems();
+    const related = (candidate: WorkItem): boolean => relatedKey(candidate.workKey) ||
+      (work.unit.kind === 'tv' && candidate.unit.kind === 'tv' && candidate.unit.arr === work.unit.arr && candidate.unit.serviceId === work.unit.serviceId);
+    const relatedKeys = new Set(works.filter(related).map(({ workKey: key }) => key));
+    const groupKey = work.unit.kind === 'tv' ? `group:sonarr:${work.unit.serviceId}` : null;
+    const cutoff = new Date(Date.parse(now) - CLAIM_TTL_MS).toISOString();
+    const leases = this.db.prepare('SELECT work_key,owner FROM unit_claims WHERE claimed_at>=?').all(cutoff) as Array<{ work_key: string; owner: string }>;
+    if (leases.some((lease) => (relatedKeys.has(lease.work_key) || lease.work_key === groupKey) && lease.owner !== ownerToken)) return 'work-claimed';
+
+    const openIntents = this.db.prepare("SELECT * FROM grab_intents WHERE released_at IS NULL AND status IN ('submitting','awaiting-queue','active','import-blocked','uncertain')").all() as Record<string, unknown>[];
+    for (const row of openIntents) {
+      const intent = this.decodeIntent(row);
+      if (intent.coverage.some((capture) => relatedKey(capture.workKey))) return 'reservation-open';
+    }
+    const queueRows = this.db.prepare('SELECT queue_coverage_json FROM work_items').all() as Array<{ queue_coverage_json: string }>;
+    for (const row of queueRows) {
+      let coverage: unknown;
+      try { coverage = JSON.parse(row.queue_coverage_json) as unknown; } catch { return 'queue-coverage-unknown'; }
+      validateCoverage(coverage, true);
+      if ((coverage as IntentCoverage[]).some((capture) => relatedKey(capture.workKey))) return 'queue-coverage-held';
+    }
+    return null;
   }
 
   /** Mints a short-lived, single-use proof handle after the trusted operator service completed its reads. */
@@ -602,13 +759,13 @@ export class State {
     if (input.work.workKey !== input.key) throw new Error('Work key does not match reconciliation key');
     const apply = this.db.transaction(() => {
       this.assertClaim(input.key, input.token, input.work.lastObservedAt);
-      this.db.prepare(`INSERT INTO work_items (work_key,content_identity,missing_fingerprint,unit_json,status,last_search_at,next_search_at,fail_count,last_outcome,last_observed_at,blocked_reason)
-        VALUES (@workKey,@contentIdentity,@missingFingerprint,@unitJson,@status,@lastSearchAt,@nextSearchAt,@failCount,@lastOutcome,@lastObservedAt,@blockedReason)
-        ON CONFLICT(work_key) DO UPDATE SET content_identity=excluded.content_identity,missing_fingerprint=excluded.missing_fingerprint,unit_json=excluded.unit_json,status=excluded.status,last_search_at=excluded.last_search_at,next_search_at=excluded.next_search_at,fail_count=excluded.fail_count,last_outcome=excluded.last_outcome,last_observed_at=excluded.last_observed_at,blocked_reason=excluded.blocked_reason`).run({
+      this.db.prepare(`INSERT INTO work_items (work_key,content_identity,missing_fingerprint,unit_json,status,last_search_at,next_search_at,fail_count,last_outcome,last_observed_at,blocked_reason,reset_pending_at)
+        VALUES (@workKey,@contentIdentity,@missingFingerprint,@unitJson,@status,@lastSearchAt,@nextSearchAt,@failCount,@lastOutcome,@lastObservedAt,@blockedReason,@resetPendingAt)
+        ON CONFLICT(work_key) DO UPDATE SET content_identity=excluded.content_identity,missing_fingerprint=excluded.missing_fingerprint,unit_json=excluded.unit_json,status=excluded.status,last_search_at=excluded.last_search_at,next_search_at=excluded.next_search_at,fail_count=excluded.fail_count,last_outcome=excluded.last_outcome,last_observed_at=excluded.last_observed_at,blocked_reason=excluded.blocked_reason,reset_pending_at=excluded.reset_pending_at`).run({
         workKey: input.work.workKey, contentIdentity: input.work.contentIdentity, missingFingerprint: input.work.missingFingerprint,
         unitJson: JSON.stringify(input.work.unit), status: input.work.status, lastSearchAt: input.work.lastSearchAt,
         nextSearchAt: input.work.nextSearchAt, failCount: input.work.failCount, lastOutcome: input.work.lastOutcome,
-        lastObservedAt: input.work.lastObservedAt, blockedReason: input.work.blockedReason,
+        lastObservedAt: input.work.lastObservedAt, blockedReason: input.work.blockedReason, resetPendingAt: input.work.resetPendingAt ?? null,
       });
       for (const update of input.intentUpdates) {
         if (!INTENT_STATUSES.includes(update.status)) throw new Error('Invalid intent status');
@@ -1082,6 +1239,7 @@ export class State {
       status: row.status, lastSearchAt: row.last_search_at ?? null, nextSearchAt: row.next_search_at ?? null,
       failCount: row.fail_count, lastOutcome: row.last_outcome ?? null, lastObservedAt: row.last_observed_at, blockedReason: row.blocked_reason ?? null,
       lastQueueObservedAt: row.queue_observed_at ?? null, queueObservationKnown: row.queue_known === 1,
+      ...(row.reset_pending_at === null || row.reset_pending_at === undefined ? {} : { resetPendingAt: row.reset_pending_at }),
     };
     validateWorkItem(item);
     return item;
@@ -1192,6 +1350,11 @@ export class State {
     if (!columns.has('queue_observed_at')) this.db.exec('ALTER TABLE work_items ADD COLUMN queue_observed_at TEXT');
     if (!columns.has('queue_known')) this.db.exec('ALTER TABLE work_items ADD COLUMN queue_known INTEGER NOT NULL DEFAULT 0 CHECK (queue_known IN (0,1))');
     if (!columns.has('queue_failure_refs_json')) this.db.exec("ALTER TABLE work_items ADD COLUMN queue_failure_refs_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(queue_failure_refs_json))");
+  }
+
+  private ensureOperationsColumns(): void {
+    const columns = new Set((this.db.prepare('PRAGMA table_info(work_items)').all() as Array<{ name: string }>).map((column) => column.name));
+    if (!columns.has('reset_pending_at')) this.db.exec('ALTER TABLE work_items ADD COLUMN reset_pending_at TEXT');
   }
 
   private ensureGroupAssociationColumns(): void {
@@ -1323,6 +1486,12 @@ const ASSOCIATION_CHALLENGE = 'I reviewed the supplied current queue and library
 
 function hashSecret(value: string): string {
   return createHash('sha256').update(value).digest('hex');
+}
+
+function safeActivityText(value: string, max: number): string {
+  return value.replace(/\b[a-z][a-z\d+.-]{1,15}:\/\/\S+/giu, '[URL]').replace(/magnet:\?\S+/giu, '[URL]')
+    .replace(/(?:^|[\s("'=])\/(?:[^/\s]+\/)+[^/\s]+/gu, ' [PATH]').replace(/\b[A-Za-z]:\\(?:[^\\\s]+\\)*[^\\\s]+/gu, '[PATH]').replace(/\b(?:[\da-f]{64}|[\da-f]{40}|[\da-f]{32})\b/giu, '[HASH]')
+    .replace(/[\u0000-\u001f\u007f]/gu, ' ').replace(/\s+/gu, ' ').trim().slice(0, max);
 }
 
 function stableJson(value: unknown): string {

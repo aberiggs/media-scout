@@ -253,6 +253,21 @@ export class Runner {
     return eligibleWorkUnits(snapshot).some((unit) => unit.key === workKey);
   }
 
+  private async recordedSearch(query: string, categories: number[], indexerIds: number[], units: WorkUnit[]): Promise<Release[]> {
+    let activityId: number | undefined;
+    try {
+      activityId = this.deps.state.startSearchActivity({ source: 'cycle', query, media: units.map(({ key, title }) => ({ workKey: key, title })), now: this.now().toISOString() });
+    } catch { /* Activity is an independent bounded projection and never gates a decision. */ }
+    try {
+      const releases = await this.deps.prowlarr.search({ query, categories, indexerIds });
+      if (activityId !== undefined) try { this.deps.state.finishSearchActivity({ id: activityId, now: this.now().toISOString(), resultCount: releases.length }); } catch { /* Keep search outcomes independent from activity persistence. */ }
+      return releases;
+    } catch (error) {
+      if (activityId !== undefined) try { this.deps.state.finishSearchActivity({ id: activityId, now: this.now().toISOString(), resultCount: null, errorCode: safeErrorCode(error) }); } catch { /* Preserve the original upstream failure. */ }
+      throw error;
+    }
+  }
+
   /** Resolve only due, otherwise-actionable source jobs; unknown reads and missing associators stay held. */
   private async resolveAssociations(snapshot: LibrarySnapshot, queues: QueueReads): Promise<AssociationDecision[]> {
     if (!this.deps.associator) return [];
@@ -374,7 +389,7 @@ export class Runner {
       const releases: Release[] = [];
       stage = 'search';
       try {
-        for (const query of planned) releases.push(...await this.deps.prowlarr.search({ query: query.query, categories: query.categories, indexerIds: allowlist }));
+        for (const query of planned) releases.push(...await this.recordedSearch(query.query, query.categories, allowlist, currentGroup.targets));
       } catch (error) {
         await this.finishGroupBackoff(currentGroup, startedKeys, claims.ownerToken, error, summary, error instanceof ApiError ? error.retryAfter : undefined, 'search');
         startedKeys = [];
@@ -557,7 +572,7 @@ export class Runner {
       });
       this.deps.state.applyWorkReconciliation({ key: row.work.workKey, token: claims.ownerToken, work: row.work, intentUpdates: related });
       const queue = queues[row.work.unit.arr];
-      this.deps.state.applyWorkQueueObservation({ key: row.work.workKey, token: claims.ownerToken, observedAt: queue.observedAt, known: queue.kind === 'known', coverage: row.queueCoverage, failedQueueRefs: row.queueFailureRefs });
+      this.deps.state.applyWorkQueueObservation({ key: row.work.workKey, token: claims.ownerToken, observedAt: queue.observedAt, known: row.work.queueObservationKnown && queue.kind === 'known', coverage: row.queueCoverage, failedQueueRefs: row.queueFailureRefs });
     }
     if (staleObservation) return null;
     return { snapshot, queues, rows: result.items };
@@ -949,7 +964,7 @@ export class Runner {
           return intent !== undefined && intentUpdateRelatesToWork(intent, row.work, existing, update.status);
         });
          this.deps.state.applyWorkReconciliation({ key, token, work: row.work, intentUpdates: related });
-         this.deps.state.applyWorkQueueObservation({ key, token, observedAt: queueRead.observedAt, known: queueRead.kind === 'known', coverage: row.queueCoverage, failedQueueRefs: row.queueFailureRefs });
+          this.deps.state.applyWorkQueueObservation({ key, token, observedAt: queueRead.observedAt, known: row.work.queueObservationKnown && queueRead.kind === 'known', coverage: row.queueCoverage, failedQueueRefs: row.queueFailureRefs });
          if (row.manualReviewReason && !(deferAssociationReview && row.blockedReason === 'queue-ambiguous')) {
            const reviewNow = this.now().toISOString();
            const linkedUncertain = queueRead.kind === 'known' && intents.find((intent) => intent.status === 'uncertain' && !intent.releasedAt && intent.confirmedAt === null && Date.parse(intent.queueDeadlineAt) <= Date.parse(reviewNow) && intent.coverage.some((capture) => capture.workKey === key));
@@ -1104,7 +1119,7 @@ export class Runner {
         return intent !== undefined && intentUpdateRelatesToWork(intent, latest.work, freshWorkItems, update.status);
       });
       this.deps.state.applyWorkReconciliation({ key: unit.key, token, work: latest.work, intentUpdates: related });
-      this.deps.state.applyWorkQueueObservation({ key: unit.key, token, observedAt: freshQueue.observedAt, known: true, coverage: latest.queueCoverage, failedQueueRefs: latest.queueFailureRefs });
+      this.deps.state.applyWorkQueueObservation({ key: unit.key, token, observedAt: freshQueue.observedAt, known: latest.work.queueObservationKnown && freshQueue.kind === 'known', coverage: latest.queueCoverage, failedQueueRefs: latest.queueFailureRefs });
     }
     if (latest?.manualReviewReason) this.flagReviewOnce(unit.key, latest.manualReviewReason);
     if (!latest || latest.work.status !== 'searching' || ['queue-unknown', 'queue-review', 'queue-ambiguous', 'content-identity-changed'].includes(latest.blockedReason ?? '') || candidateOverlapsQueue(originalCoverage, latest.activeCoverage)) {

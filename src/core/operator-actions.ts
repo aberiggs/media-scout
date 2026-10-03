@@ -58,7 +58,7 @@ export class OperatorActions {
       if (!intent || intent.releasedAt || intent.confirmedAt !== null || intent.status === 'failed' || intent.status === 'fulfilled' || intent.status === 'active' || intent.status === 'import-blocked') throw new Error('Intent is not eligible for operator release');
       if (Date.parse(now) < Date.parse(intent.queueDeadlineAt)) throw new Error('Intent queue grace deadline has not passed');
       claims = this.claimsFor(this.releaseWorkKeys(intent), reads.observation);
-      targetNames = intent.coverage.map(({ workKey }) => safeName(reads.snapshot.sonarr.series.find(({ series }) => workKey.startsWith(`sonarr:${series.id}:`))?.series.title ?? reads.snapshot.radarr.movies.find(({ id }) => workKey === `radarr:${id}`)?.title ?? workKey));
+      targetNames = claims.map(({ workKey }) => safeName(workLabel(this.deps.state.getWorkItem(workKey), reads.snapshot)));
       const capturesMissing = intent.coverage.every((capture) => {
         const entry = reads.observation.libraryEvidence.find((candidate) => candidate.workKey === capture.workKey);
         const ids = capture.episodeIds ?? entry?.targetIds ?? [];
@@ -72,7 +72,7 @@ export class OperatorActions {
       if (targetIndex < 0) throw new Error('Review work is not in the prepared private association lookup');
       claims = this.claimsFor([review.workKey], reads.observation);
       reads.observation.associationEvidence = this.associationEvidence(request);
-      targetNames = [safeName(reads.snapshot.sonarr.series.find(({ series }) => review.workKey.startsWith(`sonarr:${series.id}:`))?.series.title ?? reads.snapshot.radarr.movies.find(({ id }) => review.workKey === `radarr:${id}`)?.title ?? review.workKey)];
+      targetNames = [safeName(workLabel(this.deps.state.getWorkItem(review.workKey), reads.snapshot))];
     }
     const receipt = this.deps.state.issueOperatorObservation({ operation: input.operation, reviewId: input.reviewId, claims, observation: reads.observation, now });
     return {
@@ -291,6 +291,13 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value) ?? 'null';
 }
 function digest(value: string): string { return createHash('sha256').update(value).digest('hex'); }
+function workLabel(work: ReturnType<State['getWorkItem']>, snapshot: LibrarySnapshot): string {
+  if (!work) return 'Work item';
+  const title = work.unit.kind === 'tv'
+    ? snapshot.sonarr.series.find(({ series }) => series.id === work.unit.serviceId)?.series.title ?? work.unit.title
+    : snapshot.radarr.movies.find(({ id }) => id === work.unit.serviceId)?.title ?? work.unit.title;
+  return work.unit.kind === 'tv' ? `${title} — Season ${work.unit.season?.seasonNumber ?? 'unknown'}` : title;
+}
 function safeName(value: string): string {
   return value.replace(/\b[a-z][a-z\d+.-]{1,15}:\/\/\S+/giu, '[URL]').replace(/magnet:\?\S+/giu, '[URL]')
     .replace(/(?:^|[\s("'=])\/(?:[^/\s]+\/)+[^/\s]+/gu, ' [PATH]').replace(/[A-Za-z]:\\(?:[^\\\s]+\\)*[^\\\s]+/gu, '[PATH]')

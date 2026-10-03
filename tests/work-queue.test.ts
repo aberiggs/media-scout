@@ -18,7 +18,7 @@ const snapshot = (episodes: Episode[] = [ep(101, true), ep(102, false)], movies:
   radarr: { known: true, movies },
 });
 const knownTvQueue = (records: SonarrQueueRecord[] = [], observedAt = NOW): QueueRead<SonarrQueueRecord> => ({ kind: 'known', records, observedAt });
-const knownMovieQueue = (records: RadarrQueueRecord[] = []): QueueRead<RadarrQueueRecord> => ({ kind: 'known', records, observedAt: NOW });
+const knownMovieQueue = (records: RadarrQueueRecord[] = [], observedAt = NOW): QueueRead<RadarrQueueRecord> => ({ kind: 'known', records, observedAt });
 const emptyIntents: GrabIntent[] = [];
 
 function reconcile(input: {
@@ -39,6 +39,30 @@ function reconcile(input: {
 }
 
 describe('reconcileWork', () => {
+  it('consumes a reset marker only after a known library observation began after reset and re-enables rediscovery', () => {
+    const resetAt = '2026-09-29T00:05:00.000Z';
+    const prior = { ...reconcile().items.find((item) => item.work.workKey === 'sonarr:4:s1')!.work,
+      status: 'backoff' as const, lastSearchAt: NOW, nextSearchAt: resetAt, resetPendingAt: resetAt };
+    const evaluate = (inventory: LibrarySnapshot) => reconcileWork({
+      snapshot: inventory, queues: { sonarr: knownTvQueue([], inventory.observedAt), radarr: knownMovieQueue([], inventory.observedAt) },
+      existingWorkItems: [prior], intents: [], now: '2026-09-29T00:10:00.000Z', minRetryHours: 6, queueGraceMin: 30,
+    }).items.find((item) => item.work.workKey === prior.workKey)!;
+
+    expect(evaluate(snapshot()).work.resetPendingAt).toBe(resetAt); // observation predates reset
+    const unknown = snapshot();
+    unknown.observedAt = '2026-09-29T00:06:00.000Z';
+    unknown.sonarr.known = false;
+    unknown.sonarr.series = [];
+    expect(evaluate(unknown).work.resetPendingAt).toBe(resetAt); // timestamp alone is not proof
+    const after = snapshot();
+    after.observedAt = '2026-09-29T00:06:00.000Z';
+    const refreshed = evaluate(after);
+    expect(refreshed.work.resetPendingAt).toBeNull();
+    expect(refreshed.work.status).toBe('ready');
+    expect(refreshed.eligibleUnit?.key).toBe(prior.workKey);
+    expect(refreshed.work.lastSearchAt).toBe(NOW); // reconciliation itself does not issue a search
+  });
+
   it('keeps all missing inventory while making only aired episodes eligible', () => {
     const result = reconcile();
     const row = result.items.find((item) => item.work.workKey === 'sonarr:4:s1');

@@ -228,7 +228,8 @@ function copyUnit(unit: WorkUnit, missing: NonNullable<WorkUnit['season']>['miss
 
 function terminalItem(old: WorkItem, status: 'fulfilled' | 'inactive', now: string): WorkItem {
   const unit = old.unit.kind === 'tv' ? { ...old.unit, season: { seasonNumber: old.unit.season!.seasonNumber, missing: [] } } : old.unit;
-  return { ...old, unit, status, missingFingerprint: JSON.stringify([old.contentIdentity, []]), nextSearchAt: null, lastObservedAt: now, blockedReason: null };
+  return { ...old, unit, status, missingFingerprint: JSON.stringify([old.contentIdentity, []]), nextSearchAt: null, lastObservedAt: now, blockedReason: null,
+    resetPendingAt: old.resetPendingAt && Date.parse(now) <= Date.parse(old.resetPendingAt) ? old.resetPendingAt : null };
 }
 
 function withQueueFreshness(
@@ -833,6 +834,7 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
       lastQueueObservedAt: queueFresh && input.queues[arr].kind === 'known' ? input.queues[arr].observedAt : old?.lastQueueObservedAt ?? null,
       queueObservationKnown: queueFresh,
       blockedReason,
+      resetPendingAt: old?.resetPendingAt && Date.parse(input.snapshot.observedAt) <= Date.parse(old.resetPendingAt) ? old.resetPendingAt : null,
     };
     result.push({ work, eligibleUnit: residual, queueCoverage: heldQueueCoverage, queueFailureRefs: [...queueFailureRefs], activeCoverage: allCoverage, blockedReason, intentUpdates: [], manualReviewReason });
   }

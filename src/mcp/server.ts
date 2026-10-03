@@ -114,9 +114,20 @@ export function createMcpServer(stack: Stack): McpServer {
     },
     async ({ query, limit }) => {
       const current = snapshot();
-      if (missingSettings(current.config.settings).length) throw new Error('Settings are incomplete');
-      const releases = await withSafeUpstreamErrors(() => current.prowlarr.search({ query, categories: [], limit }));
-      return jsonResult({ releases: releases.map(toPublicRelease) });
+      let activityId: number | undefined;
+      try { activityId = state.startSearchActivity({ source: 'manual', query, media: [], now: new Date().toISOString() }); } catch { /* Telemetry never gates a manual query. */ }
+      try {
+        if (missingSettings(current.config.settings).length) throw new Error('Settings are incomplete');
+        const releases = await current.prowlarr.search({ query, categories: [], limit });
+        if (activityId !== undefined) try { state.finishSearchActivity({ id: activityId, now: new Date().toISOString(), resultCount: releases.length }); } catch { /* Search result delivery remains independent. */ }
+        return jsonResult({ releases: releases.map(toPublicRelease) });
+      } catch (error) {
+        if (activityId !== undefined) {
+          const code = error instanceof ApiError ? error.status === 0 ? 'network-error' : `http-${error.status}` : 'operation-failed';
+          try { state.finishSearchActivity({ id: activityId, now: new Date().toISOString(), resultCount: null, errorCode: code }); } catch { /* Preserve the original search failure. */ }
+        }
+        return withSafeUpstreamErrors(async () => { throw error; });
+      }
     },
   );
 

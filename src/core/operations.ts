@@ -35,8 +35,18 @@ export class OperationsDashboard {
     const requestedScope = input.scope ?? 'active';
     const countScope: OperationsScope = requestedScope === 'all' || (input.status !== undefined && TERMINAL_STATUSES.has(input.status as WorkStatus)) ? 'all' : 'active';
     const visibleWork = work.filter((item) => !item.resetPendingAt && (countScope === 'all' || !TERMINAL_STATUSES.has(item.status)));
-    const allRows = visibleWork.map((item): WorkRow => {
-      const action = this.withOperatorGate(this.state.getWorkActionEligibility(item.workKey, now), operatorEnabled);
+    const counts: Record<string, number> = Object.fromEntries(STATUSES.map((status) => [status, 0]));
+    for (const item of visibleWork) counts[item.status] = (counts[item.status] ?? 0) + 1;
+    const query = input.q?.toLocaleLowerCase() ?? '';
+    const rows = visibleWork.filter((item) => {
+      if (input.status && item.status !== input.status) return false;
+      return !query || `${item.workKey} ${safeTitle(item.unit.title)}`.toLocaleLowerCase().includes(query);
+    });
+    const page = rows.slice(input.offset, input.offset + input.limit);
+    const projected = page.map((item): WorkRow => {
+      const action = operatorEnabled
+        ? this.state.getWorkActionEligibility(item.workKey, now)
+        : this.withOperatorGate({ retry: { allowed: false }, reset: { allowed: false } }, false);
       const observationState = observationFreshness(item, nowMs);
       const observedIds = new Set(persistedQueue.flatMap((observation) => observation.coverage.flatMap((coverage) => coverageTargets(coverage, item, workByKey))));
       const reservedIds = new Set(reservations.flatMap((intent) => intent.coverage.flatMap((coverage) => coverageTargets(coverage, item, workByKey))));
@@ -49,12 +59,8 @@ export class OperationsDashboard {
         coverage: { observed: observedIds.size, reserved: reservedIds.size }, actions: action,
       };
     });
-    const counts: Record<string, number> = Object.fromEntries(STATUSES.map((status) => [status, 0]));
-    for (const item of allRows) counts[item.status] = (counts[item.status] ?? 0) + 1;
-    const query = input.q?.toLocaleLowerCase() ?? '';
-    const rows = allRows.filter((item) => (!input.status || item.status === input.status) && (!query || `${item.workKey} ${item.title}`.toLocaleLowerCase().includes(query)));
     return {
-      items: rows.slice(input.offset, input.offset + input.limit), total: rows.length, counts,
+      items: projected, total: rows.length, counts,
       openReviewCount: this.state.listManualReview(false).length, generatedAt, scope: requestedScope, countScope,
       freshness: { staleAfterHours: WORK_OBSERVATION_STALE_AFTER_MS / 3_600_000 },
     };
@@ -73,10 +79,12 @@ export class OperationsDashboard {
       return `${review.workKey} ${title} ${review.reason}`.toLocaleLowerCase().includes(query);
     });
     const intents = this.state.listGrabIntents();
-    const projected = rows.map((review): ReviewRow => {
+    const page = rows.slice(input.offset, input.offset + input.limit);
+    const projected = page.map((review): ReviewRow => {
       const work = this.state.getWorkItem(review.workKey);
       const ordinary = RETRY_REASONS.has(review.reason);
-      const actions = this.withOperatorGate(this.state.getWorkActionEligibility(review.workKey, now), operatorEnabled);
+      const canRetryOrReset = operatorEnabled && review.resolvedAt === null && ordinary;
+      const actions = canRetryOrReset ? this.state.getWorkActionEligibility(review.workKey, now) : undefined;
       const canAssociate = operatorEnabled && review.resolvedAt === null && review.reason === 'queue-review';
       const linkedIntent = review.subjectKind === 'intent' && review.subjectKey
         ? intents.find(({ id }) => id === review.subjectKey) : undefined;
@@ -89,14 +97,14 @@ export class OperationsDashboard {
         mediaType: work?.unit.kind ?? 'unknown', ...(work?.unit.kind === 'tv' ? { season: work.unit.season?.seasonNumber } : {}), reason: safeReason(review.reason),
         summary: reviewSummary(review.reason), createdAt: review.createdAt, resolvedAt: review.resolvedAt,
         actions: {
-          retry: !operatorEnabled ? optOut : review.resolvedAt === null && ordinary ? actions.retry : { allowed: false, reason: ordinary ? 'review-resolved' : 'review-not-eligible' },
-          reset: !operatorEnabled ? optOut : review.resolvedAt === null && ordinary ? actions.reset : { allowed: false, reason: ordinary ? 'review-resolved' : 'review-not-eligible' },
+          retry: !operatorEnabled ? optOut : canRetryOrReset ? actions!.retry : { allowed: false, reason: ordinary ? 'review-resolved' : 'review-not-eligible' },
+          reset: !operatorEnabled ? optOut : canRetryOrReset ? actions!.reset : { allowed: false, reason: ordinary ? 'review-resolved' : 'review-not-eligible' },
           associate: canAssociate ? { allowed: true } : { allowed: false, reason: operatorEnabled ? 'action-not-eligible' : 'operator-actions-disabled' },
           release: canRelease ? { allowed: true } : { allowed: false, reason: operatorEnabled ? 'action-not-eligible' : 'operator-actions-disabled' },
         },
       };
     });
-    return { items: projected.slice(input.offset, input.offset + input.limit), total: projected.length, generatedAt: safeNow.toISOString() };
+    return { items: projected, total: rows.length, generatedAt: safeNow.toISOString() };
   }
 
   private withOperatorGate(actions: Record<WorkAction, { allowed: boolean; reason?: string }>, enabled: boolean): Record<WorkAction, { allowed: boolean; reason?: string }> {

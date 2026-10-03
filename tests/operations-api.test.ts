@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import pino from 'pino';
 import { buildApp } from '../src/daemon';
 import type { Stack } from '../src/compose';
@@ -40,6 +40,59 @@ function makeApp(cycle: () => Promise<CycleSummary> = async () => ({ units: 0, s
 afterEach(async () => { for (const resource of resources.splice(0)) { await resource.app.close(); resource.state.close(); } });
 
 describe('operational dashboard API', () => {
+  it('projects eligibility only for displayed work and skips it when operator actions are disabled', async () => {
+    const { state } = await makeApp();
+    const now = new Date();
+    const dashboard = new OperationsDashboard(state, () => now);
+    const eligibility = vi.spyOn(state, 'getWorkActionEligibility');
+
+    const beyondPage = dashboard.work({ limit: 1, offset: 1 }, true, now);
+    expect(beyondPage).toMatchObject({ items: [], total: 1, counts: { backoff: 1 } });
+    expect(eligibility).not.toHaveBeenCalled();
+
+    const visible = dashboard.work({ limit: 1, offset: 0 }, true, now);
+    expect(visible).toMatchObject({ total: 1, items: [{ workKey: 'sonarr:4:s1', actions: { retry: { allowed: true }, reset: { allowed: true } } }] });
+    expect(eligibility).toHaveBeenCalledTimes(1);
+
+    const disabled = dashboard.work({ limit: 1, offset: 0 }, false, now);
+    expect(disabled).toMatchObject({ total: 1, counts: { backoff: 1 }, items: [{ actions: {
+      retry: { allowed: false, reason: 'operator-actions-disabled' }, reset: { allowed: false, reason: 'operator-actions-disabled' },
+    } }] });
+    expect(eligibility).toHaveBeenCalledTimes(1);
+  });
+
+  it('projects review eligibility only for displayed open ordinary reviews', async () => {
+    const { state } = await makeApp();
+    const now = new Date();
+    const dashboard = new OperationsDashboard(state, () => now);
+    const eligibility = vi.spyOn(state, 'getWorkActionEligibility');
+    const at = new Date(now.getTime() - 1_000);
+    state.flagManualReview('sonarr:4:s1', 'queue-review', undefined, at);
+    state.flagManualReview('sonarr:4:s1', 'picker-manual', undefined, at);
+    const resolvedId = state.listManualReview(false).find((row) => row.reason === 'picker-manual')!.id;
+    state.resolveManualReview(resolvedId, now);
+
+    const offPage = dashboard.reviews({ resolved: false, limit: 1, offset: 0 }, true, now);
+    expect(offPage.total).toBe(2);
+    expect(offPage.items).toMatchObject([{ reason: 'queue-review' }]);
+    expect(eligibility).not.toHaveBeenCalled();
+
+    const disabled = dashboard.reviews({ resolved: false, limit: 10, offset: 0 }, false, now);
+    expect(disabled.items).toHaveLength(2);
+    expect(disabled.items.every((row) => row.actions.retry.reason === 'operator-actions-disabled')).toBe(true);
+    expect(eligibility).not.toHaveBeenCalled();
+
+    const resolved = dashboard.reviews({ resolved: true, limit: 10, offset: 0 }, true, now);
+    expect(resolved.items).toHaveLength(1);
+    expect(resolved.items[0]?.actions.retry).toEqual({ allowed: false, reason: 'review-resolved' });
+    expect(eligibility).not.toHaveBeenCalled();
+
+    const ordinary = dashboard.reviews({ resolved: false, q: 'Show', limit: 1, offset: 1 }, true, now);
+    expect(ordinary.items).toHaveLength(1);
+    expect(ordinary.items[0]?.actions.retry).toMatchObject({ allowed: false, reason: 'review-not-eligible' });
+    expect(eligibility).toHaveBeenCalledTimes(1);
+  });
+
   it('accepts the frontend default All-filter URLs for work and activity', async () => {
     const { app } = await makeApp();
     const work = await app.inject({ method: 'GET', url: '/api/operations/work?status=&q=&limit=50&offset=0' });

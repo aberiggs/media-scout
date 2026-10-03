@@ -367,23 +367,28 @@ describe('operations dashboard', () => {
       observedAt, queueObservationKnown: true, queueObservedAt: observedAt, observationState: 'stale' as const,
       actions: { retry: { allowed: false, reason: 'queue-observation-stale' }, reset: { allowed: false, reason: 'queue-observation-stale' } },
     }
+    const reviewWaiting = {
+      ...odyssey, workKey: 'radarr:316', title: 'Unmonitored movie', status: 'manual',
+    }
     globalThis.fetch = async (input, init) => {
       if (String(input) === '/api/settings') return jsonResponse(envelope)
       operationRequests.push({ input, init })
-      if (String(input).startsWith('/api/operations/work')) return workResponse({ items: [odyssey], total: 1, counts: { 'waiting-release': 1 }, openReviewCount: 0, generatedAt: '2026-10-02T00:00:00.000Z' })
+      if (String(input).startsWith('/api/operations/work')) return workResponse({ items: [odyssey, reviewWaiting], total: 2, counts: { 'waiting-release': 1, manual: 1 }, openReviewCount: 0, generatedAt: '2026-10-02T00:00:00.000Z' })
       return defaultOperationResponse(input)
     }
     render(<App />)
     await screen.findByRole('heading', { name: 'The Odyssey' })
-    assert.equal(screen.getByText('Waiting for queue').textContent, 'Waiting for queue')
-    assert.equal(screen.queryByText(/Waiting for the submitted release to appear/), null)
+    assert.equal(screen.getByText('Waiting for release').textContent, 'Waiting for release')
+    const waitingReleaseRow = screen.getByRole('heading', { name: 'The Odyssey' }).closest('.ops-work-row') as HTMLElement
+    assert.equal(waitingReleaseRow.querySelector('.ops-hold-reason'), null)
+    assert.equal(within(screen.getByRole('heading', { name: 'Unmonitored movie' }).closest('.ops-work-row')!).getByText('Waiting for the movie to become available or the requested episodes to air.').textContent, 'Waiting for the movie to become available or the requested episodes to air.')
     const sourceLine = document.querySelector('.ops-observation-sources')
     assert.ok(sourceLine?.textContent?.includes('Library + queue'))
     assert.equal((sourceLine?.textContent?.match(/Oct 1/gu) ?? []).length, 1)
     assert.equal(screen.queryByText(/Next eligible pass|Last search/u), null)
-    assert.equal(screen.getAllByRole('button', { name: 'Retry' }).length, 1)
-    assert.equal((screen.getByRole('button', { name: 'Retry' }) as HTMLButtonElement).disabled, true)
-    assert.equal((screen.getByRole('button', { name: 'Reset tracking' }) as HTMLButtonElement).disabled, true)
+    assert.equal(within(waitingReleaseRow).getAllByRole('button', { name: 'Retry' }).length, 1)
+    assert.equal((within(waitingReleaseRow).getByRole('button', { name: 'Retry' }) as HTMLButtonElement).disabled, true)
+    assert.equal((within(waitingReleaseRow).getByRole('button', { name: 'Reset tracking' }) as HTMLButtonElement).disabled, true)
     assert.equal(screen.queryByText(/queue-observation-stale|waiting-release/), null)
     assert.equal(document.querySelectorAll('.ops-action-reason').length, 0)
     assert.ok(screen.getByText(/Refresh view reloads saved status; it does not start a poll/))

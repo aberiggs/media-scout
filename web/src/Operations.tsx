@@ -195,7 +195,7 @@ function formatDate(value: string | null | undefined, markClockAhead = false): s
 
 function statusLabel(value: string): string {
   const labels: Record<string, string> = {
-    'waiting-release': 'Waiting for queue', cooldown: 'Cooling down', backoff: 'Retry delayed', searching: 'Searching',
+    'waiting-release': 'Waiting for release', cooldown: 'Cooling down', backoff: 'Retry delayed', searching: 'Searching',
     ready: 'Ready', manual: 'Manual review', fulfilled: 'Complete', inactive: 'Inactive',
   }
   const fallback = value.replace(/-/gu, ' ')
@@ -208,7 +208,7 @@ function holdReasonLabel(value: string): string {
     'queue-active': 'A matching download is active',
     'queue-ambiguous': 'Queue coverage needs review',
     'active-intent': 'A download reservation is still active',
-    'waiting-release': 'Waiting for the submitted release to appear in the queue',
+    'waiting-release': 'Waiting for the movie to become available or the requested episodes to air.',
     'manual-review': 'A human review is needed',
     'content-identity-changed': 'Library details changed; review is needed',
     'queue-review': 'Queue coverage needs review',

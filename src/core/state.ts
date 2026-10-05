@@ -24,6 +24,15 @@ export interface ManualReviewRow {
   resolvedAt: string | null;
   subjectKind?: 'intent' | 'queue' | null;
   subjectKey?: string | null;
+  targetEvidence?: UnparseableTargetEvidence | null;
+  targetEvidenceInvalid?: boolean;
+}
+
+export interface UnparseableTargetEvidence {
+  arr: 'sonarr' | 'radarr';
+  serviceId: number;
+  externalId: number;
+  episodeIds: number[] | null;
 }
 
 export interface OperatorClaim {
@@ -107,7 +116,8 @@ CREATE TABLE IF NOT EXISTS manual_review (
   created_at  TEXT NOT NULL,
   resolved_at TEXT,
   subject_kind TEXT,
-  subject_key TEXT
+  subject_key TEXT,
+  target_evidence_json TEXT CHECK (target_evidence_json IS NULL OR json_valid(target_evidence_json))
 );
 CREATE TABLE IF NOT EXISTS unit_claims (
   work_key   TEXT PRIMARY KEY,
@@ -227,6 +237,41 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function validateReviewEvidence(value: unknown): UnparseableTargetEvidence {
+  if (!isRecord(value) || (value.arr !== 'sonarr' && value.arr !== 'radarr') || !Number.isSafeInteger(value.serviceId) || Number(value.serviceId) < 0 || !Number.isSafeInteger(value.externalId) || Number(value.externalId) < 0) throw new Error('Invalid review target evidence');
+  if (value.episodeIds !== null && (!validPositiveIds(value.episodeIds) || value.arr !== 'sonarr')) throw new Error('Invalid review target episodes');
+  if (value.episodeIds === null && value.arr !== 'radarr') throw new Error('TV review target requires episode ids');
+  return { arr: value.arr, serviceId: Number(value.serviceId), externalId: Number(value.externalId), episodeIds: value.episodeIds === null ? null : [...value.episodeIds as number[]].sort((a, b) => a - b) };
+}
+
+function decodeReviewEvidence(json: string): UnparseableTargetEvidence {
+  let value: unknown;
+  try { value = JSON.parse(json) as unknown; } catch { throw new Error('Corrupt review target evidence'); }
+  return validateReviewEvidence(value);
+}
+
+export function reviewEvidenceMatchesWorkKey(workKey: string, evidence: UnparseableTargetEvidence): boolean {
+  const tv = /^(sonarr):(0|[1-9]\d*):s(0|[1-9]\d*)$/.exec(workKey);
+  if (tv) return evidence.arr === 'sonarr' && evidence.episodeIds !== null && Number.isSafeInteger(Number(tv[2])) && Number(tv[2]) === evidence.serviceId && Number.isSafeInteger(Number(tv[3]));
+  const movie = /^(radarr):(0|[1-9]\d*)$/.exec(workKey);
+  return !!movie && evidence.arr === 'radarr' && Number.isSafeInteger(Number(movie[2])) && Number(movie[2]) === evidence.serviceId && evidence.episodeIds === null;
+}
+
+function decodeManualReviewRow(row: Record<string, unknown>): ManualReviewRow {
+  let targetEvidence: UnparseableTargetEvidence | undefined;
+  let targetEvidenceInvalid = false;
+  if (row.target_evidence_json !== null && row.target_evidence_json !== undefined) {
+    try { targetEvidence = decodeReviewEvidence(String(row.target_evidence_json)); } catch { targetEvidenceInvalid = true; }
+  }
+  return {
+    id: Number(row.id), workKey: String(row.work_key), reason: String(row.reason), details: (row.details as string | null) ?? null,
+    createdAt: String(row.created_at), resolvedAt: (row.resolved_at as string | null) ?? null,
+    ...((row.subject_kind ?? null) === null ? {} : { subjectKind: String(row.subject_kind) as 'intent' | 'queue' }),
+    ...((row.subject_key ?? null) === null ? {} : { subjectKey: String(row.subject_key) }),
+    ...(targetEvidence ? { targetEvidence } : {}), ...(targetEvidenceInvalid ? { targetEvidenceInvalid: true } : {}),
+  };
+}
+
 function validIso(value: unknown, label: string): asserts value is string {
   if (typeof value !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z$/.test(value) || !Number.isFinite(Date.parse(value)) || new Date(value).toISOString().slice(0, 19) !== value.slice(0, 19)) {
     throw new Error(`Invalid ${label}: expected ISO timestamp`);
@@ -328,6 +373,7 @@ export class State {
     this.ensureOperationsColumns();
     this.ensureGroupAssociationColumns();
     this.ensureOperatorColumns();
+    this.ensureReviewEvidenceColumn();
   }
 
   static open(path: string): State {
@@ -406,6 +452,41 @@ export class State {
       .run(workKey, reason, details ?? null, at.toISOString());
   }
 
+  flagUnparseableReview(input: { workKey: string; details: string; evidence: UnparseableTargetEvidence; at: Date }): boolean {
+    const evidence = validateReviewEvidence(input.evidence);
+    if (!reviewEvidenceMatchesWorkKey(input.workKey, evidence)) throw new Error('Review evidence does not match work key');
+    const json = JSON.stringify(evidence);
+    const inserted = this.db.prepare(`INSERT INTO manual_review(work_key,reason,details,created_at,target_evidence_json)
+      SELECT ?,'unparseable-title',?,?,? WHERE NOT EXISTS (
+        SELECT 1 FROM manual_review WHERE work_key=? AND reason='unparseable-title' AND details=? AND resolved_at IS NULL AND target_evidence_json=?)`)
+      .run(input.workKey, input.details, input.at.toISOString(), json, input.workKey, input.details, json);
+    return inserted.changes === 1;
+  }
+
+  listOpenUnparseableReviews(): Array<{ id: number; workKey: string }> {
+    return (this.db.prepare("SELECT id,work_key FROM manual_review WHERE reason='unparseable-title' AND resolved_at IS NULL AND subject_kind IS NULL AND subject_key IS NULL ORDER BY created_at DESC,id DESC").all() as Array<{ id: number; work_key: string }>)
+      .map(({ id, work_key }) => ({ id, workKey: work_key }));
+  }
+
+  getManualReview(id: number): ManualReviewRow | null {
+    const row = this.db.prepare('SELECT * FROM manual_review WHERE id=?').get(id) as Record<string, unknown> | undefined;
+    return row ? decodeManualReviewRow(row) : null;
+  }
+
+  hasOpenManualReview(workKey: string, reason: string): boolean {
+    return this.db.prepare('SELECT 1 FROM manual_review WHERE work_key=? AND reason=? AND resolved_at IS NULL LIMIT 1').get(workKey, reason) !== undefined;
+  }
+
+  /** Resolves only an open, unlinked unparseable-title row while its work lease is held. */
+  resolveUnparseableReview(input: { id: number; workKey: string; token: string; now: string }): boolean {
+    return this.db.transaction(() => {
+      this.assertClaim(input.workKey, input.token, input.now);
+      const result = this.db.prepare("UPDATE manual_review SET resolved_at=? WHERE id=? AND work_key=? AND reason='unparseable-title' AND resolved_at IS NULL AND subject_kind IS NULL AND subject_key IS NULL")
+        .run(input.now, input.id, input.workKey);
+      return result.changes === 1;
+    })();
+  }
+
   /** Records a review explicitly linked by trusted reconciliation to one actual intent. */
   flagManualReviewLinked(input: { workKey: string; reason: string; details?: string; intentId: string; at?: Date }): void {
     const at = input.at ?? new Date();
@@ -435,16 +516,7 @@ export class State {
     const sql = includeResolved
       ? 'SELECT * FROM manual_review ORDER BY created_at DESC, id DESC'
       : 'SELECT * FROM manual_review WHERE resolved_at IS NULL ORDER BY created_at DESC, id DESC';
-    return (this.db.prepare(sql).all() as Record<string, unknown>[]).map((r) => ({
-      id: r.id as number,
-      workKey: r.work_key as string,
-      reason: r.reason as string,
-      details: (r.details as string | null) ?? null,
-      createdAt: r.created_at as string,
-      resolvedAt: (r.resolved_at as string | null) ?? null,
-      ...((r.subject_kind ?? null) === null ? {} : { subjectKind: r.subject_kind as 'intent' | 'queue' }),
-      ...((r.subject_key ?? null) === null ? {} : { subjectKey: r.subject_key as string }),
-    }));
+    return (this.db.prepare(sql).all() as Record<string, unknown>[]).map(decodeManualReviewRow);
   }
 
   /** Read-only eligibility shared by dashboard projections and the transactional action command. */
@@ -1382,6 +1454,11 @@ export class State {
     if (!intentColumns.has('release_note')) this.db.exec('ALTER TABLE grab_intents ADD COLUMN release_note TEXT');
     const associationColumns = new Set((this.db.prepare('PRAGMA table_info(queue_associations)').all() as Array<{ name: string }>).map((column) => column.name));
     if (!associationColumns.has('human_override_json')) this.db.exec('ALTER TABLE queue_associations ADD COLUMN human_override_json TEXT');
+  }
+
+  private ensureReviewEvidenceColumn(): void {
+    const columns = new Set((this.db.prepare('PRAGMA table_info(manual_review)').all() as Array<{ name: string }>).map(({ name }) => name));
+    if (!columns.has('target_evidence_json')) this.db.exec('ALTER TABLE manual_review ADD COLUMN target_evidence_json TEXT');
   }
 
   /**

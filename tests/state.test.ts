@@ -152,6 +152,16 @@ describe('State.manual_review', () => {
     const rows = s.listManualReview(true);
     expect(rows.map((r) => r.reason)).toEqual(['new', 'old']);
   });
+
+  it('deduplicates unparseable reviews by captured identity and target generation', () => {
+    const s = State.open(':memory:');
+    const base = { workKey: 'sonarr:1:s1', details: 'same malformed release', at: T1 };
+    s.flagUnparseableReview({ ...base, evidence: { arr: 'sonarr', serviceId: 1, externalId: 11, episodeIds: [101] } });
+    s.flagUnparseableReview({ ...base, evidence: { arr: 'sonarr', serviceId: 1, externalId: 11, episodeIds: [101] } });
+    s.flagUnparseableReview({ ...base, evidence: { arr: 'sonarr', serviceId: 1, externalId: 11, episodeIds: [102] } });
+    expect(s.listManualReview()).toHaveLength(2);
+    expect(s.listManualReview().map(({ targetEvidence }) => targetEvidence?.episodeIds)).toEqual([[102], [101]]);
+  });
 });
 
 describe('State additive queue-column migration', () => {

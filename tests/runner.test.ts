@@ -28,6 +28,7 @@ const TV_CLIENT = { tv: 'qBit-TV', movie: 'qBit-Movies' };
 const seriesFixture = JSON.parse(
   readFileSync(new URL('./fixtures/sonarr-series.json', import.meta.url), 'utf8'),
 );
+const movieFixture = JSON.parse(readFileSync(new URL('./fixtures/radarr-movie.json', import.meta.url), 'utf8')) as Record<string, unknown>;
 const releaseFixture = JSON.parse(
   readFileSync(new URL('./fixtures/prowlarr-release.json', import.meta.url), 'utf8'),
 );
@@ -284,6 +285,8 @@ function buildStack(
 function mockDiscovery(opts: {
   series?: unknown[];
   episodes?: Record<number, unknown[]>;
+  episodeProvider?: (seriesId: number) => unknown[];
+  episodeStatus?: Record<number, number>;
   movies?: unknown[];
   downloadClients?: unknown[];
   indexers?: unknown[];
@@ -295,7 +298,10 @@ function mockDiscovery(opts: {
   nock(SONARR).persist().get('/api/v3/series').reply(200, opts.series ?? []);
   for (const s of opts.series ?? []) {
     const series = s as { id: number; seriesType: string };
-    nock(SONARR).persist().get('/api/v3/episode').query({ seriesId: series.id }).reply(200, opts.episodes?.[series.id] ?? episodesFor(series));
+    nock(SONARR).persist().get('/api/v3/episode').query({ seriesId: series.id }).reply(() => {
+      if (opts.episodeStatus?.[series.id]) return [opts.episodeStatus[series.id]!, []];
+      return [200, opts.episodeProvider ? opts.episodeProvider(series.id) : opts.episodes?.[series.id] ?? episodesFor(series)];
+    });
   }
   nock(RADARR).persist().get('/api/v3/movie').reply(200, opts.movies ?? []);
   nock(PROWLARR).get('/api/v1/downloadclient').reply(200, opts.downloadClients ?? downloadClientsFixture);
@@ -313,6 +319,33 @@ function mockDiscovery(opts: {
   }
   nock(RADARR).persist().get('/api/v3/queue').query(true).reply(opts.radarrQueue?.status ?? 200, queueEnvelope(opts.radarrQueue?.records ?? []));
 }
+
+async function runCleanupPoll(input: {
+  episodes?: Record<number, unknown[]>;
+  movies?: unknown[];
+  episodeStatus?: Record<number, number>;
+  series?: unknown[];
+  workKey?: string;
+  evidence?: { arr: 'sonarr' | 'radarr'; serviceId: number; externalId: number; episodeIds: number[] | null };
+  at?: Date;
+  clock?: () => Date;
+  skipReview?: boolean;
+  seed?: (state: State) => void;
+} = {}) {
+  const key = input.workKey ?? 'sonarr:1:s1';
+  mockDiscovery({ series: input.series ?? [tvSeries(1, 'Review Target', 368013)], episodes: input.episodes, movies: input.movies, episodeStatus: input.episodeStatus });
+  const state = State.open(':memory:');
+  if (!input.skipReview) {
+    if (input.evidence) state.flagUnparseableReview({ workKey: key, details: 'same malformed release', evidence: input.evidence, at: input.at ?? NOW });
+    else state.flagManualReview(key, 'unparseable-title', 'same malformed release', input.at ?? NOW);
+  }
+  input.seed?.(state);
+  const stack = buildStack(new FakeLLM(), { state, clock: input.clock });
+  const summary = await stack.runner.cycle();
+  return { state, runner: stack.runner, summary, warns: stack.warns };
+}
+
+const captureOne = { arr: 'sonarr' as const, serviceId: 1, externalId: 368013, episodeIds: [101] };
 
 function mockSearch(
   opts: unknown[] | { status: number; body?: unknown[]; headers?: Record<string, string>; queryIs?: (q: Record<string, unknown>) => boolean } = [],
@@ -866,7 +899,9 @@ describe('Runner.cycle', () => {
     const llm = new FakeLLM();
     llm.planner.set('sonarr:1:s1', [{ query: 'Frieren', categories: [5070] }]);
     llm.picks.set('sonarr:1:s1', { verdict: 'grab', releaseIndex: 0, reason: 'healthy' });
-    mockDiscovery({ series: [tvSeries(1, "Frieren: Beyond Journey's End", 368013)] });
+    const initialEpisodes = episodesFor({ id: 1, seriesType: 'anime' });
+    let currentEpisodes = initialEpisodes;
+    mockDiscovery({ series: [tvSeries(1, "Frieren: Beyond Journey's End", 368013)], episodeProvider: () => currentEpisodes });
     mockSearch([
       release({ guid: 'g-unparseable', title: 'Some.Random.Trash.Bag.mkv', infoHash: 'HASHUNPARSEABLE00000000000000000000' }),
       release(),
@@ -882,6 +917,252 @@ describe('Runner.cycle', () => {
       expect.objectContaining({ workKey: 'sonarr:1:s1', reason: 'unparseable-title', details: 'Some.Random.Trash.Bag.mkv' }),
     ]);
     expect(decisionRow(state, 'sonarr:1:s1')).toMatchObject({ verdict: 'grab', grabbed: 1 });
+
+    currentEpisodes = initialEpisodes.map((item) => ({ ...item, hasFile: true }));
+    await runner.cycle();
+    expect(state.listManualReview(true)).toEqual([expect.objectContaining({ reason: 'unparseable-title', resolvedAt: expect.any(String) })]);
+  });
+
+  it('keeps captured review open when only part of its episode set has files', async () => {
+    const { state } = await runCleanupPoll({ evidence: { ...captureOne, episodeIds: [101, 102] }, episodes: {
+      1: [episode(1, { id: 101, hasFile: true }), episode(1, { id: 102, episodeNumber: 2, hasFile: false })],
+    } });
+    expect(state.listManualReview(true)[0]?.resolvedAt).toBeNull();
+  });
+
+  it('keeps review open when the relevant episode inventory is unknown', async () => {
+    const { state } = await runCleanupPoll({ evidence: captureOne, episodeStatus: { 1: 503 } });
+    expect(state.listManualReview(true)[0]?.resolvedAt).toBeNull();
+  });
+
+  it.each([
+    ['changed external identity', [tvSeries(1, 'Review Target', 900001)], { 1: [episode(1, { id: 101, hasFile: true })] }],
+    ['same episode id in a different series', [tvSeries(1, 'Review Target', 368013), tvSeries(2, 'Other', 2)], {
+      1: [], 2: [episode(2, { id: 101, hasFile: true })],
+    }],
+  ])('does not resolve on %s', async (_label, series, episodes) => {
+    const { state } = await runCleanupPoll({ evidence: captureOne, series, episodes });
+    expect(state.listManualReview()[0]?.resolvedAt).toBeNull();
+  });
+
+  it('does not treat an empty queue as file-completion evidence', async () => {
+    const { state } = await runCleanupPoll({ evidence: captureOne, episodes: { 1: [episode(1, { id: 101, hasFile: false })] } });
+    expect(state.listManualReview()[0]?.resolvedAt).toBeNull();
+  });
+
+  it('leaves unrelated and subject-linked reviews untouched', async () => {
+    const { state } = await runCleanupPoll({
+      evidence: captureOne,
+      episodes: { 1: [episode(1, { id: 101, hasFile: true })] },
+      seed: (ledger) => {
+        ledger.flagManualReview('sonarr:1:s1', 'queue-review', 'unrelated reason', NOW);
+        const db = (ledger as unknown as { db: Database.Database }).db;
+        db.prepare("INSERT INTO manual_review(work_key,reason,details,created_at,subject_kind,subject_key) VALUES(?,?,?,?,?,?)")
+          .run('sonarr:1:s1', 'unparseable-title', 'linked', NOW.toISOString(), 'queue', 'queue:1');
+      },
+    });
+    expect(state.listManualReview()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ reason: 'queue-review', details: 'unrelated reason', resolvedAt: null }),
+      expect.objectContaining({ reason: 'unparseable-title', details: 'linked', subjectKind: 'queue', resolvedAt: null }),
+    ]));
+    expect(state.listManualReview(true).find(({ details }) => details === 'same malformed release')?.resolvedAt).toEqual(expect.any(String));
+  });
+
+  it('resolves positive captured evidence even when no durable WorkItem exists', async () => {
+    const { state } = await runCleanupPoll({ evidence: captureOne, episodes: { 1: [episode(1, { id: 101, hasFile: true })] } });
+    expect(state.getWorkItem('sonarr:1:s1')).toBeNull();
+    expect(state.listManualReview(true)[0]?.resolvedAt).toEqual(expect.any(String));
+  });
+
+  const seedLegacyIdentity = (ledger: State, observedAt: Date = NOW, blockedReason: string | null = null) => {
+    const unit = { key: 'sonarr:1:s1', kind: 'tv' as const, arr: 'sonarr' as const, serviceId: 1, externalId: 368013,
+      title: 'Review Target', altTitles: [], season: { seasonNumber: 1, missing: [{ episodeId: 101, episodeNumber: 1, absoluteEpisodeNumber: null, title: 'Episode' }] } };
+    const work: WorkItem = { workKey: unit.key, contentIdentity: 'sonarr:1:368013:tv', missingFingerprint: 'legacy', unit,
+      status: 'ready', lastSearchAt: null, nextSearchAt: null, failCount: 0, lastOutcome: null, lastObservedAt: observedAt.toISOString(),
+      lastQueueObservedAt: null, queueObservationKnown: false, blockedReason };
+    const token = ledger.claimUnit(unit.key, observedAt)!;
+    ledger.applyWorkReconciliation({ key: unit.key, token, work, intentUpdates: [] });
+    ledger.releaseClaim(unit.key, token);
+  };
+
+  it('uses full season completion for identity-matched legacy reviews', async () => {
+    const complete = [episode(1, { id: 101, hasFile: true }), episode(1, { id: 102, episodeNumber: 2, hasFile: true })];
+    const fulfilled = await runCleanupPoll({ episodes: { 1: complete }, seed: seedLegacyIdentity });
+    expect(fulfilled.state.listManualReview(true)[0]?.resolvedAt).toEqual(expect.any(String));
+  });
+
+  it('keeps identity-matched legacy review open when any season episode is missing', async () => {
+    const partial = [episode(1, { id: 101, hasFile: true }), episode(1, { id: 102, episodeNumber: 2, hasFile: false })];
+    const { state } = await runCleanupPoll({ episodes: { 1: partial }, seed: seedLegacyIdentity });
+    expect(state.listManualReview(true)).toEqual([expect.objectContaining({ reason: 'unparseable-title', resolvedAt: null })]);
+  });
+
+  it('leaves evidence-less orphan legacy review open even when season files are complete', async () => {
+    const complete = [episode(1, { id: 101, hasFile: true }), episode(1, { id: 102, episodeNumber: 2, hasFile: true })];
+    const { state } = await runCleanupPoll({ episodes: { 1: complete } });
+    expect(state.listManualReview(true)).toEqual([expect.objectContaining({ reason: 'unparseable-title', resolvedAt: null })]);
+  });
+
+  it('keeps legacy review open if current season inventory omits its previous missing target id', async () => {
+    const { state } = await runCleanupPoll({ episodes: { 1: [episode(1, { id: 102, episodeNumber: 2, hasFile: true })] }, seed: seedLegacyIdentity });
+    expect(state.listManualReview(true)[0]?.resolvedAt).toBeNull();
+  });
+
+  it('allows legacy prior target episode ids to move seasons when positively filed in the same series', async () => {
+    const { state } = await runCleanupPoll({ episodes: { 1: [
+      episode(1, { id: 101, seasonNumber: 2, episodeNumber: 1, hasFile: true }),
+      episode(1, { id: 102, seasonNumber: 1, episodeNumber: 2, hasFile: true }),
+    ] }, seed: seedLegacyIdentity });
+    expect(state.listManualReview(true)[0]?.resolvedAt).toEqual(expect.any(String));
+  });
+
+  it('keeps legacy review open under a content-identity-changed work hold', async () => {
+    const { state } = await runCleanupPoll({
+      episodes: { 1: [episode(1, { id: 101, hasFile: true })] },
+      seed: (ledger) => seedLegacyIdentity(ledger, NOW, 'content-identity-changed'),
+    });
+    expect(state.listManualReview(true).find(({ reason }) => reason === 'unparseable-title')?.resolvedAt).toBeNull();
+  });
+
+  it('keeps legacy review open when a content-identity-changed review is also open', async () => {
+    const { state } = await runCleanupPoll({
+      episodes: { 1: [episode(1, { id: 101, hasFile: true })] },
+      seed: (ledger) => {
+        seedLegacyIdentity(ledger);
+        ledger.flagManualReview('sonarr:1:s1', 'content-identity-changed', 'identity changed', NOW);
+      },
+    });
+    const reviews = state.listManualReview(true);
+    expect(reviews.find(({ reason }) => reason === 'unparseable-title')?.resolvedAt).toBeNull();
+    expect(reviews.find(({ reason }) => reason === 'content-identity-changed')?.resolvedAt).toBeNull();
+  });
+
+  it.each(['held claim', 'observation predates review'])('does not resolve with a %s', async (caseName) => {
+    const { state } = await runCleanupPoll({
+      evidence: captureOne,
+      episodes: { 1: [episode(1, { id: 101, hasFile: true })] },
+      at: caseName === 'observation predates review' ? new Date(NOW.getTime() + 1_000) : NOW,
+      seed: caseName === 'held claim' ? (ledger) => { ledger.claimUnit('sonarr:1:s1', NOW); } : undefined,
+    });
+    expect(state.listManualReview(true)[0]?.resolvedAt).toBeNull();
+  });
+
+  it('does not resolve against a library snapshot older than the durable work observation', async () => {
+    const laterDurableObservation = new Date(NOW.getTime() + 1_000);
+    let clockCalls = 0;
+    const clock = () => ++clockCalls === 1 ? NOW : new Date(NOW.getTime() + 2_000);
+    const { state } = await runCleanupPoll({
+      evidence: captureOne,
+      episodes: { 1: [episode(1, { id: 101, hasFile: true })] },
+      clock,
+      seed: (ledger) => seedLegacyIdentity(ledger, laterDurableObservation),
+    });
+    expect(state.listManualReview(true)[0]?.resolvedAt).toBeNull();
+  });
+
+  it('does not resolve from a future-dated library observation', async () => {
+    let clockCalls = 0;
+    const future = new Date(NOW.getTime() + 60_000);
+    const clock = () => ++clockCalls === 1 ? future : NOW;
+    const { state } = await runCleanupPoll({ evidence: captureOne, episodes: { 1: [episode(1, { id: 101, hasFile: true })] }, clock });
+    expect(state.listManualReview(true)[0]?.resolvedAt).toBeNull();
+  });
+
+  it('does not resolve from an invalid library observation timestamp', async () => {
+    mockDiscovery({ series: [tvSeries(1, 'Review Target', 368013)], episodes: { 1: [episode(1, { id: 101, hasFile: true })] } });
+    const state = State.open(':memory:');
+    state.flagUnparseableReview({ workKey: 'sonarr:1:s1', details: 'same malformed release', evidence: captureOne, at: NOW });
+    const runner = buildStack(new FakeLLM(), { state }).runner;
+    const deps = (runner as unknown as { deps: RunnerDeps }).deps;
+    const validSnapshot = await deps.watcher.getSnapshot();
+    vi.spyOn(deps.watcher, 'getSnapshot').mockResolvedValue({ ...validSnapshot, observedAt: 'not-an-iso-date' });
+    await runner.cycle();
+    expect(state.listManualReview(true)[0]?.resolvedAt).toBeNull();
+  });
+
+  it.each([
+    ['service id', 'sonarr:1:s1', { ...captureOne, serviceId: 2 }],
+    ['Arr', 'sonarr:1:s1', { arr: 'radarr' as const, serviceId: 1, externalId: 368013, episodeIds: null }],
+    ['key syntax', 'sonarr:1', captureOne],
+  ])('rejects insertion when captured evidence contradicts work-key %s', (_label, workKey, evidence) => {
+    const state = State.open(':memory:');
+    expect(() => state.flagUnparseableReview({ workKey, details: 'bad evidence', at: NOW, evidence })).toThrow(/does not match work key/);
+  });
+
+  it('does not resolve persisted malformed evidence whose service identity contradicts its work key', async () => {
+    const { state } = await runCleanupPoll({
+      skipReview: true,
+      series: [tvSeries(1, 'Review Target', 368013), tvSeries(2, 'Other service', 368013)],
+      episodes: { 1: [episode(1, { id: 101, hasFile: true })], 2: [episode(2, { id: 101, hasFile: true })] },
+      seed: (ledger) => {
+        const db = (ledger as unknown as { db: Database.Database }).db;
+        db.prepare("INSERT INTO manual_review(work_key,reason,details,created_at,target_evidence_json) VALUES(?,?,?,?,?)")
+          .run('sonarr:1:s1', 'unparseable-title', 'same malformed release', NOW.toISOString(), JSON.stringify({ ...captureOne, serviceId: 2 }));
+        db.prepare("INSERT INTO manual_review(work_key,reason,details,created_at,target_evidence_json) VALUES(?,?,?,?,?)")
+          .run('sonarr:01:s1', 'unparseable-title', 'same malformed release', NOW.toISOString(), JSON.stringify(captureOne));
+      },
+    });
+    expect(state.listManualReview(true)).toHaveLength(2);
+    expect(state.listManualReview(true).every(({ resolvedAt }) => resolvedAt === null)).toBe(true);
+  });
+
+  it('does not resolve persisted TV evidence for a Radarr key even when the movie has a file', async () => {
+    const { state } = await runCleanupPoll({
+      skipReview: true,
+      movies: [{ ...movieFixture, hasFile: true }],
+      seed: (ledger) => {
+        const db = (ledger as unknown as { db: Database.Database }).db;
+        db.prepare("INSERT INTO manual_review(work_key,reason,details,created_at,target_evidence_json) VALUES(?,?,?,?,?)")
+          .run('sonarr:1:s1', 'unparseable-title', 'same malformed release', NOW.toISOString(), JSON.stringify({ arr: 'radarr', serviceId: 3, externalId: 671, episodeIds: null }));
+      },
+    });
+    expect(state.listManualReview(true)[0]?.resolvedAt).toBeNull();
+  });
+
+  it.each([
+    ['invalid JSON', 'not-json'],
+    ['valid JSON with invalid schema', JSON.stringify({ arr: 'sonarr', serviceId: 'bad', externalId: 368013, episodeIds: [101] })],
+  ])('tolerates and leaves persisted %s review evidence open during poll and listing', async (_label, evidenceJson) => {
+    const { state, warns } = await runCleanupPoll({
+      skipReview: true,
+      episodes: { 1: [episode(1, { id: 101, hasFile: true })] },
+      seed: (ledger) => {
+        const db = (ledger as unknown as { db: Database.Database }).db;
+        db.pragma('ignore_check_constraints = ON');
+        db.prepare("INSERT INTO manual_review(work_key,reason,details,created_at,target_evidence_json) VALUES(?,?,?,?,?)")
+          .run('sonarr:1:s1', 'unparseable-title', 'same malformed release', NOW.toISOString(), evidenceJson);
+      },
+    });
+    expect(warns).toHaveLength(0);
+    expect(state.listManualReview()).toEqual([expect.objectContaining({ targetEvidenceInvalid: true, resolvedAt: null })]);
+  });
+
+  it('does not resolve persisted evidence with an unsafe integer season in the work key', async () => {
+    const { state } = await runCleanupPoll({
+      workKey: 'sonarr:1:s9007199254740992',
+      skipReview: true,
+      episodes: { 1: [episode(1, { id: 101, hasFile: true })] },
+      seed: (ledger) => {
+        const db = (ledger as unknown as { db: Database.Database }).db;
+        db.prepare("INSERT INTO manual_review(work_key,reason,details,created_at,target_evidence_json) VALUES(?,?,?,?,?)")
+          .run('sonarr:1:s9007199254740992', 'unparseable-title', 'same malformed release', NOW.toISOString(), JSON.stringify(captureOne));
+      },
+    });
+    expect(state.listManualReview(true)[0]?.resolvedAt).toBeNull();
+  });
+
+  it('keeps a resolved timestamp stable across repeated import polls', async () => {
+    let filesPresent = false;
+    const episodes = [episode(1, { id: 101, hasFile: false })];
+    mockDiscovery({ series: [tvSeries(1, 'Review Target', 368013)], episodeProvider: () => episodes.map((item) => ({ ...item, hasFile: filesPresent })) });
+    const state = State.open(':memory:');
+    state.flagUnparseableReview({ workKey: 'sonarr:1:s1', details: 'same malformed release', evidence: captureOne, at: NOW });
+    const runner = buildStack(new FakeLLM(), { state }).runner;
+    filesPresent = true;
+    await runner.cycle();
+    const resolvedAt = state.listManualReview(true)[0]!.resolvedAt;
+    await runner.cycle();
+    expect(state.listManualReview(true)[0]!.resolvedAt).toBe(resolvedAt);
   });
 
   it('malformed season labels never reach picker or grab', async () => {

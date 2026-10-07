@@ -1,6 +1,6 @@
 # Public repository and dev-image publishing
 
-Media Scout uses the public repository [github.com/aberiggs/media-scout](https://github.com/aberiggs/media-scout) and is intended to publish a **development-only** GHCR image at `ghcr.io/aberiggs/media-scout`. There is no stable-release promise, semver release policy, automatic homelab deployment, or `latest` image tag. The registry image is an alternative to building from source with `docker-compose.yml`.
+Media Scout uses the public repository [github.com/aberiggs/media-scout](https://github.com/aberiggs/media-scout) and publishes a development GHCR image at `ghcr.io/aberiggs/media-scout`. There is no stable-release promise, semver release policy, or automatic homelab deployment. The registry image is an alternative to building from source with `docker-compose.yml`.
 
 The public repository was initialized with an MIT license commit (`1ae5e5d8e46b9093e5bd9829fa508c00c8ef2cf5`). Preserve that history and add reviewed snapshot changes as ordinary commits; do not replace or rewrite the branch history.
 
@@ -23,23 +23,23 @@ For a single-maintainer repository, do not require an approving review that the 
 
 CI runs the existing `checks` job on every pull request and main push. The container matrix is skipped only when change detection confirms a non-empty diff containing exclusively `docs/**` paths and Markdown files (`*.md`). `LICENSE` is a Docker build input, so it is not treated as docs-only. Missing/invalid/empty diffs and any other path require the container build. The `container-build` aggregate required check remains present: it passes only when checks and detection succeed and either the runtime-change matrix succeeds or the docs-only matrix was intentionally skipped. Main-branch dev publishing additionally requires a known runtime path in the diff; uncertain/empty diffs build but do not publish.
 
-Coordinate with the GitHub Actions/workflow owner before relying on registry behavior. The dev-only publication contract is:
+Coordinate with the GitHub Actions/workflow owner before relying on registry behavior. The main-branch image publication contract is:
 
 - Validate pull requests, but do not publish a runnable image from an unmerged PR.
-- On an approved push to `main`, publish `ghcr.io/aberiggs/media-scout:dev` and a commit-addressed tag prefixed with `sha-`, for example `ghcr.io/aberiggs/media-scout:sha-<full-commit-sha>`. Replace the placeholder with the exact full-SHA tag produced by the workflow. Do not publish `latest`; do not publish on version-tag creation until a separate release policy exists.
+- On an approved push to `main`, publish `ghcr.io/aberiggs/media-scout:latest`, `ghcr.io/aberiggs/media-scout:dev`, and a commit-addressed tag prefixed with `sha-`, for example `ghcr.io/aberiggs/media-scout:sha-<full-commit-sha>`. `latest` is updated only by successful main-branch image publications; pull requests and version-tag creation do not publish it.
 - Do not deploy to a homelab or trigger deployment from the workflow. Publishing an image is not authorization to run it.
 - Use the repository-scoped `GITHUB_TOKEN` and least-privilege package permissions for Actions. Never add runtime API keys to Actions secrets for this image build; image building must not need the operator's Sonarr, Radarr, Prowlarr, download-client, or LLM credentials.
 
-Both `dev` and `sha-<full-commit-sha>` are mutable tags and can be overwritten by later builds or reruns. The SHA-shaped tag identifies a source commit, not an immutable image artifact; use an image digest to identify the exact immutable artifact tested or selected for rollback. The `dev` tag means the latest qualifying main-branch build, not a reviewed stable version. There is no automatic update behavior in `docker-compose.ghcr.yml`; an operator explicitly chooses and pulls an image.
+The `latest` and `dev` tags are mutable and point to the latest qualifying main-branch image publication, not a reviewed stable version. The SHA-shaped tag identifies a source commit, not an immutable image artifact; use an image digest to identify the exact immutable artifact tested or selected for rollback. There is no automatic update behavior in `docker-compose.ghcr.yml`; an operator explicitly chooses and pulls an image.
 
 ## 4. First GHCR package and visibility
 
 The first successful publication creates the package. GitHub Container Registry packages are **private by default**, even if the source repository is public. If anonymous image pulls are intended, the maintainer must open the package settings in GitHub and explicitly change package visibility to public, then verify anonymous pull access. Otherwise, users must authenticate to `ghcr.io` using an appropriately scoped token; do not put that token in `.env`, Compose YAML, or shell history.
 
-The published-image Compose file requires `MEDIA_AGENT_IMAGE`, supplied either in the shell environment or an optional `.env` file. `.env` is optional for bootstrap defaults; when present, it can contain bootstrap overrides and the Compose image reference. Integration, monitoring, and safety values are stored in SQLite instead. Compose v2.24 or later supports the optional env-file declaration used by these Compose files. For example, an operator may select the currently published dev image in `.env`:
+The published-image Compose file requires `MEDIA_AGENT_IMAGE`, supplied either in the shell environment or an optional `.env` file. `.env` is optional for bootstrap defaults; when present, it can contain bootstrap overrides and the Compose image reference. Integration, monitoring, and safety values are stored in SQLite instead. Compose v2.24 or later supports the optional env-file declaration used by these Compose files. For example, select the newest successful main image in `.env`:
 
 ```dotenv
-MEDIA_AGENT_IMAGE=ghcr.io/aberiggs/media-scout:dev
+MEDIA_AGENT_IMAGE=ghcr.io/aberiggs/media-scout:latest
 ```
 
 To use a commit-addressed tag instead, set `MEDIA_AGENT_IMAGE=ghcr.io/aberiggs/media-scout:sha-<full-commit-sha>` to the exact tag created by the workflow. For example, a **format-only, non-published** SHA-shaped tag is `ghcr.io/aberiggs/media-scout:sha-0123456789abcdef0123456789abcdef01234567`. To pin the exact immutable artifact by registry digest, use `ghcr.io/aberiggs/media-scout@sha256:<digest>`. Then:
@@ -59,8 +59,8 @@ Before merging a publishing change or using the published image:
 
 1. Confirm the secret/history audit is complete and the checked-out commit is the intended reviewed revision.
 2. Run the project-required tests, typecheck, and Docker build. Confirm the PR workflows pass and use their actual check-context names in branch protection.
-3. Merge through the protected PR path. Check that the main-branch image workflow publishes only `dev` and the `sha-<full-commit-sha>` tag, with no `latest`, release-tag trigger, or deployment step.
-4. Confirm both image tags refer to the expected commit. If anonymous pulls are desired, explicitly set and verify public GHCR visibility.
+3. Merge through the protected PR path. Check that the main-branch image workflow publishes `latest`, `dev`, and the `sha-<full-commit-sha>` tag, with no release-tag trigger or deployment step.
+4. Confirm all image tags refer to the expected commit. If anonymous pulls are desired, explicitly set and verify public GHCR visibility.
 5. Record the full commit and/or image digest used for the controlled rollout. Before testing the upgraded image, check the persisted UI settings, keep monitoring disabled, and confirm **Safety → Dry-run mode** is enabled. Only disable dry-run in the UI after an operator separately authorizes a reviewed live-grab transition; a `DRY_RUN=true` environment value does not replace this check.
 
 The Node package version is not, by itself, a published-release signal. No semver/version-bump policy is defined yet; maintainers may decide one separately before creating formal releases.

@@ -277,7 +277,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate dev and commit-addressed SHA tags
+      - name: Generate latest, dev, and commit-addressed SHA tags
         id: meta
         if: steps.current-main.outputs.publish == 'true'
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # docker/metadata-action v6
@@ -285,6 +285,7 @@ jobs:
           images: ${{ steps.image.outputs.name }}
           flavor: latest=false
           tags: |
+            type=raw,value=latest
             type=raw,value=dev
             type=sha,format=long,prefix=sha-
           labels: |
@@ -292,7 +293,7 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=MIT
 
-      - name: Build and publish multi-platform dev image
+      - name: Build and publish multi-platform main image
         if: steps.current-main.outputs.publish == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # docker/build-push-action v7
         with:

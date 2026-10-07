@@ -11,6 +11,7 @@ import {
   Eye,
   EyeOff,
   Film,
+  History,
   KeyRound,
   LoaderCircle,
   LockKeyhole,
@@ -23,6 +24,7 @@ import {
   Waves,
 } from 'lucide-react'
 import { mergeSettings, type Settings, type SettingsEnvelope, type SettingsStatus } from './types'
+import { OperationsPage } from './Operations'
 
 const MAX_INTERVAL_MINUTES = 35_791
 
@@ -42,6 +44,12 @@ class SettingsRequestError extends Error {
 }
 
 type Notice = { kind: 'error' | 'success' | 'info'; text: string; details?: string[] } | null
+type Page = 'queue' | 'reviews' | 'activity' | 'settings'
+
+function currentPage(): Page {
+  const page = window.location.hash.slice(1)
+  return page === 'reviews' || page === 'activity' || page === 'settings' ? page : 'queue'
+}
 
 const issueFieldLabels: Record<string, string> = {
   'integrations.prowlarr.url': 'Prowlarr service URL',
@@ -139,6 +147,7 @@ function errorText(error: unknown, settings: Settings): string {
 }
 
 function App() {
+  const [page, setPage] = useState<Page>(() => currentPage())
   const [settings, setSettings] = useState<Settings | null>(null)
   const [savedSnapshot, setSavedSnapshot] = useState('')
   const [status, setStatus] = useState<SettingsStatus | null>(null)
@@ -187,6 +196,12 @@ function App() {
       activeLoad.current = null
     }
   }, [loadSettings])
+
+  useEffect(() => {
+    const onHashChange = () => setPage(currentPage())
+    window.addEventListener('hashchange', onHashChange)
+    return () => window.removeEventListener('hashchange', onHashChange)
+  }, [])
 
   const update = useCallback((change: (current: Settings) => Settings) => {
     setSettings((current) => current ? change(current) : current)
@@ -245,22 +260,24 @@ function App() {
   }
 
   const saveLabel = saving ? 'Saving…' : isDirty ? 'Save changes' : 'All changes saved'
+  const pageLabels: Record<Page, string> = { queue: 'Queue', reviews: 'Manual review', activity: 'Search history', settings: 'Settings' }
   const missingSettings = status?.missing ?? []
   const prowlarrConfigured = Boolean(settings?.integrations.prowlarr.url && settings.integrations.prowlarr.apiKey && settings.integrations.prowlarr.tvClient && settings.integrations.prowlarr.movieClient)
 
   return (
     <div className="app-shell">
       <aside className="sidebar" aria-label="Main navigation">
-        <a className="brand" href="#settings" aria-label="Media Scout settings">
+          <a className="brand" href="#queue" aria-label="Media Scout queue">
           <span className="brand-mark"><Waves size={20} strokeWidth={2.2} /></span>
           <span className="brand-name">media<span>scout</span></span>
         </a>
 
         <div className="workspace-label">WORKSPACE</div>
-        <nav className="primary-nav">
-          <a className="nav-item active" href="#settings" aria-current="page"><Settings2 size={17} /> Settings <span className="nav-dot" /></a>
-          <div className="nav-item disabled" aria-disabled="true"><Activity size={17} /> Activity <span className="coming-soon">SOON</span></div>
-          <div className="nav-item disabled" aria-disabled="true"><Radio size={17} /> Logs <span className="coming-soon">SOON</span></div>
+        <nav className="primary-nav" aria-label="Workspace">
+          <a className={`nav-item ${page === 'queue' ? 'active' : ''}`} href="#queue" aria-current={page === 'queue' ? 'page' : undefined}><Activity size={17} /> Queue {page === 'queue' && <span className="nav-dot" />}</a>
+          <a className={`nav-item ${page === 'reviews' ? 'active' : ''}`} href="#reviews" aria-current={page === 'reviews' ? 'page' : undefined}><ShieldCheck size={17} /> Reviews {page === 'reviews' && <span className="nav-dot" />}</a>
+          <a className={`nav-item ${page === 'activity' ? 'active' : ''}`} href="#activity" aria-current={page === 'activity' ? 'page' : undefined}><History size={17} /> Search history {page === 'activity' && <span className="nav-dot" />}</a>
+          <a className={`nav-item ${page === 'settings' ? 'active' : ''}`} href="#settings" aria-current={page === 'settings' ? 'page' : undefined}><Settings2 size={17} /> Settings {page === 'settings' && <span className="nav-dot" />}</a>
         </nav>
 
         <div className="sidebar-bottom">
@@ -271,17 +288,18 @@ function App() {
 
       <div className="main-column">
         <header className="topbar">
-          <div className="crumb"><span>Workspace</span><span className="crumb-divider">/</span><strong>Settings</strong></div>
+          <div className="crumb"><span>Workspace</span><span className="crumb-divider">/</span><strong>{pageLabels[page]}</strong></div>
           <div className="topbar-right">
-            {status && <span className={`connection-chip ${status.ready ? 'is-ready' : 'needs-setup'}`}><span className="sr-only">Instance status: </span><span className="chip-dot" />{status.ready ? 'Ready' : 'Setup needed'}</span>}
-            <button className="button button-primary top-save" type="submit" form="settings-form" disabled={!isDirty || loading || saving}>
+            {page === 'settings' && status && <span className={`connection-chip ${status.ready ? 'is-ready' : 'needs-setup'}`}><span className="sr-only">Instance status: </span><span className="chip-dot" />{status.ready ? 'Ready' : 'Setup needed'}</span>}
+            {page === 'settings' && <button className="button button-primary top-save" type="submit" form="settings-form" disabled={!isDirty || loading || saving}>
               {saving ? <LoaderCircle className="spin" size={16} /> : isDirty ? <Save size={16} /> : <Check size={16} />}
               <span>{saveLabel}</span>
-            </button>
+            </button>}
           </div>
         </header>
 
-        <main id="settings" className="page-wrap">
+        <main id={page} className="page-wrap">
+          {page === 'settings' ? <>
           <div className="page-heading">
             <div>
               <div className="eyebrow"><span className="eyebrow-mark" /> YOUR INSTANCE</div>
@@ -431,6 +449,7 @@ function App() {
               </fieldset>
             </form>
           )}
+          </> : <OperationsPage page={page} />}
           <footer className="page-footer"><span>MEDIA SCOUT</span><span className="footer-divider" /><span>MADE FOR YOUR HOME LAB</span></footer>
         </main>
       </div>

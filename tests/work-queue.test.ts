@@ -18,7 +18,7 @@ const snapshot = (episodes: Episode[] = [ep(101, true), ep(102, false)], movies:
   radarr: { known: true, movies },
 });
 const knownTvQueue = (records: SonarrQueueRecord[] = [], observedAt = NOW): QueueRead<SonarrQueueRecord> => ({ kind: 'known', records, observedAt });
-const knownMovieQueue = (records: RadarrQueueRecord[] = []): QueueRead<RadarrQueueRecord> => ({ kind: 'known', records, observedAt: NOW });
+const knownMovieQueue = (records: RadarrQueueRecord[] = [], observedAt = NOW): QueueRead<RadarrQueueRecord> => ({ kind: 'known', records, observedAt });
 const emptyIntents: GrabIntent[] = [];
 
 function reconcile(input: {
@@ -39,6 +39,30 @@ function reconcile(input: {
 }
 
 describe('reconcileWork', () => {
+  it('consumes a reset marker only after a known library observation began after reset and re-enables rediscovery', () => {
+    const resetAt = '2026-09-29T00:05:00.000Z';
+    const prior = { ...reconcile().items.find((item) => item.work.workKey === 'sonarr:4:s1')!.work,
+      status: 'backoff' as const, lastSearchAt: NOW, nextSearchAt: resetAt, resetPendingAt: resetAt };
+    const evaluate = (inventory: LibrarySnapshot) => reconcileWork({
+      snapshot: inventory, queues: { sonarr: knownTvQueue([], inventory.observedAt), radarr: knownMovieQueue([], inventory.observedAt) },
+      existingWorkItems: [prior], intents: [], now: '2026-09-29T00:10:00.000Z', minRetryHours: 6, queueGraceMin: 30,
+    }).items.find((item) => item.work.workKey === prior.workKey)!;
+
+    expect(evaluate(snapshot()).work.resetPendingAt).toBe(resetAt); // observation predates reset
+    const unknown = snapshot();
+    unknown.observedAt = '2026-09-29T00:06:00.000Z';
+    unknown.sonarr.known = false;
+    unknown.sonarr.series = [];
+    expect(evaluate(unknown).work.resetPendingAt).toBe(resetAt); // timestamp alone is not proof
+    const after = snapshot();
+    after.observedAt = '2026-09-29T00:06:00.000Z';
+    const refreshed = evaluate(after);
+    expect(refreshed.work.resetPendingAt).toBeNull();
+    expect(refreshed.work.status).toBe('ready');
+    expect(refreshed.eligibleUnit?.key).toBe(prior.workKey);
+    expect(refreshed.work.lastSearchAt).toBe(NOW); // reconciliation itself does not issue a search
+  });
+
   it('keeps all missing inventory while making only aired episodes eligible', () => {
     const result = reconcile();
     const row = result.items.find((item) => item.work.workKey === 'sonarr:4:s1');
@@ -130,17 +154,162 @@ describe('reconcileWork', () => {
     });
     expect(fulfilled.items[0]?.work).toMatchObject({
       status: 'fulfilled', lastQueueObservedAt: LATER, queueObservationKnown: false,
+      unit: { season: { missing: [{ episodeId: 101 }, { episodeId: 102 }] } },
     });
     expect(fulfilled.intentUpdates).toContainEqual(expect.objectContaining({ id: capture.id, status: 'fulfilled' }));
 
-    const unmonitored = snapshot([{ ...ep(101, true), monitored: false }, { ...ep(102, false), monitored: false }]);
+    const nextKnownAt = '2026-09-29T00:32:00.000Z';
+    const nextKnown = reconcileWork({
+      snapshot: { ...filled, observedAt: nextKnownAt }, queues: { sonarr: knownTvQueue([], nextKnownAt), radarr: knownMovieQueue([], nextKnownAt) },
+      existingWorkItems: [fulfilled.items[0]!.work], intents: [], now: nextKnownAt, minRetryHours: 6, queueGraceMin: 30,
+    });
+    expect(nextKnown.items[0]?.work).toMatchObject({ status: 'fulfilled', unit: { season: { missing: [{ episodeId: 101 }, { episodeId: 102 }] } } });
+
+    const unmonitored = snapshot([{ ...ep(101, true, true), monitored: false }, { ...ep(102, false, true), monitored: false }]);
+    unmonitored.sonarr.series[0]!.series = { ...series, monitored: false };
+    const unmonitoredComplete = reconcileWork({
+      snapshot: { ...unmonitored, observedAt: currentAt }, queues: { sonarr: knownTvQueue([], currentAt), radarr: knownMovieQueue([], currentAt) },
+      existingWorkItems: [previouslyObserved], intents: [], now: currentAt, minRetryHours: 6, queueGraceMin: 30,
+    });
+    expect(unmonitoredComplete.items[0]?.work).toMatchObject({
+      status: 'fulfilled', unit: { season: { missing: [{ episodeId: 101 }, { episodeId: 102 }] } },
+    });
+    const unmonitoredNextPoll = reconcileWork({
+      snapshot: { ...unmonitored, observedAt: nextKnownAt }, queues: { sonarr: knownTvQueue([], nextKnownAt), radarr: knownMovieQueue([], nextKnownAt) },
+      existingWorkItems: [unmonitoredComplete.items[0]!.work], intents: [], now: nextKnownAt, minRetryHours: 6, queueGraceMin: 30,
+    });
+    expect(unmonitoredNextPoll.items[0]?.work.status).toBe('fulfilled');
+
+    const incompleteUnmonitored = snapshot([{ ...ep(101, true, true), monitored: false }, { ...ep(102, false), monitored: false }]);
+    incompleteUnmonitored.sonarr.series[0]!.series = { ...series, monitored: false };
     const inactive = reconcileWork({
-      snapshot: { ...unmonitored, observedAt: currentAt }, queues: { sonarr: knownTvQueue([], NOW), radarr: knownMovieQueue() },
+      snapshot: { ...incompleteUnmonitored, observedAt: currentAt }, queues: { sonarr: knownTvQueue([], NOW), radarr: knownMovieQueue() },
       existingWorkItems: [previouslyObserved], intents: [], now: currentAt, minRetryHours: 6, queueGraceMin: 30,
     });
     expect(inactive.items[0]?.work).toMatchObject({
       status: 'inactive', lastQueueObservedAt: LATER, queueObservationKnown: false,
+      unit: { season: { missing: [{ episodeId: 101 }, { episodeId: 102 }] } },
     });
+    const filesArrivedLater = snapshot([{ ...ep(101, true, true), monitored: false }, { ...ep(102, true, true), monitored: false }]);
+    filesArrivedLater.sonarr.series[0]!.series = { ...series, monitored: false };
+    const reclassified = reconcileWork({
+      snapshot: { ...filesArrivedLater, observedAt: nextKnownAt }, queues: { sonarr: knownTvQueue([], nextKnownAt), radarr: knownMovieQueue([], nextKnownAt) },
+      existingWorkItems: [inactive.items[0]!.work], intents: [], now: nextKnownAt, minRetryHours: 6, queueGraceMin: 30,
+    });
+    expect(reclassified.items[0]?.work.status).toBe('fulfilled');
+
+    const removedTarget = snapshot([{ ...ep(101, true, true), monitored: false }]);
+    removedTarget.sonarr.series[0]!.series = { ...series, monitored: false };
+    const removedNotComplete = reconcileWork({
+      snapshot: { ...removedTarget, observedAt: currentAt }, queues: { sonarr: knownTvQueue([], currentAt), radarr: knownMovieQueue([], currentAt) },
+      existingWorkItems: [previouslyObserved], intents: [], now: currentAt, minRetryHours: 6, queueGraceMin: 30,
+    });
+    expect(removedNotComplete.items[0]?.work.status).toBe('inactive');
+
+    const emptyTerminal = { ...previouslyObserved, status: 'inactive' as const, unit: { ...previouslyObserved.unit, season: { seasonNumber: 1, missing: [] } } };
+    const emptyCannotComplete = reconcileWork({
+      snapshot: { ...snapshot([ep(101, true), ep(102, true)]), observedAt: currentAt }, queues: { sonarr: knownTvQueue([], currentAt), radarr: knownMovieQueue([], currentAt) },
+      existingWorkItems: [emptyTerminal], intents: [], now: currentAt, minRetryHours: 6, queueGraceMin: 30,
+    });
+    expect(emptyCannotComplete.items[0]?.work.status).toBe('ready'); // actual missing targets reappear; empty history is not completion proof
+
+    const previousMovie = reconcile({ inventory: snapshot([], [movie()]) }).items.find((item) => item.work.workKey === 'radarr:8')!.work;
+    for (const monitored of [true, false]) {
+      const completedMovie = snapshot([], [movie({ monitored, hasFile: true })]);
+      const completed = reconcileWork({
+        snapshot: { ...completedMovie, observedAt: currentAt }, queues: { sonarr: knownTvQueue([], currentAt), radarr: knownMovieQueue([], currentAt) },
+        existingWorkItems: [previousMovie], intents: [], now: currentAt, minRetryHours: 6, queueGraceMin: 30,
+      });
+      const completedMovieWork = completed.items.find((item) => item.work.workKey === previousMovie.workKey)!.work;
+      expect(completedMovieWork.status).toBe('fulfilled');
+      const secondPollAt = '2026-09-29T00:32:00.000Z';
+      const secondPoll = reconcileWork({
+        snapshot: { ...completedMovie, observedAt: secondPollAt }, queues: { sonarr: knownTvQueue([], secondPollAt), radarr: knownMovieQueue([], secondPollAt) },
+        existingWorkItems: [completedMovieWork], intents: [], now: secondPollAt, minRetryHours: 6, queueGraceMin: 30,
+      });
+      expect(secondPoll.items.find((item) => item.work.workKey === previousMovie.workKey)?.work.status).toBe('fulfilled');
+    }
+    const noMovieFile = snapshot([], [movie({ monitored: false, hasFile: false })]);
+    const inactiveMovie = reconcileWork({
+      snapshot: { ...noMovieFile, observedAt: currentAt }, queues: { sonarr: knownTvQueue([], currentAt), radarr: knownMovieQueue([], currentAt) },
+      existingWorkItems: [previousMovie], intents: [], now: currentAt, minRetryHours: 6, queueGraceMin: 30,
+    });
+    expect(inactiveMovie.items.find((item) => item.work.workKey === previousMovie.workKey)?.work.status).toBe('inactive');
+  });
+
+  it('rechecks legacy empty TV snapshots only against a nonempty complete same-season file inventory', () => {
+    const previous = reconcile().items.find((item) => item.work.workKey === 'sonarr:4:s1')!.work;
+    const legacyTerminal: WorkItem = {
+      ...previous, status: 'inactive', missingFingerprint: JSON.stringify([previous.contentIdentity, []]),
+      unit: { ...previous.unit, season: { seasonNumber: 1, missing: [] } },
+    };
+    const poll = (episodes: Episode[], options: { monitored?: boolean; known?: boolean } = {}, old = legacyTerminal) => {
+      const inventory = snapshot(episodes);
+      inventory.sonarr.series[0]!.series = { ...inventory.sonarr.series[0]!.series, monitored: options.monitored ?? true };
+      if (options.known === false) {
+        inventory.sonarr.series[0]!.known = false;
+        inventory.sonarr.series[0]!.episodes = null;
+      }
+      return reconcileWork({
+        snapshot: inventory, queues: { sonarr: knownTvQueue([], inventory.observedAt), radarr: knownMovieQueue([], inventory.observedAt) },
+        existingWorkItems: [old], intents: [], now: inventory.observedAt, minRetryHours: 6, queueGraceMin: 30,
+      });
+    };
+    for (const monitored of [true, false]) {
+      const completeEpisodes = [ep(101, true, true), ep(102, true, true)].map((item) => ({ ...item, monitored }));
+      const complete = poll(completeEpisodes, { monitored });
+      expect(complete.items[0]?.work.status).toBe('fulfilled');
+      const nextPoll = poll(completeEpisodes, { monitored }, complete.items[0]!.work);
+      expect(nextPoll.items[0]?.work.status).toBe('fulfilled');
+    }
+    expect(poll([ep(101, true, true), { ...ep(102, true, false), monitored: false }]).items[0]?.work.status).toBe('inactive');
+    expect(poll([]).items[0]?.work.status).toBe('inactive');
+    expect(poll([{ ...ep(201, true, true), seasonNumber: 2 }]).items[0]?.work.status).toBe('inactive');
+    const unknown = poll([ep(101, true, true), ep(102, true, true)], { known: false });
+    expect(unknown.items[0]).toMatchObject({ work: { status: 'inactive' }, blockedReason: 'library-unknown' });
+  });
+
+  it('uses positive file evidence before unmonitored inactivity for TV and Radarr work, while incomplete or unknown remains non-fulfilled', () => {
+    const previousTv = reconcile().items.find((item) => item.work.workKey === 'sonarr:4:s1')!.work;
+    const capture: GrabIntent = {
+      id: 'completion-capture', ownerToken: 'owner', arr: 'sonarr', indexerId: 4, guid: 'completion-release', infoHash: 'completion-hash',
+      releaseTitle: 'Show S01', coverage: [{ workKey: previousTv.workKey, episodeIds: [101, 102], basis: 'explicit-episodes' }],
+      status: 'active', startedAt: NOW, confirmedAt: NOW, queueDeadlineAt: LATER, lastSeenAt: LATER, queueRefs: ['download:completion'],
+    };
+    const runTv = (monitored: boolean, files: [boolean, boolean], known = true) => {
+      const inventory = snapshot([ep(101, true, files[0]), ep(102, true, files[1])]);
+      inventory.sonarr.series[0]!.series = { ...inventory.sonarr.series[0]!.series, monitored };
+      inventory.sonarr.series[0]!.episodes = inventory.sonarr.series[0]!.episodes!.map((item) => ({ ...item, monitored }));
+      if (!known) {
+        inventory.sonarr.series[0]!.known = false;
+        inventory.sonarr.series[0]!.episodes = null;
+      }
+      return reconcileWork({
+        snapshot: inventory, queues: { sonarr: knownTvQueue([], inventory.observedAt), radarr: knownMovieQueue([], inventory.observedAt) },
+        existingWorkItems: [previousTv], intents: [capture], now: inventory.observedAt, minRetryHours: 6, queueGraceMin: 30,
+      });
+    };
+    for (const monitored of [true, false]) {
+      const complete = runTv(monitored, [true, true]);
+      expect(complete.items.find((item) => item.work.workKey === previousTv.workKey)?.work.status).toBe('fulfilled');
+      expect(complete.intentUpdates).toContainEqual(expect.objectContaining({ id: capture.id, status: 'fulfilled' }));
+    }
+    const incomplete = runTv(false, [true, false]);
+    expect(incomplete.items.find((item) => item.work.workKey === previousTv.workKey)?.work.status).toBe('inactive');
+    expect(incomplete.intentUpdates).not.toContainEqual(expect.objectContaining({ id: capture.id, status: 'fulfilled' }));
+    const unknown = runTv(false, [true, true], false);
+    expect(unknown.items.find((item) => item.work.workKey === previousTv.workKey)).toMatchObject({ work: { status: previousTv.status }, blockedReason: 'library-unknown' });
+    expect(unknown.intentUpdates).not.toContainEqual(expect.objectContaining({ id: capture.id, status: 'fulfilled' }));
+
+    const previousMovie = reconcile({ inventory: snapshot([], [movie()]) }).items.find((item) => item.work.workKey === 'radarr:8')!.work;
+    for (const monitored of [true, false]) {
+      const inventory = snapshot([], [movie({ monitored, hasFile: true })]);
+      const result = reconcileWork({ snapshot: inventory, queues: { sonarr: knownTvQueue([], inventory.observedAt), radarr: knownMovieQueue([], inventory.observedAt) }, existingWorkItems: [previousMovie], intents: [], now: inventory.observedAt, minRetryHours: 6, queueGraceMin: 30 });
+      expect(result.items.find((item) => item.work.workKey === previousMovie.workKey)?.work.status).toBe('fulfilled');
+    }
+    const incompleteMovie = snapshot([], [movie({ monitored: false, hasFile: false })]);
+    const movieResult = reconcileWork({ snapshot: incompleteMovie, queues: { sonarr: knownTvQueue([], incompleteMovie.observedAt), radarr: knownMovieQueue([], incompleteMovie.observedAt) }, existingWorkItems: [previousMovie], intents: [], now: incompleteMovie.observedAt, minRetryHours: 6, queueGraceMin: 30 });
+    expect(movieResult.items.find((item) => item.work.workKey === previousMovie.workKey)?.work.status).toBe('inactive');
   });
 
   it('reopens cooldown for a new missing target but preserves it when targets were only removed', () => {

@@ -513,6 +513,7 @@ describe('mcp server tools', () => {
     expect(raw).not.toContain('downloadUrl');
     expect(raw).not.toContain('http');
     expect(raw).not.toContain('apikey');
+    expect(stack.state.listSearchActivity()).toMatchObject([{ source: 'manual', query: 'Frieren', resultCount: 2, outcome: 'success' }]);
   });
 
   it('MCP upstream failures retain HTTP status but never expose credential URLs or response bodies', async () => {
@@ -531,6 +532,7 @@ describe('mcp server tools', () => {
     expect(message).not.toContain('prowlarr.test');
     expect(message).not.toContain('credential-SECRET');
     expect(message).not.toContain('upstream body');
+    expect(stack.state.listSearchActivity()).toMatchObject([{ source: 'manual', query: 'test', resultCount: null, outcome: 'error', errorCode: 'http-503' }]);
   });
 
   it('ma_pick grabs a chosen release, preserves out-of-range errors, and holds submitted coverage', async () => {

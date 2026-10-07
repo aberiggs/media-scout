@@ -16,6 +16,8 @@ export interface WorkItem {
   lastQueueObservedAt: string | null;
   queueObservationKnown: boolean;
   blockedReason: string | null;
+  /** Pending operator reset is consumed only by a later known library observation. */
+  resetPendingAt?: string | null;
 }
 
 export interface IntentCoverage {
@@ -61,6 +63,8 @@ export interface WorkQueueStatusRow {
   status: WorkStatus;
   nextSearchAt: string | null;
   lastObservedAt: string;
+  lastQueueObservedAt: string | null;
+  queueObservationKnown: boolean;
   missingCount: number;
   coveredEpisodeIds: number[];
   safeHoldReason: string | null;

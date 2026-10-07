@@ -195,7 +195,7 @@ class TerminalAfterAcceptedState extends State {
       ...prior,
       status: 'fulfilled',
       missingFingerprint: JSON.stringify([prior.contentIdentity, []]),
-      unit: { ...prior.unit, season: { seasonNumber: prior.unit.season.seasonNumber, missing: [] } },
+      unit: { ...prior.unit, season: { ...prior.unit.season } },
       lastObservedAt: input.now,
     };
     this.applyWorkReconciliation({ key: prior.workKey, token: intent.ownerToken, work: terminal, intentUpdates: [{ id: intent.id, status: 'fulfilled' }] });
@@ -373,6 +373,7 @@ describe('Runner.cycle', () => {
     });
     expect(state.hasHash('FIXTUREHASH0000000000000000000000000')).toBe(true);
     expect(state.hasRelease(5, grabBody.guid)).toBe(true);
+    expect(state.listSearchActivity()).toMatchObject([{ source: 'cycle', query: 'Frieren', resultCount: 1, outcome: 'success', media: [{ workKey: 'sonarr:1:s1' }] }]);
   });
 
   it('DRY_RUN: grabs logged only — grab endpoint never called, decision recorded, hash NOT recorded', async () => {
@@ -417,7 +418,7 @@ describe('Runner.cycle', () => {
     expect(rejectedLaterGrab.isDone()).toBe(false);
     expect(summary.grabbed).toBe(1);
     expect(state.workBeforeFailure).toMatchObject({ status: 'fulfilled' });
-    expect(state.getWorkItem('sonarr:1:s1'), JSON.stringify(warns)).toMatchObject({ status: 'fulfilled', unit: { season: { missing: [] } } });
+    expect(state.getWorkItem('sonarr:1:s1'), JSON.stringify(warns)).toMatchObject({ status: 'fulfilled', unit: { season: { missing: [{ episodeId: 101 }] } } });
     expect(state.getWorkItem('sonarr:1:s2')).toMatchObject({ status: 'backoff', failCount: 1 });
     expect(state.listWorkItems()).toHaveLength(2); // both terminal and nonterminal rows remain decodable
     expect(state.listGrabIntents()).toMatchObject([{ status: 'fulfilled', coverage: [{ workKey: 'sonarr:1:s1', episodeIds: [101] }] }]);
@@ -571,6 +572,8 @@ describe('Runner.cycle', () => {
     expect(decisionRow(state, 'sonarr:1:s1')).toBeUndefined(); // no decision for the aborted unit
     expect(state.lastDecisionAt('sonarr:1:s1')).toBeNull();
     expect(decisionRow(state, 'sonarr:2:s1')).toMatchObject({ verdict: 'grab', grabbed: 1 });
+    expect(state.listSearchActivity().find(({ query }) => query === 'Frieren')).toMatchObject({ source: 'cycle', resultCount: null, outcome: 'error', errorCode: 'http-429' });
+    expect(state.listSearchActivity().find(({ query }) => query === 'Other')).toMatchObject({ source: 'cycle', resultCount: 1, outcome: 'success' });
   });
 
   it('429 refreshes the healthy allowlist: the next unit only queries non-cooling indexers (I5)', async () => {
@@ -1186,6 +1189,39 @@ describe('Runner.cycle', () => {
     expect(JSON.stringify(warns)).not.toContain('private');
   });
 
+  it('persists a known-but-stale queue read as unknown and retains prior queue coverage in main reconciliation', async () => {
+    const llm = new FakeLLM();
+    const state = State.open(':memory:');
+    const futureQueueAt = new Date(NOW.getTime() + 5 * 60_000).toISOString();
+    const unit = {
+      key: 'sonarr:1:s1', kind: 'tv' as const, arr: 'sonarr' as const, serviceId: 1, externalId: 11,
+      title: 'Show', altTitles: [], seriesType: 'standard' as const,
+      season: { seasonNumber: 1, missing: [
+        { episodeId: 101, episodeNumber: 1, absoluteEpisodeNumber: null, title: 'Pilot' },
+        { episodeId: 102, episodeNumber: 2, absoluteEpisodeNumber: null, title: 'Second' },
+      ] },
+    };
+    const work: WorkItem = {
+      workKey: unit.key, contentIdentity: 'sonarr:1:11:tv',
+      missingFingerprint: JSON.stringify(['sonarr:1:11:tv', [[101, 1, null, true], [102, 2, null, true]]]),
+      unit, status: 'cooldown', lastSearchAt: null, nextSearchAt: futureQueueAt, failCount: 0, lastOutcome: null,
+      lastObservedAt: NOW.toISOString(), lastQueueObservedAt: futureQueueAt, queueObservationKnown: true, blockedReason: null,
+    };
+    const seedOwner = state.claimUnit(work.workKey, NOW)!;
+    state.applyWorkReconciliation({ key: work.workKey, token: seedOwner, work, intentUpdates: [] });
+    const savedCoverage = [{ workKey: work.workKey, episodeIds: [102], basis: 'explicit-episodes' as const }];
+    state.applyWorkQueueObservation({ key: work.workKey, token: seedOwner, observedAt: futureQueueAt, known: true, coverage: savedCoverage });
+    state.releaseClaim(work.workKey, seedOwner);
+
+    mockDiscovery({ series: [tvSeries(1, 'Show', 11, 'standard')], episodes: { 1: [episode(1, { id: 101 }), episode(1, { id: 102, episodeNumber: 2 })] } });
+    const { runner } = buildStack(llm, { state });
+    await runner.cycle();
+
+    expect(state.listWorkQueueObservations()[0]).toMatchObject({ known: false, observedAt: futureQueueAt, coverage: savedCoverage });
+    expect(state.getWorkItem(work.workKey)).toMatchObject({ queueObservationKnown: false, blockedReason: 'queue-unknown' });
+    expect(state.getWorkQueueStatus().items[0]).toMatchObject({ queueObservationKnown: false, coveredEpisodeIds: [102], safeHoldReason: 'queue-unknown' });
+  });
+
   it('continues paid work for an independently healthy Arr when the other source queue is unknown', async () => {
     const movie = JSON.parse(readFileSync(new URL('./fixtures/radarr-movie.json', import.meta.url), 'utf8')) as Record<string, unknown>;
     const llm = new FakeLLM();
@@ -1536,6 +1572,8 @@ describe('Runner.cycle', () => {
       [{ workKey: 'sonarr:1:s1', episodeIds: [101], basis: 'explicit-episodes' }],
       [{ workKey: 'sonarr:1:s2', episodeIds: [201], basis: 'explicit-episodes' }],
     ]);
+    expect(state.listSearchActivity().find(({ query }) => query === 'Show S01')).toMatchObject({ media: [{ workKey: 'sonarr:1:s1' }] });
+    expect(state.listSearchActivity().find(({ query }) => query === 'Show S02')).toMatchObject({ media: [{ workKey: 'sonarr:1:s2' }] });
   });
 
   it('keeps the first accepted group release when the second is rejected and never reserves the third', async () => {
@@ -1787,6 +1825,43 @@ describe('Runner.cycle', () => {
 });
 
 describe('Runner.manualPick', () => {
+  it('legacy single-item reverify persists a known-but-stale queue read as unknown and retains earlier holds', async () => {
+    const llm = new FakeLLM();
+    llm.planner.set('sonarr:1:s1', [{ query: 'Show S01', categories: [5000] }]);
+    const series = tvSeries(1, 'Show', 11, 'standard');
+    const episodes = [episode(1, { id: 101, title: 'Pilot' }), episode(1, { id: 102, episodeNumber: 2, title: 'Second' })];
+    nock(SONARR).persist().get('/api/v3/series').reply(200, [series]);
+    nock(SONARR).persist().get('/api/v3/episode').query({ seriesId: 1 }).reply(200, episodes);
+    nock(RADARR).persist().get('/api/v3/movie').reply(200, []);
+    nock(PROWLARR).get('/api/v1/downloadclient').reply(200, downloadClientsFixture);
+    nock(PROWLARR).get('/api/v1/indexer').reply(200, indexersFixture);
+    nock(PROWLARR).get('/api/v1/indexerstatus').reply(200, []);
+    const queueEnvelope = (records: unknown[]) => ({ page: 1, pageSize: 100, totalRecords: records.length, records });
+    const existing = { id: 77, downloadId: 'held-episode-102', seriesId: 1, episodeId: 102, seasonNumber: 1, status: 'downloading', trackedDownloadStatus: 'ok', trackedDownloadState: 'downloading' };
+    let queueReads = 0;
+    let clock = new Date(NOW);
+    nock(SONARR).persist().get('/api/v3/queue').query(true).reply(() => {
+      queueReads += 1;
+      if (queueReads === 1) return [200, queueEnvelope([existing])];
+      // The endpoint succeeds, but this completed observation is older than the library snapshot.
+      clock = new Date(NOW.getTime() - 60_000);
+      return [200, queueEnvelope([])];
+    });
+    nock(RADARR).persist().get('/api/v3/queue').query(true).reply(200, queueEnvelope([]));
+    mockSearch([release({ title: 'Show S01E01 1080p' })]);
+    const grab = mockGrab({});
+    const { runner, state } = buildStack(llm, { clock: () => clock });
+
+    const result = await runner.manualPick('sonarr:1:s1', 0);
+
+    expect(queueReads).toBe(2);
+    expect(result.outcome).toBe('reverify-failed');
+    expect(grab.isDone()).toBe(false);
+    expect(state.listWorkQueueObservations()[0]).toMatchObject({ known: false, coverage: [{ workKey: 'sonarr:1:s1', episodeIds: [102] }] });
+    expect(state.getWorkItem('sonarr:1:s1')).toMatchObject({ queueObservationKnown: false, blockedReason: 'queue-unknown' });
+    expect(state.getWorkQueueStatus().items[0]).toMatchObject({ queueObservationKnown: false, coveredEpisodeIds: [102], safeHoldReason: 'queue-unknown' });
+  });
+
   it('grabs the chosen verified candidate through the chokepoint and records decision + hash', async () => {
     const llm = new FakeLLM();
     llm.planner.set('sonarr:1:s1', [{ query: 'Frieren', categories: [5070] }]);
@@ -1807,6 +1882,18 @@ describe('Runner.manualPick', () => {
     expect(result.releaseTitle).toContain('SubsPlease');
     expect(decisionRow(state, 'sonarr:1:s1')).toMatchObject({ verdict: 'grab', grabbed: 1 });
     expect(state.hasHash('FIXTUREHASH0000000000000000000000000')).toBe(true);
+    expect(state.listSearchActivity()).toMatchObject([{ source: 'manual', query: 'Frieren', resultCount: 2, outcome: 'success', media: [{ workKey: 'sonarr:1:s1' }] }]);
+  });
+
+  it('records manualPick search failures as bounded manual activity without changing the failure behavior', async () => {
+    const llm = new FakeLLM();
+    llm.planner.set('sonarr:1:s1', [{ query: 'Frieren', categories: [5070] }]);
+    mockDiscovery({ series: [tvSeries(1, 'Show', 11, 'standard')] });
+    mockSearch({ status: 503 });
+    const { runner, state } = buildStack(llm, { dryRun: false });
+
+    await expect(runner.manualPick('sonarr:1:s1', 0)).rejects.toThrow();
+    expect(state.listSearchActivity()).toMatchObject([{ source: 'manual', query: 'Frieren', resultCount: null, outcome: 'error', errorCode: 'http-503' }]);
   });
 
   it('DRY_RUN manual pick logs intent without grabbing (I3 applies to human picks too)', async () => {

@@ -250,6 +250,16 @@ async function callErrorText(name: string, args: Record<string, unknown>): Promi
 }
 
 describe('mcp server tools', () => {
+  it('exposes general search and a mutating general grab tool with a ten-release limit', async () => {
+    await connect(new FakeLLM());
+    const listed = await client.listTools();
+    const searchTool = listed.tools.find(({ name }) => name === 'ma_general_search');
+    const grabTool = listed.tools.find(({ name }) => name === 'ma_general_grab');
+    expect(searchTool).toBeDefined();
+    expect(grabTool?.description).toContain('separate explicit approval');
+    expect(grabTool?.inputSchema.properties?.releaseIds).toMatchObject({ maxItems: 10 });
+  });
+
   it('ma_status reports config + open review count', async () => {
     await connect(new FakeLLM());
     stack.state.flagManualReview('sonarr:1:s1', 'unparseable-title', 'Some.Trash.mkv', NOW);

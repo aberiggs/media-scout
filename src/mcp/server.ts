@@ -10,7 +10,7 @@ import { ApiError } from '../http';
 import type { Release } from '../types/prowlarr';
 
 /**
- * Registers the six media-agent tools on a fresh McpServer (stdio transport attached by runMcpServer/tests).
+ * Registers media-agent tools on a fresh McpServer (stdio transport attached by runMcpServer/tests).
  * Handler throws are converted by the SDK into isError tool results — one failing call never crashes the server.
  */
 export function createMcpServer(stack: Stack): McpServer {
@@ -44,6 +44,14 @@ export function createMcpServer(stack: Stack): McpServer {
       }
       if (error instanceof Error && error.message.startsWith('LLM ')) throw new Error('LLM request failed');
       throw error;
+    }
+  };
+  const safeGeneralOperation = async <T>(call: () => Promise<T>): Promise<T> => {
+    try { return await withSafeUpstreamErrors(call); }
+    catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error && typeof (error as { code?: unknown }).code === 'string' ? (error as { code: string }).code : '';
+      if (['invalid-request','search-unavailable','operator-actions-disabled','search-expired','invalid-confirmation','invalid-release-selection','settings-changed','destination-changed'].includes(code)) throw new Error(code);
+      throw new Error('General search unavailable');
     }
   };
 
@@ -129,6 +137,18 @@ export function createMcpServer(stack: Stack): McpServer {
         return withSafeUpstreamErrors(async () => { throw error; });
       }
     },
+  );
+
+  server.registerTool(
+    'ma_general_search',
+    { description: 'Plan a general search, return candidate releases for explicit user selection. This tool never picks or grabs a release.', inputSchema: z.object({ query: z.string().trim().min(1).max(500) }).strict() },
+    async ({ query }) => jsonResult(await safeGeneralOperation(() => snapshot().generalSearch.search({ query }))),
+  );
+
+  server.registerTool(
+    'ma_general_grab',
+    { description: 'Mutating: submit only release IDs explicitly selected by the user after showing them and obtaining separate explicit approval. A confirmation token and confirmed=true are not proof of user approval.', annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true }, inputSchema: z.object({ searchId: z.string().uuid(), confirmationToken: z.string().min(32).max(256), releaseIds: z.array(z.string().uuid()).min(1).max(10), confirmed: z.literal(true) }).strict() },
+    async ({ searchId, confirmationToken, releaseIds, confirmed }) => jsonResult(await safeGeneralOperation(() => snapshot().generalSearch.grab(searchId, { confirmationToken, releaseIds, confirmed }))),
   );
 
   server.registerTool(

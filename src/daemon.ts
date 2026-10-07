@@ -10,6 +10,7 @@ import { missingSettings, settingsSchema, type Settings } from './settings';
 import type { CycleSummary } from './core/runner';
 import { OperationsDashboard } from './core/operations';
 import type { WorkAction } from './core/state';
+import { z } from 'zod';
 
 type CycleAttempt = { ok: true; summary: CycleSummary } | { ok: false; conflict: true } | { ok: false; error: unknown };
 interface CycleGate { run(): Promise<CycleAttempt>; settled(): Promise<void>; isRunning(): boolean }
@@ -62,6 +63,23 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
   });
   app.decorate('cycleGate', gate);
   const operations = new OperationsDashboard(stack.state);
+
+  app.post('/api/search', async (request, reply) => {
+    if (!mutationAllowed(request)) return reply.code(403).send({ error: 'cross-origin mutation rejected', code: 'origin-rejected' });
+    const body = z.object({ query: z.string().trim().min(1).max(500) }).strict().safeParse(request.body);
+    if (!body.success) return reply.code(400).send({ error: 'invalid search request', code: 'invalid-request' });
+    try { return await stack.createSnapshot(stack.state.getSettings()).generalSearch.search(body.data); }
+    catch (error) { const code = safeGeneralErrorCode(error); const status = code === 'invalid-request' ? 400 : code === 'search-unavailable' ? 503 : 502; return reply.code(status).send({ error: 'general search unavailable', code }); }
+  });
+  app.post('/api/search/:id/grab', async (request, reply) => {
+    if (!mutationAllowed(request)) return reply.code(403).send({ error: 'cross-origin mutation rejected', code: 'origin-rejected' });
+    const id = (request.params as { id?: string }).id;
+    if (!id || !/^[0-9a-f-]{36}$/i.test(id)) return reply.code(400).send({ error: 'invalid search id', code: 'invalid-request' });
+    const body = z.object({ confirmationToken: z.string().min(32).max(256), releaseIds: z.array(z.string().uuid()).min(1).max(10), confirmed: z.literal(true) }).strict().safeParse(request.body);
+    if (!body.success) return reply.code(400).send({ error: 'invalid grab request', code: 'invalid-request' });
+    try { return await stack.createSnapshot(stack.state.getSettings()).generalSearch.grab(id, body.data); }
+    catch (error) { const code = safeGeneralErrorCode(error); const status = code === 'invalid-request' ? 400 : code === 'operator-actions-disabled' ? 403 : code === 'search-expired' ? 404 : code === 'invalid-confirmation' || code === 'invalid-release-selection' ? 400 : 409; return reply.code(status).send({ error: 'general grab unavailable', code }); }
+  });
 
   app.get('/health', async () => { const settings = stack.state.getSettings(); return { status: 'ok', dryRun: settings.safety.dryRun, model: settings.ai.model }; });
   app.get('/api/settings', async () => envelope(stack.state.getSettings(), gate.isRunning()));
@@ -209,6 +227,11 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
     });
   }
   return app as unknown as FastifyInstance;
+}
+
+function safeGeneralErrorCode(error: unknown): string {
+  const code = error && typeof error === 'object' && 'code' in error && typeof (error as {code?:unknown}).code === 'string' ? (error as {code:string}).code : '';
+  return ['invalid-request','search-unavailable','operator-actions-disabled','search-expired','invalid-confirmation','invalid-release-selection','settings-changed','destination-changed'].includes(code) ? code : 'operation-failed';
 }
 
 export async function startDaemon(stack: Stack): Promise<void> {

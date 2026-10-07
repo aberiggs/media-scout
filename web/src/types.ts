@@ -1,7 +1,7 @@
 export interface Settings {
   version: 1
   integrations: {
-    prowlarr: { url: string; apiKey: string; tvClient: string; movieClient: string }
+    prowlarr: { url: string; apiKey: string; tvClient: string; movieClient: string; generalClient: string }
     sonarr: { url: string; apiKey: string }
     radarr: { url: string; apiKey: string }
   }
@@ -32,7 +32,7 @@ export interface SettingsEnvelope {
 export const defaults: Settings = {
   version: 1,
   integrations: {
-    prowlarr: { url: '', apiKey: '', tvClient: '', movieClient: '' },
+    prowlarr: { url: '', apiKey: '', tvClient: '', movieClient: '', generalClient: '' },
     sonarr: { url: '', apiKey: '' },
     radarr: { url: '', apiKey: '' },
   },

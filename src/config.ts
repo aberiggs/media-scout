@@ -11,7 +11,7 @@ const bootstrapSchema = z.object({
 /** Legacy aliases keep the core services small; these values always come from one validated DB snapshot. */
 export type Config = z.infer<typeof bootstrapSchema> & {
   settings: Settings;
-  PROWLARR_URL: string; PROWLARR_API_KEY: string; SONARR_URL: string; SONARR_API_KEY: string;
+  PROWLARR_URL: string; PROWLARR_API_KEY: string; PROWLARR_CLIENT_GENERAL?: string; SONARR_URL: string; SONARR_API_KEY: string;
   RADARR_URL: string; RADARR_API_KEY: string; PROWLARR_CLIENT_TV: string; PROWLARR_CLIENT_MOVIE: string;
   LLM_BASE_URL: string; LLM_API_KEY: string; LLM_MODEL: string; MEDIA_PREFERENCES: string;
   CYCLE_INTERVAL_MIN: number; MIN_RETRY_HOURS: number; FAILURE_BACKOFF_MIN: number;
@@ -22,7 +22,7 @@ export function configWithSettings(bootstrap: Pick<Config, 'DB_PATH' | 'HTTP_POR
   return {
     ...bootstrap, settings,
     PROWLARR_URL: settings.integrations.prowlarr.url, PROWLARR_API_KEY: settings.integrations.prowlarr.apiKey,
-    PROWLARR_CLIENT_TV: settings.integrations.prowlarr.tvClient, PROWLARR_CLIENT_MOVIE: settings.integrations.prowlarr.movieClient,
+    PROWLARR_CLIENT_TV: settings.integrations.prowlarr.tvClient, PROWLARR_CLIENT_MOVIE: settings.integrations.prowlarr.movieClient, PROWLARR_CLIENT_GENERAL: settings.integrations.prowlarr.generalClient ?? '',
     SONARR_URL: settings.integrations.sonarr.url, SONARR_API_KEY: settings.integrations.sonarr.apiKey,
     RADARR_URL: settings.integrations.radarr.url, RADARR_API_KEY: settings.integrations.radarr.apiKey,
     LLM_BASE_URL: settings.ai.baseUrl, LLM_API_KEY: settings.ai.apiKey, LLM_MODEL: settings.ai.model,

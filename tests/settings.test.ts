@@ -14,6 +14,7 @@ describe('persisted UI settings', () => {
     expect(settings.monitoring.enabled).toBe(false);
     expect(settings.safety.dryRun).toBe(true);
     expect(missingSettings(settings)).toContain('integrations.sonarr.apiKey');
+    expect(missingSettings(settings)).not.toContain('integrations.prowlarr.generalClient');
     state.close();
   });
 
@@ -28,7 +29,7 @@ describe('persisted UI settings', () => {
     first.saveSettings(configured);
     first.close();
     const second = State.open(path);
-    expect(second.getSettings()).toEqual(configured);
+    expect(second.getSettings()).toEqual({ ...configured, integrations: { ...configured.integrations, prowlarr: { ...configured.integrations.prowlarr, generalClient: '' } } });
     second.close();
     rmSync(dir, { recursive: true, force: true });
   });
@@ -43,6 +44,12 @@ describe('persisted UI settings', () => {
     const invertedBackoff = structuredClone(defaultSettings);
     invertedBackoff.monitoring.failureBackoffMinMinutes = 61;
     expect(settingsSchema.safeParse(invertedBackoff).success).toBe(false);
+  });
+
+  it('migrates version-one stored settings without a general destination to the empty default', () => {
+    const legacy = structuredClone(defaultSettings) as Record<string, any>;
+    delete legacy.integrations.prowlarr.generalClient;
+    expect(settingsSchema.parse(legacy).integrations.prowlarr.generalClient).toBe('');
   });
 
   it('bounds timer intervals to the largest safe whole-minute Node timeout', () => {

@@ -60,4 +60,12 @@ export class ProwlarrClient {
       downloadClientId,
     });
   }
+
+  async grabGeneral(release: Pick<Release, 'guid' | 'indexerId'>, downloadClientId: number): Promise<void> {
+    await this.http.postJson('/api/v1/search', {
+      indexerId: release.indexerId,
+      guid: release.guid,
+      downloadClientId,
+    });
+  }
 }

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { createHash } from 'node:crypto';
 
 /** Prowlarr DownloadProtocol enum (openapi: "unknown" | "usenet" | "torrent"). */
 export const downloadProtocolSchema = z.enum(['unknown', 'usenet', 'torrent']);
@@ -86,6 +87,42 @@ export const downloadClientCategorySchema = z.object({
   categories: z.array(z.number().int()).nullable().catch(null),
 });
 
+/** Stable canonical JSON for provider field values; object property order is irrelevant. */
+function canonicalJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (typeof value === 'object' && value !== null) {
+    return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => [key, canonicalJson(item)]));
+  }
+  return value;
+}
+
+function downloadClientRoutingDigest(raw: Record<string, unknown>, parsed: {
+  supportsCategories: boolean;
+  categories: z.infer<typeof downloadClientCategorySchema>[];
+}): string | null {
+  const fields = raw.fields;
+  const implementation = raw.implementation;
+  const configContract = raw.configContract;
+  if (typeof implementation !== 'string' || !implementation || typeof configContract !== 'string' || !configContract || !Array.isArray(fields) || fields.length === 0) return null;
+  const providerFields: Array<{ name: string; value: unknown }> = [];
+  for (const field of fields) {
+    if (typeof field !== 'object' || field === null || Array.isArray(field)) return null;
+    const record = field as Record<string, unknown>;
+    if (typeof record.name !== 'string' || !record.name.trim()) return null;
+    const value = record.value == null ? null : record.value;
+    providerFields.push({ name: record.name, value: canonicalJson(value) });
+  }
+  providerFields.sort((a, b) => compareCanonical(a.name, b.name) || compareCanonical(JSON.stringify(a.value), JSON.stringify(b.value)));
+  const categories = parsed.categories.map(({ clientCategory, categories: ids }) => ({
+    clientCategory,
+    categories: ids === null ? null : [...ids].sort((a, b) => a - b),
+  })).sort((a, b) => compareCanonical(JSON.stringify(a), JSON.stringify(b)));
+  const source = JSON.stringify({ implementation, configContract, fields: providerFields, supportsCategories: parsed.supportsCategories, categories });
+  return createHash('sha256').update(source).digest('hex');
+}
+
+function compareCanonical(a: string, b: string): number { return a < b ? -1 : a > b ? 1 : 0; }
+
 /** Prowlarr download-client entry — resolved by name to route grabs (D6). */
 export const downloadClientSchema = z.object({
   id: z.number().int(),
@@ -94,6 +131,10 @@ export const downloadClientSchema = z.object({
   protocol: downloadProtocolSchema,
   supportsCategories: z.boolean().catch(false),
   categories: z.array(downloadClientCategorySchema).catch([]),
+}).passthrough().transform((raw) => {
+  const { id, name, enable, protocol, supportsCategories, categories } = raw;
+  const routingDigest = downloadClientRoutingDigest(raw as Record<string, unknown>, { supportsCategories, categories });
+  return { id, name, enable, protocol, supportsCategories, categories, routingDigest };
 });
 export type DownloadClient = z.infer<typeof downloadClientSchema>;
 export const downloadClientListSchema = z.array(downloadClientSchema);

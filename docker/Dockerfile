@@ -24,6 +24,7 @@ COPY web/package.json web/package-lock.json ./web/
 RUN cd web && npm ci
 COPY web/index.html web/postcss.config.js web/tailwind.config.js web/vite.config.ts web/tsconfig.json ./web/
 COPY web/src ./web/src
+COPY src/types ./src/types
 RUN npm --prefix web run build
 
 COPY src ./src

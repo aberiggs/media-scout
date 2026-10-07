@@ -16,6 +16,7 @@ import {
   LoaderCircle,
   LockKeyhole,
   Radio,
+  Search,
   Save,
   Settings2,
   ShieldCheck,
@@ -25,6 +26,7 @@ import {
 } from 'lucide-react'
 import { mergeSettings, type Settings, type SettingsEnvelope, type SettingsStatus } from './types'
 import { OperationsPage } from './Operations'
+import { GeneralSearchPage } from './GeneralSearch'
 
 const MAX_INTERVAL_MINUTES = 35_791
 
@@ -44,11 +46,11 @@ class SettingsRequestError extends Error {
 }
 
 type Notice = { kind: 'error' | 'success' | 'info'; text: string; details?: string[] } | null
-type Page = 'queue' | 'reviews' | 'activity' | 'settings'
+type Page = 'queue' | 'reviews' | 'activity' | 'settings' | 'search'
 
 function currentPage(): Page {
   const page = window.location.hash.slice(1)
-  return page === 'reviews' || page === 'activity' || page === 'settings' ? page : 'queue'
+  return page === 'reviews' || page === 'activity' || page === 'settings' || page === 'search' ? page : 'queue'
 }
 
 const issueFieldLabels: Record<string, string> = {
@@ -260,7 +262,7 @@ function App() {
   }
 
   const saveLabel = saving ? 'Saving…' : isDirty ? 'Save changes' : 'All changes saved'
-  const pageLabels: Record<Page, string> = { queue: 'Queue', reviews: 'Manual review', activity: 'Search history', settings: 'Settings' }
+  const pageLabels: Record<Page, string> = { queue: 'Queue', reviews: 'Manual review', activity: 'Search history', settings: 'Settings', search: 'General search' }
   const missingSettings = status?.missing ?? []
   const prowlarrConfigured = Boolean(settings?.integrations.prowlarr.url && settings.integrations.prowlarr.apiKey && settings.integrations.prowlarr.tvClient && settings.integrations.prowlarr.movieClient)
 
@@ -277,6 +279,7 @@ function App() {
           <a className={`nav-item ${page === 'queue' ? 'active' : ''}`} href="#queue" aria-current={page === 'queue' ? 'page' : undefined}><Activity size={17} /> Queue {page === 'queue' && <span className="nav-dot" />}</a>
           <a className={`nav-item ${page === 'reviews' ? 'active' : ''}`} href="#reviews" aria-current={page === 'reviews' ? 'page' : undefined}><ShieldCheck size={17} /> Reviews {page === 'reviews' && <span className="nav-dot" />}</a>
           <a className={`nav-item ${page === 'activity' ? 'active' : ''}`} href="#activity" aria-current={page === 'activity' ? 'page' : undefined}><History size={17} /> Search history {page === 'activity' && <span className="nav-dot" />}</a>
+          <a className={`nav-item ${page === 'search' ? 'active' : ''}`} href="#search" aria-current={page === 'search' ? 'page' : undefined}><Search size={17} /> General search {page === 'search' && <span className="nav-dot" />}</a>
           <a className={`nav-item ${page === 'settings' ? 'active' : ''}`} href="#settings" aria-current={page === 'settings' ? 'page' : undefined}><Settings2 size={17} /> Settings {page === 'settings' && <span className="nav-dot" />}</a>
         </nav>
 
@@ -299,7 +302,7 @@ function App() {
         </header>
 
         <main id={page} className="page-wrap">
-          {page === 'settings' ? <>
+          {page === 'search' ? <GeneralSearchPage /> : page === 'settings' ? <>
           <div className="page-heading">
             <div>
               <div className="eyebrow"><span className="eyebrow-mark" /> YOUR INSTANCE</div>
@@ -338,6 +341,9 @@ function App() {
                         </Field>
                         <Field label="Movie download client" htmlFor="prowlarr-movie" hint="Exact client name as shown in Prowlarr">
                           <input id="prowlarr-movie" value={settings.integrations.prowlarr.movieClient} onChange={(e) => updateIntegration('prowlarr', 'movieClient', e.target.value)} placeholder="e.g. qBittorrent" />
+                        </Field>
+                        <Field className="span-two" label="General download client" htmlFor="prowlarr-general" hint="Exact Prowlarr download-client entry name. Configure that client separately with the intended general-download category.">
+                          <input id="prowlarr-general" value={settings.integrations.prowlarr.generalClient} onChange={(e) => updateIntegration('prowlarr', 'generalClient', e.target.value)} placeholder="e.g. qBittorrent" />
                         </Field>
                       </div>
                     </div>

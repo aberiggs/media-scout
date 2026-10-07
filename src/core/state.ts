@@ -226,6 +226,15 @@ CREATE TABLE IF NOT EXISTS app_settings (
   document_json TEXT NOT NULL CHECK (json_valid(document_json)),
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS general_search_snapshots (
+  id TEXT PRIMARY KEY, token_digest TEXT NOT NULL UNIQUE, expires_at TEXT NOT NULL,
+  fingerprint TEXT NOT NULL, client_name TEXT NOT NULL, client_protocol TEXT NOT NULL, client_id INTEGER, routing_digest TEXT NOT NULL,
+  dry_run INTEGER NOT NULL, payload_json TEXT NOT NULL CHECK(json_valid(payload_json))
+);
+CREATE TABLE IF NOT EXISTS general_search_receipts (
+  search_id TEXT NOT NULL, release_id TEXT NOT NULL, source_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL,
+  code TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(search_id, release_id)
+);
 `;
 
 const WORK_STATUSES: readonly WorkStatus[] = ['ready', 'waiting-release', 'searching', 'cooldown', 'backoff', 'manual', 'fulfilled', 'inactive'];
@@ -382,6 +391,7 @@ export class State {
     this.ensureGroupAssociationColumns();
     this.ensureOperatorColumns();
     this.ensureReviewEvidenceColumn();
+    this.ensureGeneralSearchColumns();
   }
 
   static open(path: string): State {
@@ -411,6 +421,47 @@ export class State {
     this.db.prepare(`INSERT INTO app_settings(id,version,document_json,updated_at) VALUES(1,?,?,?)
       ON CONFLICT(id) DO UPDATE SET version=excluded.version,document_json=excluded.document_json,updated_at=excluded.updated_at`)
       .run(validated.version, JSON.stringify(validated), new Date().toISOString());
+  }
+
+  saveGeneralSearchSnapshot(input: { id: string; tokenDigest: string; expiresAt: string; fingerprint: string; clientName: string; clientProtocol: string; clientId: number | null; routingDigest: string; dryRun: boolean; payload: unknown }): void {
+    this.db.prepare('INSERT INTO general_search_snapshots(id,token_digest,expires_at,fingerprint,client_name,client_protocol,client_id,routing_digest,dry_run,payload_json) VALUES(?,?,?,?,?,?,?,?,?,?)')
+      .run(input.id, input.tokenDigest, input.expiresAt, input.fingerprint, input.clientName, input.clientProtocol, input.clientId, input.routingDigest, input.dryRun ? 1 : 0, JSON.stringify(input.payload));
+  }
+
+  getGeneralSearchSnapshot(id: string): { tokenDigest: string; expiresAt: string; fingerprint: string; clientName: string; clientProtocol: string; clientId: number | null; routingDigest: string; dryRun: boolean; payload: unknown } | null {
+    const row = this.db.prepare('SELECT * FROM general_search_snapshots WHERE id=?').get(id) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    try { return { tokenDigest: String(row.token_digest), expiresAt: String(row.expires_at), fingerprint: String(row.fingerprint), clientName: String(row.client_name), clientProtocol: String(row.client_protocol), clientId: row.client_id === null ? null : Number(row.client_id), routingDigest: String(row.routing_digest), dryRun: Number(row.dry_run) === 1, payload: JSON.parse(String(row.payload_json)) as unknown }; } catch { return null; }
+  }
+
+  reserveGeneralSearchRelease(searchId: string, releaseId: string, now: string, sourceKey = `${searchId}:${releaseId}`, legacySourceKey?: string): { status: string; code: string | null; reserved: boolean } {
+    return this.db.transaction(() => {
+      const row = (this.db.prepare('SELECT status,code FROM general_search_receipts WHERE source_key=?').get(sourceKey)
+        ?? (legacySourceKey ? this.db.prepare('SELECT status,code FROM general_search_receipts WHERE source_key=?').get(legacySourceKey) : undefined)) as { status: string; code: string | null } | undefined;
+      if (row) return { ...row, reserved: false };
+      this.db.prepare('INSERT INTO general_search_receipts(search_id,release_id,source_key,status,code,updated_at) VALUES(?,?,?,\'submitting\',NULL,?)').run(searchId, releaseId, sourceKey, now);
+      return { status: 'submitting', code: null, reserved: true };
+    })();
+  }
+
+  finishGeneralSearchRelease(searchId: string, releaseId: string, status: string, code: string | null, now: string): void {
+    this.db.prepare('UPDATE general_search_receipts SET status=?,code=?,updated_at=? WHERE search_id=? AND release_id=?').run(status, code, now, searchId, releaseId);
+  }
+
+  cancelGeneralSearchReservation(searchId: string, releaseId: string, sourceKey: string): void {
+    this.db.prepare("DELETE FROM general_search_receipts WHERE search_id=? AND release_id=? AND source_key=? AND status='submitting'").run(searchId, releaseId, sourceKey);
+  }
+
+  pruneGeneralSearchSnapshots(now: string): void { this.db.prepare('DELETE FROM general_search_snapshots WHERE expires_at<=?').run(now); }
+
+  migrateLegacyGeneralSearchReceipt(sourceKey: string, legacySourceKey: string): void {
+    this.db.transaction(() => {
+      const exists = this.db.prepare('SELECT 1 FROM general_search_receipts WHERE source_key=?').get(sourceKey);
+      if (exists) return;
+      // Only migrate the explicit legacy key derived from this exact configured server/key.
+      // Never infer identity by scanning snapshots: distinct servers can return the same indexer/GUID.
+      this.db.prepare('UPDATE general_search_receipts SET source_key=? WHERE source_key=?').run(sourceKey, legacySourceKey);
+    })();
   }
 
   hasHash(infoHash: string): boolean {
@@ -1501,6 +1552,11 @@ export class State {
   private ensureReviewEvidenceColumn(): void {
     const columns = new Set((this.db.prepare('PRAGMA table_info(manual_review)').all() as Array<{ name: string }>).map(({ name }) => name));
     if (!columns.has('target_evidence_json')) this.db.exec('ALTER TABLE manual_review ADD COLUMN target_evidence_json TEXT');
+  }
+
+  private ensureGeneralSearchColumns(): void {
+    const columns = new Set((this.db.prepare('PRAGMA table_info(general_search_snapshots)').all() as Array<{ name: string }>).map(({ name }) => name));
+    if (!columns.has('routing_digest')) this.db.exec("ALTER TABLE general_search_snapshots ADD COLUMN routing_digest TEXT NOT NULL DEFAULT ''");
   }
 
   /**

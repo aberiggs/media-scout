@@ -10,7 +10,7 @@ const text = z.string();
 export const settingsSchema = z.object({
   version: z.literal(1),
   integrations: z.object({
-    prowlarr: z.object({ url: optionalHttpUrl, apiKey: text, tvClient: text, movieClient: text }).strict(),
+    prowlarr: z.object({ url: optionalHttpUrl, apiKey: text, tvClient: text, movieClient: text, generalClient: text.default('') }).strict(),
     sonarr: z.object({ url: optionalHttpUrl, apiKey: text }).strict(),
     radarr: z.object({ url: optionalHttpUrl, apiKey: text }).strict(),
   }).strict(),
@@ -22,10 +22,10 @@ export const settingsSchema = z.object({
   safety: z.object({ dryRun: z.boolean(), allowOperatorActions: z.boolean() }).strict(),
 }).strict();
 
-export type Settings = z.infer<typeof settingsSchema>;
+export type Settings = Omit<z.infer<typeof settingsSchema>, 'integrations'> & { integrations: Omit<z.infer<typeof settingsSchema>['integrations'], 'prowlarr'> & { prowlarr: Omit<z.infer<typeof settingsSchema>['integrations']['prowlarr'], 'generalClient'> & { generalClient?: string } } };
 export const defaultSettings: Settings = {
   version: 1,
-  integrations: { prowlarr: { url: '', apiKey: '', tvClient: '', movieClient: '' }, sonarr: { url: '', apiKey: '' }, radarr: { url: '', apiKey: '' } },
+  integrations: { prowlarr: { url: '', apiKey: '', tvClient: '', movieClient: '', generalClient: '' }, sonarr: { url: '', apiKey: '' }, radarr: { url: '', apiKey: '' } },
   ai: { apiKey: '', model: 'z-ai/glm-5.3-flash', baseUrl: 'https://openrouter.ai/api/v1', preferences: '' },
   monitoring: { enabled: false, intervalMinutes: 5, minRetryHours: 6, failureBackoffMinMinutes: 5, failureBackoffMaxMinutes: 60, queueGraceMinutes: 30 },
   safety: { dryRun: true, allowOperatorActions: false },

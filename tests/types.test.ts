@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   downloadClientListSchema,
+  downloadClientSchema,
   grabRequestSchema,
   indexerStatusListSchema,
   releaseSchema,
@@ -113,6 +114,73 @@ describe('prowlarr download client schema', () => {
     expect(tv?.categories[0]?.clientCategory).toBe('tv-sonarr');
     expect(movie?.id).toBe(2);
     expect(movie?.categories[0]?.clientCategory).toBe('radarr');
+    expect(tv?.routingDigest).toBeNull();
+    expect(tv).not.toHaveProperty('fields');
+    expect(tv).not.toHaveProperty('implementation');
+  });
+
+  it('canonicalizes routing fields independent of field/object order and hashes routing changes only', () => {
+    const client = {
+      id: 41, name: 'General', enable: true, protocol: 'torrent', supportsCategories: true,
+      categories: [{ clientCategory: 'general', categories: [2000, 5000] }],
+      implementation: 'QBittorrent', configContract: 'QBittorrentSettings', implementationName: 'qBittorrent',
+      fields: [
+        { name: 'Host', value: 'qbit-a', label: 'Host', helpText: 'Connect to this server' },
+        { name: 'Options', value: { port: 8080, urlBase: '/api', enabled: true } },
+        { name: 'Password', value: 'provider-password-secret' },
+      ],
+      infoLink: 'https://help.invalid/a', message: null,
+    };
+    const digest = downloadClientSchema.parse(client).routingDigest;
+    const reordered = downloadClientSchema.parse({
+      ...client, infoLink: 'https://help.invalid/b', implementationName: 'renamed label',
+      categories: [{ clientCategory: 'general', categories: [5000, 2000] }],
+      fields: [
+        { helpText: 'different help', label: 'Different label', value: 'provider-password-secret', name: 'Password' },
+        { value: { enabled: true, urlBase: '/api', port: 8080 }, name: 'Options' },
+        { helpText: 'other help', label: 'Other', value: 'qbit-a', name: 'Host' },
+      ],
+    }).routingDigest;
+    expect(reordered).toBe(digest);
+    for (const changed of [
+      { ...client, fields: [{ ...client.fields[0], value: 'qbit-b' }, ...client.fields.slice(1)] },
+      { ...client, fields: [client.fields[0], { ...client.fields[1], value: { ...client.fields[1]!.value as object, port: 9000 } }, client.fields[2]] },
+      { ...client, fields: [client.fields[0], { ...client.fields[1], value: { ...client.fields[1]!.value as object, urlBase: '/other' } }, client.fields[2]] },
+      { ...client, fields: [client.fields[0], { name: 'Category', value: 'tv-sonarr' }, client.fields[1], client.fields[2]] },
+      { ...client, implementation: 'OtherClient' },
+      { ...client, configContract: 'OtherSettings' },
+      { ...client, categories: [{ clientCategory: 'tv-sonarr', categories: [5000] }] },
+    ]) expect(downloadClientSchema.parse(changed).routingDigest).not.toBe(digest);
+    const parsed = downloadClientSchema.parse(client);
+    expect(parsed.routingDigest).not.toContain('provider-password-secret');
+    expect(parsed).not.toHaveProperty('fields');
+    expect(parsed).not.toHaveProperty('configContract');
+  });
+
+  it('marks routing fingerprint unavailable when provider configuration fields are omitted', () => {
+    const { fields: _fields, ...raw } = {
+      id: 41, name: 'General', enable: true, protocol: 'torrent', supportsCategories: true,
+      categories: [], implementation: 'QBittorrent', configContract: 'QBittorrentSettings', fields: [],
+    };
+    expect(downloadClientSchema.parse(raw).routingDigest).toBeNull();
+    expect(downloadClientSchema.parse({ ...raw, fields: [] }).routingDigest).toBeNull();
+  });
+
+  it('normalizes omitted provider values to null while retaining usable routing evidence', () => {
+    const base = {
+      id: 41, name: 'General', enable: true, protocol: 'torrent', supportsCategories: true,
+      categories: [{ clientCategory: 'general', categories: [2000] }],
+      implementation: 'QBittorrent', configContract: 'QBittorrentSettings',
+      fields: [
+        { name: 'host', value: 'qbit' }, { name: 'port', value: 8080 },
+        { name: 'category', value: 'general' }, { name: 'urlBase' }, { name: 'apiKey' },
+        { name: 'enabled', value: false }, { name: 'retries', value: 0 }, { name: 'empty', value: '' },
+      ],
+    };
+    const omitted = downloadClientSchema.parse(base).routingDigest;
+    const explicitNull = downloadClientSchema.parse({ ...base, fields: base.fields.map((field) => ('value' in field ? field : { ...field, value: null })) }).routingDigest;
+    expect(omitted).toMatch(/^[a-f0-9]{64}$/);
+    expect(explicitNull).toBe(omitted);
   });
 });
 

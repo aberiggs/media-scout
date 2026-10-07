@@ -6,6 +6,8 @@ Observation freshness uses one response-time snapshot and a 24-hour threshold. A
 
 Refreshing Queue, Reviews, or Search history reads the local SQLite projection; it does not trigger a cycle or search.
 
+For open-ended, non-Arr discovery and explicit release submission, see [General search](general-search.md).
+
 **Search history** records bounded search activity for seven days, up to 2,000 entries. Query terms can reveal what you are looking for; this is an operational view, not raw server logs.
 
 ## Retry and Reset

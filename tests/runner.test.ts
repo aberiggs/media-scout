@@ -373,7 +373,7 @@ describe('Runner.cycle', () => {
     });
     expect(state.hasHash('FIXTUREHASH0000000000000000000000000')).toBe(true);
     expect(state.hasRelease(5, grabBody.guid)).toBe(true);
-    expect(state.listSearchActivity()).toMatchObject([{ source: 'cycle', query: 'Frieren', resultCount: 1, outcome: 'success', media: [{ workKey: 'sonarr:1:s1' }] }]);
+    expect(state.listSearchActivity(NOW.toISOString())).toMatchObject([{ source: 'cycle', query: 'Frieren', resultCount: 1, outcome: 'success', media: [{ workKey: 'sonarr:1:s1' }] }]);
   });
 
   it('DRY_RUN: grabs logged only — grab endpoint never called, decision recorded, hash NOT recorded', async () => {
@@ -572,8 +572,8 @@ describe('Runner.cycle', () => {
     expect(decisionRow(state, 'sonarr:1:s1')).toBeUndefined(); // no decision for the aborted unit
     expect(state.lastDecisionAt('sonarr:1:s1')).toBeNull();
     expect(decisionRow(state, 'sonarr:2:s1')).toMatchObject({ verdict: 'grab', grabbed: 1 });
-    expect(state.listSearchActivity().find(({ query }) => query === 'Frieren')).toMatchObject({ source: 'cycle', resultCount: null, outcome: 'error', errorCode: 'http-429' });
-    expect(state.listSearchActivity().find(({ query }) => query === 'Other')).toMatchObject({ source: 'cycle', resultCount: 1, outcome: 'success' });
+    expect(state.listSearchActivity(NOW.toISOString()).find(({ query }) => query === 'Frieren')).toMatchObject({ source: 'cycle', resultCount: null, outcome: 'error', errorCode: 'http-429' });
+    expect(state.listSearchActivity(NOW.toISOString()).find(({ query }) => query === 'Other')).toMatchObject({ source: 'cycle', resultCount: 1, outcome: 'success' });
   });
 
   it('429 refreshes the healthy allowlist: the next unit only queries non-cooling indexers (I5)', async () => {
@@ -1572,8 +1572,8 @@ describe('Runner.cycle', () => {
       [{ workKey: 'sonarr:1:s1', episodeIds: [101], basis: 'explicit-episodes' }],
       [{ workKey: 'sonarr:1:s2', episodeIds: [201], basis: 'explicit-episodes' }],
     ]);
-    expect(state.listSearchActivity().find(({ query }) => query === 'Show S01')).toMatchObject({ media: [{ workKey: 'sonarr:1:s1' }] });
-    expect(state.listSearchActivity().find(({ query }) => query === 'Show S02')).toMatchObject({ media: [{ workKey: 'sonarr:1:s2' }] });
+    expect(state.listSearchActivity(NOW.toISOString()).find(({ query }) => query === 'Show S01')).toMatchObject({ media: [{ workKey: 'sonarr:1:s1' }] });
+    expect(state.listSearchActivity(NOW.toISOString()).find(({ query }) => query === 'Show S02')).toMatchObject({ media: [{ workKey: 'sonarr:1:s2' }] });
   });
 
   it('keeps the first accepted group release when the second is rejected and never reserves the third', async () => {
@@ -1882,7 +1882,7 @@ describe('Runner.manualPick', () => {
     expect(result.releaseTitle).toContain('SubsPlease');
     expect(decisionRow(state, 'sonarr:1:s1')).toMatchObject({ verdict: 'grab', grabbed: 1 });
     expect(state.hasHash('FIXTUREHASH0000000000000000000000000')).toBe(true);
-    expect(state.listSearchActivity()).toMatchObject([{ source: 'manual', query: 'Frieren', resultCount: 2, outcome: 'success', media: [{ workKey: 'sonarr:1:s1' }] }]);
+    expect(state.listSearchActivity(NOW.toISOString())).toMatchObject([{ source: 'manual', query: 'Frieren', resultCount: 2, outcome: 'success', media: [{ workKey: 'sonarr:1:s1' }] }]);
   });
 
   it('records manualPick search failures as bounded manual activity without changing the failure behavior', async () => {
@@ -1893,7 +1893,7 @@ describe('Runner.manualPick', () => {
     const { runner, state } = buildStack(llm, { dryRun: false });
 
     await expect(runner.manualPick('sonarr:1:s1', 0)).rejects.toThrow();
-    expect(state.listSearchActivity()).toMatchObject([{ source: 'manual', query: 'Frieren', resultCount: null, outcome: 'error', errorCode: 'http-503' }]);
+    expect(state.listSearchActivity(NOW.toISOString())).toMatchObject([{ source: 'manual', query: 'Frieren', resultCount: null, outcome: 'error', errorCode: 'http-503' }]);
   });
 
   it('DRY_RUN manual pick logs intent without grabbing (I3 applies to human picks too)', async () => {

@@ -36,6 +36,62 @@ describe('State.seen_hashes', () => {
   });
 });
 
+describe('State legacy unparseable review evidence', () => {
+  const insertWork = (db: Database.Database, missing: number[]) => {
+    const unit = { key: 'sonarr:1:s1', kind: 'tv', arr: 'sonarr', serviceId: 1, externalId: 368013, title: 'Show', altTitles: [], season: { seasonNumber: 1, missing: missing.map((episodeId, i) => ({ episodeId, episodeNumber: i + 1, absoluteEpisodeNumber: null, title: `E${i + 1}` })) } };
+    db.prepare(`INSERT INTO work_items(work_key,content_identity,missing_fingerprint,unit_json,status,fail_count,last_observed_at)
+      VALUES('sonarr:1:s1','identity','fingerprint',?,'ready',0,?)`).run(JSON.stringify(unit), T1.toISOString());
+  };
+
+  it('anchors old persisted targets before reconciliation and never overwrites the anchor', () => {
+    const db = new Database(':memory:'); const state = new State(db); insertWork(db, [101, 102]);
+    state.flagManualReview('sonarr:1:s1', 'unparseable-title', 'old', T1);
+    const token = state.claimUnit('sonarr:1:s1', T1)!;
+    state.initializeLegacyUnparseableReviews({ workKey: 'sonarr:1:s1', token, now: T1.toISOString() });
+    expect(state.getManualReview(1)).toMatchObject({ targetEvidenceKind: 'legacy', targetEvidence: { episodeIds: [101, 102] } });
+    state.initializeLegacyUnparseableReviews({ workKey: 'sonarr:1:s1', token, now: T1.toISOString() });
+    expect(state.getManualReview(1)?.targetEvidence?.episodeIds).toEqual([101, 102]);
+    expect(() => state.initializeLegacyUnparseableReviews({ workKey: 'sonarr:1:s1', token: 'wrong', now: T1.toISOString() })).toThrow();
+  });
+
+  it('marks orphan reviews ineligible and leaves captured evidence untouched', () => {
+    const state = State.open(':memory:');
+    state.flagManualReview('sonarr:1:s1', 'unparseable-title', 'orphan', T1);
+    const token = state.claimUnit('sonarr:1:s1', T1)!;
+    state.initializeLegacyUnparseableReviews({ workKey: 'sonarr:1:s1', token, now: T1.toISOString() });
+    expect(state.getManualReview(1)).toMatchObject({ targetEvidenceKind: 'legacy-ineligible' });
+    expect(state.getManualReview(1)?.targetEvidence).toBeUndefined();
+  });
+
+  it('decodes tagged legacy evidence after reopening the database and preserves non-legacy rows', () => {
+    const dir = join(tmpdir(), `media-agent-legacy-evidence-${process.pid}-${Date.now()}`);
+    const path = join(dir, 'state.db');
+    try {
+      const state = State.open(path);
+      const db = (state as unknown as { db: Database.Database }).db;
+      insertWork(db, [101, 102]);
+      state.flagManualReview('sonarr:1:s1', 'unparseable-title', 'legacy', T1);
+      state.flagUnparseableReview({ workKey: 'sonarr:1:s1', details: 'captured', evidence: { arr: 'sonarr', serviceId: 1, externalId: 368013, episodeIds: [101] }, at: T1 });
+      db.prepare("INSERT INTO manual_review(work_key,reason,details,created_at,subject_kind,subject_key) VALUES(?,?,?,?,?,?)")
+        .run('sonarr:1:s1', 'unparseable-title', 'linked', T1.toISOString(), 'queue', 'queue:1');
+      db.prepare("INSERT INTO manual_review(work_key,reason,details,created_at,resolved_at,target_evidence_json) VALUES(?,?,?,?,?,?)")
+        .run('sonarr:1:s1', 'unparseable-title', 'resolved', T1.toISOString(), T2.toISOString(), JSON.stringify({ arr: 'sonarr', serviceId: 1, externalId: 368013, episodeIds: [102] }));
+      const token = state.claimUnit('sonarr:1:s1', T1)!;
+      state.initializeLegacyUnparseableReviews({ workKey: 'sonarr:1:s1', token, now: T1.toISOString() });
+      state.close();
+
+      const reopened = State.open(path);
+      const reviews = reopened.listManualReview(true);
+      expect(reviews.find(({ details }) => details === 'legacy')).toMatchObject({ targetEvidenceKind: 'legacy', targetEvidence: { episodeIds: [101, 102] } });
+      expect(reviews.find(({ details }) => details === 'captured')).toMatchObject({ targetEvidenceKind: 'captured', targetEvidence: { episodeIds: [101] } });
+      expect(reviews.find(({ details }) => details === 'linked')).toMatchObject({ subjectKind: 'queue', subjectKey: 'queue:1' });
+      expect(reviews.find(({ details }) => details === 'linked')?.targetEvidenceKind).toBeUndefined();
+      expect(reviews.find(({ details }) => details === 'resolved')).toMatchObject({ resolvedAt: T2.toISOString(), targetEvidenceKind: 'captured' });
+      reopened.close();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
 describe('State.seen_releases', () => {
   it('persists release identities and deduplicates only the composite indexerId+guid key', () => {
     const dir = join(tmpdir(), `media-agent-release-state-${process.pid}-${Date.now()}`);
@@ -151,6 +207,16 @@ describe('State.manual_review', () => {
     s.flagManualReview('series:s1e2', 'new', 'd', T2);
     const rows = s.listManualReview(true);
     expect(rows.map((r) => r.reason)).toEqual(['new', 'old']);
+  });
+
+  it('deduplicates unparseable reviews by captured identity and target generation', () => {
+    const s = State.open(':memory:');
+    const base = { workKey: 'sonarr:1:s1', details: 'same malformed release', at: T1 };
+    s.flagUnparseableReview({ ...base, evidence: { arr: 'sonarr', serviceId: 1, externalId: 11, episodeIds: [101] } });
+    s.flagUnparseableReview({ ...base, evidence: { arr: 'sonarr', serviceId: 1, externalId: 11, episodeIds: [101] } });
+    s.flagUnparseableReview({ ...base, evidence: { arr: 'sonarr', serviceId: 1, externalId: 11, episodeIds: [102] } });
+    expect(s.listManualReview()).toHaveLength(2);
+    expect(s.listManualReview().map(({ targetEvidence }) => targetEvidence?.episodeIds)).toEqual([[102], [101]]);
   });
 });
 

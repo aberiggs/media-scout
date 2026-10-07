@@ -10,7 +10,7 @@ import type { Picker, Candidate, PickVerdict } from './picker';
 import type { Planner } from './planner';
 import { parseReleaseTitle } from './parser';
 import { isGrabbable, verifyRelease } from './guardrails';
-import type { State } from './state';
+import { reviewEvidenceMatchesWorkKey, type State } from './state';
 import type { IntentCoverage, IntentStatus, QueueRead, WorkItem } from './work-queue-types';
 import { candidateOverlapsQueue, reconcileWork, type QueueReads, type ReconciledWork } from './work-queue';
 import { eligibleWorkUnits, type LibrarySnapshot, type Watcher, type WorkUnit } from './watcher';
@@ -97,6 +97,14 @@ function physicalQueueScope(row: SonarrQueueRecord, episodeScopes: ReadonlyMap<n
 function safeErrorCode(error: unknown): string {
   if (error instanceof ApiError) return error.status === 0 ? 'network-error' : `http-${error.status}`;
   return 'operation-failed';
+}
+
+function parseReviewObservationTime(value: unknown): number | null {
+  if (typeof value !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z$/.test(value)) return null;
+  const time = Date.parse(value);
+  if (!Number.isFinite(time)) return null;
+  try { if (new Date(value).toISOString().slice(0, 19) !== value.slice(0, 19)) return null; } catch { return null; }
+  return time;
 }
 
 function isRateLimited(error: unknown): boolean {
@@ -634,7 +642,7 @@ export class Runner {
       if (physicalSlot === undefined) { physicalSlot = slots.size; slots.set(physicalKey, physicalSlot); }
       const parsed = parseReleaseCoverage(release.title);
       if (group.members[0]?.work.unit.kind === 'tv' && (parsed.kind === 'invalid' || parsed.kind === 'none')) {
-        for (const targetIndex of group.dueTargetIndices) this.flagUnparseable(group.targets[targetIndex]!.key, release.title, summary);
+        for (const targetIndex of group.dueTargetIndices) this.flagUnparseable(group.targets[targetIndex]!, release.title, summary);
         continue;
       }
       const verified = verifyGroupCoverage({ originalUnits: originals, actionableUnits: group.targets, parsed });
@@ -916,8 +924,9 @@ export class Runner {
   private async observeAndReconcile(manual: boolean, associationDecisions: AssociationDecision[] = [], deferAssociationReview = false): Promise<{ snapshot: LibrarySnapshot; queues: QueueReads; rows: ReconciledWork[] }> {
     const snapshot = await this.deps.watcher.getSnapshot();
     const queues = await this.readQueues();
+    this.resolveImportedUnparseableReviews(snapshot);
     const initialWork = this.deps.state.listWorkItems();
-      const initialIntents = this.openGrabIntents();
+    const initialIntents = this.openGrabIntents();
     const initialObservations = this.deps.state.listWorkQueueObservations();
     const initialReviews = this.deps.state.listManualReview();
     const initialManualKeys = this.manualReviewKeys(initialReviews, manual);
@@ -1043,7 +1052,7 @@ export class Runner {
     for (const release of filtered) {
       const parsed = parseReleaseTitle(release.title);
       if (unit.kind === 'tv' && parsed.season === null && parsed.seasonEpisodes === null && parsed.absoluteEpisodes === null && parsed.seasonPack !== true) {
-        this.flagUnparseable(unit.key, release.title, summary);
+        this.flagUnparseable(unit, release.title, summary);
         continue;
       }
       const verified = verifyRelease({ unit, release, parsed });
@@ -1066,11 +1075,54 @@ export class Runner {
     });
   }
 
-  private flagUnparseable(workKey: string, releaseTitle: string, summary: CycleSummary): void {
-    const exists = this.deps.state.listManualReview().some((row) => row.workKey === workKey && row.reason === 'unparseable-title' && row.details === releaseTitle);
-    if (!exists) {
-      this.deps.state.flagManualReview(workKey, 'unparseable-title', releaseTitle, this.now());
-      summary.manualFlagged++;
+  private flagUnparseable(unit: WorkUnit, releaseTitle: string, summary: CycleSummary): void {
+    const evidence = { arr: unit.arr, serviceId: unit.serviceId, externalId: unit.externalId,
+      episodeIds: unit.kind === 'tv' ? (unit.season?.missing.map(({ episodeId }) => episodeId) ?? []) : null };
+    if (unit.kind === 'tv' && (!evidence.episodeIds || evidence.episodeIds.length === 0)) return;
+    if (this.deps.state.flagUnparseableReview({ workKey: unit.key, details: releaseTitle, evidence, at: this.now() })) summary.manualFlagged++;
+  }
+
+  /** Automatic cleanup is deliberately limited to positive, identity-matched file observations. */
+  private resolveImportedUnparseableReviews(snapshot: LibrarySnapshot): void {
+    const snapshotObservedAt = parseReviewObservationTime(snapshot.observedAt);
+    const now = this.now();
+    const nowMs = now.getTime();
+    if (snapshotObservedAt === null || !Number.isFinite(nowMs) || snapshotObservedAt > nowMs) return;
+    const open = this.deps.state.listOpenUnparseableReviews();
+    for (const review of open) {
+      const token = this.deps.state.claimUnit(review.workKey, now);
+      if (!token) continue;
+      try {
+        this.deps.state.initializeLegacyUnparseableReviews({ workKey: review.workKey, token, now: now.toISOString() });
+        const current = this.deps.state.getManualReview(review.id);
+        const createdAt = parseReviewObservationTime(current?.createdAt);
+        if (!current || current.resolvedAt || current.reason !== 'unparseable-title' || current.subjectKind || current.subjectKey || current.targetEvidenceInvalid ||
+          createdAt === null || snapshotObservedAt < createdAt) continue;
+        const work = this.deps.state.getWorkItem(current.workKey);
+        const workObservedAt = work ? parseReviewObservationTime(work.lastObservedAt) : null;
+        if (work && (workObservedAt === null || snapshotObservedAt < workObservedAt)) continue;
+        const evidence = current.targetEvidence;
+        if (current.targetEvidenceKind === 'legacy-ineligible') continue;
+        if (evidence) {
+          if (!reviewEvidenceMatchesWorkKey(current.workKey, evidence)) continue;
+          if (current.targetEvidenceKind === 'legacy' && (!work || work.blockedReason === 'content-identity-changed' || this.deps.state.hasOpenManualReview(current.workKey, 'content-identity-changed'))) continue;
+          if (work && (work.unit.arr !== evidence.arr || work.unit.serviceId !== evidence.serviceId || work.unit.externalId !== evidence.externalId ||
+            (work.unit.kind === 'tv' ? evidence.episodeIds === null : evidence.episodeIds !== null))) continue;
+          if (evidence.arr === 'sonarr') {
+            if (!snapshot.sonarr.known) continue;
+            const series = snapshot.sonarr.series.find(({ series: item }) => item.id === evidence.serviceId);
+            if (!series?.known || !series.episodes || series.series.tvdbId !== evidence.externalId || !evidence.episodeIds || !evidence.episodeIds.every((id) => series.episodes!.some((episode) => episode.id === id && episode.hasFile))) continue;
+            if (current.targetEvidenceKind === 'legacy') { const season = Number(/:s(\d+)$/.exec(current.workKey)?.[1]); const inventory = series.episodes.filter((episode) => episode.seasonNumber === season); if (!inventory.length || !inventory.every(({ hasFile }) => hasFile)) continue; }
+          } else {
+            if (!snapshot.radarr.known) continue;
+            const movie = snapshot.radarr.movies.find((item) => item.id === evidence.serviceId);
+            if (!movie || movie.tmdbId !== evidence.externalId || !movie.hasFile) continue;
+          }
+        } else continue;
+        this.deps.state.resolveUnparseableReview({ id: current.id, workKey: current.workKey, token, now: now.toISOString() });
+      } finally {
+        this.deps.state.releaseClaim(review.workKey, token);
+      }
     }
   }
 

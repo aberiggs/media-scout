@@ -173,6 +173,28 @@ describe('OpenRouterLLM.json', () => {
     expect(second.isDone()).toBe(true);
   });
 
+  it('reports each initial and corrective logical attempt', async () => {
+    nock(BASE).post('/chat/completions').reply(200, replyBody('not json'));
+    nock(BASE).post('/chat/completions').reply(200, replyBody('{"verdict":"skip"}'));
+    const { llm } = build();
+    const attempts: Array<{ logicalAttempt: number; transportAttempt: number }> = [];
+    await llm.json({ system: 's', user: 'u', schema, label: 'verdict', onAttempt: (attempt) => attempts.push(attempt) });
+    expect(attempts).toEqual([
+      { logicalAttempt: 0, transportAttempt: 0 },
+      { logicalAttempt: 1, transportAttempt: 0 },
+    ]);
+  });
+
+  it('propagates onAttempt rejection before sending a request', async () => {
+    let calls = 0;
+    const stub = { chat: { send: async () => { calls++; } } } as unknown as OpenRouter;
+    const llm = new OpenRouterLLM({ client: stub, model: MODEL });
+    const failure = new Error('attempt rejected');
+    await expect(llm.json({ system: 's', user: 'u', schema, label: 'verdict', onAttempt: () => { throw failure; } }))
+      .rejects.toBe(failure);
+    expect(calls).toBe(0);
+  });
+
   it('throws with the label after garbage content twice', async () => {
     nock(BASE).post('/chat/completions').reply(200, replyBody('nope'));
     nock(BASE).post('/chat/completions').reply(200, replyBody('still nope'));

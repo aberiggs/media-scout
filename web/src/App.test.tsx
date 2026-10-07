@@ -880,257 +880,163 @@ describe('operations dashboard', () => {
   })
 })
 
-describe('general search safety', () => {
+describe('general search conversation', () => {
   beforeEach(() => {
     operationRequests = []
     globalThis.fetch = async (input, init) => {
       if (String(input) === '/api/settings') return jsonResponse(envelope)
       operationRequests.push({ input, init })
-      if (String(input) === '/api/search' && init?.method === 'POST') return jsonResponse({ status: 'selection-required', query: 'space documentary', queries: ['space documentary'], question: '', searchId: 'search-1', expiresAt: '2099-01-01T00:00:00.000Z', confirmationToken: 'confirm-1', destination: { name: 'General Client', protocol: 'torrent' }, dryRun: true, actionsAllowed: true, blockedReason: null, releases: [{ releaseId: 'r1', title: 'A Space Documentary', indexer: 'Index', size: 1073741824, seeders: 8, leechers: 1, age: 2, protocol: 'torrent', selectable: true, unavailableReason: null }] })
-      if (String(input).endsWith('/grab')) return jsonResponse({ searchId: 'search-1', dryRun: true, results: [{ releaseId: 'r1', status: 'dry-run', code: null }] })
       return defaultOperationResponse(input)
     }
   })
   afterEach(() => { cleanup(); window.history.replaceState(null, '', '/'); globalThis.fetch = originalFetch })
-  it('keeps search and review inert; canceling submits nothing', async () => {
-    render(<App />)
-    fireEvent.click(screen.getByRole('link', { name: 'General search' }))
-    fireEvent.change(await screen.findByLabelText('What would you like to find?'), { target: { value: 'space documentary' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
-    await screen.findByRole('heading', { name: 'Releases to review' })
-    assert.equal((screen.getByRole('checkbox', { name: 'Select A Space Documentary' }) as HTMLInputElement).checked, false)
-    assert.ok(screen.getByText('DRY RUN · no download sent'))
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Select A Space Documentary' }))
-    fireEvent.click(screen.getByRole('button', { name: /Review 1 release/ }))
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
-    assert.equal(operationRequests.some(({ input }) => String(input).endsWith('/grab')), false)
-  })
-  it('sends only selected release ids after explicit confirmation and labels dry run', async () => {
-    render(<App />)
-    fireEvent.click(screen.getByRole('link', { name: 'General search' }))
-    fireEvent.change(await screen.findByLabelText('What would you like to find?'), { target: { value: 'space documentary' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
-    await screen.findByRole('heading', { name: 'Releases to review' })
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Select A Space Documentary' }))
-    fireEvent.click(screen.getByRole('button', { name: /Review 1 release/ }))
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm and submit' }))
-    await screen.findByText('Dry run · not sent')
-    const grab = operationRequests.find(({ input }) => String(input).endsWith('/grab'))
-    assert.ok(grab)
-    assert.deepEqual(JSON.parse(String(grab.init?.body)), { confirmationToken: 'confirm-1', releaseIds: ['r1'], confirmed: true })
-  })
-  it('traps modal focus, restores focus on Escape, and locks edits during submission', async () => {
-    let resolveGrab!: (response: Response) => void
+  const release = (id: string, title: string) => ({ releaseId: id, title, indexer: 'Index', size: null, seeders: 4, leechers: 0, age: 2, protocol: 'torrent', selectable: true, unavailableReason: null, expiresAt: '2099-01-01T00:00:00.000Z', relevance: { classification: 'possible-match', explanation: 'Related subject' }, viability: { viable: true, reason: 'viable' } })
+  const response = (releases = [release('r1', 'A Space Documentary')], status = 'selection-required') => ({ status, query: 'space documentary', queries: ['space documentary'], question: status === 'clarification-needed' ? 'What period?' : '', searchId: 'snap-1', expiresAt: '2099-01-01T00:00:00.000Z', confirmationToken: 'confirm-1', destination: { name: 'General Client', protocol: 'torrent' }, dryRun: true, actionsAllowed: true, blockedReason: null, releases })
+  it('sends immutable initial context and retains distinct turns through clarification', async () => {
+    const calls: any[] = []
+    let count = 0
     globalThis.fetch = async (input, init) => {
       if (String(input) === '/api/settings') return jsonResponse(envelope)
-      operationRequests.push({ input, init })
-      if (String(input) === '/api/search') return jsonResponse({ status: 'selection-required', query: 'space documentary', queries: [], question: '', searchId: 'search-1', expiresAt: '2099-01-01T00:00:00.000Z', confirmationToken: 'confirm-1', destination: { name: 'General Client', protocol: 'torrent' }, dryRun: false, actionsAllowed: true, blockedReason: null, releases: [{ releaseId: 'r1', title: 'A Space Documentary', indexer: 'Index', size: null, seeders: 1, leechers: 0, age: 1, protocol: 'torrent', selectable: true, unavailableReason: null }] })
-      if (String(input).endsWith('/grab')) return new Promise(resolve => { resolveGrab = resolve })
-      return defaultOperationResponse(input)
+      calls.push({ input, init }); count++
+      return jsonResponse(response(count === 1 ? [] : [release('r1', 'A Space Documentary')], count === 1 ? 'clarification-needed' : 'selection-required'))
     }
-    render(<App />)
-    fireEvent.click(screen.getByRole('link', { name: 'General search' }))
-    fireEvent.change(await screen.findByLabelText('What would you like to find?'), { target: { value: 'space documentary' } })
+    window.history.replaceState(null, '', '/#search'); render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'), { target: { value: 'space documentaries' } })
     fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+    await screen.findAllByText('What period?')
+    fireEvent.change(screen.getByLabelText('Your answer'), { target: { value: 'early spaceflight' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     await screen.findByRole('heading', { name: 'Releases to review' })
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Select A Space Documentary' }))
-    const opener = screen.getByRole('button', { name: /Review 1 release/ })
-    opener.focus(); fireEvent.click(opener)
-    const dialog = screen.getByRole('dialog')
-    assert.equal(document.activeElement, within(dialog).getByRole('button', { name: 'Confirm and submit' }))
-    fireEvent.keyDown(document.activeElement!, { key: 'Tab' })
-    assert.equal(document.activeElement, within(dialog).getByRole('button', { name: 'Cancel' }))
-    fireEvent.keyDown(document.activeElement!, { key: 'Escape' })
-    await waitFor(() => assert.equal(screen.queryByRole('dialog'), null))
-    assert.equal(document.activeElement, opener)
-    fireEvent.click(opener)
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm and submit' }))
-    await waitFor(() => assert.ok(operationRequests.some(({ input }) => String(input).endsWith('/grab'))))
-    assert.equal(screen.queryByRole('button', { name: 'Cancel' }), null)
-    fireEvent.keyDown(document.activeElement!, { key: 'Escape' })
-    assert.ok(screen.getByRole('dialog'))
-    assert.equal((screen.getByLabelText('What would you like to find?') as HTMLInputElement).disabled, true)
-    assert.equal((screen.getByRole('checkbox', { name: 'Select A Space Documentary' }) as HTMLInputElement).disabled, true)
-    resolveGrab(jsonResponse({ searchId: 'search-1', dryRun: false, results: [{ releaseId: 'r1', status: 'submitted', code: null }] }))
-    await screen.findByText('Submitted · not completed')
+    const first = JSON.parse(String(calls[0].init.body)), second = JSON.parse(String(calls[1].init.body))
+    assert.equal(first.originalQuery, 'space documentaries'); assert.equal(second.originalQuery, 'space documentaries')
+    assert.deepEqual(second.turns.map((x: any) => x.content), ['space documentaries', 'What period?', 'early spaceflight'])
+    assert.equal(second.action, 'follow-up')
+    assert.equal(screen.getAllByText('space documentaries').length, 2); assert.ok(screen.getAllByText('early spaceflight').length >= 1)
+    assert.ok(screen.getByText('Possible match'))
   })
-  it('disables live confirmation as soon as the selection expires', async () => {
+  it('renders truthful NDJSON progress and preserves suggestions when finding more', async () => {
+    const calls: any[] = []
     globalThis.fetch = async (input, init) => {
       if (String(input) === '/api/settings') return jsonResponse(envelope)
-      operationRequests.push({ input, init })
-      if (String(input) === '/api/search') return jsonResponse({ status: 'selection-required', query: 'space documentary', queries: [], question: '', searchId: 'search-1', expiresAt: new Date(Date.now() + 300).toISOString(), confirmationToken: 'confirm-1', destination: { name: 'General Client', protocol: 'torrent' }, dryRun: false, actionsAllowed: true, blockedReason: null, releases: [{ releaseId: 'r1', title: 'A Space Documentary', indexer: 'Index', size: null, seeders: 1, leechers: 0, age: 1, protocol: 'torrent', selectable: true, unavailableReason: null }] })
-      return defaultOperationResponse(input)
+      calls.push({ input, init })
+      const next = calls.length === 1 ? response() : response([release('r1', 'A Space Documentary'), release('r2', 'A New Space Film')])
+      const events = [{ type: 'planning', sequence: 0 }, { type: 'queries', sequence: 1, queries: ['deep space'] }, { type: 'searching', sequence: 2, query: 'deep space', index: 1, total: 1 }, { type: 'curation', sequence: 3, processed: 1, total: 1 }, { type: 'complete', sequence: 4, response: next }]
+      return new Response(events.map(x => JSON.stringify(x)).join('\n')+'\n', { headers: { 'Content-Type': 'application/x-ndjson' } })
     }
-    render(<App />)
-    fireEvent.click(screen.getByRole('link', { name: 'General search' }))
-    fireEvent.change(await screen.findByLabelText('What would you like to find?'), { target: { value: 'space documentary' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
-    await screen.findByRole('heading', { name: 'Releases to review' })
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Select A Space Documentary' }))
-    fireEvent.click(screen.getByRole('button', { name: /Review 1 release/ }))
-    const confirm = screen.getByRole('button', { name: 'Confirm and submit' }) as HTMLButtonElement
-    assert.equal(confirm.disabled, false)
-    await act(async () => { await new Promise(resolve => setTimeout(resolve, 350)) })
-    await waitFor(() => assert.equal(confirm.disabled, true))
-    assert.equal(operationRequests.some(({ input }) => String(input).endsWith('/grab')), false)
+    window.history.replaceState(null, '', '/#search'); render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'), { target: { value: 'space documentary' } }); fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+    await screen.findByRole('heading', { name: 'Releases to review' }); fireEvent.click(screen.getByRole('button', { name: 'Find more' }))
+    await screen.findByRole('checkbox', { name: 'Select A New Space Film' })
+    assert.ok(screen.getByRole('checkbox', { name: 'Select A Space Documentary' }))
+    assert.ok(screen.getByText('deep space'))
+    assert.equal(JSON.parse(String(calls[1].init.body)).action, 'find-more')
   })
-  it('expires idle results and refreshes the expiry timer for a renewed result', async () => {
-    let searchCount = 0
-    globalThis.fetch = async input => {
-      if (String(input) === '/api/settings') return jsonResponse(envelope)
-      if (String(input) === '/api/search') {
-        searchCount++
-        const expiresAt = new Date(Date.now() + (searchCount === 1 ? 300 : 2200)).toISOString()
-        return jsonResponse({ status: 'selection-required', query: `query ${searchCount}`, queries: [], question: '', searchId: `search-${searchCount}`, expiresAt, confirmationToken: `token-${searchCount}`, destination: { name: 'Client', protocol: 'torrent' }, dryRun: false, actionsAllowed: true, blockedReason: null, releases: [{ releaseId: 'r1', title: 'Release', indexer: 'Index', size: null, seeders: 1, leechers: 0, age: 1, protocol: 'torrent', selectable: true, unavailableReason: null }] })
-      }
-      return defaultOperationResponse(input)
-    }
-    render(<App />)
-    fireEvent.click(screen.getByRole('link', { name: 'General search' }))
-    const query = await screen.findByLabelText('What would you like to find?')
-    fireEvent.change(query, { target: { value: 'first query' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
-    await screen.findByRole('heading', { name: 'Releases to review' })
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Select Release' }))
-    assert.equal((screen.getByRole('button', { name: /Review/ }) as HTMLButtonElement).disabled, false)
-    await waitFor(() => assert.equal((screen.getByRole('button', { name: /Review/ }) as HTMLButtonElement).disabled, true), { timeout: 3000 })
-    assert.ok(screen.getByText(/These results have expired/))
-    fireEvent.change(query, { target: { value: 'second query' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
-    await screen.findByText('query 2')
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Select Release' }))
-    assert.equal((screen.getByRole('button', { name: /Review/ }) as HTMLButtonElement).disabled, false)
-    await new Promise(resolve => setTimeout(resolve, 300))
-    assert.equal((screen.getByRole('button', { name: /Review/ }) as HTMLButtonElement).disabled, false)
-    await waitFor(() => assert.equal((screen.getByRole('button', { name: /Review/ }) as HTMLButtonElement).disabled, true), { timeout: 3000 })
+  it('reviews the complete selected manifest in an inert, keyboard-trapped modal', async () => {
+    const many = Array.from({ length: 12 }, (_, i) => release(`r${i}`, `Release ${i}`))
+    globalThis.fetch = async (input) => String(input) === '/api/settings' ? jsonResponse(envelope) : jsonResponse(response(many))
+    window.history.replaceState(null, '', '/#search'); render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'), { target: { value: 'documentary' } }); fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+    await screen.findByRole('checkbox', { name: 'Select Release 11' })
+    for (let i=0;i<12;i++) fireEvent.click(screen.getByRole('checkbox', { name: `Select Release ${i}` }))
+    const opener = screen.getByRole('button', { name: /Review 12 selected/ }); fireEvent.click(opener)
+    const dialog = screen.getByRole('dialog'); assert.equal(document.querySelector('.sidebar')?.hasAttribute('inert'), true); assert.equal(document.querySelector('#search')?.hasAttribute('inert'), true)
+    assert.equal(document.activeElement, within(dialog).getByRole('button', { name: 'Confirm full selection' }))
+    fireEvent.keyDown(document.activeElement!, { key: 'Tab' }); assert.equal(document.activeElement, within(dialog).getByRole('button', { name: 'Close review' }))
+    fireEvent.keyDown(document.activeElement!, { key: 'Escape' }); await waitFor(() => assert.equal(screen.queryByRole('dialog'), null))
+    assert.equal(document.activeElement, opener); assert.equal(document.querySelector('.sidebar')?.hasAttribute('inert'), false); assert.equal(document.querySelector('#search')?.hasAttribute('inert'), false)
   })
-  it('marks a lost or malformed grab response unknown and never offers a retry', async () => {
-    for (const failure of ['lost', 'malformed'] as const) {
-      cleanup()
-      let grabPosts = 0
-      globalThis.fetch = async (input, init) => {
-        if (String(input) === '/api/settings') return jsonResponse(envelope)
-        if (String(input) === '/api/search') return jsonResponse({ status: 'selection-required', query: 'query', queries: [], question: '', searchId: 'search-1', expiresAt: '2099-01-01T00:00:00.000Z', confirmationToken: 'token', destination: { name: 'Client', protocol: 'torrent' }, dryRun: false, actionsAllowed: true, blockedReason: null, releases: [{ releaseId: 'r1', title: 'Release', indexer: 'Index', size: null, seeders: 1, leechers: 0, age: 1, protocol: 'torrent', selectable: true, unavailableReason: null }] })
-        if (String(input).endsWith('/grab') && init?.method === 'POST') {
-          grabPosts++
-          if (failure === 'lost') throw new TypeError('network lost after request')
-          return new Response('{bad json', { status: 200, headers: { 'Content-Type': 'application/json' } })
-        }
-        return defaultOperationResponse(input)
-      }
-      render(<App />)
-      fireEvent.click(screen.getByRole('link', { name: 'General search' }))
-      fireEvent.change(await screen.findByLabelText('What would you like to find?'), { target: { value: 'query' } })
-      fireEvent.click(screen.getByRole('button', { name: 'Search' }))
-      await screen.findByRole('heading', { name: 'Releases to review' })
-      fireEvent.click(screen.getByRole('checkbox', { name: 'Select Release' }))
-      fireEvent.click(screen.getByRole('button', { name: /Review 1 release/ }))
-      fireEvent.click(screen.getByRole('button', { name: 'Confirm and submit' }))
-      await screen.findByRole('heading', { name: 'Submission status unknown' })
-      assert.ok(screen.getAllByText(/Check your download client/).length >= 1)
-      assert.ok(screen.getByText(/will not be retried from this screen/))
-      assert.equal((screen.getByRole('checkbox', { name: 'Select Release' }) as HTMLInputElement).checked, true)
-      assert.equal((screen.getByRole('checkbox', { name: 'Select Release' }) as HTMLInputElement).disabled, true)
-      assert.equal(screen.queryByRole('button', { name: /Review/ }), null)
-      assert.equal(grabPosts, 1)
-    }
-  })
-  it('treats parseable but mismatched grab receipts as unknown', async () => {
-    const validResult = (releaseId: string) => ({ releaseId, status: 'submitted', code: null })
-    const malformedBodies = [
-      {},
-      { searchId: 'search-1', dryRun: false, results: [validResult('r1')] },
-      { searchId: 'search-1', dryRun: false, results: [validResult('r1'), validResult('r1')] },
-      { searchId: 'search-1', dryRun: false, results: [validResult('r1'), validResult('other')] },
-      { searchId: 'search-1', dryRun: true, results: [validResult('r1'), validResult('r2')] },
-      { searchId: 'other-search', dryRun: false, results: [validResult('r1'), validResult('r2')] },
-    ]
-    for (const malformed of malformedBodies) {
-      cleanup()
-      let posts = 0
-      globalThis.fetch = async input => {
-        if (String(input) === '/api/settings') return jsonResponse(envelope)
-        if (String(input) === '/api/search') return jsonResponse({ status: 'selection-required', query: 'query', queries: [], question: '', searchId: 'search-1', expiresAt: '2099-01-01T00:00:00.000Z', confirmationToken: 'token', destination: { name: 'Client', protocol: 'torrent' }, dryRun: false, actionsAllowed: true, blockedReason: null, releases: ['r1', 'r2'].map((releaseId, index) => ({ releaseId, title: `Release ${index + 1}`, indexer: 'Index', size: null, seeders: 1, leechers: 0, age: 1, protocol: 'torrent', selectable: true, unavailableReason: null })) })
-        if (String(input).endsWith('/grab')) { posts++; return jsonResponse(malformed) }
-        return defaultOperationResponse(input)
-      }
-      render(<App />)
-      fireEvent.click(screen.getByRole('link', { name: 'General search' }))
-      fireEvent.change(await screen.findByLabelText('What would you like to find?'), { target: { value: 'query' } })
-      fireEvent.click(screen.getByRole('button', { name: 'Search' }))
-      await screen.findByRole('heading', { name: 'Releases to review' })
-      fireEvent.click(screen.getByRole('checkbox', { name: 'Select Release 1' }))
-      fireEvent.click(screen.getByRole('checkbox', { name: 'Select Release 2' }))
-      fireEvent.click(screen.getByRole('button', { name: /Review 2 releases/ }))
-      fireEvent.click(screen.getByRole('button', { name: 'Confirm and submit' }))
-      await screen.findByRole('heading', { name: 'Submission status unknown' })
-      assert.ok(screen.getByText(/a fresh search will not show whether these releases were received/))
-      assert.equal(posts, 1)
-      assert.equal(screen.queryByRole('button', { name: /Review/ }), null)
-    }
-  })
-  it('retains partial outcomes and does not retry uncertain releases', async () => {
+  it('paginates all releases and freezes a selection larger than ten into one operation', async () => {
+    const many = Array.from({ length: 12 }, (_, i) => release(`r${i}`, `Release ${i}`))
+    const calls: Array<{ input: RequestInfo|URL; init?: RequestInit }> = []
     globalThis.fetch = async (input, init) => {
       if (String(input) === '/api/settings') return jsonResponse(envelope)
-      operationRequests.push({ input, init })
-      if (String(input) === '/api/search') return jsonResponse({ status: 'selection-required', query: 'space documentary', queries: [], question: '', searchId: 'search-1', expiresAt: '2099-01-01T00:00:00.000Z', confirmationToken: 'confirm-1', destination: { name: 'General Client', protocol: 'usenet' }, dryRun: false, actionsAllowed: true, blockedReason: null, releases: ['r1', 'r2', 'r3'].map((releaseId, index) => ({ releaseId, title: `Release ${index + 1}`, indexer: 'Index', size: null, seeders: null, leechers: null, age: 1, protocol: 'usenet', selectable: true, unavailableReason: null })) })
-      if (String(input).endsWith('/grab')) return jsonResponse({ searchId: 'search-1', dryRun: false, results: [{ releaseId: 'r1', status: 'submitted', code: null }, { releaseId: 'r2', status: 'uncertain', code: 'request-timeout' }, { releaseId: 'r3', status: 'not-attempted', code: 'operator-actions-disabled' }] })
-      return defaultOperationResponse(input)
+      calls.push({input,init})
+      if (String(input).includes('/conversation/stream')) return jsonResponse(response(many))
+      if (String(input).endsWith('/operations')) { const create=JSON.parse(String(init?.body)); const ids=create.releaseIds as string[]; return jsonResponse({ operationId:create.operationId, releases:ids.map(releaseId=>({releaseId,status:'pending',code:null})), mode:'dry-run', destination:{name:'General Client',protocol:'torrent'}, expiresAt:'2099-01-01T00:00:00.000Z',nextOrdinal:0,stopped:false,complete:false }) }
+      if (String(input).endsWith('/step')) { const ordinal=JSON.parse(String(init?.body)).expectedOrdinal+1; const create=JSON.parse(String(calls.find(x=>String(x.input).endsWith('/operations'))?.init?.body)); const ids=create.releaseIds as string[]; return jsonResponse({ operationId:create.operationId, releases:ids.map((releaseId:string,i:number)=>({releaseId,status:i<ordinal?'dry-run':'pending',code:null})), mode:'dry-run', destination:{name:'General Client',protocol:'torrent'}, expiresAt:'2099-01-01T00:00:00.000Z',nextOrdinal:ordinal,stopped:false,complete:ordinal===ids.length }) }
+      return jsonResponse({error:'Unexpected request'},404)
     }
-    render(<App />)
-    fireEvent.click(screen.getByRole('link', { name: 'General search' }))
-    fireEvent.change(await screen.findByLabelText('What would you like to find?'), { target: { value: 'space documentary' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
-    await screen.findByRole('heading', { name: 'Releases to review' })
-    for (const title of ['Release 1', 'Release 2', 'Release 3']) fireEvent.click(screen.getByRole('checkbox', { name: `Select ${title}` }))
-    fireEvent.click(screen.getByRole('button', { name: /Review 3 releases/ }))
-    fireEvent.click(screen.getByRole('button', { name: 'Confirm and submit' }))
-    await screen.findByText('Uncertain · not retried')
-    assert.ok(screen.getByText('Submitted · not completed'))
-    assert.ok(screen.getByText('Not attempted'))
-    assert.ok(screen.getByText('The request timed out; whether it was received is unknown'))
-    assert.ok(screen.getByText('Operator actions are disabled in Settings'))
-    assert.equal(operationRequests.filter(({ input }) => String(input).endsWith('/grab')).length, 1)
-    assert.equal(screen.queryByRole('button', { name: /Retry|Resubmit/ }), null)
+    window.history.replaceState(null, '', '/#search'); render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'), {target:{value:'documentary'}}); fireEvent.click(screen.getByRole('button',{name:'Search'}))
+    await screen.findByRole('heading',{name:'Releases to review'})
+    fireEvent.change(screen.getByLabelText('Visible per page'),{target:{value:'5'}})
+    await screen.findByText('Page 1 of 3 · 12 total releases')
+    const page1=screen.getByRole('checkbox',{name:'Select Release 0'}); fireEvent.click(page1)
+    fireEvent.click(screen.getByRole('button',{name:'Next'})); fireEvent.click(screen.getByRole('checkbox',{name:'Select Release 5'}))
+    fireEvent.click(screen.getByRole('button',{name:'Next'})); fireEvent.click(screen.getByRole('checkbox',{name:'Select Release 10'}))
+    assert.ok(screen.getByText('3 selected across all pages. Display limit changes visibility only.'))
+    fireEvent.click(screen.getByRole('button',{name:/Review 3 selected/}))
+    const manifest=within(screen.getByRole('dialog')).getByRole('list')
+    assert.equal(within(manifest).getAllByRole('listitem').length,3)
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button',{name:'Confirm full selection'}))
+    await screen.findByRole('heading',{name:'Operation complete'})
+    const create=calls.find(x=>String(x.input).endsWith('/operations'))!
+    assert.deepEqual(JSON.parse(String(create.init?.body)).releaseIds,['r0','r5','r10'])
+    assert.equal(calls.filter(x=>String(x.input).endsWith('/operations')).length,1)
   })
-  it('explains when operator permissions or a general destination blocks submission', async () => {
-    for (const [destination, actionsAllowed, expected] of [
-      [{ name: 'Client', protocol: 'torrent' }, false, 'Enable Allow operator actions in Settings before submitting a release.'],
-      [null, true, 'Configure a general download client in Settings before submitting a release.'],
-    ] as const) {
-      cleanup()
-      globalThis.fetch = async input => {
-        if (String(input) === '/api/settings') return jsonResponse(envelope)
-        if (String(input) === '/api/search') return jsonResponse({ status: 'selection-required', query: 'query', queries: [], question: '', searchId: 'search-1', expiresAt: '2099-01-01T00:00:00.000Z', confirmationToken: 'token', destination, dryRun: false, actionsAllowed, blockedReason: null, releases: [{ releaseId: 'r1', title: 'Release', indexer: 'Index', size: null, seeders: null, leechers: null, age: 1, protocol: 'unknown', selectable: true, unavailableReason: null }] })
-        return defaultOperationResponse(input)
-      }
-      render(<App />)
-      fireEvent.click(screen.getByRole('link', { name: 'General search' }))
-      fireEvent.change(await screen.findByLabelText('What would you like to find?'), { target: { value: 'query' } })
-      fireEvent.click(screen.getByRole('button', { name: 'Search' }))
-      assert.ok(await screen.findByText((_, element) => element?.classList.contains('blocked-note') === true && (element.textContent ?? '').includes(expected)))
-      assert.equal(screen.getByRole('button', { name: /Review/ }).hasAttribute('disabled'), true)
-      assert.equal(operationRequests.some(({ input }) => String(input).endsWith('/grab')), false)
-    }
+  it('records discovery actions as bounded conversation turns', async () => {
+    const calls: any[]=[]
+    globalThis.fetch=async(input,init)=>{if(String(input)==='/api/settings')return jsonResponse(envelope);calls.push({input,init});return jsonResponse(response())}
+    window.history.replaceState(null,'','/#search');render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'broad request'}});fireEvent.click(screen.getByRole('button',{name:'Search'}));await screen.findByRole('heading',{name:'Releases to review'})
+    for(let i=0;i<5;i++){fireEvent.click(screen.getByRole('button',{name:'Find more'}));await waitFor(()=>assert.equal(calls.length,i+2))}
+    assert.equal((screen.getByRole('button',{name:'Find more'}) as HTMLButtonElement).disabled,true)
+    assert.ok(screen.getByText(/five follow-up limit/))
+    const final=JSON.parse(String(calls.at(-1).init.body));assert.equal(final.turns.filter((t:any)=>t.role==='user').length,6)
+    fireEvent.click(screen.getByRole('button',{name:'Start a new conversation'}))
+    assert.ok(await screen.findByLabelText('Describe what you’re looking for'))
   })
-  it('aborts an in-flight search when leaving the page and ignores its late response', async () => {
-    let resolveSearch!: (response: Response) => void
-    let signal: AbortSignal | undefined
-    globalThis.fetch = (input, init) => {
-      if (String(input) === '/api/settings') return Promise.resolve(jsonResponse(envelope))
-      if (String(input) === '/api/search') { signal = init?.signal as AbortSignal; return new Promise(resolve => { resolveSearch = resolve }) }
-      return Promise.resolve(defaultOperationResponse(input))
-    }
-    render(<App />)
-    fireEvent.click(screen.getByRole('link', { name: 'General search' }))
-    fireEvent.change(await screen.findByLabelText('What would you like to find?'), { target: { value: 'late query' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
-    await waitFor(() => assert.ok(resolveSearch))
-    fireEvent.click(screen.getByRole('link', { name: 'Settings' }))
-    await waitFor(() => assert.equal(screen.getByRole('link', { name: 'Settings' }).getAttribute('aria-current'), 'page'))
-    assert.equal(signal?.aborted, true)
-    await act(async () => { resolveSearch(jsonResponse({ status: 'selection-required', query: 'late query', queries: [], question: '', searchId: null, expiresAt: null, confirmationToken: null, destination: null, dryRun: true, actionsAllowed: false, blockedReason: null, releases: [] })); await new Promise(resolve => setTimeout(resolve, 0)) })
-    assert.equal(screen.queryByRole('heading', { name: 'Releases to review' }), null)
-    assert.ok(screen.getByRole('link', { name: 'Settings' }).getAttribute('aria-current') === 'page')
+  it('reconciles a lost create response by read-only status and never creates twice', async () => {
+    const calls: any[]=[]
+    const status={operationId:'op-known',releases:[{releaseId:'r1',status:'uncertain',code:'request-timeout'}],mode:'dry-run',destination:{name:'General Client',protocol:'torrent'},expiresAt:'2099-01-01T00:00:00.000Z',nextOrdinal:1,stopped:false,complete:true}
+    globalThis.fetch=async(input,init)=>{if(String(input)==='/api/settings')return jsonResponse(envelope);calls.push({input,init});if(String(input).includes('/conversation/stream'))return jsonResponse(response());if(String(input).endsWith('/operations'))throw new TypeError('response lost');if(String(input).startsWith('/api/general-operations/')){const id=String(input).split('/').at(-1)!;return jsonResponse({...status,operationId:id})}return jsonResponse({error:'not found'},404)}
+    window.history.replaceState(null,'','/#search');render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'query'}});fireEvent.click(screen.getByRole('button',{name:'Search'}));await screen.findByRole('heading',{name:'Releases to review'});fireEvent.click(screen.getByRole('checkbox',{name:'Select A Space Documentary'}));fireEvent.click(screen.getByRole('button',{name:/Review 1 selected/}));fireEvent.click(screen.getByRole('button',{name:'Confirm full selection'}))
+    await screen.findByRole('heading',{name:'Outcome unknown'});await screen.findByText('Unknown · check client')
+    assert.equal(calls.filter(x=>String(x.input).endsWith('/operations')).length,1)
+    assert.equal(calls.filter(x=>x.init?.method==='POST'&&String(x.input).endsWith('/step')).length,0)
+    assert.ok(calls.some(x=>String(x.input).startsWith('/api/general-operations/')&&x.init?.method===undefined))
+  })
+  it('accepts a stopped status with an already-attempted ordinal and a held not-attempted tail', async () => {
+    const calls:any[]=[], items=[release('r1','First release'),release('r2','Held release')]
+    globalThis.fetch=async(input,init)=>{if(String(input)==='/api/settings')return jsonResponse(envelope);calls.push({input,init});if(String(input).includes('/conversation/stream'))return jsonResponse(response(items));if(String(input).endsWith('/operations'))throw new TypeError('create response lost');if(String(input).startsWith('/api/general-operations/')){const id=String(input).split('/').at(-1)!;return jsonResponse({operationId:id,releases:[{releaseId:'r1',status:'failed',code:'upstream-503'},{releaseId:'r2',status:'not-attempted',code:'operation-stopped'}],mode:'dry-run',destination:{name:'General Client',protocol:'torrent'},expiresAt:'2099-01-01T00:00:00.000Z',nextOrdinal:1,stopped:true,complete:true})}return jsonResponse({error:'unexpected'},404)}
+    window.history.replaceState(null,'','/#search');render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'query'}});fireEvent.click(screen.getByRole('button',{name:'Search'}));await screen.findByRole('heading',{name:'Releases to review'});fireEvent.click(screen.getByRole('checkbox',{name:'Select First release'}));fireEvent.click(screen.getByRole('checkbox',{name:'Select Held release'}));fireEvent.click(screen.getByRole('button',{name:/Review 2 selected/}));fireEvent.click(screen.getByRole('button',{name:'Confirm full selection'}))
+    await screen.findByRole('heading',{name:'Stopped'});assert.ok(document.querySelector('.outcome-not-attempted'))
+    assert.equal(calls.filter(x=>x.init?.method==='POST'&&String(x.input).endsWith('/step')).length,0);assert.equal(calls.filter(x=>x.init?.method==='POST'&&String(x.input).endsWith('/operations')).length,1)
+  })
+  it('shows a read-only in-flight submitting ordinal without starting another step', async () => {
+    const calls:any[]=[]
+    globalThis.fetch=async(input,init)=>{if(String(input)==='/api/settings')return jsonResponse(envelope);calls.push({input,init});if(String(input).includes('/conversation/stream'))return jsonResponse(response([release('r1','In-flight release'),release('r2','Next release')]));if(String(input).endsWith('/operations'))throw new TypeError('create response lost');if(String(input).startsWith('/api/general-operations/')){const id=String(input).split('/').at(-1)!;return jsonResponse({operationId:id,releases:[{releaseId:'r1',status:'submitting',code:null},{releaseId:'r2',status:'pending',code:null}],mode:'dry-run',destination:{name:'General Client',protocol:'torrent'},expiresAt:'2099-01-01T00:00:00.000Z',nextOrdinal:1,stopped:false,complete:false})}return jsonResponse({error:'unexpected'},404)}
+    window.history.replaceState(null,'','/#search');render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'query'}});fireEvent.click(screen.getByRole('button',{name:'Search'}));await screen.findByRole('heading',{name:'Releases to review'});fireEvent.click(screen.getByRole('checkbox',{name:'Select In-flight release'}));fireEvent.click(screen.getByRole('checkbox',{name:'Select Next release'}));fireEvent.click(screen.getByRole('button',{name:/Review 2 selected/}));fireEvent.click(screen.getByRole('button',{name:'Confirm full selection'}))
+    await screen.findByRole('heading',{name:'Submission progress'});assert.ok(screen.getByText('submitting'));assert.equal(calls.filter(x=>x.init?.method==='POST'&&String(x.input).endsWith('/step')).length,0)
+  })
+  it('does not submit a selection that expires while review is open', async () => {
+    const soon=new Date(Date.now()+250).toISOString(), item={...release('r1','Short-lived'),expiresAt:soon}, resultSoon={...response([item]),expiresAt:new Date(Date.now()+60000).toISOString()}
+    const calls:any[]=[]
+    globalThis.fetch=async(input,init)=>{if(String(input)==='/api/settings')return jsonResponse(envelope);calls.push({input,init});return jsonResponse(resultSoon)}
+    window.history.replaceState(null,'','/#search');render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'query'}});fireEvent.click(screen.getByRole('button',{name:'Search'}));await screen.findByRole('heading',{name:'Releases to review'});fireEvent.click(screen.getByRole('checkbox',{name:'Select Short-lived'}));fireEvent.click(screen.getByRole('button',{name:/Review 1 selected/}))
+    const confirm=screen.getByRole('button',{name:'Confirm full selection'}) as HTMLButtonElement
+    await act(async()=>{await new Promise(resolve=>setTimeout(resolve,1150))})
+    assert.equal(confirm.disabled,true);assert.ok(screen.getByRole('alert'))
+    assert.equal(calls.some(x=>String(x.input).endsWith('/operations')),false)
+  })
+  it('reconciles a malformed step receipt read-only and never repeats its ordinal', async () => {
+    const calls:any[]=[];let operation:any
+    const good=(next:number)=>({operationId:'',releases:[{releaseId:'r1',status:next?'uncertain':'pending',code:next?'request-timeout':null}],mode:'dry-run',destination:{name:'General Client',protocol:'torrent'},expiresAt:'2099-01-01T00:00:00.000Z',nextOrdinal:next,stopped:false,complete:Boolean(next)})
+    globalThis.fetch=async(input,init)=>{if(String(input)==='/api/settings')return jsonResponse(envelope);calls.push({input,init});if(String(input).includes('/conversation/stream'))return jsonResponse(response());if(String(input).endsWith('/operations')){operation=good(0);const body=JSON.parse(String(init?.body));operation.operationId=body.operationId;return jsonResponse(operation)}if(String(input).endsWith('/step'))return jsonResponse({...good(1),operationId:operation.operationId,releases:[{releaseId:'wrong-id',status:'dry-run',code:null}]});if(String(input).startsWith('/api/general-operations/'))return jsonResponse({...good(1),operationId:operation.operationId});return jsonResponse({error:'unexpected'},404)}
+    window.history.replaceState(null,'','/#search');render(<App />);fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'query'}});fireEvent.click(screen.getByRole('button',{name:'Search'}));await screen.findByRole('heading',{name:'Releases to review'});fireEvent.click(screen.getByRole('checkbox',{name:'Select A Space Documentary'}));fireEvent.click(screen.getByRole('button',{name:/Review 1 selected/}));fireEvent.click(screen.getByRole('button',{name:'Confirm full selection'}))
+    await screen.findByText('Unknown · check client')
+    assert.equal(calls.filter(x=>String(x.input).endsWith('/step')).length,1);assert.equal(calls.filter(x=>String(x.input).startsWith('/api/general-operations/')&&x.init?.method===undefined).length,1)
+  })
+  it('does not issue another step after navigation while an ordinal response is pending', async () => {
+    let resolveStep!:(r:Response)=>void;let id='';const calls:any[]=[]
+    globalThis.fetch=(input,init)=>{if(String(input)==='/api/settings')return Promise.resolve(jsonResponse(envelope));calls.push({input,init});if(String(input).includes('/conversation/stream'))return Promise.resolve(jsonResponse(response()));if(String(input).endsWith('/operations')){id=JSON.parse(String(init?.body)).operationId;return Promise.resolve(jsonResponse({operationId:id,releases:[{releaseId:'r1',status:'pending',code:null}],mode:'dry-run',destination:{name:'General Client',protocol:'torrent'},expiresAt:'2099-01-01T00:00:00.000Z',nextOrdinal:0,stopped:false,complete:false}))}if(String(input).endsWith('/step'))return new Promise(resolve=>{resolveStep=resolve});return Promise.resolve(defaultOperationResponse(input))}
+    window.history.replaceState(null,'','/#search');render(<App />);fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'query'}});fireEvent.click(screen.getByRole('button',{name:'Search'}));await screen.findByRole('heading',{name:'Releases to review'});fireEvent.click(screen.getByRole('checkbox',{name:'Select A Space Documentary'}));fireEvent.click(screen.getByRole('button',{name:/Review 1 selected/}));fireEvent.click(screen.getByRole('button',{name:'Confirm full selection'}));await waitFor(()=>assert.ok(resolveStep))
+    fireEvent.click(screen.getByRole('link',{name:'Settings'}));await waitFor(()=>assert.equal(screen.getByRole('link',{name:'Settings'}).getAttribute('aria-current'),'page'))
+    resolveStep(jsonResponse({operationId:id,releases:[{releaseId:'r1',status:'dry-run',code:null}],mode:'dry-run',destination:{name:'General Client',protocol:'torrent'},expiresAt:'2099-01-01T00:00:00.000Z',nextOrdinal:1,stopped:false,complete:true}));await new Promise(resolve=>setTimeout(resolve,20))
+    assert.equal(calls.filter(x=>String(x.input).endsWith('/step')).length,1)
   })
 })

@@ -50,7 +50,7 @@ export function createMcpServer(stack: Stack): McpServer {
     try { return await withSafeUpstreamErrors(call); }
     catch (error) {
       const code = error && typeof error === 'object' && 'code' in error && typeof (error as { code?: unknown }).code === 'string' ? (error as { code: string }).code : '';
-      if (['invalid-request','search-unavailable','operator-actions-disabled','search-expired','invalid-confirmation','invalid-release-selection','settings-changed','destination-changed'].includes(code)) throw new Error(code);
+      if (['invalid-request','invalid-budget','search-unavailable','operator-actions-disabled','search-expired','invalid-confirmation','invalid-release-selection','settings-changed','destination-changed','operation-not-found','operation-stopped','aborted'].includes(code)) throw new Error(code);
       throw new Error('General search unavailable');
     }
   };
@@ -145,9 +145,35 @@ export function createMcpServer(stack: Stack): McpServer {
     async ({ query }) => jsonResult(await safeGeneralOperation(() => snapshot().generalSearch.search({ query }))),
   );
 
+  server.registerTool('ma_general_conversation_search', {
+    description: 'Run a bounded conversational general search; returns candidate summaries for user selection and never grabs.',
+    inputSchema: z.object({ originalQuery: z.string().trim().min(1).max(500), turns: z.array(z.object({ role: z.enum(['user','assistant']), content: z.string().max(500) }).strict()).min(1).max(11), action: z.enum(['search','follow-up','find-more','more-like-these','other-terms']), previousSearchId: z.string().uuid().optional(), confirmationToken: z.string().optional(), selectedInspirationIds: z.array(z.string()).max(10).optional(), budgets: z.object({ queryCount: z.number().int().min(1).max(20).optional(), candidateCap: z.number().int().min(1).max(1000).optional(), aiCalls: z.number().int().min(1).max(100).optional(), batchSize: z.number().int().min(1).max(100).optional(), displayLimit: z.number().int().min(1).max(1000).optional(), hideZeroSeeders: z.boolean().optional() }).strict().optional() }).strict(),
+  }, async (input) => jsonResult(await safeGeneralOperation(() => snapshot().generalSearchConversation.search(input))));
+
+  server.registerTool('ma_general_operation_create', {
+    description: 'Freeze the entire selected release manifest for an operation; this call makes no Prowlarr submission. Call only after a human has reviewed and explicitly approved every release in the complete manifest, the exact destination, and the exact live/dry-run mode. A confirmation token and confirmed=true are not proof of human approval.',
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    inputSchema: z.object({ searchId: z.string().uuid(), operationId: z.string().uuid(), confirmationToken: z.string().min(1), releaseIds: z.array(z.string().uuid()).min(1).max(1000), confirmed: z.literal(true) }).strict(),
+  }, async ({ searchId, operationId, confirmationToken, releaseIds, confirmed }) => jsonResult(await safeGeneralOperation(() => snapshot().generalSearch.createOperation(searchId, { operationId, confirmationToken, releaseIds, confirmed }))));
+  server.registerTool('ma_general_operation_status', {
+    description: 'Read general-search operation status; this call does not advance the operation.',
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    inputSchema: z.object({ operationId: z.string().uuid() }).strict(),
+  }, async ({ operationId }) => jsonResult(await safeGeneralOperation(() => snapshot().generalSearch.operationStatus(operationId))));
+  server.registerTool('ma_general_operation_step', {
+    description: 'Advance one ordinal of the previously human-approved complete frozen manifest. This step CAN submit the release to Prowlarr. Require explicit host/user destructive-action approval before every step; a confirmation token or confirmed=true is not proof of human approval. The entire manifest, exact destination, and live/dry-run mode must have been reviewed before creating the operation.',
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+    inputSchema: z.object({ operationId: z.string().uuid(), expectedOrdinal: z.number().int().nonnegative() }).strict(),
+  }, async ({ operationId, expectedOrdinal }) => jsonResult(await safeGeneralOperation(() => snapshot().generalSearch.stepOperation(operationId, { expectedOrdinal }, expectedOrdinal))));
+  server.registerTool('ma_general_operation_stop', {
+    description: 'Stop a general-search operation without submitting releases.',
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    inputSchema: z.object({ operationId: z.string().uuid() }).strict(),
+  }, async ({ operationId }) => jsonResult({ operation: await safeGeneralOperation(() => snapshot().generalSearch.stopOperation(operationId)) }));
+
   server.registerTool(
     'ma_general_grab',
-    { description: 'Mutating: submit only release IDs explicitly selected by the user after showing them and obtaining separate explicit approval. A confirmation token and confirmed=true are not proof of user approval.', annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true }, inputSchema: z.object({ searchId: z.string().uuid(), confirmationToken: z.string().min(32).max(256), releaseIds: z.array(z.string().uuid()).min(1).max(10), confirmed: z.literal(true) }).strict() },
+    { description: 'Mutating: submit only release IDs explicitly selected by the user after showing them and obtaining separate explicit approval. A confirmation token and confirmed=true are not proof of user approval.', annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true }, inputSchema: z.object({ searchId: z.string().uuid(), confirmationToken: z.string().min(32).max(256), releaseIds: z.array(z.string().uuid()).min(1).max(1000), confirmed: z.literal(true) }).strict() },
     async ({ searchId, confirmationToken, releaseIds, confirmed }) => jsonResult(await safeGeneralOperation(() => snapshot().generalSearch.grab(searchId, { confirmationToken, releaseIds, confirmed }))),
   );
 

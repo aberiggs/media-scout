@@ -3,6 +3,7 @@ import pino from 'pino';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { buildApp } from '../src/daemon';
 import type { Stack } from '../src/compose';
 import { State } from '../src/core/state';
@@ -150,6 +151,52 @@ describe('LLM-assisted general search', () => {
     f.state.close();
   });
 
+  it('excludes credential-bearing release references before snapshot persistence', async () => {
+    const f = fixture();
+    f.prowlarr.search.mockResolvedValue([release({ guid: 'https://private-user:private-password@host/release?apiKey=secret' }), release({ guid: 'safe-guid' })]);
+    const response = await f.service.search({ query: 'safe request' });
+    expect(response.releases).toHaveLength(1);
+    const snapshot = JSON.stringify(f.state.getGeneralSearchSnapshot(response.searchId!)?.payload);
+    expect(snapshot).not.toContain('private-user');
+    expect(snapshot).not.toContain('private-password');
+    expect(snapshot).not.toContain('apiKey=secret');
+    f.state.close();
+  });
+
+  it('redacts destination names in snapshots and operation status while matching the private identity digest', async () => {
+    const f = fixture();
+    f.settings.integrations.prowlarr.generalClient = 'private-api-key';
+    f.client.name = 'private-api-key'; f.state.saveSettings(f.settings);
+    f.service = new GeneralSearchService({ llm: f.llm as never, prowlarr: f.prowlarr as never, state: f.state, runtimeSettings: f.state.getSettings(), getSettings: () => f.state.getSettings() });
+    const result = await f.service.search({ query: 'safe title' });
+    const snapshot = f.state.getGeneralSearchSnapshot(result.searchId!)!;
+    expect(JSON.stringify(snapshot)).not.toContain('private-api-key');
+    expect(result.destination?.name).not.toContain('private-api-key');
+    const operation = await f.service.createOperation(result.searchId!, { operationId: randomUUID(), confirmationToken: result.confirmationToken!, releaseIds: [result.releases[0]!.releaseId], confirmed: true });
+    expect(JSON.stringify(operation)).not.toContain('private-api-key');
+    expect((await f.service.grab(result.searchId!, { confirmationToken: result.confirmationToken!, releaseIds: [result.releases[1]!.releaseId], confirmed: true })).results[0]?.status).toBe('submitted');
+    f.state.close();
+  });
+
+  it('does not persist a search snapshot if source or AI settings drift during upstream search', async () => {
+    for (const drift of ['source', 'ai'] as const) {
+      const f = fixture();
+      let resolveSearch!: (releases: Release[]) => void;
+      f.prowlarr.search.mockImplementationOnce(() => new Promise((resolve) => { resolveSearch = resolve; }));
+      const pending = f.service.search({ query: 'anything' });
+      while (!resolveSearch) await Promise.resolve();
+      const settings = f.state.getSettings();
+      if (drift === 'source') settings.integrations.prowlarr.apiKey = 'rotated-during-search';
+      else settings.ai.model = 'changed-during-search';
+      f.state.saveSettings(settings);
+      resolveSearch([release()]);
+      await expect(pending).rejects.toMatchObject({ code: 'settings-changed' });
+      const db = (f.state as unknown as { db: import('better-sqlite3').Database }).db;
+      expect((db.prepare('SELECT COUNT(*) AS count FROM general_search_snapshots').get() as { count: number }).count).toBe(0);
+      f.state.close();
+    }
+  });
+
   it('submits only the explicitly selected cached release to the exact configured client; duplicate confirmation is idempotent', async () => {
     const f = fixture(); const search = await f.service.search({ query: 'anything' });
     const chosen = search.releases[0]!;
@@ -179,6 +226,15 @@ describe('LLM-assisted general search', () => {
     const afterRotation = await f.service.search({ query: 'anything again' });
     const retry = await f.service.grab(afterRotation.searchId!, { confirmationToken: afterRotation.confirmationToken!, releaseIds: [afterRotation.releases[0]!.releaseId], confirmed: true });
     expect(retry.results[0]?.status).toBe(previousStatus);
+    expect(f.prowlarr.grabGeneral).toHaveBeenCalledTimes(1);
+    f.state.close();
+  });
+
+  it('allows a frozen no-LLM grab after AI-only settings drift', async () => {
+    const f = fixture(); const search = await f.service.search({ query: 'anything' });
+    f.settings.ai.model = 'updated-model-without-changing-source'; f.state.saveSettings(f.settings);
+    const result = await f.service.grab(search.searchId!, { confirmationToken: search.confirmationToken!, releaseIds: [search.releases[0]!.releaseId], confirmed: true });
+    expect(result.results[0]?.status).toBe('submitted');
     expect(f.prowlarr.grabGeneral).toHaveBeenCalledTimes(1);
     f.state.close();
   });
@@ -241,6 +297,18 @@ describe('LLM-assisted general search', () => {
     f.state.close();
   });
 
+  it('does not treat a dry-run step as a source submission receipt', async () => {
+    const f = fixture({ dryRun: true }); const preview = await f.service.search({ query: 'anything' });
+    const releaseId = preview.releases[0]!.releaseId;
+    expect((await f.service.grab(preview.searchId!, { confirmationToken: preview.confirmationToken!, releaseIds: [releaseId], confirmed: true })).results[0]?.status).toBe('dry-run');
+    f.settings.safety.dryRun = false; f.state.saveSettings(f.settings);
+    f.service = new GeneralSearchService({ llm: f.llm as never, prowlarr: f.prowlarr as never, state: f.state, runtimeSettings: f.state.getSettings(), getSettings: () => f.state.getSettings() });
+    const live = await f.service.search({ query: 'same source and release' });
+    expect((await f.service.grab(live.searchId!, { confirmationToken: live.confirmationToken!, releaseIds: [live.releases[0]!.releaseId], confirmed: true })).results[0]?.status).toBe('submitted');
+    expect(f.prowlarr.grabGeneral).toHaveBeenCalledTimes(1);
+    f.state.close();
+  });
+
   it('reports disabled operator actions specifically and rejects disabled, ambiguous, or protocol-mismatched destinations', async () => {
     const denied = fixture({ allow: false });
     const deniedResult = await denied.service.search({ query: 'anything' });
@@ -262,19 +330,22 @@ describe('LLM-assisted general search', () => {
     }
   });
 
-  it('marks an accepted submission uncertain when receipt completion persistence fails', async () => {
+  it('retains an outstanding durable hold when operation persistence fails after an accepted submission', async () => {
     const f = fixture(); const result = await f.service.search({ query: 'anything' });
-    const finish = vi.spyOn(f.state, 'finishGeneralSearchRelease').mockImplementationOnce(() => { throw new Error('persistence unavailable'); });
-    const response = await f.service.grab(result.searchId!, { confirmationToken: result.confirmationToken!, releaseIds: [result.releases[0]!.releaseId], confirmed: true });
-    expect(response.results[0]?.status).toBe('uncertain');
+    const finish = vi.spyOn(f.state, 'finishGeneralSearchOperationStep').mockImplementationOnce(() => { throw new Error('persistence unavailable'); });
+    const body = { confirmationToken: result.confirmationToken!, releaseIds: [result.releases[0]!.releaseId], confirmed: true as const };
+    await expect(f.service.grab(result.searchId!, body)).rejects.toThrow('persistence unavailable');
     expect(f.prowlarr.grabGeneral).toHaveBeenCalledTimes(1);
-    expect(finish).toHaveBeenCalledTimes(2);
+    expect(finish).toHaveBeenCalledTimes(1);
+    const retry = await f.service.grab(result.searchId!, body);
+    expect(retry.results[0]?.status).toBe('submitting');
+    expect(f.prowlarr.grabGeneral).toHaveBeenCalledTimes(1);
     f.state.close();
   });
 
   it('leaves a durable submitting hold when receipt persistence remains unavailable after POST', async () => {
     const f = fixture(); const result = await f.service.search({ query: 'anything' });
-    vi.spyOn(f.state, 'finishGeneralSearchRelease').mockImplementation(() => { throw new Error('persistence unavailable'); });
+    vi.spyOn(f.state, 'finishGeneralSearchOperationStep').mockImplementation(() => { throw new Error('persistence unavailable'); });
     const body = { confirmationToken: result.confirmationToken!, releaseIds: [result.releases[0]!.releaseId], confirmed: true as const };
     await expect(f.service.grab(result.searchId!, body)).rejects.toThrow();
     expect(f.prowlarr.grabGeneral).toHaveBeenCalledTimes(1);
@@ -290,13 +361,17 @@ describe('LLM-assisted general search', () => {
     f.state.close();
   });
 
-  it('enforces the ten-release cap and rejects changed client category routing', async () => {
-    const f = fixture(); const result = await f.service.search({ query: 'anything' });
-    const many = Array.from({ length: 11 }, () => result.releases[0]!.releaseId);
-    await expect(f.service.grab(result.searchId!, { confirmationToken: result.confirmationToken, releaseIds: many, confirmed: true })).rejects.toMatchObject({ code: 'invalid-request' });
+  it('accepts a frozen manifest above ten and rejects changed client category routing', async () => {
+    const f = fixture();
+    f.prowlarr.search.mockImplementation(async () => Array.from({ length: 12 }, (_, i) => release({ guid: `manifest-${i}` })));
+    const result = await f.service.search({ query: 'anything' });
+    const many = result.releases.slice(0, 11).map(({ releaseId }) => releaseId);
+    const accepted = await f.service.grab(result.searchId!, { confirmationToken: result.confirmationToken, releaseIds: many, confirmed: true });
+    expect(accepted.results).toHaveLength(11);
+    expect(f.prowlarr.grabGeneral).toHaveBeenCalledTimes(11);
     f.client.categories = [{ clientCategory: 'general', categories: [2000] }]; f.client.routingDigest = 'b'.repeat(64);
     await expect(f.service.grab(result.searchId!, { confirmationToken: result.confirmationToken, releaseIds: [result.releases[0]!.releaseId], confirmed: true })).rejects.toMatchObject({ code: 'destination-changed' });
-    expect(f.prowlarr.grabGeneral).not.toHaveBeenCalled();
+    expect(f.prowlarr.grabGeneral).toHaveBeenCalledTimes(11);
     f.state.close();
   });
 
@@ -352,7 +427,7 @@ describe('LLM-assisted general search', () => {
     const f = fixture(); const result = await f.service.search({ query: 'anything' });
     f.prowlarr.grabGeneral.mockRejectedValueOnce({ status: 429 });
     const response = await f.service.grab(result.searchId!, { confirmationToken: result.confirmationToken!, releaseIds: result.releases.map(({ releaseId }) => releaseId), confirmed: true });
-    expect(response.results.map(({ status, code }) => [status, code])).toEqual([['failed', 'upstream-429'], ['not-attempted', 'previous-submission-failed']]);
+    expect(response.results.map(({ status, code }) => [status, code])).toEqual([['failed', 'upstream-429'], ['not-attempted', 'upstream-429']]);
     expect(f.prowlarr.grabGeneral).toHaveBeenCalledTimes(1);
     f.state.close();
   });
@@ -406,7 +481,7 @@ describe('LLM-assisted general search', () => {
     f.state.close();
   });
 
-  it('cancels a fresh reservation if settings change immediately before POST', async () => {
+  it('rejects operation creation when settings change during manifest preflight', async () => {
     const f = fixture(); const result = await f.service.search({ query: 'anything' });
     const releaseId = result.releases[0]!.releaseId;
     const body = { confirmationToken: result.confirmationToken!, releaseIds: [releaseId], confirmed: true as const };
@@ -417,8 +492,7 @@ describe('LLM-assisted general search', () => {
       const settings = readSettings();
       return reads === 4 ? { ...settings, safety: { ...settings.safety, allowOperatorActions: false } } : settings;
     });
-    const blocked = await f.service.grab(result.searchId!, body);
-    expect(blocked.results[0]).toMatchObject({ status: 'not-attempted', code: 'operator-actions-disabled' });
+    await expect(f.service.grab(result.searchId!, body)).rejects.toMatchObject({ code: 'operator-actions-disabled' });
     expect(f.prowlarr.grabGeneral).not.toHaveBeenCalled();
     settingsSpy.mockRestore();
     const retried = await f.service.grab(result.searchId!, body);

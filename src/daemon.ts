@@ -71,11 +71,69 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
     try { return await stack.createSnapshot(stack.state.getSettings()).generalSearch.search(body.data); }
     catch (error) { const code = safeGeneralErrorCode(error); const status = code === 'invalid-request' ? 400 : code === 'search-unavailable' ? 503 : 502; return reply.code(status).send({ error: 'general search unavailable', code }); }
   });
+  app.post('/api/search/conversation', async (request, reply) => {
+    if (!mutationAllowed(request)) return reply.code(403).send({ error: 'cross-origin mutation rejected', code: 'origin-rejected' });
+    try { return await stack.createSnapshot(stack.state.getSettings()).generalSearchConversation.search(request.body as never); }
+    catch (error) { const code = safeGeneralErrorCode(error); const status = code === 'invalid-request' ? 400 : code === 'search-unavailable' ? 503 : 502; return reply.code(status).send({ error: 'general search unavailable', code }); }
+  });
+  app.post('/api/search/conversation/stream', async (request, reply) => {
+    if (!mutationAllowed(request)) return reply.code(403).send({ error: 'cross-origin mutation rejected', code: 'origin-rejected' });
+    const controller = new AbortController();
+    let terminalEvent = false;
+    let sequence = 0;
+    reply.raw.on('close', () => { if (!reply.raw.writableEnded) controller.abort(); });
+    reply.hijack();
+    reply.raw.writeHead(200, { 'content-type': 'application/x-ndjson; charset=utf-8', 'cache-control': 'no-cache', connection: 'keep-alive' });
+    const writeEvent = (event: Record<string, unknown>): void => {
+      if (terminalEvent || controller.signal.aborted || reply.raw.destroyed) return;
+      const type = event.type;
+      if (!['planning','queries','searching','results','curation','complete','error'].includes(String(type))) return;
+      const terminal = type === 'complete' || type === 'error';
+      const output = type === 'error'
+        ? { type: 'error', sequence: sequence++, code: safeGeneralErrorCode({ code: event.code }), message: safeGeneralErrorCode({ code: event.code }) }
+        : { ...event, sequence: sequence++ };
+      if (terminal) terminalEvent = true;
+      reply.raw.write(`${JSON.stringify(output)}\n`);
+    };
+    const writeFallbackError = (error: unknown): void => {
+      const code = safeGeneralErrorCode(error);
+      writeEvent({ type: 'error', code, message: code });
+    };
+    try {
+      await stack.createSnapshot(stack.state.getSettings()).generalSearchConversation.search(request.body as never, writeEvent, controller.signal);
+      if (!terminalEvent) writeFallbackError({ code: 'operation-failed' });
+    } catch (error) {
+      if (!terminalEvent) writeFallbackError(error);
+    } finally {
+      if (!controller.signal.aborted && !reply.raw.destroyed) reply.raw.end();
+    }
+  });
+  app.post('/api/search/:id/operations', async (request, reply) => {
+    if (!mutationAllowed(request)) return reply.code(403).send({ error: 'cross-origin mutation rejected', code: 'origin-rejected' });
+    try { return await stack.createSnapshot(stack.state.getSettings()).generalSearch.createOperation((request.params as { id: string }).id, request.body); }
+    catch (error) { const code = safeGeneralErrorCode(error); return reply.code(code === 'invalid-request' ? 400 : code === 'search-expired' ? 404 : 409).send({ error: 'operation unavailable', code }); }
+  });
+  app.get('/api/general-operations/:id', async (request, reply) => {
+    try { return await stack.createSnapshot(stack.state.getSettings()).generalSearch.operationStatus((request.params as { id: string }).id); }
+    catch (error) { const code = safeGeneralErrorCode(error); return reply.code(code === 'search-expired' || code === 'operation-not-found' ? 404 : 400).send({ error: 'operation unavailable', code }); }
+  });
+  app.post('/api/general-operations/:id/step', async (request, reply) => {
+    if (!mutationAllowed(request)) return reply.code(403).send({ error: 'cross-origin mutation rejected', code: 'origin-rejected' });
+    const body = request.body as { expectedOrdinal?: unknown } | null;
+    if (!body || !Number.isSafeInteger(body.expectedOrdinal) || (body.expectedOrdinal as number) < 0) return reply.code(400).send({ error: 'invalid operation step', code: 'invalid-request' });
+    try { return await stack.createSnapshot(stack.state.getSettings()).generalSearch.stepOperation((request.params as { id: string }).id, request.body, body.expectedOrdinal as number); }
+    catch (error) { const code = safeGeneralErrorCode(error); return reply.code(code === 'search-expired' ? 404 : code === 'invalid-request' ? 400 : 409).send({ error: 'operation unavailable', code }); }
+  });
+  app.post('/api/general-operations/:id/stop', async (request, reply) => {
+    if (!mutationAllowed(request)) return reply.code(403).send({ error: 'cross-origin mutation rejected', code: 'origin-rejected' });
+    try { return { operation: await stack.createSnapshot(stack.state.getSettings()).generalSearch.stopOperation((request.params as { id: string }).id) }; }
+    catch (error) { const code = safeGeneralErrorCode(error); return reply.code(code === 'search-expired' ? 404 : 409).send({ error: 'operation unavailable', code }); }
+  });
   app.post('/api/search/:id/grab', async (request, reply) => {
     if (!mutationAllowed(request)) return reply.code(403).send({ error: 'cross-origin mutation rejected', code: 'origin-rejected' });
     const id = (request.params as { id?: string }).id;
     if (!id || !/^[0-9a-f-]{36}$/i.test(id)) return reply.code(400).send({ error: 'invalid search id', code: 'invalid-request' });
-    const body = z.object({ confirmationToken: z.string().min(32).max(256), releaseIds: z.array(z.string().uuid()).min(1).max(10), confirmed: z.literal(true) }).strict().safeParse(request.body);
+    const body = z.object({ confirmationToken: z.string().min(32).max(256), releaseIds: z.array(z.string().uuid()).min(1).max(1000), confirmed: z.literal(true) }).strict().safeParse(request.body);
     if (!body.success) return reply.code(400).send({ error: 'invalid grab request', code: 'invalid-request' });
     try { return await stack.createSnapshot(stack.state.getSettings()).generalSearch.grab(id, body.data); }
     catch (error) { const code = safeGeneralErrorCode(error); const status = code === 'invalid-request' ? 400 : code === 'operator-actions-disabled' ? 403 : code === 'search-expired' ? 404 : code === 'invalid-confirmation' || code === 'invalid-release-selection' ? 400 : 409; return reply.code(status).send({ error: 'general grab unavailable', code }); }
@@ -231,7 +289,7 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
 
 function safeGeneralErrorCode(error: unknown): string {
   const code = error && typeof error === 'object' && 'code' in error && typeof (error as {code?:unknown}).code === 'string' ? (error as {code:string}).code : '';
-  return ['invalid-request','search-unavailable','operator-actions-disabled','search-expired','invalid-confirmation','invalid-release-selection','settings-changed','destination-changed'].includes(code) ? code : 'operation-failed';
+  return ['invalid-request','invalid-budget','search-unavailable','operator-actions-disabled','search-expired','invalid-confirmation','invalid-release-selection','settings-changed','destination-changed','operation-not-found','operation-stopped','aborted'].includes(code) ? code : 'operation-failed';
 }
 
 export async function startDaemon(stack: Stack): Promise<void> {

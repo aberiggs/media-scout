@@ -1,12 +1,17 @@
 # Fresh-agent handoff: conversational general-search rewrite
 
+> **Implementation and validation status — 2026-10-06:** The additive conversational discovery lane, HTTP/NDJSON and MCP contracts, web conversation/explicit-selection flow, and durable general-search operations are implemented and have passed backend, UI, browser, typecheck, build, controlled-operation, and whole-system Oracle checks. See the [verification record](general-search-rewrite-verification.md) for exact evidence and residual limits. Delivery is tracked in [draft PR #9](https://github.com/aberiggs/media-scout/pull/9); live download-client routing/grab validation is not claimed.
+
 ## Current state
 
-The branch contains an initial, working general-search foundation, **not** the conversational rewrite described below. Keep the foundation as the base; do not describe the rewrite as already implemented. The current workflow plans one to three Prowlarr queries, returns a selected candidate list, and allows explicit confirmation of at most ten releases. Read `docs/general-search.md`, `docs/operations.md`, and the implementation/tests before making changes.
+### Pre-rewrite foundation baseline (historical)
+
+The original handoff was written against an initial foundation: one-to-three planned Prowlarr queries and a legacy confirmation path capped at ten releases. That description is retained only as a historical baseline; it is no longer the current implementation. Read `docs/general-search.md`, `docs/operations.md`, [the verification record](general-search-rewrite-verification.md), and current implementation/tests before making changes.
 
 Existing relevant code:
 
 - `src/core/general-search.ts`: current search/grab service and safety checks.
+- `src/core/general-search-conversation.ts`: bounded iterative conversational discovery service.
 - `src/types/general-search.ts`: current HTTP/MCP payload contracts.
 - `src/clients/prowlarr.ts`, `src/types/prowlarr.ts`: upstream API parsing and provider-routing digest.
 - `src/core/state.ts`: settings, snapshots, and durable submission receipts.
@@ -14,17 +19,20 @@ Existing relevant code:
 - `src/mcp/server.ts`: stdio MCP tools.
 - `src/compose.ts`: immutable composed runtime clients/settings.
 - `web/src/GeneralSearch.tsx`, `web/src/App.tsx`, `web/src/App.test.tsx`: current UI and tests.
+- `docs/general-search-rewrite-verification.md`: implementation summary, evidence, pending gates, and residual limitations.
 - `docker/Dockerfile`: the web build consumes shared types from `src/types`; preserve its copy-before-build ordering.
 
 Preserve existing general-search HTTP/MCP behavior where possible and keep `ma_search` / `ma_pick` backward-compatible. Do not change Sonarr/Radarr monitoring behavior as a side effect.
 
-## Start with coordination and contracts
+## Original coordination and contract requirements
+
+The following records the original project requirements for historical context. Implementation evidence and any remaining release work are in the [verification record](general-search-rewrite-verification.md).
 
 This is a substantial product/architecture change. Before coding, inspect the repository and write a concise design plan covering UX flow, API/event/data contracts, durable operation model, safety transitions, migration/compatibility, and tests. If that plan materially changes the direction or weakens a requirement below, pause and obtain the user's decision rather than silently substituting an approach.
 
 Delegate UI implementation and visual review to `@designer`; delegate bounded backend contracts/implementation to `@fixer`; ask `@oracle` for a risk-focused review of staged-selection, streaming, and durable-operation safety. Agree on shared contracts first and divide file ownership to avoid overlapping edits. Keep the work focused; don't start unrelated roadmap items.
 
-## Product and UX requirements
+## Original product and UX requirements (historical acceptance checklist)
 
 1. Make the discovery experience chat-first: one composer, distinct immutable user/assistant turns, and the original request retained as context across at most five bounded follow-up turns. A follow-up must not overwrite prior turns or share mutable form state with them.
 2. Handle broad, useful requests directly; don't force needless exact-title/creator clarification loops. Clarify only when genuinely needed.
@@ -35,7 +43,7 @@ Delegate UI implementation and visual review to `@designer`; delegate bounded ba
 7. Show truthful progress events: planning, proposed query terms, searching, results, curation. Streaming may be SSE or another justified design while retaining existing JSON endpoints for compatibility. Never fake percentage timers or expose private chain-of-thought. No generic job/worker framework unless the approved plan shows it is necessary.
 8. Keep conversation state in page memory by default. Do not persist conversations unless the user explicitly approves that change.
 
-## Selection and durable submission safety
+## Original selection and durable submission safety requirements
 
 The current 10-item cap is insufficient for manifest-sized selections. Allow all returned selectable release IDs, bounded by a documented/configurable candidate cap. Approval must freeze the entire selected manifest before the first POST; there must be no silent partial-selection substitution.
 
@@ -48,7 +56,7 @@ Use a durable, serial, bounded-step operation with a status/reconciliation API (
 - Require explicit human review of destination, mode, and the complete selection; confirm the frozen manifest. Never let the LLM select/submit or turn a streamed result into an implicit approval.
 - Keep “submitted” distinct from completed download/import. Retain durable receipt handling and no automatic retries for ambiguous outcomes.
 
-## Privacy, compatibility, and deployment constraints
+## Original privacy, compatibility, and deployment constraints
 
 - Never return, prompt with, log, or persist API secrets, raw provider field values, private upstream URLs, or credential-bearing release data. Existing safe public snapshots/receipts must remain secret-free.
 - Preserve canonical routing verification: provider implementation/config contract, canonical provider fields, and category routing belong in the private digest. Omitted/null optional Prowlarr field values are equivalent; meaningful false/zero/empty-string values remain distinct.
@@ -57,7 +65,9 @@ Use a durable, serial, bounded-step operation with a status/reconciliation API (
 - The API has no authentication; document trusted-network/loopback exposure. Keep Compose binding loopback-only by default.
 - Prowlarr's actual download-client schema/category behavior needs controlled live/API validation; do not claim parser or routing correctness from mocks alone. Don't change Arr operations.
 
-## Test and review expectations
+## Original test and review expectations
+
+These checklist items record the rewrite's original acceptance criteria; current results and remaining limitations are in the [verification record](general-search-rewrite-verification.md).
 
 Add focused tests before declaring completion. Cover at least:
 

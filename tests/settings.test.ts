@@ -13,6 +13,7 @@ describe('persisted UI settings', () => {
     expect(settingsSchema.safeParse(settings).success).toBe(true);
     expect(settings.monitoring.enabled).toBe(false);
     expect(settings.safety.dryRun).toBe(true);
+    expect(settings.generalSearch).toEqual({ maxQueries: 6, maxCandidates: 200, maxAiCalls: 12, batchSize: 20, displayLimit: 40, hideZeroSeeders: true });
     expect(missingSettings(settings)).toContain('integrations.sonarr.apiKey');
     expect(missingSettings(settings)).not.toContain('integrations.prowlarr.generalClient');
     state.close();
@@ -50,6 +51,14 @@ describe('persisted UI settings', () => {
     const legacy = structuredClone(defaultSettings) as Record<string, any>;
     delete legacy.integrations.prowlarr.generalClient;
     expect(settingsSchema.parse(legacy).integrations.prowlarr.generalClient).toBe('');
+  });
+
+  it('defaults general-search budgets on older version-one settings and validates their bounds', () => {
+    const legacy = structuredClone(defaultSettings) as Record<string, any>;
+    delete legacy.generalSearch;
+    expect(settingsSchema.parse(legacy).generalSearch).toEqual(defaultSettings.generalSearch);
+    legacy.generalSearch = { ...defaultSettings.generalSearch, maxQueries: 21 };
+    expect(settingsSchema.safeParse(legacy).success).toBe(false);
   });
 
   it('bounds timer intervals to the largest safe whole-minute Node timeout', () => {

@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createHash, randomUUID } from 'node:crypto';
 import nock from 'nock';
 import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -15,6 +16,7 @@ import { buildStack, type Stack } from '../src/compose';
 import { configWithSettings, loadConfig } from '../src/config';
 import { defaultSettings } from '../src/settings';
 import { State } from '../src/core/state';
+import { GeneralSearchService } from '../src/core/general-search';
 import { createMcpServer } from '../src/mcp/server';
 import { ApiError } from '../src/http';
 import type { LLMClient } from '../src/clients/llm';
@@ -250,14 +252,101 @@ async function callErrorText(name: string, args: Record<string, unknown>): Promi
 }
 
 describe('mcp server tools', () => {
-  it('exposes general search and a mutating general grab tool with a ten-release limit', async () => {
+  it('sends the full explicitly approved >10 manifest through the real service and rejects larger bounds before POST', async () => {
+    await connect(new FakeLLM());
+    const settings = structuredClone(stack.state.getSettings());
+    settings.integrations.prowlarr = { url: PROWLARR, apiKey: 'prowlarr-key', tvClient: '', movieClient: '', generalClient: 'Download' };
+    settings.safety.allowOperatorActions = true;
+    settings.safety.dryRun = false;
+    stack.state.saveSettings(settings);
+    const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+    const token = 't'.repeat(64);
+    const searchId = randomUUID();
+    const cached = Array.from({ length: 11 }, () => ({
+      public: { releaseId: randomUUID(), title: 'safe release', indexer: 'Indexer', size: 1, seeders: 1, leechers: 0, age: 1, protocol: 'torrent' as const, selectable: true, unavailableReason: null },
+      release: { guid: randomUUID(), indexerId: 7 }, sourceKey: randomUUID(), legacySourceKey: randomUUID(),
+    }));
+    const fingerprint = hash(JSON.stringify([settings.integrations.prowlarr.url, settings.integrations.prowlarr.apiKey, settings.integrations.prowlarr.generalClient, settings.safety.dryRun, settings.safety.allowOperatorActions]));
+    stack.state.saveGeneralSearchSnapshot({ id: searchId, tokenDigest: hash(token), expiresAt: '2026-10-07T00:00:00.000Z', fingerprint, clientName: 'Download', clientProtocol: 'torrent', clientId: 1, routingDigest: 'routing', dryRun: false, payload: { releases: cached } });
+    const prowlarr = { getDownloadClients: vi.fn(async () => [{ id: 1, name: 'Download', enable: true, protocol: 'torrent' as const, routingDigest: 'routing', supportsCategories: true, categories: [] }]), grabGeneral: vi.fn(async () => {}) };
+    const makeGeneral = () => new GeneralSearchService({ llm: {} as never, prowlarr: prowlarr as never, state: stack.state, getSettings: () => stack.state.getSettings(), runtimeSettings: stack.state.getSettings(), now: () => NOW });
+    const originalSnapshot = stack.createSnapshot;
+    stack.createSnapshot = (next) => ({ ...originalSnapshot(next), generalSearch: makeGeneral() }) as unknown as Stack;
+    const releaseIds = cached.map(({ public: release }) => release.releaseId);
+    const submitted = await callJson('ma_general_grab', { searchId, confirmationToken: token, releaseIds, confirmed: true });
+    expect((submitted.results as unknown[])).toHaveLength(11);
+    expect(prowlarr.grabGeneral).toHaveBeenCalledTimes(11);
+
+    const tightened = stack.state.getSettings();
+    tightened.generalSearch!.maxCandidates = 10;
+    stack.state.saveSettings(tightened);
+    const before = prowlarr.grabGeneral.mock.calls.length;
+    await callErrorText('ma_general_grab', { searchId, confirmationToken: token, releaseIds, confirmed: true });
+    expect(prowlarr.grabGeneral).toHaveBeenCalledTimes(before);
+    await callErrorText('ma_general_grab', { searchId, confirmationToken: token, releaseIds: Array.from({ length: 1001 }, () => randomUUID()), confirmed: true });
+    expect(prowlarr.grabGeneral).toHaveBeenCalledTimes(before);
+  });
+
+  it('registers and dispatches additive conversation and operation tools without making status mutating', async () => {
+    await connect(new FakeLLM());
+    const methods = {
+      search: vi.fn(async () => ({ status: 'selection-required', releases: [] })),
+      createOperation: vi.fn(async (_id: string, _raw: unknown) => ({ operationId: 'op', nextOrdinal: 0 })),
+      operationStatus: vi.fn(async () => ({ operationId: 'op', nextOrdinal: 0 })),
+      stepOperation: vi.fn(async (_id: string, _body: unknown, _ordinal: number) => ({ operationId: 'op', nextOrdinal: 1 })),
+      stopOperation: vi.fn(async () => ({ operation: { operationId: 'op', stopped: true } })),
+    };
+    const originalSnapshot = stack.createSnapshot;
+    stack.createSnapshot = (settings) => ({ ...originalSnapshot(settings), generalSearch: { ...originalSnapshot(settings).generalSearch, createOperation: methods.createOperation, operationStatus: methods.operationStatus, stepOperation: methods.stepOperation, stopOperation: methods.stopOperation }, generalSearchConversation: { search: methods.search } }) as unknown as Stack;
+
+    const listed = await client.listTools();
+    const names = listed.tools.map(({ name }) => name);
+    expect(names).toContain('ma_general_conversation_search');
+    expect(names).toContain('ma_general_operation_create');
+    expect(names).toContain('ma_general_operation_status');
+    expect(names).toContain('ma_general_operation_step');
+    expect(names).toContain('ma_general_operation_stop');
+    expect(names).toContain('ma_search');
+    expect(names).toContain('ma_pick');
+    expect(names).toContain('ma_general_grab');
+    const creation=listed.tools.find(({name})=>name==='ma_general_operation_create');
+    const statusTool=listed.tools.find(({ name }) => name === 'ma_general_operation_status');
+    const step=listed.tools.find(({name})=>name==='ma_general_operation_step');
+    expect(creation?.description).toContain('entire selected release manifest');
+    expect(creation?.description).toContain('explicitly approved every release');
+    expect(creation?.description).toContain('confirmation token and confirmed=true are not proof');
+    expect(creation?.annotations).toMatchObject({readOnlyHint:false,destructiveHint:false});
+    expect(statusTool?.annotations).toMatchObject({ readOnlyHint: true, destructiveHint:false });
+    expect(step?.description).toContain('CAN submit the release to Prowlarr');
+    expect(step?.description).toContain('host/user destructive-action approval');
+    expect(step?.description).toContain('complete frozen manifest');
+    expect(step?.annotations).toMatchObject({readOnlyHint:false,destructiveHint:true,openWorldHint:true});
+
+    const originalQuery = 'space opera';
+    await callJson('ma_general_conversation_search', { originalQuery, turns: [{ role: 'user', content: originalQuery }], action: 'search' });
+    const searchId = '11111111-1111-4111-8111-111111111111';
+    const operationId = '22222222-2222-4222-8222-222222222222';
+    await callJson('ma_general_operation_create', { searchId, operationId, confirmationToken: 'token', releaseIds: ['33333333-3333-4333-8333-333333333333'], confirmed: true });
+    await callJson('ma_general_operation_status', { operationId });
+    expect(methods.operationStatus).toHaveBeenCalledTimes(1);
+    expect(methods.stepOperation).not.toHaveBeenCalled();
+    await callJson('ma_general_operation_step', { operationId, expectedOrdinal: 0 });
+    await callJson('ma_general_operation_stop', { operationId });
+    expect(methods.search).toHaveBeenCalledTimes(1);
+    expect(methods.createOperation).toHaveBeenCalledTimes(1);
+    expect(methods.stepOperation).toHaveBeenCalledTimes(1);
+    expect(methods.stopOperation).toHaveBeenCalledTimes(1);
+  });
+
+  it('exposes general search and a mutating general grab tool with the transport cap', async () => {
     await connect(new FakeLLM());
     const listed = await client.listTools();
     const searchTool = listed.tools.find(({ name }) => name === 'ma_general_search');
     const grabTool = listed.tools.find(({ name }) => name === 'ma_general_grab');
     expect(searchTool).toBeDefined();
     expect(grabTool?.description).toContain('separate explicit approval');
-    expect(grabTool?.inputSchema.properties?.releaseIds).toMatchObject({ maxItems: 10 });
+    expect(grabTool?.annotations).toMatchObject({readOnlyHint:false,destructiveHint:true,openWorldHint:true});
+    expect(grabTool?.inputSchema.properties?.releaseIds).toMatchObject({ maxItems: 1000 });
   });
 
   it('ma_status reports config + open review count', async () => {

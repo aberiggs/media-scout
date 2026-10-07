@@ -164,6 +164,7 @@ describe('OpenRouterLLM.json deadline', () => {
   it('does not start a scheduled 5xx retry after the deadline', async () => {
     vi.useFakeTimers();
     let calls = 0;
+    const attempts: Array<{ logicalAttempt: number; transportAttempt: number }> = [];
     let requestSignal: AbortSignal | undefined;
     const llm = build((input) => {
       calls++;
@@ -174,7 +175,7 @@ describe('OpenRouterLLM.json deadline', () => {
       }));
     });
     let settled = false;
-    const result = call(llm).then(
+    const result = llm.json({ system: 'sys', user: 'user', schema, label: 'verdict', onAttempt: (attempt) => attempts.push(attempt) }).then(
       () => ({ ok: true as const }),
       (error: unknown) => ({ ok: false as const, error }),
     ).finally(() => { settled = true; });
@@ -185,10 +186,13 @@ describe('OpenRouterLLM.json deadline', () => {
     expect(settled).toBe(true);
     expect(requestSignal?.aborted).toBe(true);
     expect(calls).toBeGreaterThan(1);
+    expect(attempts.length).toBe(calls);
+    expect(attempts.every((attempt) => attempt.logicalAttempt === 0)).toBe(true);
     const callsAtDeadline = calls;
     await vi.advanceTimersByTimeAsync(120_000);
 
     expect(calls).toBe(callsAtDeadline);
+    expect(attempts.length).toBe(callsAtDeadline);
     expect(vi.getTimerCount()).toBe(0);
     const outcome = await result;
     expect(outcome.ok).toBe(false);

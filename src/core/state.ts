@@ -229,11 +229,16 @@ CREATE TABLE IF NOT EXISTS app_settings (
 CREATE TABLE IF NOT EXISTS general_search_snapshots (
   id TEXT PRIMARY KEY, token_digest TEXT NOT NULL UNIQUE, expires_at TEXT NOT NULL,
   fingerprint TEXT NOT NULL, client_name TEXT NOT NULL, client_protocol TEXT NOT NULL, client_id INTEGER, routing_digest TEXT NOT NULL,
-  dry_run INTEGER NOT NULL, payload_json TEXT NOT NULL CHECK(json_valid(payload_json))
+  dry_run INTEGER NOT NULL, payload_json TEXT NOT NULL CHECK(json_valid(payload_json)), client_name_digest TEXT
 );
 CREATE TABLE IF NOT EXISTS general_search_receipts (
   search_id TEXT NOT NULL, release_id TEXT NOT NULL, source_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL,
   code TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(search_id, release_id)
+);
+CREATE TABLE IF NOT EXISTS general_search_operations (
+  operation_id TEXT PRIMARY KEY, search_id TEXT NOT NULL, request_digest TEXT NOT NULL,
+  status_json TEXT NOT NULL CHECK(json_valid(status_json)), private_json TEXT NOT NULL CHECK(json_valid(private_json)),
+  created_at TEXT NOT NULL
 );
 `;
 
@@ -423,15 +428,108 @@ export class State {
       .run(validated.version, JSON.stringify(validated), new Date().toISOString());
   }
 
-  saveGeneralSearchSnapshot(input: { id: string; tokenDigest: string; expiresAt: string; fingerprint: string; clientName: string; clientProtocol: string; clientId: number | null; routingDigest: string; dryRun: boolean; payload: unknown }): void {
-    this.db.prepare('INSERT INTO general_search_snapshots(id,token_digest,expires_at,fingerprint,client_name,client_protocol,client_id,routing_digest,dry_run,payload_json) VALUES(?,?,?,?,?,?,?,?,?,?)')
-      .run(input.id, input.tokenDigest, input.expiresAt, input.fingerprint, input.clientName, input.clientProtocol, input.clientId, input.routingDigest, input.dryRun ? 1 : 0, JSON.stringify(input.payload));
+  saveGeneralSearchSnapshot(input: { id: string; tokenDigest: string; expiresAt: string; fingerprint: string; clientName: string; clientNameDigest?: string; clientProtocol: string; clientId: number | null; routingDigest: string; dryRun: boolean; payload: unknown }): void {
+    const clientNameDigest = input.clientNameDigest ?? createHash('sha256').update(input.clientName).digest('hex');
+    const settings = this.getSettings();
+    const secrets = [settings.ai.apiKey, settings.integrations.prowlarr.apiKey, settings.integrations.sonarr.apiKey, settings.integrations.radarr.apiKey].filter((secret) => secret.trim()).sort((a,b)=>b.length-a.length);
+    let displayName = input.clientName;
+    for (const secret of secrets) displayName = displayName.replaceAll(secret, '[removed]');
+    displayName = displayName.replace(/\b[a-z][a-z\d+.-]*:\/\/[^\s"'<>]+/gi, '[removed]').replace(/\bmagnet:\?[^\s"'<>]*/gi, '[removed]')
+      .replace(/(?:api[_ -]?key|token|password|secret)\s*[:=]\s*\S+/gi, '[removed]').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 300);
+    this.db.prepare('INSERT INTO general_search_snapshots(id,token_digest,expires_at,fingerprint,client_name,client_protocol,client_id,routing_digest,dry_run,payload_json,client_name_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
+      .run(input.id, input.tokenDigest, input.expiresAt, input.fingerprint, displayName, input.clientProtocol, input.clientId, input.routingDigest, input.dryRun ? 1 : 0, JSON.stringify(input.payload), clientNameDigest);
   }
 
-  getGeneralSearchSnapshot(id: string): { tokenDigest: string; expiresAt: string; fingerprint: string; clientName: string; clientProtocol: string; clientId: number | null; routingDigest: string; dryRun: boolean; payload: unknown } | null {
+  /** Freeze a complete manifest atomically; identical retries are idempotent, differing reuse conflicts. */
+  createGeneralSearchOperation(input: { operationId: string; searchId: string; requestDigest: string; status: unknown; privatePayload: unknown; now: string }): { created: boolean; status: unknown; privatePayload: unknown } {
+    return this.db.transaction(() => {
+      const existing = this.db.prepare('SELECT request_digest,status_json,private_json FROM general_search_operations WHERE operation_id=?').get(input.operationId) as { request_digest: string; status_json: string; private_json: string } | undefined;
+      if (existing) {
+        if (existing.request_digest !== input.requestDigest) throw Object.assign(new Error('operation-id-conflict'), { code: 'operation-id-conflict' });
+        return { created: false, status: JSON.parse(existing.status_json) as unknown, privatePayload: JSON.parse(existing.private_json) as unknown };
+      }
+      this.db.prepare('INSERT INTO general_search_operations(operation_id,search_id,request_digest,status_json,private_json,created_at) VALUES(?,?,?,?,?,?)')
+        .run(input.operationId, input.searchId, input.requestDigest, JSON.stringify(input.status), JSON.stringify(input.privatePayload), input.now);
+      return { created: true, status: input.status, privatePayload: input.privatePayload };
+    }).immediate();
+  }
+
+  getGeneralSearchOperation(operationId: string): { status: unknown; privatePayload: unknown; requestDigest: string } | null {
+    const row = this.db.prepare('SELECT status_json,private_json,request_digest FROM general_search_operations WHERE operation_id=?').get(operationId) as { status_json: string; private_json: string; request_digest: string } | undefined;
+    if (!row) return null;
+    try { return { status: JSON.parse(row.status_json) as unknown, privatePayload: JSON.parse(row.private_json) as unknown, requestDigest: row.request_digest }; } catch { return null; }
+  }
+
+  /** Atomic serial step claim and source-qualified release reservation. Claims are never reclaimed. */
+  claimGeneralSearchOperationStep(input: { operationId: string; expectedOrdinal: number; now: string; releaseId: string; sourceKey: string; legacySourceKey: string; reserveReceipt?: boolean }): { claimed: boolean; status: unknown; privatePayload: unknown; receipt?: { status: string; code: string | null } } | null {
+    return this.db.transaction(() => {
+      const row = this.db.prepare('SELECT status_json,private_json FROM general_search_operations WHERE operation_id=?').get(input.operationId) as { status_json: string; private_json: string } | undefined;
+      if (!row) return null;
+      const status = JSON.parse(row.status_json) as { nextOrdinal: number; stopped: boolean; complete: boolean; releases: Array<{releaseId:string;status:string;code:string|null}> };
+      const privatePayload = JSON.parse(row.private_json) as unknown;
+      if (status.stopped || status.complete || status.nextOrdinal !== input.expectedOrdinal || status.releases.some((item) => item.status === 'submitting')) return { claimed: false, status, privatePayload };
+      const item = status.releases[input.expectedOrdinal];
+      if (!item || item.releaseId !== input.releaseId || item.status !== 'pending') return { claimed: false, status, privatePayload };
+      const receipt = input.reserveReceipt === false ? undefined : (this.db.prepare('SELECT status,code FROM general_search_receipts WHERE source_key=?').get(input.sourceKey)
+        ?? this.db.prepare('SELECT status,code FROM general_search_receipts WHERE source_key=?').get(input.legacySourceKey)) as {status:string;code:string|null}|undefined;
+      if (receipt) {
+        item.status = receipt.status === 'submitted' ? 'previously-submitted' : receipt.status === 'submitting' ? 'uncertain' : receipt.status;
+        item.code = receipt.status === 'submitted' ? null : (receipt.code ?? 'previous-submission-held');
+        status.nextOrdinal += 1;
+        status.stopped = receipt.status !== 'submitted';
+        if (status.stopped) for (const rest of status.releases.slice(status.nextOrdinal)) if (rest.status === 'pending') { rest.status = 'not-attempted'; rest.code = receipt.code ?? 'previous-submission-held'; }
+        status.complete = !status.releases.some((entry) => entry.status === 'pending' || entry.status === 'submitting');
+        this.db.prepare('UPDATE general_search_operations SET status_json=? WHERE operation_id=?').run(JSON.stringify(status), input.operationId);
+        return { claimed: false, status, privatePayload, receipt };
+      }
+      if (input.reserveReceipt !== false) this.db.prepare("INSERT INTO general_search_receipts(search_id,release_id,source_key,status,code,updated_at) VALUES(?,?,?,'submitting',NULL,?)")
+        .run(input.operationId, input.releaseId, input.sourceKey, input.now);
+      item.status = 'submitting';
+      status.nextOrdinal += 1;
+      this.db.prepare('UPDATE general_search_operations SET status_json=? WHERE operation_id=?').run(JSON.stringify(status), input.operationId);
+      return { claimed: true, status, privatePayload };
+    }).immediate();
+  }
+
+  /** Persist actual POST outcome and atomically close all later work on any non-success. */
+  finishGeneralSearchOperationStep(input: { operationId: string; releaseId: string; status: string; code: string | null; now: string; stop: boolean; stopCode?: string | null }): unknown {
+    return this.db.transaction(() => {
+      const row = this.db.prepare('SELECT status_json FROM general_search_operations WHERE operation_id=?').get(input.operationId) as {status_json:string}|undefined;
+      if (!row) throw new Error('operation-not-found');
+      const status = JSON.parse(row.status_json) as { nextOrdinal: number; stopped: boolean; complete: boolean; releases: Array<{releaseId:string;status:string;code:string|null}> };
+      const item = status.releases.find((entry) => entry.releaseId === input.releaseId);
+      if (!item || item.status !== 'submitting') throw new Error('operation-step-not-owned');
+      item.status = input.status;
+      item.code = input.code;
+      this.db.prepare('UPDATE general_search_receipts SET status=?,code=?,updated_at=? WHERE search_id=? AND release_id=? AND status=\'submitting\'')
+        .run(input.status, input.code, input.now, input.operationId, input.releaseId);
+      if (input.stop || status.stopped) {
+        status.stopped = true;
+        for (const rest of status.releases) if (rest.status === 'pending') { rest.status = 'not-attempted'; rest.code = input.stopCode ?? input.code ?? 'operation-stopped'; }
+      }
+      status.complete = !status.releases.some((entry) => entry.status === 'pending' || entry.status === 'submitting');
+      this.db.prepare('UPDATE general_search_operations SET status_json=? WHERE operation_id=?').run(JSON.stringify(status), input.operationId);
+      return status;
+    }).immediate();
+  }
+
+  stopGeneralSearchOperation(operationId: string): unknown | null {
+    return this.db.transaction(() => {
+      const row = this.db.prepare('SELECT status_json FROM general_search_operations WHERE operation_id=?').get(operationId) as {status_json:string}|undefined;
+      if (!row) return null;
+      const status = JSON.parse(row.status_json) as { stopped: boolean; complete: boolean; releases: Array<{status:string;code:string|null}> };
+      status.stopped = true;
+      for (const item of status.releases) if (item.status === 'pending') { item.status = 'not-attempted'; item.code = 'operation-stopped'; }
+      status.complete = !status.releases.some((item) => item.status === 'pending' || item.status === 'submitting');
+      this.db.prepare('UPDATE general_search_operations SET status_json=? WHERE operation_id=?').run(JSON.stringify(status), operationId);
+      return status;
+    }).immediate();
+  }
+
+  getGeneralSearchSnapshot(id: string): { tokenDigest: string; expiresAt: string; fingerprint: string; clientName: string; clientNameDigest: string; clientProtocol: string; clientId: number | null; routingDigest: string; dryRun: boolean; payload: unknown } | null {
     const row = this.db.prepare('SELECT * FROM general_search_snapshots WHERE id=?').get(id) as Record<string, unknown> | undefined;
     if (!row) return null;
-    try { return { tokenDigest: String(row.token_digest), expiresAt: String(row.expires_at), fingerprint: String(row.fingerprint), clientName: String(row.client_name), clientProtocol: String(row.client_protocol), clientId: row.client_id === null ? null : Number(row.client_id), routingDigest: String(row.routing_digest), dryRun: Number(row.dry_run) === 1, payload: JSON.parse(String(row.payload_json)) as unknown }; } catch { return null; }
+    try { const clientName = String(row.client_name); return { tokenDigest: String(row.token_digest), expiresAt: String(row.expires_at), fingerprint: String(row.fingerprint), clientName, clientNameDigest: String(row.client_name_digest ?? createHash('sha256').update(clientName).digest('hex')), clientProtocol: String(row.client_protocol), clientId: row.client_id === null ? null : Number(row.client_id), routingDigest: String(row.routing_digest), dryRun: Number(row.dry_run) === 1, payload: JSON.parse(String(row.payload_json)) as unknown }; } catch { return null; }
   }
 
   reserveGeneralSearchRelease(searchId: string, releaseId: string, now: string, sourceKey = `${searchId}:${releaseId}`, legacySourceKey?: string): { status: string; code: string | null; reserved: boolean } {
@@ -1557,6 +1655,19 @@ export class State {
   private ensureGeneralSearchColumns(): void {
     const columns = new Set((this.db.prepare('PRAGMA table_info(general_search_snapshots)').all() as Array<{ name: string }>).map(({ name }) => name));
     if (!columns.has('routing_digest')) this.db.exec("ALTER TABLE general_search_snapshots ADD COLUMN routing_digest TEXT NOT NULL DEFAULT ''");
+    if (!columns.has('client_name_digest')) this.db.exec('ALTER TABLE general_search_snapshots ADD COLUMN client_name_digest TEXT');
+    const settings = this.getSettings();
+    const secrets = [settings.ai.apiKey, settings.integrations.prowlarr.apiKey, settings.integrations.sonarr.apiKey, settings.integrations.radarr.apiKey].filter((secret) => secret.trim()).sort((a,b)=>b.length-a.length);
+    const rows = this.db.prepare('SELECT id,client_name FROM general_search_snapshots WHERE client_name_digest IS NULL').all() as Array<{id:string;client_name:string}>;
+    const update = this.db.prepare('UPDATE general_search_snapshots SET client_name=?,client_name_digest=? WHERE id=? AND client_name_digest IS NULL');
+    for (const row of rows) {
+      const digest = createHash('sha256').update(row.client_name).digest('hex');
+      let displayName = row.client_name;
+      for (const secret of secrets) displayName = displayName.replaceAll(secret, '[removed]');
+      displayName = displayName.replace(/\b[a-z][a-z\d+.-]*:\/\/[^\s"'<>]+/gi, '[removed]').replace(/\bmagnet:\?[^\s"'<>]*/gi, '[removed]')
+        .replace(/(?:api[_ -]?key|token|password|secret)\s*[:=]\s*\S+/gi, '[removed]').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 300);
+      update.run(displayName, digest, row.id);
+    }
   }
 
   /**

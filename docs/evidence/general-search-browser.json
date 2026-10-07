@@ -1,0 +1,297 @@
+{
+  "timestamp": "2026-10-07T04:51:36.517Z",
+  "sourceDigest": "99580444b4d94c6232f0758fb17c21d7c52fcee8ec7594e6a77cf3c6192cc6c5",
+  "viewports": {
+    "desktop": {
+      "size": {
+        "width": 1440,
+        "height": 900
+      },
+      "states": [
+        "empty",
+        "clarification",
+        "results",
+        "selection-11",
+        "modal-11",
+        "keyboard-focus",
+        "autofill-render",
+        "expired",
+        "stopped-held",
+        "stopped-held-reconciled",
+        "unknown",
+        "unknown-reconciled",
+        "success-11"
+      ],
+      "overflowCheckedAtEveryState": true,
+      "configuration": {
+        "maxQueries": 6,
+        "maxCandidates": 200,
+        "maxAiCalls": 12,
+        "batchSize": 20,
+        "displayLimit": 5,
+        "hideZeroSeeders": true
+      },
+      "assertions": {
+        "all11SelectedAcrossPages": true,
+        "modalManifestItems": 11,
+        "serialOrdinals": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10
+        ],
+        "lostStepPOSTCount": 1,
+        "recheckPOSTCountDelta": 0,
+        "readonlyGETSeen": true,
+        "stoppedStatusTailNotAttemptedVisible": true,
+        "liveUncertainHeldTailVisible": true,
+        "uncertainNoRetry": true,
+        "modalConfirmReachability": {
+          "dialog": {
+            "x": 425,
+            "y": 168.5,
+            "width": 590,
+            "height": 562.984375,
+            "scrollHeight": 561,
+            "clientHeight": 561
+          },
+          "confirm": {
+            "x": 789.234375,
+            "y": 661.484375,
+            "width": 197.765625,
+            "height": 42,
+            "visible": true,
+            "hitTarget": true
+          }
+        },
+        "reviewActionNotObstructedByNavigation": {
+          "action": {
+            "x": 392,
+            "y": 766.3125,
+            "width": 176.34375,
+            "height": 42,
+            "visible": true,
+            "hitTarget": true
+          },
+          "sidebar": {
+            "left": 0,
+            "right": 238,
+            "top": 0,
+            "bottom": 900
+          },
+          "topbar": {
+            "top": 0,
+            "bottom": 65
+          }
+        },
+        "composerKeyboardSubmit": true,
+        "clarificationDraftCleared": true,
+        "originalTurnPreserved": true,
+        "modalEscapeRestoresFocus": true,
+        "tabAndShiftTabContained": true,
+        "inertBackground": true,
+        "expiredConfirmationDisabled": true,
+        "progressEvents": [
+          "planning",
+          "queries",
+          "searching",
+          "results",
+          "curation",
+          "complete"
+        ],
+        "fiveFollowupsPreservedRootAndDisabledFurtherAction": true,
+        "noConsoleOrPageErrors": true,
+        "forcedAutofillPseudo": "forced via CDP",
+        "forcedAutofillComputed": {
+          "color": "rgb(231, 233, 230)",
+          "background": "rgba(0, 0, 0, 0)",
+          "textFill": "rgb(231, 233, 230)"
+        }
+      },
+      "requestCounts": {
+        "GET /api/settings": 20,
+        "POST /api/search/conversation/stream": 12,
+        "POST /api/search/09ee370a-0d60-4742-a7a6-d1d76eb49fff/operations": 1,
+        "POST /api/general-operations/878f6261-c86f-4d65-94f7-a8dbe22e1b82/step": 11,
+        "POST /api/search/b3d1c3ee-2890-4179-a712-a51c4c94abad/operations": 1,
+        "POST /api/general-operations/b25aebca-8621-4cc5-a5be-f8219d04b6d1/step": 1,
+        "GET /api/general-operations/b25aebca-8621-4cc5-a5be-f8219d04b6d1": 2,
+        "POST /api/search/d86992ab-c9ee-43b9-9af4-9a5d1429f74e/operations": 1,
+        "POST /api/general-operations/1a4f202b-0971-4f8b-897d-a733b6f023d2/step": 1,
+        "GET /api/general-operations/1a4f202b-0971-4f8b-897d-a733b6f023d2": 2
+      },
+      "screenshots": [
+        "empty-desktop.png",
+        "clarification-desktop.png",
+        "results-desktop.png",
+        "selection-11-desktop.png",
+        "modal-11-desktop.png",
+        "keyboard-focus-desktop.png",
+        "autofill-render-desktop.png",
+        "expired-desktop.png",
+        "stopped-held-desktop.png",
+        "stopped-held-reconciled-desktop.png",
+        "unknown-desktop.png",
+        "unknown-reconciled-desktop.png",
+        "success-11-desktop.png"
+      ],
+      "nativeTextareaAutofill": "Not applicable/not provided by Chromium; no native autofill claim."
+    },
+    "mobile": {
+      "size": {
+        "width": 390,
+        "height": 844
+      },
+      "states": [
+        "empty",
+        "clarification",
+        "results",
+        "selection-11",
+        "modal-11",
+        "keyboard-focus",
+        "autofill-render",
+        "expired",
+        "stopped-held",
+        "stopped-held-reconciled",
+        "unknown",
+        "unknown-reconciled",
+        "success-11"
+      ],
+      "overflowCheckedAtEveryState": true,
+      "configuration": {
+        "maxQueries": 6,
+        "maxCandidates": 200,
+        "maxAiCalls": 12,
+        "batchSize": 20,
+        "displayLimit": 5,
+        "hideZeroSeeders": true
+      },
+      "assertions": {
+        "all11SelectedAcrossPages": true,
+        "modalManifestItems": 11,
+        "serialOrdinals": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10
+        ],
+        "lostStepPOSTCount": 1,
+        "recheckPOSTCountDelta": 0,
+        "readonlyGETSeen": true,
+        "stoppedStatusTailNotAttemptedVisible": true,
+        "liveUncertainHeldTailVisible": true,
+        "uncertainNoRetry": true,
+        "modalConfirmReachability": {
+          "dialog": {
+            "x": 9,
+            "y": 222.640625,
+            "width": 372,
+            "height": 612.359375,
+            "scrollHeight": 610,
+            "clientHeight": 610
+          },
+          "confirm": {
+            "x": 27,
+            "y": 775,
+            "width": 336,
+            "height": 42,
+            "visible": true,
+            "hitTarget": true
+          }
+        },
+        "reviewActionNotObstructedByNavigation": {
+          "action": {
+            "x": 28,
+            "y": 708.484375,
+            "width": 176.34375,
+            "height": 42,
+            "visible": true,
+            "hitTarget": true
+          },
+          "sidebar": {
+            "left": 0,
+            "right": 390,
+            "top": 0,
+            "bottom": 101
+          },
+          "topbar": {
+            "top": 0,
+            "bottom": 56
+          }
+        },
+        "composerKeyboardSubmit": true,
+        "clarificationDraftCleared": true,
+        "originalTurnPreserved": true,
+        "modalEscapeRestoresFocus": true,
+        "tabAndShiftTabContained": true,
+        "inertBackground": true,
+        "expiredConfirmationDisabled": true,
+        "progressEvents": [
+          "planning",
+          "queries",
+          "searching",
+          "results",
+          "curation",
+          "complete"
+        ],
+        "fiveFollowupsPreservedRootAndDisabledFurtherAction": true,
+        "noConsoleOrPageErrors": true,
+        "forcedAutofillPseudo": "forced via CDP",
+        "forcedAutofillComputed": {
+          "color": "rgb(231, 233, 230)",
+          "background": "rgba(0, 0, 0, 0)",
+          "textFill": "rgb(231, 233, 230)"
+        }
+      },
+      "requestCounts": {
+        "GET /api/settings": 20,
+        "POST /api/search/conversation/stream": 12,
+        "POST /api/search/5a3b7001-eeed-4f33-9b0c-5788df9ac229/operations": 1,
+        "POST /api/general-operations/bcc42df3-0c47-4b7b-9ac5-da6d0d4b6a3a/step": 11,
+        "POST /api/search/dbfb8467-6bbd-4616-9f90-bcfcf6c443e6/operations": 1,
+        "POST /api/general-operations/e6f12088-d473-4ed2-ab59-92d3d010121c/step": 1,
+        "GET /api/general-operations/e6f12088-d473-4ed2-ab59-92d3d010121c": 2,
+        "POST /api/search/0bc14b2b-9800-4257-a01f-f3c78f04c056/operations": 1,
+        "POST /api/general-operations/e4ca2767-0e58-4e21-a6a2-209a86f079fa/step": 1,
+        "GET /api/general-operations/e4ca2767-0e58-4e21-a6a2-209a86f079fa": 2
+      },
+      "screenshots": [
+        "empty-mobile.png",
+        "clarification-mobile.png",
+        "results-mobile.png",
+        "selection-11-mobile.png",
+        "modal-11-mobile.png",
+        "keyboard-focus-mobile.png",
+        "autofill-render-mobile.png",
+        "expired-mobile.png",
+        "stopped-held-mobile.png",
+        "stopped-held-reconciled-mobile.png",
+        "unknown-mobile.png",
+        "unknown-reconciled-mobile.png",
+        "success-11-mobile.png"
+      ],
+      "nativeTextareaAutofill": "Not applicable/not provided by Chromium; no native autofill claim."
+    }
+  },
+  "nativeTextareaAutofill": "Not provided by Chromium for textarea; forced pseudo-state styling checked, not native autofill.",
+  "copyOnlyCorrection": {
+    "previousFullSuiteSourceDigest": "2102ff7e8a5b368568a9455426b62e7a91019bff1a47eeaf195392cf2bb01944",
+    "currentSourceDigest": "99580444b4d94c6232f0758fb17c21d7c52fcee8ec7594e6a77cf3c6192cc6c5",
+    "delta": "Operation heading precedence only; no layout/styles or operation flow changed.",
+    "targetedUnknownBrowserEvidence": "unknown-copy-evidence.json"
+  }
+}

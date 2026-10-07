@@ -3,7 +3,7 @@ import { z } from 'zod';
 import type { LLMClient } from '../clients/llm';
 import type { ProwlarrClient } from '../clients/prowlarr';
 import type { DownloadClient, Release } from '../types/prowlarr';
-import type { GeneralRelease, GeneralSearchResponse, GeneralGrabResponse } from '../types/general-search';
+import type { GeneralRelease, GeneralSearchResponse, GeneralGrabResponse, GeneralSearchOperationCreateRequest, GeneralSearchOperationStatus } from '../types/general-search';
 import type { State } from './state';
 import type { Settings } from '../settings';
 
@@ -24,6 +24,10 @@ const safeText = (value: string, s: Settings, maxLength = 300) => {
     .slice(0, maxLength);
 };
 const sha = (s: string) => createHash('sha256').update(s).digest('hex');
+export const safeReference = (value: string, s: Settings) => {
+  const secrets = [s.integrations.prowlarr.apiKey, s.integrations.sonarr.apiKey, s.integrations.radarr.apiKey, s.ai.apiKey].filter((item) => item.trim()).sort((a,b)=>b.length-a.length);
+  return !!value && !/[a-z][a-z\d+.-]*:\/\/|magnet:\?|(?:api[_ -]?key|token|password|secret)\s*[:=]|[\w.%+-]+:[^/\s@]+@/i.test(value) && !secrets.some((secret) => value.includes(secret));
+};
 type Cached = { public: GeneralRelease; release: Pick<Release, 'guid' | 'indexerId'>; sourceKey: string; legacySourceKey: string };
 
 export class GeneralSearchService {
@@ -70,10 +74,12 @@ export class GeneralSearchService {
     const dest = await this.destination(s).catch(() => ({ client: null as never, error: 'destination-unavailable' }));
     if (this.runtimeFingerprint(this.deps.getSettings()) !== this.runtimeFingerprint(s)) throw Object.assign(new Error('settings-changed'), { code: 'settings-changed' });
     const groups = await Promise.all(cleanQueries.map((q) => this.deps.prowlarr.search({ query: q, categories: [] })));
+    if (this.runtimeFingerprint(this.deps.getSettings()) !== this.runtimeFingerprint(s)) throw Object.assign(new Error('settings-changed'), { code: 'settings-changed' });
     const seen = new Set<string>(); const cached: Cached[] = [];
     for (const r of groups.flat()) {
       const key = `${r.indexerId}:${r.guid}`; if (seen.has(key)) continue; seen.add(key);
-      if (cached.length >= 100) break;
+      if (!safeReference(r.guid, s)) continue;
+      if (cached.length >= (s.generalSearch?.maxCandidates ?? 200)) break;
       const id = randomUUID();
       const compatible = !!dest.client && (dest.client.protocol === r.protocol);
       const sourceKey = this.stableSubmissionKey(s, r.indexerId, r.guid);
@@ -82,56 +88,186 @@ export class GeneralSearchService {
       cached.push({ public: { releaseId: id, title: safeText(r.title, s), indexer: safeText(r.indexer, s), size: r.size, seeders: r.seeders, leechers: r.leechers, age: r.age, protocol: r.protocol, selectable: compatible, unavailableReason: compatible ? null : (dest.error ?? 'protocol-mismatch') }, release: { guid: r.guid, indexerId: r.indexerId }, sourceKey, legacySourceKey });
     }
     const searchId = randomUUID(), token = randomBytes(32).toString('hex'), expiresAt = new Date(this.now().getTime() + 15 * 60_000).toISOString();
+    if (this.runtimeFingerprint(this.deps.getSettings()) !== this.runtimeFingerprint(s)) throw Object.assign(new Error('settings-changed'), { code: 'settings-changed' });
     this.deps.state.pruneGeneralSearchSnapshots(this.now().toISOString());
-    this.deps.state.saveGeneralSearchSnapshot({ id: searchId, tokenDigest: sha(token), expiresAt, fingerprint: this.fingerprint(s), clientName: dest.client?.name ?? s.integrations.prowlarr.generalClient ?? '', clientProtocol: dest.client?.protocol ?? '', clientId: dest.client?.id ?? null, routingDigest: dest.client?.routingDigest ?? '', dryRun: s.safety.dryRun, payload: { releases: cached } });
+    const rawClientName = dest.client?.name ?? s.integrations.prowlarr.generalClient ?? '';
+    this.deps.state.saveGeneralSearchSnapshot({ id: searchId, tokenDigest: sha(token), expiresAt, fingerprint: this.fingerprint(s), clientName: safeText(rawClientName, s), clientNameDigest: sha(rawClientName), clientProtocol: dest.client?.protocol ?? '', clientId: dest.client?.id ?? null, routingDigest: dest.client?.routingDigest ?? '', dryRun: s.safety.dryRun, payload: { releases: cached } });
     const blockedReason = !s.safety.allowOperatorActions ? 'operator-actions-disabled' : dest.error ?? (cached.length > 0 && cached.every(({ public: release }) => !release.selectable) ? 'destination-protocol-mismatch' : null);
     return { status: 'selection-required', query: cleanQuery, queries: cleanQueries, question: 'Which release or releases would you like to download? Select explicitly, then confirm.', searchId, expiresAt, confirmationToken: token, releases: cached.map(({public:p})=>p), destination: dest.client ? { name: safeText(dest.client.name, s), protocol: dest.client.protocol as 'usenet'|'torrent' } : null, dryRun: s.safety.dryRun, actionsAllowed: s.safety.allowOperatorActions, blockedReason };
   }
+
+  /** Freeze an entire selected manifest before any upstream mutation. */
+  async createOperation(searchId: string, raw: unknown): Promise<GeneralSearchOperationStatus> {
+    const body = raw as Partial<GeneralSearchOperationCreateRequest> | null;
+    if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some((key) => !['operationId','confirmationToken','releaseIds','confirmed'].includes(key)) ||
+      typeof body.operationId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.operationId) ||
+      typeof body.confirmationToken !== 'string' || !Array.isArray(body.releaseIds) || body.releaseIds.length < 1 || body.releaseIds.length > 1000 ||
+      !body.releaseIds.every((id) => typeof id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) || new Set(body.releaseIds).size !== body.releaseIds.length || body.confirmed !== true) {
+      throw Object.assign(new Error('invalid-request'), { code: 'invalid-request' });
+    }
+    const requestDigest = sha(JSON.stringify({ searchId, tokenDigest: sha(body.confirmationToken), releaseIds: body.releaseIds }));
+    const existing = this.deps.state.getGeneralSearchOperation(body.operationId);
+    if (existing) {
+      if (existing.requestDigest !== requestDigest) throw Object.assign(new Error('operation-id-conflict'), { code: 'operation-id-conflict' });
+      return existing.status as GeneralSearchOperationStatus;
+    }
+    const maxCandidates = Math.min(1000, this.runtimeSettings().generalSearch?.maxCandidates ?? 200);
+    if (body.releaseIds.length > maxCandidates) throw Object.assign(new Error('invalid-request'), { code: 'invalid-request' });
+    const snapshot = this.deps.state.getGeneralSearchSnapshot(searchId);
+    if (!snapshot || !Number.isFinite(Date.parse(snapshot.expiresAt)) || Date.parse(snapshot.expiresAt) <= this.now().getTime()) throw Object.assign(new Error('search-expired'), { code: 'search-expired' });
+    if (sha(body.confirmationToken) !== snapshot.tokenDigest) throw Object.assign(new Error('invalid-confirmation'), { code: 'invalid-confirmation' });
+    const releases = (snapshot.payload as { releases?: Cached[] } | null)?.releases;
+    if (!Array.isArray(releases)) throw Object.assign(new Error('search-expired'), { code: 'search-expired' });
+    const byId = new Map(releases.map((item) => [item.public.releaseId, item]));
+    const selected = body.releaseIds.map((id) => byId.get(id));
+    // Validate all IDs and selectability before persisting any operation state.
+    if (selected.some((item) => !item || !item.public.selectable)) throw Object.assign(new Error('invalid-release-selection'), { code: 'invalid-release-selection' });
+    const manifest = selected.map((item) => item!);
+    const expiresAtOf = (item: Cached) => {
+      const publicExpiry = (item.public as GeneralRelease & { expiresAt?: string }).expiresAt;
+      const expiry = publicExpiry === undefined ? Date.parse(snapshot.expiresAt) : Date.parse(publicExpiry);
+      if (!Number.isFinite(expiry) || expiry <= this.now().getTime()) throw Object.assign(new Error('search-expired'), { code: 'search-expired' });
+      return expiry;
+    };
+    const itemExpiries = manifest.map(expiresAtOf);
+    if (manifest.some(({ release }) => !safeReference(release.guid, this.runtimeSettings()))) throw Object.assign(new Error('invalid-release-selection'), { code: 'invalid-release-selection' });
+    const current = this.deps.getSettings();
+    if (this.prowlarrFingerprint(current) !== this.prowlarrFingerprint(this.runtimeSettings()) || this.fingerprint(current) !== snapshot.fingerprint || !current.safety.allowOperatorActions) throw Object.assign(new Error(!current.safety.allowOperatorActions ? 'operator-actions-disabled' : 'settings-changed'), { code: !current.safety.allowOperatorActions ? 'operator-actions-disabled' : 'settings-changed' });
+    let destination: { client: DownloadClient; error: string | null };
+    try { destination = await this.destination(this.runtimeSettings()); }
+    catch { destination = { client: null as never, error: 'destination-unavailable' }; }
+    const afterLookup = this.deps.getSettings();
+    if (this.prowlarrFingerprint(afterLookup) !== this.prowlarrFingerprint(this.runtimeSettings()) || this.fingerprint(afterLookup) !== snapshot.fingerprint || !afterLookup.safety.allowOperatorActions) throw Object.assign(new Error(!afterLookup.safety.allowOperatorActions ? 'operator-actions-disabled' : 'settings-changed'), { code: !afterLookup.safety.allowOperatorActions ? 'operator-actions-disabled' : 'settings-changed' });
+    if (body.releaseIds.length > Math.min(1000, afterLookup.generalSearch?.maxCandidates ?? 200)) throw Object.assign(new Error('invalid-request'), { code: 'invalid-request' });
+    if (destination.error || !destination.client || destination.client.id !== snapshot.clientId || destination.client.protocol !== snapshot.clientProtocol || destination.client.routingDigest !== snapshot.routingDigest || sha(destination.client.name) !== snapshot.clientNameDigest) throw Object.assign(new Error('destination-changed'), { code: 'destination-changed' });
+    for (const expiry of itemExpiries) if (!Number.isFinite(expiry) || expiry <= this.now().getTime()) throw Object.assign(new Error('search-expired'), { code: 'search-expired' });
+    const now = this.now().toISOString();
+    const operationExpiry = new Date(Math.min(Date.parse(snapshot.expiresAt), ...itemExpiries)).toISOString();
+    const status: GeneralSearchOperationStatus = {
+      operationId: body.operationId,
+      releases: manifest.map(({ public: item }) => ({ releaseId: item.releaseId, status: 'pending' as const, code: null })),
+      mode: snapshot.dryRun ? 'dry-run' : 'live',
+      destination: { name: safeText(snapshot.clientName, this.runtimeSettings()), protocol: snapshot.clientProtocol as 'usenet' | 'torrent' },
+      expiresAt: operationExpiry,
+      nextOrdinal: 0,
+      stopped: false,
+      complete: false,
+    };
+    const created = this.deps.state.createGeneralSearchOperation({ operationId: body.operationId, searchId, requestDigest, status, privatePayload: { manifest, fingerprint: snapshot.fingerprint, sourceFingerprint: this.prowlarrFingerprint(this.runtimeSettings()), dryRun: snapshot.dryRun, clientId: snapshot.clientId, routingDigest: snapshot.routingDigest, clientNameDigest: snapshot.clientNameDigest }, now });
+    return created.status as GeneralSearchOperationStatus;
+  }
+
+  async operationStatus(operationId: string): Promise<GeneralSearchOperationStatus> {
+    const operation = this.deps.state.getGeneralSearchOperation(operationId);
+    if (!operation) throw Object.assign(new Error('operation-not-found'), { code: 'operation-not-found' });
+    return operation.status as GeneralSearchOperationStatus;
+  }
+
+  /** Execute exactly one frozen manifest entry. The SQLite claim is durable before any await. */
+  async stepOperation(operationId: string, raw: unknown, expectedOrdinal?: number): Promise<GeneralSearchOperationStatus> {
+    const body = raw as { expectedOrdinal?: unknown } | null;
+    if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some((key) => key !== 'expectedOrdinal') || !Number.isSafeInteger(body.expectedOrdinal) || Number(body.expectedOrdinal) < 0 || (expectedOrdinal !== undefined && expectedOrdinal !== body.expectedOrdinal)) throw Object.assign(new Error('invalid-request'), { code: 'invalid-request' });
+    const initial = this.deps.state.getGeneralSearchOperation(operationId);
+    if (!initial) throw Object.assign(new Error('operation-not-found'), { code: 'operation-not-found' });
+    const initialStatus = initial.status as GeneralSearchOperationStatus;
+    const privateData = initial.privatePayload as { manifest: Cached[]; fingerprint: string; sourceFingerprint: string; dryRun: boolean; clientId: number | null; routingDigest: string; clientNameDigest: string };
+    const ordinal = Number(body.expectedOrdinal);
+    const item = privateData.manifest?.[ordinal];
+    if (!item) return initialStatus;
+    const claim = this.deps.state.claimGeneralSearchOperationStep({ operationId, expectedOrdinal: ordinal, now: this.now().toISOString(), releaseId: item.public.releaseId, sourceKey: item.sourceKey, legacySourceKey: item.legacySourceKey, reserveReceipt: !privateData.dryRun });
+    if (!claim) throw Object.assign(new Error('operation-not-found'), { code: 'operation-not-found' });
+    if (!claim.claimed) return claim.status as GeneralSearchOperationStatus;
+
+    const finish = (status: string, code: string | null, stop: boolean, stopCode?: string | null) => this.deps.state.finishGeneralSearchOperationStep({ operationId, releaseId: item.public.releaseId, status, code, now: this.now().toISOString(), stop, stopCode }) as GeneralSearchOperationStatus;
+    const check = (): string | null => {
+      const currentOperation = this.deps.state.getGeneralSearchOperation(operationId);
+      if (!currentOperation) return 'operation-not-found';
+      const currentStatus = currentOperation.status as GeneralSearchOperationStatus;
+      if (currentStatus.stopped) return 'operation-stopped';
+      const now = this.now().getTime();
+      const expiry = Math.min(Date.parse(currentStatus.expiresAt), Date.parse((item.public as GeneralRelease & { expiresAt?: string }).expiresAt ?? currentStatus.expiresAt));
+      if (!Number.isFinite(expiry) || expiry <= now) return 'search-expired';
+      const current = this.deps.getSettings();
+      if (this.prowlarrFingerprint(current) !== privateData.sourceFingerprint || this.prowlarrFingerprint(this.runtimeSettings()) !== privateData.sourceFingerprint) return 'settings-changed';
+      if (!current.safety.allowOperatorActions) return 'operator-actions-disabled';
+      if (current.safety.dryRun !== privateData.dryRun || this.fingerprint(current) !== privateData.fingerprint) return 'settings-changed';
+      return null;
+    };
+    const before = check();
+    if (before) return finish('not-attempted', before, true);
+
+    let destination: { client: DownloadClient; error: string | null };
+    try { destination = await this.destination(this.runtimeSettings()); }
+    catch { return finish('not-attempted', 'destination-unavailable', true); }
+    const afterLookup = check();
+    if (afterLookup) return finish('not-attempted', afterLookup, true);
+    const statusDest = initialStatus.destination;
+    if (destination.error || !destination.client || sha(destination.client.name) !== privateData.clientNameDigest || destination.client.protocol !== statusDest.protocol ||
+      destination.client.id !== privateData.clientId || destination.client.routingDigest !== privateData.routingDigest || sha(destination.client.name) !== privateData.clientNameDigest) return finish('not-attempted', 'destination-changed', true);
+    if (privateData.dryRun) return finish('dry-run', null, false);
+    const immediatelyBeforePost = check();
+    if (immediatelyBeforePost) return finish('not-attempted', immediatelyBeforePost, true);
+
+    let outcome: { status: 'submitted' | 'failed' | 'uncertain'; code: string | null };
+    try {
+      await this.deps.prowlarr.grabGeneral(item.release, destination.client.id);
+    } catch (error) {
+      const api = error as { status?: number };
+      const uncertain = !api || !Number.isInteger(api.status) || api.status === 0 || ((api.status ?? 0) >= 200 && (api.status ?? 0) < 300) || (api.status ?? 0) >= 500;
+      outcome = { status: uncertain ? 'uncertain' : 'failed', code: uncertain ? 'upstream-uncertain' : `upstream-${api.status}` };
+      return finish(outcome.status, outcome.code, true);
+    }
+    // The POST result is authoritative even if configuration changes while it was in flight.
+    const changedAfterPost = check();
+    outcome = { status: 'submitted', code: null };
+    return finish(outcome.status, outcome.code, !!changedAfterPost, changedAfterPost);
+  }
+
+  async stopOperation(operationId: string): Promise<GeneralSearchOperationStatus> {
+    const stopped = this.deps.state.stopGeneralSearchOperation(operationId);
+    if (!stopped) throw Object.assign(new Error('operation-not-found'), { code: 'operation-not-found' });
+    return stopped as GeneralSearchOperationStatus;
+  }
   async grab(searchId: string, raw: unknown): Promise<GeneralGrabResponse> {
     const body = raw as Record<string, unknown> | null;
-    if (!body || Array.isArray(body) || Object.keys(body).some((k)=>!['confirmationToken','releaseIds','confirmed'].includes(k)) || typeof body.confirmationToken !== 'string' || !Array.isArray(body.releaseIds) || body.releaseIds.length < 1 || body.releaseIds.length > 10 || !body.releaseIds.every((x)=>typeof x==='string') || new Set(body.releaseIds).size!==body.releaseIds.length || body.confirmed !== true) throw Object.assign(new Error('invalid-request'), {code:'invalid-request'});
+    const max = Math.min(1000, this.runtimeSettings().generalSearch?.maxCandidates ?? 200);
+    if (!body || Array.isArray(body) || Object.keys(body).some((k)=>!['confirmationToken','releaseIds','confirmed'].includes(k)) || typeof body.confirmationToken !== 'string' || !Array.isArray(body.releaseIds) || body.releaseIds.length < 1 || body.releaseIds.length > max || !body.releaseIds.every((x)=>typeof x==='string') || new Set(body.releaseIds).size!==body.releaseIds.length || body.confirmed !== true) throw Object.assign(new Error('invalid-request'), {code:'invalid-request'});
     const snapshot = this.deps.state.getGeneralSearchSnapshot(searchId);
-    const expiresAt = snapshot ? Date.parse(snapshot.expiresAt) : Number.NaN;
-    if (!snapshot || !Number.isFinite(expiresAt) || expiresAt <= this.now().getTime()) throw Object.assign(new Error('search-expired'), {code:'search-expired'});
+    if (!snapshot || !Number.isFinite(Date.parse(snapshot.expiresAt)) || Date.parse(snapshot.expiresAt) <= this.now().getTime()) throw Object.assign(new Error('search-expired'), {code:'search-expired'});
     if (sha(body.confirmationToken) !== snapshot.tokenDigest) throw Object.assign(new Error('invalid-confirmation'), {code:'invalid-confirmation'});
-    const runtimeSettings = this.runtimeSettings();
     const initialSettings = this.deps.getSettings();
-    if (this.prowlarrFingerprint(initialSettings) !== this.prowlarrFingerprint(runtimeSettings)) throw Object.assign(new Error('settings-changed'), { code: 'settings-changed' });
+    if (this.prowlarrFingerprint(initialSettings) !== this.prowlarrFingerprint(this.runtimeSettings())) throw Object.assign(new Error('settings-changed'), { code: 'settings-changed' });
     this.assertCurrent(snapshot, initialSettings);
-    const dest = await this.destination(runtimeSettings);
-    const s = this.deps.getSettings();
-    if (this.prowlarrFingerprint(s) !== this.prowlarrFingerprint(runtimeSettings)) throw Object.assign(new Error('settings-changed'), { code: 'settings-changed' });
-    this.assertCurrent(snapshot, s);
-    if (dest.error || dest.client.name !== snapshot.clientName || dest.client.protocol !== snapshot.clientProtocol || dest.client.id !== snapshot.clientId || dest.client.routingDigest !== snapshot.routingDigest) throw Object.assign(new Error('destination-changed'), {code:'destination-changed'});
     const cached = (snapshot.payload as { releases?: Cached[] })?.releases;
     if (!Array.isArray(cached)) throw Object.assign(new Error('search-expired'), {code:'search-expired'});
     const byId = new Map(cached.map((c)=>[c.public.releaseId,c]));
-    if (body.releaseIds.some((id)=>!byId.has(id))) throw Object.assign(new Error('invalid-release-selection'), {code:'invalid-release-selection'});
-    const results: GeneralGrabResponse['results'] = [];
-    for (let i=0;i<body.releaseIds.length;i++) {
-      const id = body.releaseIds[i] as string; const item = byId.get(id)!;
-      if (!item.public.selectable) { results.push({releaseId:id,status:'not-attempted',code:'release-unavailable'}); for (const rest of body.releaseIds.slice(i+1) as string[]) results.push({releaseId:rest,status:'not-attempted',code:'previous-selection-unavailable'}); break; }
-      try { this.assertCurrent(snapshot, this.deps.getSettings()); }
-      catch (error) { results.push({releaseId:id,status:'not-attempted',code:this.errorCode(error)}); for (const rest of body.releaseIds.slice(i+1) as string[]) results.push({releaseId:rest,status:'not-attempted',code:this.errorCode(error)}); break; }
-      if (s.safety.dryRun) { results.push({releaseId:id,status:'dry-run',code:null}); continue; }
-      const reserved = this.deps.state.reserveGeneralSearchRelease(searchId,id,this.now().toISOString(),item.sourceKey,item.legacySourceKey);
-      if (!reserved.reserved) {
-        results.push({releaseId:id,status:reserved.status as GeneralGrabResponse['results'][number]['status'],code:reserved.code});
-        if (reserved.status !== 'submitted') { for (const rest of body.releaseIds.slice(i+1) as string[]) results.push({releaseId:rest,status:'not-attempted',code:'previous-submission-failed'}); break; }
-        continue;
-      }
-      try { this.assertCurrent(snapshot, this.deps.getSettings()); }
-      catch (error) {
-        this.deps.state.cancelGeneralSearchReservation(searchId, id, item.sourceKey);
-        const code = this.errorCode(error);
-        results.push({releaseId:id,status:'not-attempted',code});
-        for (const rest of body.releaseIds.slice(i+1) as string[]) results.push({releaseId:rest,status:'not-attempted',code});
-        break;
-      }
-      try { await this.deps.prowlarr.grabGeneral(item.release, dest.client.id); this.deps.state.finishGeneralSearchRelease(searchId,id,'submitted',null,this.now().toISOString()); results.push({releaseId:id,status:'submitted',code:null}); }
-      catch (error) { const api = error as {status?:number}; const uncertain = !api || !Number.isInteger(api.status) || api.status === 0 || ((api.status ?? 0) >= 200 && (api.status ?? 0) < 300) || (api.status ?? 0) >= 500; const status = uncertain ? 'uncertain' : 'failed'; const code = uncertain ? 'upstream-uncertain' : `upstream-${api.status}`; this.deps.state.finishGeneralSearchRelease(searchId,id,status,code,this.now().toISOString()); results.push({releaseId:id,status,code}); for (const rest of body.releaseIds.slice(i+1) as string[]) results.push({releaseId:rest,status:'not-attempted',code:'previous-submission-failed'}); break; }
+    if (body.releaseIds.some((id)=>!byId.has(id) || !byId.get(id)!.public.selectable || !safeReference(byId.get(id)!.release.guid, this.runtimeSettings()))) throw Object.assign(new Error('invalid-release-selection'), {code:'invalid-release-selection'});
+    const ids = body.releaseIds as string[];
+    const beforeLookup = this.deps.getSettings();
+    if (this.prowlarrFingerprint(beforeLookup) !== this.prowlarrFingerprint(this.runtimeSettings())) throw Object.assign(new Error('settings-changed'), { code: 'settings-changed' });
+    this.assertCurrent(snapshot, beforeLookup);
+    const preflightDestination = await this.destination(this.runtimeSettings());
+    const afterLookup = this.deps.getSettings();
+    if (this.prowlarrFingerprint(afterLookup) !== this.prowlarrFingerprint(this.runtimeSettings())) throw Object.assign(new Error('settings-changed'), { code: 'settings-changed' });
+    this.assertCurrent(snapshot, afterLookup);
+    if (preflightDestination.error || !preflightDestination.client || sha(preflightDestination.client.name) !== snapshot.clientNameDigest || preflightDestination.client.protocol !== snapshot.clientProtocol || preflightDestination.client.id !== snapshot.clientId || preflightDestination.client.routingDigest !== snapshot.routingDigest) throw Object.assign(new Error('destination-changed'), { code: 'destination-changed' });
+    const digest = sha(JSON.stringify([searchId, snapshot.tokenDigest, ids]));
+    const chars = digest.slice(0,32).split(''); chars[12]='5'; chars[16]=((parseInt(chars[16]!,16)&3)|8).toString(16);
+    const operationId = `${chars.slice(0,8).join('')}-${chars.slice(8,12).join('')}-${chars.slice(12,16).join('')}-${chars.slice(16,20).join('')}-${chars.slice(20).join('')}`;
+    let status = await this.createOperation(searchId, { operationId, confirmationToken: body.confirmationToken, releaseIds: ids, confirmed: true });
+    while (!status.stopped && !status.complete && status.nextOrdinal < ids.length && !status.releases.some((item) => item.status === 'submitting')) {
+      const ordinal = status.nextOrdinal;
+      const next = await this.stepOperation(operationId, { expectedOrdinal: ordinal });
+      status = next;
+      if (status.nextOrdinal === ordinal || status.releases.some((item) => item.status === 'submitting')) break;
     }
-    return {searchId,dryRun:s.safety.dryRun,results};
+    const noAttemptFatal = status.releases.find((item) => item.status === 'not-attempted' && item.code === 'destination-changed');
+    if (noAttemptFatal && !status.releases.some((item) => item.status === 'submitted' || item.status === 'previously-submitted')) throw Object.assign(new Error(noAttemptFatal.code!), { code: noAttemptFatal.code });
+    return { searchId, dryRun: status.mode === 'dry-run', results: status.releases.map((item) => ({
+      releaseId: item.releaseId,
+      status: (item.status === 'previously-submitted' ? 'submitted' : item.status === 'pending' ? 'not-attempted' : item.status) as GeneralGrabResponse['results'][number]['status'],
+      code: item.code,
+    })) };
   }
   private assertCurrent(snapshot: NonNullable<ReturnType<State['getGeneralSearchSnapshot']>>, settings: Settings): void {
     const expiry = Date.parse(snapshot.expiresAt);
@@ -139,5 +275,4 @@ export class GeneralSearchService {
     if (!settings.safety.allowOperatorActions) throw Object.assign(new Error('operator-actions-disabled'), { code: 'operator-actions-disabled' });
     if (this.fingerprint(settings) !== snapshot.fingerprint || settings.safety.dryRun !== snapshot.dryRun) throw Object.assign(new Error('settings-changed'), { code: 'settings-changed' });
   }
-  private errorCode(error: unknown): string { return error && typeof error === 'object' && 'code' in error && typeof error.code === 'string' ? error.code : 'settings-changed'; }
 }

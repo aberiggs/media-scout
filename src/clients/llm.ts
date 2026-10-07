@@ -17,6 +17,7 @@ export interface LLMClient {
     label: string;
     /** Explicit provider-compatible JSON Schema for refinements/nullable wire fields. */
     jsonSchema?: { name: string; schema: Record<string, unknown> };
+    onAttempt?: (attempt: { logicalAttempt: number; transportAttempt: number }) => void;
   }): Promise<T>;
 }
 
@@ -79,6 +80,7 @@ export class OpenRouterLLM implements LLMClient {
     schema: z.ZodType<T>;
     label: string;
     jsonSchema?: { name: string; schema: Record<string, unknown> };
+    onAttempt?: (attempt: { logicalAttempt: number; transportAttempt: number }) => void;
   }): Promise<T> {
     const controller = new AbortController();
     const timeoutMs = this.deps.timeoutMs ?? JSON_DEADLINE_MS;
@@ -101,6 +103,8 @@ export class OpenRouterLLM implements LLMClient {
           args.jsonSchema,
           attempt > 0,
           controller.signal,
+          args.onAttempt,
+          attempt,
         );
         try {
           const parsed = JSON.parse(stripFences(content)) as unknown;
@@ -132,6 +136,8 @@ export class OpenRouterLLM implements LLMClient {
     jsonSchema: { name: string; schema: Record<string, unknown> } | undefined,
     correcting: boolean,
     signal: AbortSignal,
+    onAttempt: ((attempt: { logicalAttempt: number; transportAttempt: number }) => void) | undefined,
+    logicalAttempt: number,
   ): Promise<string> {
     const generatedSchema = jsonSchema?.schema ?? withoutMetaSchema(z.toJSONSchema(schema));
     let completion: Awaited<ReturnType<OpenRouter['chat']['send']>>;
@@ -157,7 +163,7 @@ export class OpenRouterLLM implements LLMClient {
           },
         },
         provider: { requireParameters: true },
-      }, signal);
+      }, signal, onAttempt, logicalAttempt);
     } catch (error) {
       throw normalizeOpenRouterError(error);
     }
@@ -179,12 +185,15 @@ export class OpenRouterLLM implements LLMClient {
   private async sendWithRetry(
     chatRequest: Parameters<OpenRouter['chat']['send']>[0]['chatRequest'],
     signal: AbortSignal,
+    onAttempt: ((attempt: { logicalAttempt: number; transportAttempt: number }) => void) | undefined,
+    logicalAttempt: number,
   ): Promise<Awaited<ReturnType<OpenRouter['chat']['send']>>> {
     const startedAt = Date.now();
     let retryIndex = 0;
     for (;;) {
       if (signal.aborted) throw signal.reason;
       try {
+        onAttempt?.({ logicalAttempt, transportAttempt: retryIndex });
         // The SDK's backoff sleeps cannot be aborted. Keep its configured retry
         // behavior for recognized HTTP errors here so the JSON deadline also bounds waits.
         return await this.deps.client.chat.send({ chatRequest }, {

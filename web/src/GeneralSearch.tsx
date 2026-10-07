@@ -1,119 +1,182 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
-import { AlertCircle, ArrowRight, Check, Clock3, LoaderCircle, Search, ShieldCheck, Sparkles } from 'lucide-react'
-import type { GeneralGrabResponse, GeneralSearchResponse } from '../../src/types/general-search'
+import { createPortal } from 'react-dom'
+import { AlertCircle, ArrowRight, Check, Clock3, LoaderCircle, Search, ShieldCheck, Sparkles, X } from 'lucide-react'
+import type { GeneralConversationRelease, GeneralSearchBudgets, GeneralSearchConversationRequest, GeneralSearchConversationResponse, GeneralSearchOperationStatus, GeneralSearchProgressEvent, GeneralSearchTurn } from '../../src/types/general-search'
 
-const grabStatuses = new Set(['submitted', 'dry-run', 'submitting', 'failed', 'uncertain', 'not-attempted'])
+const defaults: GeneralSearchBudgets = { queryCount: 6, candidateCap: 200, aiCalls: 12, batchSize: 20, displayLimit: 40, hideZeroSeeders: true }
+const labels: Record<string, string> = { planning: 'Understanding your request', queries: 'Search terms ready', searching: 'Searching indexers', results: 'Results received', curation: 'Reviewing relevance', complete: 'Search complete', error: 'Search stopped' }
 
-function isGrabResponse(value: unknown, expected: { searchId: string; dryRun: boolean; releaseIds: string[] }): value is GeneralGrabResponse {
+function eventValue(value: unknown): value is GeneralSearchProgressEvent { return Boolean(value && typeof value === 'object' && 'type' in value) }
+const releaseStatuses = new Set(['pending','submitting','submitted','previously-submitted','dry-run','failed','uncertain','not-attempted'])
+function isStatus(value: unknown, expected: { id: string; manifest: string[]; mode: 'live'|'dry-run'; destination: { name: string; protocol: 'usenet'|'torrent' } }): value is GeneralSearchOperationStatus {
   if (!value || typeof value !== 'object') return false
-  const candidate = value as Partial<GeneralGrabResponse>
-  if (candidate.searchId !== expected.searchId || candidate.dryRun !== expected.dryRun || !Array.isArray(candidate.results)) return false
-  const returned = new Set<string>()
-  for (const item of candidate.results) {
-    if (!item || typeof item !== 'object') return false
-    const result = item as GeneralGrabResponse['results'][number]
-    if (typeof result.releaseId !== 'string' || !expected.releaseIds.includes(result.releaseId) || returned.has(result.releaseId)) return false
-    if (typeof result.status !== 'string' || !grabStatuses.has(result.status) || !(result.code === null || typeof result.code === 'string')) return false
-    returned.add(result.releaseId)
-  }
-  return returned.size === expected.releaseIds.length && expected.releaseIds.every(id => returned.has(id))
+  const x = value as Partial<GeneralSearchOperationStatus>
+  if (x.operationId !== expected.id || !Array.isArray(x.releases) || x.releases.length !== expected.manifest.length || x.mode !== expected.mode || !x.destination || x.destination.name !== expected.destination.name || x.destination.protocol !== expected.destination.protocol || typeof x.expiresAt !== 'string' || !Number.isFinite(Date.parse(x.expiresAt)) || !Number.isSafeInteger(x.nextOrdinal) || (x.nextOrdinal as number) < 0 || (x.nextOrdinal as number) > expected.manifest.length || typeof x.stopped !== 'boolean' || typeof x.complete !== 'boolean') return false
+  if (x.releases.some((r,i) => !r || r.releaseId !== expected.manifest[i] || !releaseStatuses.has(r.status as string) || !(r.code === null || typeof r.code === 'string'))) return false
+   const ordinal = x.nextOrdinal as number
+   const stopped = x.stopped
+   if (!x.releases.every((r,i) => {
+     if (i < ordinal) {
+       if (r.status === 'submitting') return i === ordinal - 1 && !stopped && !x.complete
+       return ['submitted','previously-submitted','dry-run','failed','uncertain','not-attempted'].includes(r.status)
+     }
+     return stopped ? r.status === 'not-attempted' : r.status === 'pending'
+   })) return false
+  if (x.releases.some(r => r.status === 'uncertain') && ordinal < expected.manifest.length && !x.stopped && !x.complete) return false
+  return true
 }
+function uuid() { return globalThis.crypto?.randomUUID?.() ?? `web-${Date.now()}-${Math.random().toString(36).slice(2)}` }
 
 export function GeneralSearchPage() {
-  const [query, setQuery] = useState('')
-  const [result, setResult] = useState<GeneralSearchResponse | null>(null)
+  const [draft, setDraft] = useState('')
+  const [original, setOriginal] = useState('')
+  const [turns, setTurns] = useState<readonly GeneralSearchTurn[]>([])
+  const [result, setResult] = useState<GeneralSearchConversationResponse | null>(null)
   const [selected, setSelected] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const [review, setReview] = useState(false)
-  const [outcomes, setOutcomes] = useState<GeneralGrabResponse | null>(null)
-  const [unknownSubmission, setUnknownSubmission] = useState<string[]>([])
-  const sequence = useRef(0)
-  const controller = useRef<AbortController | null>(null)
-  const opener = useRef<HTMLElement | null>(null)
-  const dialog = useRef<HTMLElement | null>(null)
-  const confirmButton = useRef<HTMLButtonElement | null>(null)
+  const [events, setEvents] = useState<GeneralSearchProgressEvent[]>([])
+  const [operation, setOperation] = useState<GeneralSearchOperationStatus | null>(null)
+  const [operationId, setOperationId] = useState('')
+  const [operationUnknownId, setOperationUnknownId] = useState('')
+  const [page, setPage] = useState(0)
+  const [frozenSelection, setFrozenSelection] = useState<string[]>([])
+  const [budget, setBudget] = useState<GeneralSearchBudgets>(defaults)
+  const [budgetCeilings, setBudgetCeilings] = useState({ queryCount: 20, candidateCap: 1000, aiCalls: 100, batchSize: 100, displayLimit: 1000 })
   const [now, setNow] = useState(Date.now())
+  const sequence = useRef(0), controller = useRef<AbortController | null>(null)
+  const stopRequested = useRef(new Set<string>())
+  const manifestRef = useRef<string[]>([])
+  const unknownContext = useRef<{ id: string; manifest: string[]; mode: 'live'|'dry-run'; destination: { name: string; protocol: 'usenet'|'torrent' } } | null>(null)
+  const opener = useRef<HTMLElement | null>(null), dialog = useRef<HTMLElement | null>(null), focusTarget = useRef<HTMLButtonElement | null>(null)
+  const [dialogOpen, setDialogOpen] = useState(false)
+  const releases = result?.releases ?? []
+  const pages = Math.max(1, Math.ceil(releases.length / Math.max(1, budget.displayLimit)))
+  const visible = releases.slice(page * Math.max(1,budget.displayLimit), (page + 1) * Math.max(1,budget.displayLimit))
+  const continuationCount = Math.max(0, turns.filter(t => t.role === 'user').length - 1)
+  const continuationLocked = continuationCount >= 5 || busy || dialogOpen || Boolean(operation || operationUnknownId)
+  const expired = Boolean(result?.expiresAt && Date.parse(result.expiresAt) <= now)
+  const selectedExpired = selected.some(id => { const release=result?.releases.find(r=>r.releaseId===id); return Boolean(release && Date.parse(release.expiresAt)<=now) })
+  const blocked = Boolean(!result?.searchId || !result.confirmationToken || !result.actionsAllowed || !result.destination || expired || selectedExpired)
   useEffect(() => () => { sequence.current++; controller.current?.abort() }, [])
   useEffect(() => {
-    if (!result?.expiresAt) return
-    const expiresAt = Date.parse(result.expiresAt)
-    if (!Number.isFinite(expiresAt) || expiresAt <= now) return
-    const timer = window.setTimeout(() => setNow(Date.now()), Math.min(2_147_000_000, expiresAt - Date.now()))
-    return () => window.clearTimeout(timer)
-  }, [result?.expiresAt, now])
+    let active = true
+    void fetch('/api/settings').then(r => r.ok ? r.json() : null).then((payload: unknown) => {
+      if (!active || !payload || typeof payload !== 'object') return
+      const raw = (payload as { settings?: { generalSearch?: Record<string, unknown> } }).settings?.generalSearch
+      if (!raw) return
+      const ceiling = (key: string, fallback: number, hardMax: number) => typeof raw[key] === 'number' && Number.isFinite(raw[key]) ? Math.max(1, Math.min(hardMax, Math.floor(raw[key] as number))) : fallback
+      const next = { queryCount: ceiling('maxQueries', 6, 20), candidateCap: ceiling('maxCandidates', 200, 1000), aiCalls: ceiling('maxAiCalls', 12, 100), batchSize: ceiling('batchSize', 20, 100), displayLimit: ceiling('displayLimit', 40, 1000) }
+      setBudgetCeilings(next)
+      setBudget(current => ({ ...current, queryCount: Math.min(current.queryCount,next.queryCount), candidateCap: Math.min(current.candidateCap,next.candidateCap), aiCalls: Math.min(current.aiCalls,next.aiCalls), batchSize: Math.min(current.batchSize,next.batchSize), displayLimit: Math.min(current.displayLimit,next.displayLimit), hideZeroSeeders: typeof raw.hideZeroSeeders === 'boolean' ? raw.hideZeroSeeders : current.hideZeroSeeders }))
+    }).catch(() => {})
+    return () => { active = false }
+  }, [])
+  useEffect(() => { if (!result?.expiresAt) return; const t = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(t) }, [result?.expiresAt])
   useEffect(() => {
-    if (!review) return
-    confirmButton.current?.focus()
-    return () => { opener.current?.focus() }
-  }, [review])
-  const search = async (event: FormEvent) => {
-    event.preventDefault()
-    const clean = query.trim()
-    if (!clean || busy) return
-    const id = ++sequence.current
-    controller.current?.abort()
-    const aborter = new AbortController(); controller.current = aborter
-    setBusy(true); setError(''); setResult(null); setSelected([]); setReview(false); setOutcomes(null); setUnknownSubmission([])
+    if (!dialogOpen) return
+    focusTarget.current?.focus()
+    const background = Array.from(document.querySelectorAll<HTMLElement>('.sidebar, .topbar, #search, .page-footer'))
+    const prior = background.map(node => node.hasAttribute('inert'))
+    background.forEach(node => node.setAttribute('inert', ''))
+    return () => { background.forEach((node,i) => { if (!prior[i]) node.removeAttribute('inert') }); opener.current?.focus() }
+  }, [dialogOpen])
+
+  async function search(action: GeneralSearchConversationRequest['action'], text?: string) {
+    if (busy || (action !== 'search' && !result)) return
+    const clean = (text ?? draft).trim()
+    if (action === 'search' && !clean) return
+    if (action !== 'search' && continuationCount >= 5) return
+    const actionCopy: Record<string,string> = { 'find-more':'Find more results', 'more-like-these':'Find releases like my selected examples', 'other-terms':'Try different search terms' }
+    const turnText = action === 'search' || action === 'follow-up' ? clean : actionCopy[action]
+    const userTurn: GeneralSearchTurn = { role: 'user', content: turnText }
+    const nextTurns = action === 'search' ? [userTurn] : [...turns, userTurn]
+    const root = action === 'search' ? clean : original
+    const req: GeneralSearchConversationRequest = { originalQuery: root, turns: nextTurns, action, budgets: budget, ...(result?.searchId ? { previousSearchId: result.searchId, confirmationToken: result.confirmationToken ?? undefined } : {}), ...(action === 'more-like-these' ? { selectedInspirationIds: selected } : {}) }
+    const id = ++sequence.current, aborter = new AbortController(); controller.current?.abort(); controller.current = aborter
+    setBusy(true); setError(''); setEvents([]); setSelected([]); setDraft(''); setPage(0)
+    if (action === 'search') { setOriginal(clean); setTurns(nextTurns); setResult(null); setOperation(null); setOperationId(''); setOperationUnknownId('') }
+    else setTurns(nextTurns)
     try {
-      const response = await fetch('/api/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ query: clean }), signal: aborter.signal })
-      const body = await response.json()
-      if (!response.ok) throw new Error(body.error || 'Search could not be completed.')
-      if (sequence.current === id) { setNow(Date.now()); setResult(body as GeneralSearchResponse) }
+      const response = await fetch('/api/search/conversation/stream', { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' }, body: JSON.stringify(req), signal: aborter.signal })
+      if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.error || 'Search could not be completed.') }
+      if (response.body && response.headers.get('content-type')?.includes('ndjson')) {
+        const reader = response.body.getReader(), decoder = new TextDecoder(); let buffer = '', final: GeneralSearchConversationResponse | null = null
+        while (true) { const { value, done } = await reader.read(); buffer += decoder.decode(value, { stream: !done }); const lines = buffer.split('\n'); buffer = lines.pop() ?? ''
+          for (const line of lines) { if (!line.trim()) continue; const event: unknown = JSON.parse(line); if (!eventValue(event)) continue; if (sequence.current !== id) return; setEvents(current => [...current, event]); if (event.type === 'complete') final = event.response; if (event.type === 'error') throw new Error(event.message) }
+          if (done) break
+        }
+        if (buffer.trim()) { const ev: unknown = JSON.parse(buffer); if (eventValue(ev) && ev.type === 'complete') final = ev.response }
+        if (!final) throw new Error('The search ended without a complete result.')
+        if (sequence.current === id) { setResult(final); setPage(0); setTurns(current => [...current, { role: 'assistant', content: final!.status === 'clarification-needed' ? final!.question : `Found ${final!.releases.length} candidates. Review relevance and availability before selecting.` }]) }
+      } else {
+        const body = await response.json() as GeneralSearchConversationResponse
+        if (sequence.current === id) { setResult(body); setPage(0); setTurns(current => [...current, { role: 'assistant', content: body.status === 'clarification-needed' ? body.question : `Found ${body.releases.length} candidates. Review relevance and availability before selecting.` }]) }
+      }
     } catch (e) { if (sequence.current === id && !aborter.signal.aborted) setError(e instanceof Error ? e.message : 'Search could not be completed.') }
     finally { if (sequence.current === id) setBusy(false) }
   }
-  const submit = async () => {
-    if (!result?.searchId || !result.confirmationToken || !result.actionsAllowed || !selected.length || busy) return
-    const id = ++sequence.current
-    const submittedIds = [...selected]
-    setBusy(true); setError('')
-    try {
-      const response = await fetch(`/api/search/${encodeURIComponent(result.searchId)}/grab`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirmationToken: result.confirmationToken, releaseIds: selected, confirmed: true }) })
-      const body: unknown = await response.json()
-      if (!response.ok) throw new Error(body && typeof body === 'object' && 'error' in body && typeof body.error === 'string' ? body.error : 'Selected releases could not be submitted.')
-      if (!isGrabResponse(body, { searchId: result.searchId, dryRun: result.dryRun, releaseIds: submittedIds })) throw new Error('The submission response was incomplete or did not match this selection.')
-      if (sequence.current === id) { setOutcomes(body); setReview(false) }
-    } catch {
-      if (sequence.current === id) {
-        setUnknownSubmission(submittedIds)
-        setReview(false)
-        setError('We couldn’t confirm whether these releases reached the download client. Check the client before taking any further action; this screen will not retry them.')
-      }
-    }
-    finally { if (sequence.current === id) setBusy(false) }
+
+  function submitComposer(event: FormEvent) { event.preventDefault(); void search(!result ? 'search' : 'follow-up') }
+  function newConversation() { sequence.current++; controller.current?.abort(); setBusy(false); setDraft(''); setOriginal(''); setTurns([]); setResult(null); setSelected([]); setEvents([]); setOperation(null); setOperationId(''); setOperationUnknownId(''); setError(''); setPage(0); setFrozenSelection([]); unknownContext.current=null }
+  function toggle(id: string) { setSelected(items => items.includes(id) ? items.filter(x => x !== id) : items.length < (budget.candidateCap || 200) ? [...items, id] : items) }
+  async function reconcile(id = operationId, manifest = manifestRef.current, mode: 'live'|'dry-run' = result?.dryRun ? 'dry-run':'live', destination: { name: string; protocol: 'usenet'|'torrent' } | null = result?.destination ?? null) {
+    if (!id || !destination) return
+    try { const r = await fetch(`/api/general-operations/${encodeURIComponent(id)}`); const body: unknown = await r.json(); if (!r.ok || !isStatus(body,{id,manifest,mode,destination})) throw new Error('Operation status is unavailable or does not match the frozen selection. Do not resubmit.'); setOperationId(id); setOperationUnknownId(''); setOperation(body) }
+    catch (e) { if (id === operationId || id === operationUnknownId) setError(e instanceof Error ? e.message : 'Status could not be checked.') }
   }
-  const toggle = (id: string) => setSelected(current => current.includes(id) ? current.filter(x => x !== id) : current.length < 10 ? [...current, id] : current)
-  const expired = Boolean(result?.expiresAt && Date.parse(result.expiresAt) <= now)
-  const blocked = result && (!result.actionsAllowed || !result.destination || !result.confirmationToken || !result.searchId || expired || unknownSubmission.length > 0)
+  async function submitOperation() {
+    if (!result?.searchId || !result.confirmationToken || !selected.length || blocked || busy) return
+    const approvedDestination = result.destination
+    if (!approvedDestination) return
+    const frozen = [...frozenSelection], opId = uuid(), opSequence = ++sequence.current, approvedMode = result.dryRun ? 'dry-run' : 'live'; manifestRef.current = frozen; unknownContext.current = { id: opId, manifest: frozen, mode: approvedMode, destination: approvedDestination }; setOperationId(opId); setOperationUnknownId(opId); setBusy(true); setError('')
+    const base = `/api/search/${encodeURIComponent(result.searchId)}/operations`
+    try {
+      const create = await fetch(base, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ operationId: opId, confirmationToken: result.confirmationToken, releaseIds: frozen, confirmed: true }) })
+      const created: unknown = await create.json(); if (sequence.current !== opSequence) return
+      if (!create.ok || !isStatus(created,{id:opId,manifest:frozen,mode:approvedMode,destination:approvedDestination})) throw new Error('Could not verify the frozen operation manifest. Check status; do not create another operation.')
+      setOperationUnknownId('')
+      setOperation(created)
+      let state = created
+      while (!state.complete && !state.stopped && state.nextOrdinal < frozen.length) {
+        if (sequence.current !== opSequence || stopRequested.current.has(opId)) return
+        const currentOrdinal = state.nextOrdinal
+        try {
+          const step = await fetch(`/api/general-operations/${encodeURIComponent(opId)}/step`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expectedOrdinal: currentOrdinal }) })
+          const body: unknown = await step.json(); if (sequence.current !== opSequence) return
+          if (!step.ok || !isStatus(body,{id:opId,manifest:frozen,mode:approvedMode,destination:approvedDestination}) || body.nextOrdinal <= currentOrdinal || body.nextOrdinal > currentOrdinal + 1) throw new Error('Step response did not match the next frozen ordinal.')
+          state = body; setOperation(body)
+          if (body.releases.some(r=>r.status==='uncertain'||r.status==='submitting') || stopRequested.current.has(opId)) break
+        } catch { if (sequence.current !== opSequence) return; setOperationUnknownId(opId); await reconcile(opId,frozen,approvedMode,approvedDestination); break }
+      }
+      setDialogOpen(false)
+    } catch (e) { if (sequence.current !== opSequence) return; await reconcile(opId,frozen,approvedMode,approvedDestination); setDialogOpen(false); setError(e instanceof Error ? e.message : 'Operation status is unknown. Check status; do not retry.') }
+    finally { if (sequence.current === opSequence) setBusy(false) }
+  }
+  async function stopOperation() { const c=unknownContext.current;if (!c) return; const seq=sequence.current;stopRequested.current.add(c.id); try { const r = await fetch(`/api/general-operations/${encodeURIComponent(c.id)}/stop`, { method: 'POST' }); const body = await r.json(); if(sequence.current!==seq)return;if (!r.ok||!isStatus(body.operation,c)) throw new Error(); setOperation(body.operation) } catch { if(sequence.current===seq)setError('Could not confirm the stop request. Check operation status.') } }
+
   return <div className="general-search">
-    <div className="page-heading"><div><div className="eyebrow"><span className="eyebrow-mark"/> OPEN-ENDED DISCOVERY</div><h1>General search<span className="heading-period">.</span></h1><p className="page-intro">Describe what you’re looking for. You choose what, if anything, gets sent to a download client.</p></div><div className="heading-stamp"><Sparkles size={15}/><span>YOU STAY IN CONTROL</span></div></div>
-    <form className="general-search-form" onSubmit={search}><label htmlFor="general-query">What would you like to find?</label><div className="general-query-wrap"><Search size={19}/><input id="general-query" value={query} maxLength={500} disabled={busy || review} onChange={e => setQuery(e.target.value)} placeholder="A thoughtful documentary about deep-sea exploration…"/><button className="button button-primary" disabled={busy || review || !query.trim()}>{busy ? <LoaderCircle className="spin" size={16}/> : <ArrowRight size={16}/>}<span>{busy ? 'Working…' : 'Search'}</span></button></div><span className="field-hint">Use your own words. No download is started by searching or selecting.</span></form>
+    <div className="page-heading"><div><div className="eyebrow"><span className="eyebrow-mark"/> OPEN-ENDED DISCOVERY</div><h1>General search<span className="heading-period">.</span></h1><p className="page-intro">Explore in your own words. Nothing is sent to a download client without your review.</p></div><div className="heading-stamp"><Sparkles size={15}/><span>YOU STAY IN CONTROL</span></div></div>
+    {!original && <section className="conversation-empty"><span className="conversation-orbit"><Search size={21}/></span><p className="eyebrow">A GOOD PLACE TO START</p><h2>What are you in the mood to find?</h2><p>Describe a genre, subject, era, or feeling. You can refine the search together.</p></section>}
+    {turns.length > 0 && <><section className="conversation-thread" aria-label="Search conversation">{turns.map((turn, index) => <article className={`chat-turn ${turn.role}`} key={`${index}-${turn.content}`}><span className="turn-label">{turn.role === 'user' ? 'YOU' : 'MEDIA SCOUT'}</span><p>{turn.content}</p></article>)}</section><button type="button" className="text-button new-conversation" disabled={busy||dialogOpen} onClick={newConversation}>Start a new conversation</button></>}
+    {events.length > 0 && <section className="search-activity" aria-live="polite" aria-label="Search activity"><div className="activity-title"><span className={busy ? 'activity-pulse' : 'activity-done'} />{busy ? 'Working on your search' : 'Search activity'}</div><ol>{events.map((event, i) => <li key={`${event.sequence}-${i}`} className={event.type}>{labels[event.type]}{event.type === 'queries' && event.queries.length > 0 && <span>{event.queries.join(' · ')}</span>}{event.type === 'searching' && <span>{event.query} · {event.index} of {event.total}</span>}{event.type === 'curation' && <span>{event.processed} of {event.total} reviewed</span>}</li>)}</ol></section>}
+    <form className="general-search-form" onSubmit={submitComposer}><label htmlFor="general-query">{!result ? 'Describe what you’re looking for' : result.status === 'clarification-needed' ? 'Your answer' : 'Add a detail or direction'}</label><div className="general-query-wrap"><Search size={19}/><textarea id="general-query" autoComplete="on" value={draft} maxLength={500} disabled={busy||dialogOpen||continuationLocked} onChange={e => setDraft(e.target.value)} placeholder={original ? 'Add a detail, or what you’d like to explore next…' : 'A thoughtful documentary about deep-sea exploration…'} rows={2}/><button className="button button-primary" disabled={busy||dialogOpen||continuationLocked||!draft.trim()}>{busy ? <LoaderCircle className="spin" size={16}/> : <ArrowRight size={16}/>}<span>{busy ? 'Searching…' : !result ? original ? 'Start a fresh search' : 'Search' : 'Continue'}</span></button></div><span className="field-hint">Searches and selections never send a download. Conversations stay in this page.</span></form>
+     <details className="search-preferences"><summary>Search controls <span>Budgets & availability</span></summary><div className="budget-grid">{([['queryCount','Queries'],['candidateCap','Candidate cap'],['aiCalls','AI calls'],['batchSize','Prompt batch'],['displayLimit','Visible per page']] as const).map(([key,label])=><label key={key}>{label}<input disabled={busy||dialogOpen} type="number" min="1" max={budgetCeilings[key]} value={budget[key]} onChange={e=>setBudget(b=>({...b,[key]:Math.min(budgetCeilings[key],Math.max(1,Number(e.target.value)||1))}))}/></label>)}<label className="zero-toggle"><input disabled={busy||dialogOpen} type="checkbox" checked={!budget.hideZeroSeeders} onChange={e=>setBudget(b=>({...b,hideZeroSeeders:!e.target.checked}))}/> Include torrents with zero seeders</label></div></details>
     {error && <div className="notice notice-error" role="alert"><AlertCircle size={17}/><p>{error}</p></div>}
-    {busy && !result && <div className="loading-view" role="status"><LoaderCircle className="spin" size={21}/><span>Searching indexers…</span></div>}
-    {result && <section className="general-results" aria-live="polite">
-      <div className="general-query-summary"><span className="eyebrow">SEARCHING FOR</span><h2>{result.query}</h2>{result.queries.length > 0 && <p>Search terms: {result.queries.join(' · ')}</p>}</div>
-      {result.status === 'clarification-needed' && <form className="clarification-card" onSubmit={search}><Sparkles size={18}/><div><h2>A quick question</h2><p>{result.question}</p><label htmlFor="refined-query">Refine your search</label><textarea id="refined-query" rows={2} value={query} disabled={busy || review} onChange={e => setQuery(e.target.value)} maxLength={500}/><button className="button button-primary" disabled={busy || review || !query.trim()}>Search with this detail <ArrowRight size={15}/></button></div></form>}
-      {result.status === 'selection-required' && <>
-        <div className="search-destination"><span><ShieldCheck size={16}/> Destination</span><strong>{result.destination ? `${result.destination.name} · ${result.destination.protocol}` : 'Not configured'}</strong><b className={result.dryRun ? 'dry' : 'live'}>{result.dryRun ? 'DRY RUN · no download sent' : 'LIVE · explicit confirmation required'}</b></div>
-        {blocked && <div className="blocked-note" role="status"><AlertCircle size={17}/><span>{unknownSubmission.length ? 'Submission status is unknown. Check your download client before taking further action; a fresh search will not show whether these releases were received.' : expired ? 'These results have expired. Search again to get a fresh selection.' : result.blockedReason || (!result.destination ? 'Configure a general download client in Settings before submitting a release.' : !result.actionsAllowed ? 'Enable Allow operator actions in Settings before submitting a release.' : 'This selection cannot be submitted. Search again for a fresh selection.')} Search results remain available to review.</span></div>}
-        {result.releases.length === 0 ? <div className="empty-search"><Search size={22}/><h2>No matching releases</h2><p>Try a broader description or different wording.</p></div> : <>
-          <div className="results-heading"><div><h2>Releases to review</h2><p>Nothing is selected yet. Choose up to 10 releases.</p></div><span>{selected.length} / 10 selected</span></div>
-          <div className="release-list">{result.releases.map(release => <label className={`release-row ${!release.selectable ? 'unavailable' : ''}`} key={release.releaseId}><input type="checkbox" aria-label={`Select ${release.title}`} checked={selected.includes(release.releaseId)} disabled={busy || review || !release.selectable || (selected.length >= 10 && !selected.includes(release.releaseId)) || Boolean(outcomes) || unknownSubmission.length > 0} onChange={() => toggle(release.releaseId)}/><span className="release-copy"><strong>{release.title}</strong><span>{release.indexer} · {release.protocol} · {release.size === null ? 'Size unknown' : `${(release.size / 1024 ** 3).toFixed(1)} GB`}{release.protocol === 'torrent' && release.seeders !== null ? ` · ${release.seeders} seeders` : ''}</span>{release.unavailableReason && <em>{release.unavailableReason}</em>}</span><span className="release-age"><Clock3 size={13}/>{release.age}d</span></label>)}</div>
-          {!outcomes && !unknownSubmission.length && <button className="button button-primary review-button" disabled={busy || !selected.length || Boolean(blocked)} onClick={e => { opener.current = e.currentTarget; setReview(true) }}>Review {selected.length || 'selected'} release{selected.length === 1 ? '' : 's'} <ArrowRight size={16}/></button>}
-        </>}
-      </>}
-      {outcomes && <div className="outcome-card"><h2>Submission results</h2><p>{outcomes.dryRun ? 'Dry run: no downloads were sent.' : 'A submitted status means sent to the client, not finished downloading.'}</p>{outcomes.results.map(outcome => { const release = result.releases.find(item => item.releaseId === outcome.releaseId); const labels: Record<typeof outcome.status, string> = { submitted: 'Submitted · not completed', 'dry-run': 'Dry run · not sent', submitting: 'Submitting', failed: 'Failed', uncertain: 'Uncertain · not retried', 'not-attempted': 'Not attempted' }; const explanations: Record<string, string> = { 'client-unavailable': 'Download client was unavailable', 'client-rejected': 'Download client did not accept this release', 'request-timeout': 'The request timed out; whether it was received is unknown', 'upstream-error': 'The download service reported an error', 'configuration-missing': 'A required download setting is missing', 'operator-actions-disabled': 'Operator actions are disabled in Settings', 'search-expired': 'The search selection expired before submission' }; return <div className="outcome-row" key={outcome.releaseId}><strong>{release?.title || 'Selected release'}</strong><span className={`outcome-${outcome.status}`}>{labels[outcome.status]}</span>{outcome.code && <small>{explanations[outcome.code] || 'More detail is available in the application logs.'}</small>}</div> })}</div>}
-      {unknownSubmission.length > 0 && <div className="outcome-card" role="status"><h2>Submission status unknown</h2><p>Media Scout did not receive a clear result. Check your download client before taking any further action. These releases will not be retried from this screen.</p>{unknownSubmission.map(id => <div className="outcome-row" key={id}><strong>{result.releases.find(release => release.releaseId === id)?.title || 'Selected release'}</strong><span className="outcome-uncertain">Unknown · check client</span></div>)}</div>}
+    {result && result.status === 'clarification-needed' && <section className="clarification-card"><Sparkles size={18}/><div><h2>A quick question</h2><p>{result.question}</p></div></section>}
+    {result?.status === 'selection-required' && <section className="general-results" aria-live="polite"><div className="general-query-summary"><span className="eyebrow">CANDIDATES FOR</span><h2>{original}</h2>{result.queries.length>0&&<p>Search terms: {result.queries.join(' · ')}</p>}</div>
+      <div className="search-destination"><span><ShieldCheck size={16}/> Destination</span><strong>{result.destination ? `${result.destination.name} · ${result.destination.protocol}` : 'Not configured'}</strong><b className={result.dryRun?'dry':'live'}>{result.dryRun?'DRY RUN · no download sent':'LIVE · explicit confirmation required'}</b></div>
+      {expired&&<div className="blocked-note" role="status"><Clock3 size={16}/>This result set has expired. You can explore again, but it cannot be submitted.</div>}
+      <div className="results-heading"><div><h2>Releases to review</h2><p>Match quality is a suggestion, not a guarantee. Choose any number up to the candidate cap.</p></div><span>{selected.length} selected</span></div>
+      {releases.length===0?<div className="empty-search"><Search size={22}/><h2>No matching releases</h2><p>Try a broader description or another search direction.</p></div>:<div className="release-list">{visible.map((release: GeneralConversationRelease)=>{const releaseExpired=Date.parse(release.expiresAt)<=now;return <label className={`release-row ${!release.selectable?'unavailable':''}`} key={release.releaseId}><input type="checkbox" aria-label={`Select ${release.title}`} checked={selected.includes(release.releaseId)} disabled={busy||dialogOpen||blocked||releaseExpired||!release.selectable||Boolean(operation)||(!selected.includes(release.releaseId)&&selected.length>=budget.candidateCap)} onChange={()=>toggle(release.releaseId)}/><span className="release-copy"><strong>{release.title}</strong><span>{release.indexer} · {release.protocol} · {release.size===null?'Size unknown':`${(release.size/1024**3).toFixed(1)} GB`}{release.protocol==='torrent'&&release.seeders!==null?` · ${release.seeders} seeders`:''}</span><span className="release-badges">{release.relevance&&<em className={`relevance-${release.relevance.classification}`}>{release.relevance.classification==='match'?'Match':'Possible match'}</em>}{release.viability&&<em className={`viability-${release.viability.reason}`}>{release.viability.reason==='viable'?'Viability signals look good':release.viability.reason==='unknown'?'Availability unknown':release.viability.reason==='zero-seeders'?'Zero seeders':release.viability.reason==='stale'?'Stale result':release.viability.reason}</em>}</span>{release.relevance?.explanation&&<span className="release-explanation">{release.relevance.explanation}</span>}{release.unavailableReason&&<em>{release.unavailableReason}</em>}{releaseExpired&&<em>Selection expired</em>}</span><span className="release-age"><Clock3 size={13}/>{release.age}d</span></label>})}</div>}
+      {pages>1&&<nav className="release-pagination" aria-label="Result pages"><button type="button" className="button button-secondary" disabled={page===0} onClick={()=>setPage(n=>Math.max(0,n-1))}>Previous</button><span>Page {page+1} of {pages} · {releases.length} total releases</span><button type="button" className="button button-secondary" disabled={page>=pages-1} onClick={()=>setPage(n=>Math.min(pages-1,n+1))}>Next</button></nav>}
+      <p className="display-note">{selected.length} selected across all pages. Display limit changes visibility only.</p>
+      <div className="discovery-actions"><button type="button" className="button button-secondary" disabled={continuationLocked} onClick={()=>void search('find-more')}>Find more</button><button type="button" className="button button-secondary" disabled={continuationLocked||!selected.length} onClick={()=>void search('more-like-these')}>More like these</button><button type="button" className="button button-secondary" disabled={continuationLocked} onClick={()=>void search('other-terms')}>Try other terms</button></div>
+      {continuationCount>=5&&<p className="limit-note" role="status">You’ve reached the five follow-up limit. Start a new search to keep exploring.</p>}
+      {!operation&&!operationUnknownId&&<button className="button button-primary review-button" disabled={busy||dialogOpen||!selected.length||blocked} onClick={e=>{opener.current=e.currentTarget;setFrozenSelection([...selected]);setDialogOpen(true)}}>Review {selected.length} selected <ArrowRight size={16}/></button>}
     </section>}
-    {review && result && <div className="search-modal-backdrop"><section ref={dialog} className="search-modal" role="dialog" aria-modal="true" aria-labelledby="search-review-title" onKeyDown={(event: KeyboardEvent<HTMLElement>) => {
-      if (event.key === 'Escape' && !busy) { event.preventDefault(); setReview(false); return }
-      if (event.key !== 'Tab') return
-      const focusable = Array.from(dialog.current?.querySelectorAll<HTMLElement>('button:not([disabled]),input:not([disabled]),textarea:not([disabled]),[href],[tabindex]:not([tabindex="-1"])') ?? [])
-      if (!focusable.length) { event.preventDefault(); return }
-      const first = focusable[0], last = focusable[focusable.length - 1]
-      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
-      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
-    }}><span className="eyebrow">FINAL CHECK</span><h2 id="search-review-title">Review selected releases</h2><p>Only these {selected.length} releases will be submitted. This is a deliberate action; searching and selecting did not contact your download client.</p><div className="search-confirm-destination"><strong>{result.dryRun ? 'DRY RUN' : 'LIVE DOWNLOAD'}</strong><span>{result.destination?.name || 'No destination'}</span></div>{expired && <p role="alert">These results have expired. Close this review and search again.</p>}<ul>{selected.map(id => <li key={id}>{result.releases.find(r => r.releaseId === id)?.title}</li>)}</ul><div className="modal-actions">{!busy && <button type="button" className="button button-secondary" onClick={() => setReview(false)}>Cancel</button>}<button ref={confirmButton} type="button" className="button button-primary" disabled={busy || Boolean(blocked)} onClick={() => void submit()}>{busy ? <><LoaderCircle className="spin" size={16}/> Submitting…</> : <><Check size={16}/> Confirm and submit</>}</button></div></section></div>}
+    {operationUnknownId&&<section className="outcome-card" role="status"><div className="operation-heading"><div><span className="eyebrow">OPERATION {operationUnknownId.slice(0,8)}</span><h2>Outcome not confirmed</h2></div><button type="button" className="button button-secondary" onClick={()=>{const c=unknownContext.current;if(c)void reconcile(c.id,c.manifest,c.mode,c.destination)}}>Check status</button></div><p>Media Scout could not verify the operation response. It will not create or submit the selection again. Check the saved status before taking further action.</p></section>}
+     {operation&&<section className="outcome-card" aria-live="polite"><div className="operation-heading"><div><span className="eyebrow">OPERATION {operationId.slice(0,8)}</span><h2>{operation.releases.some(r=>r.status==='uncertain')?'Outcome unknown':operation.stopped?'Stopped':operation.complete?'Operation complete':'Submission progress'}</h2></div><button type="button" className="button button-secondary" onClick={()=>{const c=unknownContext.current;if(c)void reconcile(c.id,c.manifest,c.mode,c.destination)}}>Check status</button></div><p>{operation.mode==='dry-run'?'Dry run: no download was sent.':'Submitted means accepted by the download client, not completed or imported.'} Destination: {operation.destination.name} · {operation.mode}.</p><div className="operation-list">{operation.releases.map(item=><div className="outcome-row" key={item.releaseId}><strong>{result?.releases.find(r=>r.releaseId===item.releaseId)?.title||'Selected release'}</strong><span className={`outcome-${item.status}`}>{item.status==='previously-submitted'?'Previously submitted':item.status==='submitted'?'Submitted · not completed':item.status==='dry-run'?'Dry run · not sent':item.status==='uncertain'?'Unknown · check client':item.status}</span></div>)}</div>{!operation.complete&&!operation.stopped&&<button className="button button-secondary" type="button" onClick={()=>void stopOperation()}>Stop future steps</button>}{operation.releases.some(r=>r.status==='uncertain')&&<p className="unknown-note">Check your download client before taking any further action. This operation will not retry an uncertain step.</p>}</section>}
+   {dialogOpen&&result&&createPortal(<div className="search-modal-backdrop"><section ref={dialog} className="search-modal" role="dialog" aria-modal="true" aria-labelledby="search-review-title" aria-describedby="search-review-description" onKeyDown={(e:KeyboardEvent<HTMLElement>)=>{if(e.key==='Escape'&&!busy){e.preventDefault();setDialogOpen(false);return}if(e.key!=='Tab')return;const all=Array.from(dialog.current?.querySelectorAll<HTMLElement>('button:not([disabled]),[href],input:not([disabled])')??[]);if(!all.length){e.preventDefault();return}if(e.shiftKey&&document.activeElement===all[0]){e.preventDefault();all.at(-1)?.focus()}else if(!e.shiftKey&&document.activeElement===all.at(-1)){e.preventDefault();all[0].focus()}}}><button className="modal-close" type="button" aria-label="Close review" onClick={()=>setDialogOpen(false)} disabled={busy}><X size={18}/></button><span className="eyebrow">FINAL CHECK</span><h2 id="search-review-title">Review your selection</h2><p id="search-review-description">This is the complete frozen selection. No release will be added or removed after you confirm.</p><div className="search-confirm-destination"><strong>{result.dryRun?'DRY RUN':'LIVE'}</strong><span>{result.destination?.name||'No destination'} · {result.destination?.protocol}</span></div><ul className="manifest-list">{frozenSelection.map(id=><li key={id}>{result.releases.find(r=>r.releaseId===id)?.title||id}</li>)}</ul>{(expired||selectedExpired)&&<p role="alert">{expired?'These results have expired.':'A selected release has expired.'} Close this review and search again.</p>}<div className="modal-actions"><button type="button" className="button button-secondary" disabled={busy} onClick={()=>setDialogOpen(false)}>Cancel</button><button ref={focusTarget} type="button" className="button button-primary" disabled={busy||blocked} onClick={()=>void submitOperation()}>{busy?<><LoaderCircle className="spin" size={16}/> Working…</>:<><Check size={16}/> Confirm full selection</>}</button></div></section></div>,document.body)}
   </div>
 }

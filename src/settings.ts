@@ -20,15 +20,24 @@ export const settingsSchema = z.object({
     failureBackoffMinMinutes: z.number().int().min(1), failureBackoffMaxMinutes: z.number().int().min(1), queueGraceMinutes: z.number().int().min(1),
   }).strict().refine((m) => m.failureBackoffMaxMinutes >= m.failureBackoffMinMinutes, { path: ['failureBackoffMaxMinutes'], message: 'must be at least failureBackoffMinMinutes' }),
   safety: z.object({ dryRun: z.boolean(), allowOperatorActions: z.boolean() }).strict(),
+  generalSearch: z.object({
+    maxQueries: z.number().int().min(1).max(20).default(6),
+    maxCandidates: z.number().int().min(1).max(1000).default(200),
+    maxAiCalls: z.number().int().min(1).max(100).default(12),
+    batchSize: z.number().int().min(1).max(100).default(20),
+    displayLimit: z.number().int().min(1).max(1000).default(40),
+    hideZeroSeeders: z.boolean().default(true),
+  }).strict().default({ maxQueries: 6, maxCandidates: 200, maxAiCalls: 12, batchSize: 20, displayLimit: 40, hideZeroSeeders: true }),
 }).strict();
 
-export type Settings = Omit<z.infer<typeof settingsSchema>, 'integrations'> & { integrations: Omit<z.infer<typeof settingsSchema>['integrations'], 'prowlarr'> & { prowlarr: Omit<z.infer<typeof settingsSchema>['integrations']['prowlarr'], 'generalClient'> & { generalClient?: string } } };
+export type Settings = Omit<z.infer<typeof settingsSchema>, 'integrations' | 'generalSearch'> & { generalSearch?: z.infer<typeof settingsSchema>['generalSearch']; integrations: Omit<z.infer<typeof settingsSchema>['integrations'], 'prowlarr'> & { prowlarr: Omit<z.infer<typeof settingsSchema>['integrations']['prowlarr'], 'generalClient'> & { generalClient?: string } } };
 export const defaultSettings: Settings = {
   version: 1,
   integrations: { prowlarr: { url: '', apiKey: '', tvClient: '', movieClient: '', generalClient: '' }, sonarr: { url: '', apiKey: '' }, radarr: { url: '', apiKey: '' } },
   ai: { apiKey: '', model: 'z-ai/glm-5.3-flash', baseUrl: 'https://openrouter.ai/api/v1', preferences: '' },
   monitoring: { enabled: false, intervalMinutes: 5, minRetryHours: 6, failureBackoffMinMinutes: 5, failureBackoffMaxMinutes: 60, queueGraceMinutes: 30 },
   safety: { dryRun: true, allowOperatorActions: false },
+  generalSearch: { maxQueries: 6, maxCandidates: 200, maxAiCalls: 12, batchSize: 20, displayLimit: 40, hideZeroSeeders: true },
 };
 
 export function missingSettings(settings: Settings): string[] {

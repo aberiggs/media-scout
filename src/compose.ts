@@ -12,6 +12,7 @@ import { QueueAssociator } from './core/queue-association';
 import { State } from './core/state';
 import { OperatorActions } from './core/operator-actions';
 import { GeneralSearchService } from './core/general-search';
+import { GeneralSearchConversationService } from './core/general-search-conversation';
 import { Watcher } from './core/watcher';
 import type { Config } from './config';
 import { configWithSettings } from './config';
@@ -41,6 +42,7 @@ export interface Stack {
   runner: Runner;
   operatorActions: OperatorActions;
   generalSearch: GeneralSearchService;
+  generalSearchConversation: GeneralSearchConversationService;
   logger: pino.Logger;
   createSnapshot(settings: Settings): Stack;
 }
@@ -114,8 +116,9 @@ export function buildStack(deps: BuildStackDeps): Stack {
 
   const operatorActions = new OperatorActions({ enabled: config.ALLOW_OPERATOR_ACTIONS, config, state, watcher, sonarr, radarr, now });
   const generalSearch = new GeneralSearchService({ llm, prowlarr, state, runtimeSettings: structuredClone(config.settings), getSettings: () => state.getSettings(), now });
+  const generalSearchConversation = new GeneralSearchConversationService({ llm, prowlarr, state, runtimeSettings: structuredClone(config.settings), getSettings: () => state.getSettings(), now });
 
-  const stack: Stack = { config, state, watcher, sonarr, radarr, prowlarr, llm, planner, picker, runner, operatorActions, generalSearch, logger,
+  const stack: Stack = { config, state, watcher, sonarr, radarr, prowlarr, llm, planner, picker, runner, operatorActions, generalSearch, generalSearchConversation, logger,
     createSnapshot: (settings) => buildStack({ config: configWithSettings(config, settings), logger, now, state, ...(deps.llm ? { llm: deps.llm } : {}) }),
   };
   return stack;

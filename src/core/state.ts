@@ -25,6 +25,7 @@ export interface ManualReviewRow {
   subjectKind?: 'intent' | 'queue' | null;
   subjectKey?: string | null;
   targetEvidence?: UnparseableTargetEvidence | null;
+  targetEvidenceKind?: 'captured' | 'legacy' | 'legacy-ineligible';
   targetEvidenceInvalid?: boolean;
 }
 
@@ -260,15 +261,22 @@ export function reviewEvidenceMatchesWorkKey(workKey: string, evidence: Unparsea
 function decodeManualReviewRow(row: Record<string, unknown>): ManualReviewRow {
   let targetEvidence: UnparseableTargetEvidence | undefined;
   let targetEvidenceInvalid = false;
+  let targetEvidenceKind: ManualReviewRow['targetEvidenceKind'];
   if (row.target_evidence_json !== null && row.target_evidence_json !== undefined) {
-    try { targetEvidence = decodeReviewEvidence(String(row.target_evidence_json)); } catch { targetEvidenceInvalid = true; }
+    try {
+      const raw: unknown = JSON.parse(String(row.target_evidence_json));
+      if (isRecord(raw) && raw.kind === 'legacy') { targetEvidence = validateReviewEvidence(raw); targetEvidenceKind = 'legacy'; }
+      else if (isRecord(raw) && raw.kind === 'legacy-ineligible' && Object.keys(raw).length === 1) targetEvidenceKind = 'legacy-ineligible';
+      else if (isRecord(raw) && Object.prototype.hasOwnProperty.call(raw, 'kind')) throw new Error('Unknown review evidence tag');
+      else { targetEvidence = decodeReviewEvidence(String(row.target_evidence_json)); targetEvidenceKind = 'captured'; }
+    } catch { targetEvidenceInvalid = true; }
   }
   return {
     id: Number(row.id), workKey: String(row.work_key), reason: String(row.reason), details: (row.details as string | null) ?? null,
     createdAt: String(row.created_at), resolvedAt: (row.resolved_at as string | null) ?? null,
     ...((row.subject_kind ?? null) === null ? {} : { subjectKind: String(row.subject_kind) as 'intent' | 'queue' }),
     ...((row.subject_key ?? null) === null ? {} : { subjectKey: String(row.subject_key) }),
-    ...(targetEvidence ? { targetEvidence } : {}), ...(targetEvidenceInvalid ? { targetEvidenceInvalid: true } : {}),
+    ...(targetEvidence ? { targetEvidence } : {}), ...(targetEvidenceKind ? { targetEvidenceKind } : {}), ...(targetEvidenceInvalid ? { targetEvidenceInvalid: true } : {}),
   };
 }
 
@@ -461,6 +469,39 @@ export class State {
         SELECT 1 FROM manual_review WHERE work_key=? AND reason='unparseable-title' AND details=? AND resolved_at IS NULL AND target_evidence_json=?)`)
       .run(input.workKey, input.details, input.at.toISOString(), json, input.workKey, input.details, json);
     return inserted.changes === 1;
+  }
+
+  initializeLegacyUnparseableReviews(input: { workKey: string; token: string; now: string }): void {
+    validIso(input.now, 'now');
+    this.db.transaction(() => { this.assertClaim(input.workKey, input.token, input.now); this.initializeLegacyReviews(input.workKey); })();
+  }
+
+  private initializeLegacyReviews(workKey: string): void {
+    const rows = this.db.prepare("SELECT id FROM manual_review WHERE work_key=? AND reason='unparseable-title' AND resolved_at IS NULL AND subject_kind IS NULL AND subject_key IS NULL AND target_evidence_json IS NULL").all(workKey) as Array<{id:number}>;
+    if (!rows.length) return;
+    const work = this.getWorkItem(workKey);
+    const hasIdentityHold = this.hasOpenManualReview(workKey, 'content-identity-changed');
+    let evidence: UnparseableTargetEvidence | null = null;
+    if (work && !hasIdentityHold && work.blockedReason !== 'content-identity-changed') {
+      try {
+        const candidate: UnparseableTargetEvidence = {
+          arr: work.unit.arr,
+          serviceId: work.unit.serviceId,
+          externalId: work.unit.externalId,
+          episodeIds: work.unit.kind === 'tv' ? work.unit.season?.missing.map(({ episodeId }) => episodeId) ?? [] : null,
+        };
+        const tv = /^(sonarr):(0|[1-9]\d*):s(0|[1-9]\d*)$/.exec(workKey);
+        const movie = /^radarr:(0|[1-9]\d*)$/.exec(workKey);
+        const keyMatches = work.unit.kind === 'tv'
+          ? !!tv && work.unit.season?.seasonNumber === Number(tv[3])
+          : !!movie;
+        const validated = validateReviewEvidence(candidate);
+        if (work.workKey === workKey && keyMatches && reviewEvidenceMatchesWorkKey(workKey, validated)) evidence = validated;
+      } catch { /* Invalid durable identity is conservatively ineligible. */ }
+    }
+    const tag = evidence ? JSON.stringify({ kind: 'legacy', ...evidence }) : JSON.stringify({ kind: 'legacy-ineligible' });
+    const update = this.db.prepare('UPDATE manual_review SET target_evidence_json=? WHERE id=? AND target_evidence_json IS NULL');
+    for (const row of rows) update.run(tag, row.id);
   }
 
   listOpenUnparseableReviews(): Array<{ id: number; workKey: string }> {
@@ -837,6 +878,7 @@ export class State {
     if (input.work.workKey !== input.key) throw new Error('Work key does not match reconciliation key');
     const apply = this.db.transaction(() => {
       this.assertClaim(input.key, input.token, input.work.lastObservedAt);
+      this.initializeLegacyReviews(input.key);
       this.db.prepare(`INSERT INTO work_items (work_key,content_identity,missing_fingerprint,unit_json,status,last_search_at,next_search_at,fail_count,last_outcome,last_observed_at,blocked_reason,reset_pending_at)
         VALUES (@workKey,@contentIdentity,@missingFingerprint,@unitJson,@status,@lastSearchAt,@nextSearchAt,@failCount,@lastOutcome,@lastObservedAt,@blockedReason,@resetPendingAt)
         ON CONFLICT(work_key) DO UPDATE SET content_identity=excluded.content_identity,missing_fingerprint=excluded.missing_fingerprint,unit_json=excluded.unit_json,status=excluded.status,last_search_at=excluded.last_search_at,next_search_at=excluded.next_search_at,fail_count=excluded.fail_count,last_outcome=excluded.last_outcome,last_observed_at=excluded.last_observed_at,blocked_reason=excluded.blocked_reason,reset_pending_at=excluded.reset_pending_at`).run({

@@ -1093,6 +1093,7 @@ export class Runner {
       const token = this.deps.state.claimUnit(review.workKey, now);
       if (!token) continue;
       try {
+        this.deps.state.initializeLegacyUnparseableReviews({ workKey: review.workKey, token, now: now.toISOString() });
         const current = this.deps.state.getManualReview(review.id);
         const createdAt = parseReviewObservationTime(current?.createdAt);
         if (!current || current.resolvedAt || current.reason !== 'unparseable-title' || current.subjectKind || current.subjectKey || current.targetEvidenceInvalid ||
@@ -1101,42 +1102,23 @@ export class Runner {
         const workObservedAt = work ? parseReviewObservationTime(work.lastObservedAt) : null;
         if (work && (workObservedAt === null || snapshotObservedAt < workObservedAt)) continue;
         const evidence = current.targetEvidence;
+        if (current.targetEvidenceKind === 'legacy-ineligible') continue;
         if (evidence) {
           if (!reviewEvidenceMatchesWorkKey(current.workKey, evidence)) continue;
+          if (current.targetEvidenceKind === 'legacy' && (!work || work.blockedReason === 'content-identity-changed' || this.deps.state.hasOpenManualReview(current.workKey, 'content-identity-changed'))) continue;
           if (work && (work.unit.arr !== evidence.arr || work.unit.serviceId !== evidence.serviceId || work.unit.externalId !== evidence.externalId ||
             (work.unit.kind === 'tv' ? evidence.episodeIds === null : evidence.episodeIds !== null))) continue;
           if (evidence.arr === 'sonarr') {
             if (!snapshot.sonarr.known) continue;
             const series = snapshot.sonarr.series.find(({ series: item }) => item.id === evidence.serviceId);
             if (!series?.known || !series.episodes || series.series.tvdbId !== evidence.externalId || !evidence.episodeIds || !evidence.episodeIds.every((id) => series.episodes!.some((episode) => episode.id === id && episode.hasFile))) continue;
+            if (current.targetEvidenceKind === 'legacy') { const season = Number(/:s(\d+)$/.exec(current.workKey)?.[1]); const inventory = series.episodes.filter((episode) => episode.seasonNumber === season); if (!inventory.length || !inventory.every(({ hasFile }) => hasFile)) continue; }
           } else {
             if (!snapshot.radarr.known) continue;
             const movie = snapshot.radarr.movies.find((item) => item.id === evidence.serviceId);
             if (!movie || movie.tmdbId !== evidence.externalId || !movie.hasFile) continue;
           }
-        } else {
-          // Historical rows have no captured generation: require a matching durable identity and complete season inventory.
-          if (work?.blockedReason === 'content-identity-changed' || this.deps.state.hasOpenManualReview(current.workKey, 'content-identity-changed')) continue;
-          const tv = /^sonarr:(\d+):s(\d+)$/.exec(current.workKey);
-          const movieKey = /^radarr:(\d+)$/.exec(current.workKey);
-          if (tv) {
-            if (!snapshot.sonarr.known) continue;
-            const serviceId = Number(tv[1]);
-            const prior = work?.unit.kind === 'tv' && work.unit.serviceId === serviceId ? work.unit : null;
-            const series = snapshot.sonarr.series.find(({ series: item }) => item.id === serviceId);
-            if (!series?.known || !series.episodes || !prior || series.series.tvdbId !== prior.externalId) continue;
-            const priorEpisodeIds = prior.season?.missing.map(({ episodeId }) => episodeId) ?? [];
-            if (!priorEpisodeIds.length || !priorEpisodeIds.every((id) => series.episodes!.some((episode) => episode.id === id && episode.hasFile))) continue;
-            const inventory = series.episodes.filter((episode) => episode.seasonNumber === Number(tv[2]));
-            if (!inventory.length || !inventory.every(({ hasFile }) => hasFile)) continue;
-          } else if (movieKey) {
-            if (!snapshot.radarr.known) continue;
-            const serviceId = Number(movieKey[1]);
-            const prior = work?.unit.kind === 'movie' && work.unit.serviceId === serviceId ? work.unit : null;
-            const movie = snapshot.radarr.movies.find((item) => item.id === serviceId);
-            if (!prior || !movie || movie.tmdbId !== prior.externalId || !movie.hasFile) continue;
-          } else continue;
-        }
+        } else continue;
         this.deps.state.resolveUnparseableReview({ id: current.id, workKey: current.workKey, token, now: now.toISOString() });
       } finally {
         this.deps.state.releaseClaim(review.workKey, token);

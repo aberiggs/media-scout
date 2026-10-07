@@ -322,6 +322,7 @@ function mockDiscovery(opts: {
 
 async function runCleanupPoll(input: {
   episodes?: Record<number, unknown[]>;
+  episodeProvider?: (seriesId: number) => unknown[];
   movies?: unknown[];
   episodeStatus?: Record<number, number>;
   series?: unknown[];
@@ -330,11 +331,13 @@ async function runCleanupPoll(input: {
   at?: Date;
   clock?: () => Date;
   skipReview?: boolean;
+  seedBeforeReview?: (state: State) => void;
   seed?: (state: State) => void;
 } = {}) {
   const key = input.workKey ?? 'sonarr:1:s1';
-  mockDiscovery({ series: input.series ?? [tvSeries(1, 'Review Target', 368013)], episodes: input.episodes, movies: input.movies, episodeStatus: input.episodeStatus });
+  mockDiscovery({ series: input.series ?? [tvSeries(1, 'Review Target', 368013)], episodes: input.episodes, episodeProvider: input.episodeProvider, movies: input.movies, episodeStatus: input.episodeStatus });
   const state = State.open(':memory:');
+  input.seedBeforeReview?.(state);
   if (!input.skipReview) {
     if (input.evidence) state.flagUnparseableReview({ workKey: key, details: 'same malformed release', evidence: input.evidence, at: input.at ?? NOW });
     else state.flagManualReview(key, 'unparseable-title', 'same malformed release', input.at ?? NOW);
@@ -406,7 +409,7 @@ describe('Runner.cycle', () => {
     });
     expect(state.hasHash('FIXTUREHASH0000000000000000000000000')).toBe(true);
     expect(state.hasRelease(5, grabBody.guid)).toBe(true);
-    expect(state.listSearchActivity()).toMatchObject([{ source: 'cycle', query: 'Frieren', resultCount: 1, outcome: 'success', media: [{ workKey: 'sonarr:1:s1' }] }]);
+    expect(state.listSearchActivity(NOW.toISOString())).toMatchObject([{ source: 'cycle', query: 'Frieren', resultCount: 1, outcome: 'success', media: [{ workKey: 'sonarr:1:s1' }] }]);
   });
 
   it('DRY_RUN: grabs logged only — grab endpoint never called, decision recorded, hash NOT recorded', async () => {
@@ -605,8 +608,8 @@ describe('Runner.cycle', () => {
     expect(decisionRow(state, 'sonarr:1:s1')).toBeUndefined(); // no decision for the aborted unit
     expect(state.lastDecisionAt('sonarr:1:s1')).toBeNull();
     expect(decisionRow(state, 'sonarr:2:s1')).toMatchObject({ verdict: 'grab', grabbed: 1 });
-    expect(state.listSearchActivity().find(({ query }) => query === 'Frieren')).toMatchObject({ source: 'cycle', resultCount: null, outcome: 'error', errorCode: 'http-429' });
-    expect(state.listSearchActivity().find(({ query }) => query === 'Other')).toMatchObject({ source: 'cycle', resultCount: 1, outcome: 'success' });
+    expect(state.listSearchActivity(NOW.toISOString()).find(({ query }) => query === 'Frieren')).toMatchObject({ source: 'cycle', resultCount: null, outcome: 'error', errorCode: 'http-429' });
+    expect(state.listSearchActivity(NOW.toISOString()).find(({ query }) => query === 'Other')).toMatchObject({ source: 'cycle', resultCount: 1, outcome: 'success' });
   });
 
   it('429 refreshes the healthy allowlist: the next unit only queries non-cooling indexers (I5)', async () => {
@@ -987,13 +990,61 @@ describe('Runner.cycle', () => {
 
   it('uses full season completion for identity-matched legacy reviews', async () => {
     const complete = [episode(1, { id: 101, hasFile: true }), episode(1, { id: 102, episodeNumber: 2, hasFile: true })];
-    const fulfilled = await runCleanupPoll({ episodes: { 1: complete }, seed: seedLegacyIdentity });
+    const fulfilled = await runCleanupPoll({ episodes: { 1: complete }, seedBeforeReview: seedLegacyIdentity });
     expect(fulfilled.state.listManualReview(true)[0]?.resolvedAt).toEqual(expect.any(String));
+  });
+
+  it('keeps an orphan review ineligible across missing, filed, and repeated polls', async () => {
+    let current = [episode(1, { id: 101, hasFile: false })];
+    const { state, runner } = await runCleanupPoll({ episodeProvider: () => current });
+    const marker = state.getManualReview(1);
+    expect(marker).toMatchObject({ targetEvidenceKind: 'legacy-ineligible', resolvedAt: null });
+    current = [episode(1, { id: 101, hasFile: true })];
+    await runner.cycle();
+    await runner.cycle();
+    expect(state.getManualReview(1)).toMatchObject({ targetEvidenceKind: 'legacy-ineligible', resolvedAt: null });
+  });
+
+  it('retains legacy [101,102] anchor after missing101 and filed101 polls', async () => {
+    const seedOldWork = (ledger: State) => {
+      const unit = { key: 'sonarr:1:s1', kind: 'tv' as const, arr: 'sonarr' as const, serviceId: 1, externalId: 368013,
+        title: 'Review Target', altTitles: [], season: { seasonNumber: 1, missing: [101, 102].map((episodeId, index) => ({ episodeId, episodeNumber: index + 1, absoluteEpisodeNumber: null, title: `Episode ${index + 1}` })) } };
+      const work: WorkItem = { workKey: unit.key, contentIdentity: 'sonarr:1:368013:tv', missingFingerprint: 'legacy', unit,
+        status: 'ready', lastSearchAt: null, nextSearchAt: null, failCount: 0, lastOutcome: null, lastObservedAt: NOW.toISOString(),
+        lastQueueObservedAt: null, queueObservationKnown: false, blockedReason: null };
+      const token = ledger.claimUnit(unit.key, NOW)!;
+      ledger.applyWorkReconciliation({ key: unit.key, token, work, intentUpdates: [] });
+      ledger.releaseClaim(unit.key, token);
+    };
+    let current = [episode(1, { id: 101, hasFile: false })];
+    const { state, runner } = await runCleanupPoll({ episodeProvider: () => current, seedBeforeReview: seedOldWork });
+    expect(state.getManualReview(1)).toMatchObject({ targetEvidenceKind: 'legacy', targetEvidence: { episodeIds: [101, 102] }, resolvedAt: null });
+    current = [episode(1, { id: 101, hasFile: true })];
+    await runner.cycle();
+    expect(state.getManualReview(1)).toMatchObject({ targetEvidenceKind: 'legacy', targetEvidence: { episodeIds: [101, 102] }, resolvedAt: null });
+  });
+
+  it('does not migrate a legacy review under a held claim, then migrates after release', async () => {
+    let owner = '';
+    const seed = (ledger: State) => {
+      const unit = { key: 'sonarr:1:s1', kind: 'tv' as const, arr: 'sonarr' as const, serviceId: 1, externalId: 368013,
+        title: 'Review Target', altTitles: [], season: { seasonNumber: 1, missing: [{ episodeId: 101, episodeNumber: 1, absoluteEpisodeNumber: null, title: 'Episode' }] } };
+      const work: WorkItem = { workKey: unit.key, contentIdentity: 'sonarr:1:368013:tv', missingFingerprint: 'legacy', unit,
+        status: 'ready', lastSearchAt: null, nextSearchAt: null, failCount: 0, lastOutcome: null, lastObservedAt: NOW.toISOString(),
+        lastQueueObservedAt: null, queueObservationKnown: false, blockedReason: null };
+      owner = ledger.claimUnit(unit.key, NOW)!;
+      ledger.applyWorkReconciliation({ key: unit.key, token: owner, work, intentUpdates: [] });
+    };
+    const { state, runner } = await runCleanupPoll({ episodes: { 1: [episode(1, { id: 101, hasFile: false })] }, seedBeforeReview: seed });
+    expect(state.getManualReview(1)?.targetEvidenceKind).toBeUndefined();
+    state.releaseClaim('sonarr:1:s1', owner);
+    await runner.cycle();
+    expect(state.getManualReview(1)).toMatchObject({ targetEvidenceKind: 'legacy', targetEvidence: { episodeIds: [101] }, resolvedAt: null });
   });
 
   it('keeps identity-matched legacy review open when any season episode is missing', async () => {
     const partial = [episode(1, { id: 101, hasFile: true }), episode(1, { id: 102, episodeNumber: 2, hasFile: false })];
-    const { state } = await runCleanupPoll({ episodes: { 1: partial }, seed: seedLegacyIdentity });
+    const { state } = await runCleanupPoll({ episodes: { 1: partial }, seedBeforeReview: seedLegacyIdentity });
     expect(state.listManualReview(true)).toEqual([expect.objectContaining({ reason: 'unparseable-title', resolvedAt: null })]);
   });
 
@@ -1004,7 +1055,7 @@ describe('Runner.cycle', () => {
   });
 
   it('keeps legacy review open if current season inventory omits its previous missing target id', async () => {
-    const { state } = await runCleanupPoll({ episodes: { 1: [episode(1, { id: 102, episodeNumber: 2, hasFile: true })] }, seed: seedLegacyIdentity });
+    const { state } = await runCleanupPoll({ episodes: { 1: [episode(1, { id: 102, episodeNumber: 2, hasFile: true })] }, seedBeforeReview: seedLegacyIdentity });
     expect(state.listManualReview(true)[0]?.resolvedAt).toBeNull();
   });
 
@@ -1012,7 +1063,7 @@ describe('Runner.cycle', () => {
     const { state } = await runCleanupPoll({ episodes: { 1: [
       episode(1, { id: 101, seasonNumber: 2, episodeNumber: 1, hasFile: true }),
       episode(1, { id: 102, seasonNumber: 1, episodeNumber: 2, hasFile: true }),
-    ] }, seed: seedLegacyIdentity });
+    ] }, seedBeforeReview: seedLegacyIdentity });
     expect(state.listManualReview(true)[0]?.resolvedAt).toEqual(expect.any(String));
   });
 
@@ -1853,8 +1904,8 @@ describe('Runner.cycle', () => {
       [{ workKey: 'sonarr:1:s1', episodeIds: [101], basis: 'explicit-episodes' }],
       [{ workKey: 'sonarr:1:s2', episodeIds: [201], basis: 'explicit-episodes' }],
     ]);
-    expect(state.listSearchActivity().find(({ query }) => query === 'Show S01')).toMatchObject({ media: [{ workKey: 'sonarr:1:s1' }] });
-    expect(state.listSearchActivity().find(({ query }) => query === 'Show S02')).toMatchObject({ media: [{ workKey: 'sonarr:1:s2' }] });
+    expect(state.listSearchActivity(NOW.toISOString()).find(({ query }) => query === 'Show S01')).toMatchObject({ media: [{ workKey: 'sonarr:1:s1' }] });
+    expect(state.listSearchActivity(NOW.toISOString()).find(({ query }) => query === 'Show S02')).toMatchObject({ media: [{ workKey: 'sonarr:1:s2' }] });
   });
 
   it('keeps the first accepted group release when the second is rejected and never reserves the third', async () => {
@@ -2163,7 +2214,7 @@ describe('Runner.manualPick', () => {
     expect(result.releaseTitle).toContain('SubsPlease');
     expect(decisionRow(state, 'sonarr:1:s1')).toMatchObject({ verdict: 'grab', grabbed: 1 });
     expect(state.hasHash('FIXTUREHASH0000000000000000000000000')).toBe(true);
-    expect(state.listSearchActivity()).toMatchObject([{ source: 'manual', query: 'Frieren', resultCount: 2, outcome: 'success', media: [{ workKey: 'sonarr:1:s1' }] }]);
+    expect(state.listSearchActivity(NOW.toISOString())).toMatchObject([{ source: 'manual', query: 'Frieren', resultCount: 2, outcome: 'success', media: [{ workKey: 'sonarr:1:s1' }] }]);
   });
 
   it('records manualPick search failures as bounded manual activity without changing the failure behavior', async () => {
@@ -2174,7 +2225,7 @@ describe('Runner.manualPick', () => {
     const { runner, state } = buildStack(llm, { dryRun: false });
 
     await expect(runner.manualPick('sonarr:1:s1', 0)).rejects.toThrow();
-    expect(state.listSearchActivity()).toMatchObject([{ source: 'manual', query: 'Frieren', resultCount: null, outcome: 'error', errorCode: 'http-503' }]);
+    expect(state.listSearchActivity(NOW.toISOString())).toMatchObject([{ source: 'manual', query: 'Frieren', resultCount: null, outcome: 'error', errorCode: 'http-503' }]);
   });
 
   it('DRY_RUN manual pick logs intent without grabbing (I3 applies to human picks too)', async () => {

@@ -922,6 +922,102 @@ describe('general search conversation', () => {
   afterEach(() => { cleanup(); window.history.replaceState(null, '', '/'); globalThis.fetch = originalFetch })
   const release = (id: string, title: string) => ({ releaseId: id, title, indexer: 'Index', size: null, seeders: 4, leechers: 0, age: 2, protocol: 'torrent', selectable: true, unavailableReason: null, expiresAt: '2099-01-01T00:00:00.000Z', relevance: { classification: 'possible-match', explanation: 'Related subject' }, viability: { viable: true, reason: 'viable' } })
   const response = (releases = [release('r1', 'A Space Documentary')], status = 'selection-required') => ({ status, query: 'space documentary', queries: ['space documentary'], question: status === 'clarification-needed' ? 'What period?' : '', searchId: 'snap-1', expiresAt: '2099-01-01T00:00:00.000Z', confirmationToken: 'confirm-1', destination: { name: 'General Client', protocol: 'torrent' }, dryRun: true, actionsAllowed: true, blockedReason: null, releases })
+  const interpretation = { searchSpace: { focus: 'mixed', identityAnchors: ['Apollo 11'], alternativeAnchors: ['NASA', 'ESA'], referenceEntities: ['For All Mankind'], medium: { value: 'documentary', provenance: 'assumption' }, positives: [{ text: 'real archival footage', strength: 'hard' }, { text: 'tense, thoughtful tone', strength: 'soft' }], negatives: [{ text: 'fictionalized retelling', strength: 'hard' }, { text: 'graphic violence', strength: 'soft' }], expansionScope: 'associations' }, proposals: [{ query: 'Apollo 11 archival documentary', purpose: 'Keep the named mission central', branch: 'identity', strategy: 'identity-preserving', preserves: ['Apollo 11'] }, { query: 'NASA space-race documentary', purpose: 'Explore related space-program stories', branch: 'related', strategy: 'association', preserves: ['space exploration'] }] }
+  it('shows an optional interpretation in ordinary JSON results with careful intent labels', async () => {
+    globalThis.fetch = async input => String(input) === '/api/settings' ? jsonResponse(envelope) : jsonResponse({ ...response(), searchInterpretation: interpretation })
+    window.history.replaceState(null, '', '/#search'); render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'), { target: { value: 'Apollo 11 documentary, like For All Mankind, thoughtful not fictionalized' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+    await screen.findByRole('heading', { name: 'Releases to review' })
+    fireEvent.click(screen.getByText('Understood as'))
+    assert.ok(screen.getByText('Assumed', { exact: false }))
+    const copy = document.querySelector('.search-interpretation')?.textContent ?? ''
+    assert.match(copy, /Required identities: Apollo 11/)
+    assert.match(copy, /Alternatives: any of NASA OR ESA/)
+    assert.match(copy, /Similarity references, not required: For All Mankind/)
+    assert.match(copy, /Requirements: real archival footage/)
+    assert.match(copy, /Exclusions: fictionalized retelling/)
+    assert.match(copy, /Preferences: tense, thoughtful tone/)
+    assert.match(copy, /Possible search directions; these are planned, not necessarily searched/)
+    assert.match(copy, /Keep the named mission central/)
+  })
+  it('shows interpretation from NDJSON query progress and lets the final response replace it', async () => {
+    const finalInterpretation = { ...interpretation, searchSpace: { ...interpretation.searchSpace, medium: { value: null, provenance: 'unknown' } } }
+    const events = [{ type: 'queries', sequence: 0, queries: ['progress proposal'], searchInterpretation: interpretation }, { type: 'complete', sequence: 1, response: { ...response(), searchInterpretation: finalInterpretation } }]
+    globalThis.fetch = async input => String(input) === '/api/settings' ? jsonResponse(envelope) : new Response(events.map(x => JSON.stringify(x)).join('\n') + '\n', { headers: { 'Content-Type': 'application/x-ndjson' } })
+    window.history.replaceState(null, '', '/#search'); render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'), { target: { value: 'complex request' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+    await screen.findByRole('heading', { name: 'Releases to review' })
+    fireEvent.click(screen.getByText('Understood as'))
+    assert.match(document.querySelector('.search-interpretation')?.textContent ?? '', /Similarity references, not required: For All Mankind/)
+    assert.equal(screen.queryByText(/Medium: documentary/), null)
+  })
+  it('rejects malformed optional interpretation metadata in HTTP and NDJSON responses', async () => {
+    globalThis.fetch = async input => String(input) === '/api/settings' ? jsonResponse(envelope) : jsonResponse({ ...response(), searchInterpretation: { ...interpretation, searchSpace: { ...interpretation.searchSpace, focus: 'unsupported' } } })
+    window.history.replaceState(null, '', '/#search'); render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'), { target: { value: 'bad HTTP metadata' } }); fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+    assert.ok(await screen.findByText('Search returned incomplete results. Try again.'))
+    cleanup(); window.history.replaceState(null, '', '/#search')
+    globalThis.fetch = async input => String(input) === '/api/settings' ? jsonResponse(envelope) : new Response(JSON.stringify({ type: 'queries', sequence: 0, queries: ['query'], searchInterpretation: { ...interpretation, proposals: [{ ...interpretation.proposals[0], strategy: 'unsupported' }] } }) + '\n', { headers: { 'Content-Type': 'application/x-ndjson' } })
+    render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'), { target: { value: 'bad event metadata' } }); fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+    assert.ok(await screen.findByText('Search activity was incomplete. Try again.'))
+  })
+  it('rejects interpretation medium/provenance mismatches and values beyond contract bounds', async () => {
+    const invalid = [
+      { ...interpretation, searchSpace: { ...interpretation.searchSpace, medium: { value: 'film', provenance: 'unknown' } } },
+      { ...interpretation, searchSpace: { ...interpretation.searchSpace, identityAnchors: Array(13).fill('anchor') } },
+      { ...interpretation, proposals: [{ ...interpretation.proposals[0], query: 'q'.repeat(301) }] },
+      { ...interpretation, searchSpace: { ...interpretation.searchSpace, positives: [{ text: 'line one\nline two', strength: 'hard' }] } },
+    ]
+    for (const [index, bad] of invalid.entries()) {
+      globalThis.fetch = async input => String(input) === '/api/settings' ? jsonResponse(envelope) : jsonResponse({ ...response(), searchInterpretation: bad })
+      window.history.replaceState(null, '', '/#search'); render(<App />)
+      fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'), { target: { value: `invalid interpretation ${index}` } }); fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+      assert.ok(await screen.findByText('Search returned incomplete results. Try again.'))
+      cleanup()
+    }
+  })
+  it('accepts up to twenty accumulated interpretation proposals in JSON and NDJSON', async () => {
+    for (const count of [6, 20, 21]) {
+      const accumulated = { ...interpretation, proposals: Array.from({ length: count }, (_, i) => ({ ...interpretation.proposals[0], query: `proposal ${i}`, purpose: `Purpose ${i}` })) }
+      globalThis.fetch = async input => String(input) === '/api/settings' ? jsonResponse(envelope) : jsonResponse({ ...response(), searchInterpretation: accumulated })
+      window.history.replaceState(null, '', '/#search'); render(<App />)
+      fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'), { target: { value: `json ${count}` } }); fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+      if (count === 21) assert.ok(await screen.findByText('Search returned incomplete results. Try again.'))
+      else {
+        await screen.findByRole('heading', { name: 'Releases to review' })
+        assert.match(document.querySelector('.search-interpretation')?.textContent ?? '', /Possible search directions/)
+      }
+      cleanup()
+
+      const events = [{ type: 'queries', sequence: 0, queries: ['proposal'], searchInterpretation: accumulated }, { type: 'complete', sequence: 1, response: response() }]
+      globalThis.fetch = async input => String(input) === '/api/settings' ? jsonResponse(envelope) : new Response(events.map(event => JSON.stringify(event)).join('\n') + '\n', { headers: { 'Content-Type': 'application/x-ndjson' } })
+      window.history.replaceState(null, '', '/#search'); render(<App />)
+      fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'), { target: { value: `ndjson ${count}` } }); fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+      if (count === 21) assert.ok(await screen.findByText('Search activity was incomplete. Try again.'))
+      else {
+        await screen.findByRole('heading', { name: 'Releases to review' })
+      }
+      cleanup()
+    }
+  })
+  it('renders only one interpretation after stopping a follow-up', async () => {
+    let calls = 0
+    globalThis.fetch = async (input) => {
+      if (String(input) === '/api/settings') return jsonResponse(envelope)
+      calls++
+      if (calls === 1) return jsonResponse({ ...response(), searchInterpretation: interpretation })
+      return new Promise<Response>(() => {})
+    }
+    window.history.replaceState(null, '', '/#search'); render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'), { target: { value: 'Apollo documentary' } }); fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+    await screen.findByRole('heading', { name: 'Releases to review' })
+    fireEvent.change(screen.getByLabelText('Refine your search'), { target: { value: 'more context' } }); fireEvent.click(screen.getByRole('button', { name: 'Update search' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop search' }))
+    assert.equal(document.querySelectorAll('.search-interpretation').length, 1)
+  })
   it('sends immutable initial context and retains distinct turns through clarification', async () => {
     const calls: any[] = []
     let count = 0
@@ -943,6 +1039,26 @@ describe('general search conversation', () => {
     assert.equal(second.action, 'follow-up')
     assert.equal(screen.getAllByText('space documentaries').length, 1); assert.equal(screen.queryByLabelText('Search conversation'), null)
     assert.ok(screen.getByText('Possible match'))
+  })
+  it('restores a failed initial query for an exact retry without retyping', async () => {
+    const calls: any[] = []
+    globalThis.fetch = async (input, init) => {
+      if (String(input) === '/api/settings') return jsonResponse(envelope)
+      calls.push({ input, init })
+      if (calls.length === 1) return jsonResponse({ error: 'Temporary search failure' }, 503)
+      return jsonResponse(response())
+    }
+    window.history.replaceState(null, '', '/#search'); render(<App />)
+    const query = await screen.findByLabelText('Describe what you’re looking for') as HTMLTextAreaElement
+    fireEvent.change(query, { target: { value: 'a very specific root query' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+    await screen.findByRole('alert')
+    assert.equal((screen.getByLabelText('Describe what you’re looking for') as HTMLTextAreaElement).value, 'a very specific root query')
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+    await screen.findByRole('heading', { name: 'Releases to review' })
+    assert.equal(calls.length, 2)
+    assert.equal(JSON.parse(String(calls[0].init.body)).originalQuery, 'a very specific root query')
+    assert.equal(JSON.parse(String(calls[1].init.body)).originalQuery, 'a very specific root query')
   })
   it('renders truthful NDJSON progress and preserves suggestions when finding more', async () => {
     const calls: any[] = []

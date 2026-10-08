@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
 import { createPortal } from 'react-dom'
 import { AlertCircle, ArrowRight, Check, Clock3, LoaderCircle, Search, ShieldCheck, Sparkles, X, SlidersHorizontal, Square, Plus } from 'lucide-react'
-import type { GeneralConversationRelease, GeneralSearchBudgets, GeneralSearchConversationRequest, GeneralSearchConversationResponse, GeneralSearchDiagnostics, GeneralSearchOperationStatus, GeneralSearchProgressEvent, GeneralSearchTurn } from '../../src/types/general-search'
+import type { GeneralConversationRelease, GeneralSearchBudgets, GeneralSearchConversationRequest, GeneralSearchConversationResponse, GeneralSearchDiagnostics, GeneralSearchInterpretation, GeneralSearchOperationStatus, GeneralSearchProgressEvent, GeneralSearchTurn } from '../../src/types/general-search'
 
 const defaults: GeneralSearchBudgets = { queryCount: 6, candidateCap: 200, aiCalls: 12, batchSize: 20, displayLimit: 40, hideZeroSeeders: true }
 const labels: Record<string, string> = { planning: 'Planning search', queries: 'Search terms', searching: 'Searching indexers', results: 'Candidates found', curation: 'Checking relevance', complete: 'Search complete', error: 'Search stopped' }
@@ -18,6 +18,16 @@ function validDiagnostics(value:unknown):value is GeneralSearchDiagnostics {
   const d=value as any,l=d.ledger,a=l?.assessed
   return typeof d.complete==='boolean'&&stopReasons.has(d.stopReason)&&d.sourceInventory==='not-reported'&&finiteCount(l?.raw)&&finiteCount(l?.added)&&finiteCount(l?.duplicates)&&finiteCount(l?.reactivated)&&finiteCount(l?.reassessed)&&Boolean(l?.filtered&&typeof l.filtered==='object'&&!Array.isArray(l.filtered)&&Object.values(l.filtered).every(finiteCount))&&Boolean(a&&finiteCount(a.match)&&finiteCount(a.possible)&&finiteCount(a.unrelated)&&finiteCount(a.unassessed))&&Array.isArray(l?.outcomes)&&l.outcomes.every((o:unknown)=>Boolean(o&&typeof o==='object'&&typeof (o as any).query==='string'&&['success','failed'].includes((o as any).outcome)&&finiteCount((o as any).raw)&&finiteCount((o as any).added)))
 }
+const singleLine=(value:unknown,maxLength:number):value is string=>typeof value==='string'&&value.length>0&&value.length<=maxLength&&!/[\r\n\u0000-\u001f\u007f]/.test(value)
+const boundedStrings=(value:unknown,maxItems=12,maxLength=500):value is string[]=>Array.isArray(value)&&value.length<=maxItems&&value.every(x=>singleLine(x,maxLength))
+function validInterpretation(value:unknown):value is GeneralSearchInterpretation {
+  if(!value||typeof value!=='object'||Array.isArray(value))return false
+  const x=value as any,s=x.searchSpace
+  if(!s||typeof s!=='object'||Array.isArray(s)||!['unique-title','head-entity','category','mood','mixed'].includes(s.focus)||!boundedStrings(s.identityAnchors)||!boundedStrings(s.alternativeAnchors)||!boundedStrings(s.referenceEntities)||!s.medium||typeof s.medium!=='object'||Array.isArray(s.medium)||!(s.medium.value===null||singleLine(s.medium.value,500))||!['explicit','context','assumption','unknown'].includes(s.medium.provenance)||(s.medium.provenance==='unknown'?s.medium.value!==null:s.medium.value===null)||!['identity-preserving','subcategories','associations'].includes(s.expansionScope))return false
+  const constraints=(items:unknown)=>Array.isArray(items)&&items.length<=12&&items.every((item:any)=>item&&typeof item==='object'&&!Array.isArray(item)&&singleLine(item.text,500)&&['hard','soft'].includes(item.strength))
+  if(!constraints(s.positives)||!constraints(s.negatives)||!Array.isArray(x.proposals)||x.proposals.length>20)return false
+  return x.proposals.every((p:any)=>p&&typeof p==='object'&&!Array.isArray(p)&&singleLine(p.query,300)&&singleLine(p.purpose,160)&&singleLine(p.branch,100)&&['identity-preserving','subcategory','association'].includes(p.strategy)&&boundedStrings(p.preserves,12,200))
+}
 function validRelease(value:unknown):value is GeneralConversationRelease {
   if(!value||typeof value!=='object')return false
   const r=value as any
@@ -32,7 +42,7 @@ function validResponse(value:unknown):value is GeneralSearchConversationResponse
   if(!value||typeof value!=='object')return false
   const r=value as any
   if(!['clarification-needed','selection-required'].includes(r.status)||typeof r.query!=='string'||!Array.isArray(r.queries)||!r.queries.every((q:unknown)=>typeof q==='string'&&q.length<=2000)||typeof r.question!=='string'||!(r.searchId===null||typeof r.searchId==='string')||!(r.expiresAt===null||(typeof r.expiresAt==='string'&&Number.isFinite(Date.parse(r.expiresAt))))||!(r.confirmationToken===null||typeof r.confirmationToken==='string')||!Array.isArray(r.releases)||!r.releases.every(validRelease)||!(r.destination===null||(r.destination&&typeof r.destination.name==='string'&&r.destination.name.length>0&&['usenet','torrent'].includes(r.destination.protocol)))||typeof r.dryRun!=='boolean'||typeof r.actionsAllowed!=='boolean'||!(r.blockedReason===null||typeof r.blockedReason==='string'))return false
-  return r.diagnostics===undefined||validDiagnostics(r.diagnostics)
+  return (r.diagnostics===undefined||validDiagnostics(r.diagnostics))&&(r.searchInterpretation===undefined||validInterpretation(r.searchInterpretation))
 }
 function validEvent(value: unknown): value is GeneralSearchProgressEvent {
   if(!eventValue(value)) return false
@@ -41,7 +51,7 @@ function validEvent(value: unknown): value is GeneralSearchProgressEvent {
   if(e.runId!==undefined&&typeof e.runId!=='string') return false
   if(e.stageId!==undefined&&typeof e.stageId!=='string') return false
   if(e.type==='planning') return e.message===undefined||typeof e.message==='string'
-  if(e.type==='queries') return Array.isArray(e.queries)&&e.queries.length<=100&&e.queries.every((x:unknown)=>typeof x==='string'&&x.length<=2000)
+  if(e.type==='queries') return Array.isArray(e.queries)&&e.queries.length<=100&&e.queries.every((x:unknown)=>typeof x==='string'&&x.length<=2000)&&(e.searchInterpretation===undefined||validInterpretation(e.searchInterpretation))
   if(e.type==='searching') return typeof e.query==='string'&&e.query.length<=2000&&Number.isSafeInteger(e.index)&&e.index>=0&&Number.isSafeInteger(e.total)&&e.total>=e.index
   if(e.type==='results') return Array.isArray(e.releases)&&e.releases.every(validRelease)&&(e.provisional===undefined||e.provisional===true)
   if(e.type==='curation') return Number.isSafeInteger(e.processed)&&e.processed>=0&&Number.isSafeInteger(e.total)&&e.total>=e.processed
@@ -68,6 +78,23 @@ function isStatus(value: unknown, expected: { id: string; manifest: string[]; mo
   return true
 }
 function uuid() { return globalThis.crypto?.randomUUID?.() ?? `web-${Date.now()}-${Math.random().toString(36).slice(2)}` }
+
+function InterpretationDetails({ interpretation }: { interpretation: GeneralSearchInterpretation }) {
+  const space=interpretation.searchSpace
+  const mediumLabel=space.medium.provenance==='assumption'?'Assumed':space.medium.provenance==='explicit'?'You specified':space.medium.provenance==='context'?'From context':'Not specified'
+  return <details className="search-interpretation"><summary>Understood as</summary><div className="interpretation-content">
+    <p><strong>Search focus:</strong> {space.focus==='unique-title'?'a specific title':space.focus==='head-entity'?'a named entity or franchise':space.focus==='category'?'a category':space.focus==='mood'?'a mood':'a mix of themes'}</p>
+    {(space.medium.value||space.medium.provenance!=='unknown')&&<p><strong>Medium:</strong> {space.medium.value||'not specified'} ({mediumLabel.toLowerCase()})</p>}
+    {space.identityAnchors.length>0&&<p><strong>Required identities:</strong> {space.identityAnchors.join(', ')}</p>}
+    {space.alternativeAnchors.length>0&&<p><strong>Alternatives:</strong> any of {space.alternativeAnchors.join(' OR ')}</p>}
+    {space.referenceEntities.length>0&&<p><strong>Similarity references, not required:</strong> {space.referenceEntities.join(', ')}</p>}
+    {space.positives.filter(x=>x.strength==='hard').length>0&&<p><strong>Requirements:</strong> {space.positives.filter(x=>x.strength==='hard').map(x=>x.text).join('; ')}</p>}
+    {space.negatives.filter(x=>x.strength==='hard').length>0&&<p><strong>Exclusions:</strong> {space.negatives.filter(x=>x.strength==='hard').map(x=>x.text).join('; ')}</p>}
+    {space.positives.filter(x=>x.strength==='soft').length>0&&<p><strong>Preferences:</strong> {space.positives.filter(x=>x.strength==='soft').map(x=>x.text).join('; ')}</p>}
+    {space.negatives.filter(x=>x.strength==='soft').length>0&&<p><strong>Things to avoid:</strong> {space.negatives.filter(x=>x.strength==='soft').map(x=>x.text).join('; ')}</p>}
+    {interpretation.proposals.length>0&&<><p className="interpretation-proposal-note">Possible search directions; these are planned, not necessarily searched.</p><ul>{interpretation.proposals.slice(0,8).map((proposal,i)=><li key={`${i}-${proposal.query}`}><strong>{proposal.purpose}:</strong> {proposal.query}</li>)}</ul></>}
+  </div></details>
+}
 
 export function GeneralSearchPage() {
   const [draft, setDraft] = useState('')
@@ -96,6 +123,7 @@ export function GeneralSearchPage() {
   const pendingRun=useRef<{id:number;action:GeneralSearchConversationRequest['action']}|null>(null)
   const searchAuth=useRef<{searchId:string;confirmationToken:string}|null>(null)
   const [provisional, setProvisional] = useState<GeneralConversationRelease[]>([])
+  const [searchInterpretation, setSearchInterpretation] = useState<GeneralSearchInterpretation | null>(null)
   const [errorDiagnostics,setErrorDiagnostics]=useState<GeneralSearchDiagnostics|null>(null)
   const [activityOpen, setActivityOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -156,7 +184,7 @@ export function GeneralSearchPage() {
     const root = action === 'search' ? clean : original
     const req: GeneralSearchConversationRequest = { originalQuery: root, turns: nextTurns, action, budgets: budget, ...(action!=='search'&&searchAuth.current ? { previousSearchId: searchAuth.current.searchId, confirmationToken: searchAuth.current.confirmationToken } : {}), ...(action === 'more-like-these' ? { selectedInspirationIds: selected } : {}) }
     const id = ++searchRun.current, aborter = new AbortController(); controller.current?.abort(); controller.current = aborter;pendingRun.current={id,action}
-    setSearchBusy(true); setStopped(false); setError('');setErrorDiagnostics(null); setEvents([]); backendRunId.current=null;lastEventSequence.current=-1;setProvisional([]); setActivityStage('Planning search'); setActivityQueries([]); setCuration(null); setSelected([]); setDraft(''); setPage(0)
+     setSearchBusy(true); setStopped(false); setError('');setErrorDiagnostics(null); setEvents([]); backendRunId.current=null;lastEventSequence.current=-1;setProvisional([]); if(action==='search')setSearchInterpretation(null); setActivityStage('Planning search'); setActivityQueries([]); setCuration(null); setSelected([]); setDraft(''); setPage(0)
     setSnapshotCurrent(false)
     if (action === 'search') { searchAuth.current=null;setOriginal(clean); setTurns(nextTurns); setResult(null) }
     else setTurns(nextTurns)
@@ -175,7 +203,7 @@ export function GeneralSearchPage() {
         lastEventSequence.current=item.sequence
         setEvents(current=>{const index=item.stageId?current.findIndex(x=>(x as GeneralSearchProgressEvent&{stageId?:string}).stageId===item.stageId):-1;if(index>=0){const next=[...current];next[index]=item;return next}return [...current,item]})
         if(item.type==='planning')setActivityStage(labels.planning)
-        if(item.type==='queries'){setActivityStage('Search terms ready');setActivityQueries(item.queries)}
+         if(item.type==='queries'){setActivityStage('Search terms ready');setActivityQueries(item.queries);if(item.searchInterpretation)setSearchInterpretation(item.searchInterpretation)}
         if(item.type==='searching')setActivityStage(`Searching · term ${item.index} · limit ${item.total}`)
         if(item.type==='curation'){setActivityStage('Checking relevance');setCuration({processed:item.processed,total:item.total})}
         if(item.type==='results'&&item.provisional)setProvisional(item.releases.map(r=>({...r,selectable:false,unavailableReason:r.unavailableReason||'Still searching'})))
@@ -195,14 +223,14 @@ export function GeneralSearchPage() {
         const body:unknown=await response.json();if(searchRun.current!==id)return;if(!validResponse(body))throw new Error('Search returned incomplete results. Try again.');final=body
       }
       if(searchRun.current!==id)return
-      if(final){const complete=final.diagnostics?.complete!==false;const authoritative={...final,confirmationToken:complete?final.confirmationToken:null,actionsAllowed:complete?final.actionsAllowed:false,releases:complete?final.releases:final.releases.map(r=>({...r,selectable:false,unavailableReason:r.unavailableReason||'Search did not complete'}))};if(complete&&final.searchId&&final.confirmationToken)searchAuth.current={searchId:final.searchId,confirmationToken:final.confirmationToken};setResult(authoritative);setSnapshotCurrent(complete);if(!complete)setErrorDiagnostics(final.diagnostics??null);setProvisional([]);setPage(0);setActivityStage(complete?'Search complete':'Search ended early');setTurns(current=>[...current,{role:'assistant',content:authoritative.status==='clarification-needed'?authoritative.question:complete?`Found ${authoritative.releases.length} candidates.`:'Search ended early. Results cannot be selected.'}]);pendingRun.current=null}
-    } catch (e) { if (searchRun.current === id && !aborter.signal.aborted) {const message=e instanceof Error ? e.message : 'Search could not be completed.';setError(message);setActivityStage('Search could not be completed');if(pendingRun.current?.id===id){setTurns(current=>[...current,{role:'assistant',content:`Search did not complete: ${message}`}]);pendingRun.current=null}} }
+      if(final){const complete=final.diagnostics?.complete!==false;const authoritative={...final,confirmationToken:complete?final.confirmationToken:null,actionsAllowed:complete?final.actionsAllowed:false,releases:complete?final.releases:final.releases.map(r=>({...r,selectable:false,unavailableReason:r.unavailableReason||'Search did not complete'}))};setSearchInterpretation(final.searchInterpretation??null);if(complete&&final.searchId&&final.confirmationToken)searchAuth.current={searchId:final.searchId,confirmationToken:final.confirmationToken};setResult(authoritative);setSnapshotCurrent(complete);if(!complete)setErrorDiagnostics(final.diagnostics??null);setProvisional([]);setPage(0);setActivityStage(complete?'Search complete':'Search ended early');setTurns(current=>[...current,{role:'assistant',content:authoritative.status==='clarification-needed'?authoritative.question:complete?`Found ${authoritative.releases.length} candidates.`:'Search ended early. Results cannot be selected.'}]);pendingRun.current=null}
+    } catch (e) { if (searchRun.current === id && !aborter.signal.aborted) {const message=e instanceof Error ? e.message : 'Search could not be completed.';setError(message);setActivityStage('Search could not be completed');if(pendingRun.current?.id===id){if(action==='search')setDraft(clean);setTurns(current=>[...current,{role:'assistant',content:`Search did not complete: ${message}`}]);pendingRun.current=null}} }
     finally { if (searchRun.current === id) setSearchBusy(false) }
   }
 
   function submitComposer(event: FormEvent) { event.preventDefault(); void search(!result ? 'search' : 'follow-up') }
   function stopSearch() { if (!searchBusy) return;const pending=pendingRun.current;searchRun.current++; controller.current?.abort(); setSearchBusy(false); setStopped(true); setActivityStage('Search stopped');setSnapshotCurrent(false);setTurns(current=>pending? [...current,{role:'assistant',content:'Search stopped. Any early results are not confirmed.'}]:current);pendingRun.current=null;setProvisional(current=>current.map(r=>({...r,selectable:false,unavailableReason:'Search stopped before results were confirmed'}))) }
-  function newConversation() { searchRun.current++; controller.current?.abort();searchAuth.current=null; setSearchBusy(false); setStopped(false); setDialogOpen(false); setDraft(''); setOriginal(''); setTurns([]); setResult(null);setSnapshotCurrent(false); setProvisional([]); setSelected([]); setEvents([]); setActivityStage(''); setActivityQueries([]); setCuration(null); setError('');setErrorDiagnostics(null); setPage(0) }
+  function newConversation() { searchRun.current++; controller.current?.abort();searchAuth.current=null; setSearchBusy(false); setStopped(false); setDialogOpen(false); setDraft(''); setOriginal(''); setTurns([]); setResult(null);setSnapshotCurrent(false); setProvisional([]);setSearchInterpretation(null); setSelected([]); setEvents([]); setActivityStage(''); setActivityQueries([]); setCuration(null); setError('');setErrorDiagnostics(null); setPage(0) }
   function toggle(id: string) { setSelected(items => items.includes(id) ? items.filter(x => x !== id) : items.length < (budget.candidateCap || 200) ? [...items, id] : items) }
   async function reconcile(id = operationId, manifest = manifestRef.current, mode: 'live'|'dry-run' = unknownContext.current?.mode??(result?.dryRun ? 'dry-run':'live'), destination: { name: string; protocol: 'usenet'|'torrent' } | null = unknownContext.current?.destination??result?.destination??null) {
     if (!id || !destination) return
@@ -242,10 +270,11 @@ export function GeneralSearchPage() {
 
   return <div className="general-search">
     <div className="search-title-row"><h1>General search</h1></div><div className="search-toolbar"><span>Search in your own words. Nothing is sent without your review.</span><div><button type="button" className="button button-secondary" onClick={newConversation}><Plus size={15}/> New search</button>{searchBusy&&<button type="button" className="button button-secondary stop-search" onClick={stopSearch}><Square size={14}/> Stop search</button>}</div></div>
-    <form className="general-search-form" onSubmit={submitComposer}><label htmlFor="general-query">{result?.status==='clarification-needed'?'Your answer':original?'Refine your search':'Describe what you’re looking for'}</label><div className="general-query-wrap"><Search size={19} aria-hidden="true"/><textarea id="general-query" autoComplete="off" value={draft} maxLength={500} disabled={searchBusy||dialogOpen||continuationLocked} onChange={e=>{setDraft(e.target.value);e.currentTarget.style.height='auto';e.currentTarget.style.height=`${Math.min(e.currentTarget.scrollHeight,180)}px`}} placeholder={original?'Add a detail or direction…':'A title, an episode, or something you’d like to explore…'} rows={1}/><button className="button button-primary" disabled={searchBusy||dialogOpen||continuationLocked||!draft.trim()}>{searchBusy?<LoaderCircle className="spin" size={16}/>:<ArrowRight size={16}/>}<span>{result?.status==='clarification-needed'?'Continue':original?'Update search':'Search'}</span></button></div><span className="field-hint">Search titles, episodes, topics, or moods. No download is sent by searching.</span></form>
+    <form className="general-search-form" onSubmit={submitComposer}><label htmlFor="general-query">{!result?'Describe what you’re looking for':result.status==='clarification-needed'?'Your answer':'Refine your search'}</label><div className="general-query-wrap"><Search size={19} aria-hidden="true"/><textarea id="general-query" autoComplete="off" value={draft} maxLength={500} disabled={searchBusy||dialogOpen||continuationLocked} onChange={e=>{setDraft(e.target.value);e.currentTarget.style.height='auto';e.currentTarget.style.height=`${Math.min(e.currentTarget.scrollHeight,180)}px`}} placeholder={result?'Add a detail or direction…':'A title, an episode, or something you’d like to explore…'} rows={1}/><button className="button button-primary" disabled={searchBusy||dialogOpen||continuationLocked||!draft.trim()}>{searchBusy?<LoaderCircle className="spin" size={16}/>:<ArrowRight size={16}/>}<span>{!result?'Search':result.status==='clarification-needed'?'Continue':'Update search'}</span></button></div><span className="field-hint">Search titles, episodes, topics, or moods. No download is sent by searching.</span></form>
        <details className="search-preferences" open={settingsOpen} onToggle={e=>setSettingsOpen(e.currentTarget.open)}><summary><SlidersHorizontal size={16}/> Search settings</summary><p className="settings-explainer">Advanced limits for this search. Values stay within the configured maximums.</p><div className="budget-grid">{([['queryCount','Search terms'],['candidateCap','Candidate cap'],['aiCalls','AI calls'],['batchSize','Prompt batch'],['displayLimit','Visible per page']] as const).map(([key,label])=><label key={key}>{label}<input disabled={searchBusy||dialogOpen} type="number" min="1" max={budgetCeilings[key]} value={budget[key]} onChange={e=>setBudget(b=>({...b,[key]:Math.min(budgetCeilings[key],Math.max(1,Number(e.target.value)||1))}))}/></label>)}<label className="zero-toggle"><input disabled={searchBusy||dialogOpen} type="checkbox" checked={!budget.hideZeroSeeders} onChange={e=>setBudget(b=>({...b,hideZeroSeeders:!e.target.checked}))}/> Include torrents with zero seeders</label></div></details>
      {error && <div className="notice notice-error" role="alert"><AlertCircle size={17}/><p>{error}</p></div>}
-     {(searchBusy||stopped||events.length>0)&&<section className="search-activity" aria-label="Search progress"><div className="activity-current" role="status"><span className={searchBusy?'activity-pulse':'activity-done'}/><strong>{activityStage||'Preparing search'}</strong>{searchBusy&&curation&&<span>{curation.processed} of {curation.total} reviewed</span>}</div>{activityQueries.length>0&&<div className="query-chips" aria-label="Search terms">{activityQueries.map((q,i)=><span key={`${i}-${q}`}>{q}</span>)}</div>}{(events.length>0||activityQueries.length>0)&&<details className="activity-details" open={activityOpen} onToggle={e=>setActivityOpen(e.currentTarget.open)}><summary>Search activity</summary><ol>{events.map((event,i)=><li key={`${event.sequence}-${i}`}>{labels[event.type]||'Search update'}{event.type==='searching'&&<span>{event.query} · term {event.index} · limit {event.total}</span>}{event.type==='curation'&&<span>{event.processed} of {event.total} reviewed</span>}</li>)}</ol></details>}</section>}
+      {(searchBusy||stopped||events.length>0)&&<section className="search-activity" aria-label="Search progress"><div className="activity-current" role="status"><span className={searchBusy?'activity-pulse':'activity-done'}/><strong>{activityStage||'Preparing search'}</strong>{searchBusy&&curation&&<span>{curation.processed} of {curation.total} reviewed</span>}</div>{activityQueries.length>0&&<div className="query-chips" aria-label="Search terms">{activityQueries.map((q,i)=><span key={`${i}-${q}`}>{q}</span>)}</div>}{searchInterpretation&&<InterpretationDetails interpretation={searchInterpretation}/ >}{(events.length>0||activityQueries.length>0)&&<details className="activity-details" open={activityOpen} onToggle={e=>setActivityOpen(e.currentTarget.open)}><summary>Search activity</summary><ol>{events.map((event,i)=><li key={`${event.sequence}-${i}`}>{labels[event.type]||'Search update'}{event.type==='searching'&&<span>{event.query} · term {event.index} · limit {event.total}</span>}{event.type==='curation'&&<span>{event.processed} of {event.total} reviewed</span>}</li>)}</ol></details>}</section>}
+      {!searchBusy&&!stopped&&searchInterpretation&&events.length===0&&<InterpretationDetails interpretation={searchInterpretation}/>}
      {provisional.length>0&&<section className="provisional-results" aria-label="Provisional search results"><div><strong>{searchBusy?'Early matches · still searching':'Partial results · search stopped'}</strong><p>These results are not confirmed and cannot be selected.</p></div><ul>{provisional.slice(0,8).map(r=><li key={r.releaseId}>{r.title}</li>)}</ul></section>}
      {result && result.status === 'clarification-needed' && <section className="clarification-card"><Sparkles size={18}/><div><h2>A quick question</h2><p>{result.question}</p></div></section>}
      {result&&!snapshotCurrent&&<p className="prior-results-note" role="status">{searchBusy?'Earlier results are shown for context while this search runs. They cannot be selected.':'These earlier results are shown for context only. They cannot be selected until a new search completes.'}</p>}

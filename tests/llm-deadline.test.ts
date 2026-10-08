@@ -4,7 +4,6 @@ import type { Fetcher } from '@openrouter/sdk';
 import { z } from 'zod';
 import { OpenRouterLLM } from '../src/clients/llm';
 
-const TIMEOUT_MS = 60_000;
 const MODEL = 'z-ai/glm-5.3-flash';
 const schema = z.object({ verdict: z.enum(['grab', 'manual', 'skip']) });
 
@@ -45,34 +44,18 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('OpenRouterLLM.json deadline', () => {
-  it('aborts a never-resolving SDK transport at 60 seconds and settles the call', async () => {
+describe('OpenRouterLLM.json cancellation and retry behavior', () => {
+  it('allows a slow successful response beyond 60 seconds', async () => {
     vi.useFakeTimers();
-    let requestSignal: AbortSignal | undefined;
-    const llm = build((input) => {
-      requestSignal = (input as Request).signal;
-      return new Promise<Response>((_resolve, reject) => {
-        requestSignal!.addEventListener('abort', () => reject(requestSignal!.reason), { once: true });
-      });
-    });
-    let settled = false;
-    const result = call(llm).then(
-      () => ({ ok: true as const }),
-      (error: unknown) => ({ ok: false as const, error }),
-    ).finally(() => { settled = true; });
-
-    await vi.advanceTimersByTimeAsync(TIMEOUT_MS - 1);
-    expect(settled).toBe(false);
-    await vi.advanceTimersByTimeAsync(1);
-
-    expect(settled).toBe(true);
-    expect(requestSignal?.aborted).toBe(true);
-    const outcome = await result;
-    expect(outcome.ok).toBe(false);
-    if (!outcome.ok) expect(outcome.error).toMatchObject({ code: 'llm-timeout' });
+    const llm = build(() => new Promise<Response>((resolve) => setTimeout(() => resolve(reply('{"verdict":"skip"}')), 61_000)));
+    const result = call(llm);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(61_000);
+    await expect(result).resolves.toEqual({ verdict: 'skip' });
+    expect(vi.getTimerCount()).toBe(0);
   });
 
-  it('cancels a response whose body stalls after headers arrive', async () => {
+  it('cancels a response body stalled after headers when the caller aborts', async () => {
     vi.useFakeTimers();
     let requestSignal: AbortSignal | undefined;
     const llm = build((input) => {
@@ -89,23 +72,17 @@ describe('OpenRouterLLM.json deadline', () => {
         headers: { 'content-type': 'application/json' },
       }));
     });
-    let settled = false;
-    const result = call(llm).then(
-      () => ({ ok: true as const }),
-      (error: unknown) => ({ ok: false as const, error }),
-    ).finally(() => { settled = true; });
+    const caller = new AbortController();
+    const remove = vi.spyOn(caller.signal, 'removeEventListener');
+    const result = llm.json({ system: 'sys', user: 'user', schema, label: 'verdict', signal: caller.signal });
     await vi.advanceTimersByTimeAsync(0);
-
-    await vi.advanceTimersByTimeAsync(TIMEOUT_MS);
-
-    expect(settled).toBe(true);
+    caller.abort(Object.assign(new Error('caller cancelled'), { code: 'aborted' }));
+    await expect(result).rejects.toMatchObject({ code: 'aborted' });
     expect(requestSignal?.aborted).toBe(true);
-    const outcome = await result;
-    expect(outcome.ok).toBe(false);
-    if (!outcome.ok) expect(outcome.error).toMatchObject({ code: 'llm-timeout' });
+    expect(remove).toHaveBeenCalledWith('abort', expect.any(Function));
   });
 
-  it('shares the deadline with the corrective JSON request and cancels that request', async () => {
+  it('cancels the corrective JSON request when the caller aborts', async () => {
     vi.useFakeTimers();
     let calls = 0;
     let correctiveSignal: AbortSignal | undefined;
@@ -121,82 +98,58 @@ describe('OpenRouterLLM.json deadline', () => {
         correctiveSignal!.addEventListener('abort', () => reject(correctiveSignal!.reason), { once: true });
       });
     });
-    let settled = false;
-    const result = call(llm).then(
-      () => ({ ok: true as const }),
-      (error: unknown) => ({ ok: false as const, error }),
-    ).finally(() => { settled = true; });
+    const caller = new AbortController();
+    const result = llm.json({ system: 'sys', user: 'user', schema, label: 'verdict', signal: caller.signal });
 
+    await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(40_000);
     expect(calls).toBe(2);
-    await vi.advanceTimersByTimeAsync(19_999);
-    expect(settled).toBe(false);
-    await vi.advanceTimersByTimeAsync(1);
-
-    expect(settled).toBe(true);
+    caller.abort(Object.assign(new Error('caller cancelled'), { code: 'aborted' }));
+    await expect(result).rejects.toMatchObject({ code: 'aborted' });
     expect(correctiveSignal?.aborted).toBe(true);
-    const outcome = await result;
-    expect(outcome.ok).toBe(false);
-    if (!outcome.ok) expect(outcome.error).toMatchObject({ code: 'llm-timeout' });
   });
 
-  it('consumes a transport rejection that arrives after the public call timed out', async () => {
+  it('consumes a transport rejection that arrives after caller cancellation', async () => {
     vi.useFakeTimers();
     let rejectTransport!: (reason: unknown) => void;
     const llm = build(() => new Promise<Response>((_resolve, reject) => {
       rejectTransport = reject;
     }));
-    const result = call(llm).then(
-      () => ({ ok: true as const }),
-      (error: unknown) => ({ ok: false as const, error }),
-    );
-
-    await vi.advanceTimersByTimeAsync(TIMEOUT_MS);
-    const outcome = await result;
-    expect(outcome.ok).toBe(false);
-    if (!outcome.ok) expect(outcome.error).toMatchObject({ code: 'llm-timeout' });
+    const caller = new AbortController();
+    const result = llm.json({ system: 'sys', user: 'user', schema, label: 'verdict', signal: caller.signal });
+    await vi.advanceTimersByTimeAsync(0);
+    caller.abort(Object.assign(new Error('caller cancelled'), { code: 'aborted' }));
+    await expect(result).rejects.toMatchObject({ code: 'aborted' });
 
     rejectTransport(new Error('late transport rejection'));
     await vi.advanceTimersByTimeAsync(0);
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it('does not start a scheduled 5xx retry after the deadline', async () => {
+  it('does not start a scheduled 5xx retry after caller cancellation', async () => {
     vi.useFakeTimers();
     let calls = 0;
     const attempts: Array<{ logicalAttempt: number; transportAttempt: number }> = [];
-    let requestSignal: AbortSignal | undefined;
-    const llm = build((input) => {
+    const llm = build(() => {
       calls++;
-      requestSignal = (input as Request).signal;
       return Promise.resolve(new Response(JSON.stringify({ error: { code: 503, message: 'busy' } }), {
         status: 503,
         headers: { 'content-type': 'application/json', 'retry-after': '120' },
       }));
     });
-    let settled = false;
-    const result = llm.json({ system: 'sys', user: 'user', schema, label: 'verdict', onAttempt: (attempt) => attempts.push(attempt) }).then(
-      () => ({ ok: true as const }),
-      (error: unknown) => ({ ok: false as const, error }),
-    ).finally(() => { settled = true; });
+    const caller = new AbortController();
+    const result = llm.json({ system: 'sys', user: 'user', schema, label: 'verdict', signal: caller.signal, onAttempt: (attempt) => attempts.push(attempt) });
 
     await vi.advanceTimersByTimeAsync(0);
     expect(calls).toBe(1);
-    await vi.advanceTimersByTimeAsync(TIMEOUT_MS);
-    expect(settled).toBe(true);
-    expect(requestSignal?.aborted).toBe(true);
-    expect(calls).toBeGreaterThan(1);
-    expect(attempts.length).toBe(calls);
-    expect(attempts.every((attempt) => attempt.logicalAttempt === 0)).toBe(true);
-    const callsAtDeadline = calls;
+    expect(calls).toBe(1);
+    caller.abort(Object.assign(new Error('caller cancelled'), { code: 'aborted' }));
+    await expect(result).rejects.toMatchObject({ code: 'aborted' });
     await vi.advanceTimersByTimeAsync(120_000);
 
-    expect(calls).toBe(callsAtDeadline);
-    expect(attempts.length).toBe(callsAtDeadline);
+    expect(calls).toBe(1);
+    expect(attempts).toEqual([{ logicalAttempt: 0, transportAttempt: 0 }]);
     expect(vi.getTimerCount()).toBe(0);
-    const outcome = await result;
-    expect(outcome.ok).toBe(false);
-    if (!outcome.ok) expect(outcome.error).toMatchObject({ code: 'llm-timeout' });
   });
 
   it.each([
@@ -243,12 +196,13 @@ describe('OpenRouterLLM.json deadline', () => {
     expect(calls).toBe(2);
   });
 
-  it('clears its deadline timer after a successful response', async () => {
+  it('removes caller abort listener after successful completion', async () => {
     vi.useFakeTimers();
     const llm = build(() => Promise.resolve(reply('{"verdict":"grab"}')));
-
-    await expect(call(llm)).resolves.toEqual({ verdict: 'grab' });
-
+    const caller = new AbortController();
+    const remove = vi.spyOn(caller.signal, 'removeEventListener');
+    await expect(llm.json({ system: 'sys', user: 'user', schema, label: 'verdict', signal: caller.signal })).resolves.toEqual({ verdict: 'grab' });
+    expect(remove).toHaveBeenCalledWith('abort', expect.any(Function));
     expect(vi.getTimerCount()).toBe(0);
   });
 });

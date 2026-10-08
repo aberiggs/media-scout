@@ -1,4 +1,7 @@
 export interface GeneralSearchRequest { query: string }
+export interface GeneralSearchSpace { focus: 'unique-title' | 'head-entity' | 'category' | 'mood' | 'mixed'; identityAnchors: string[]; alternativeAnchors: string[]; referenceEntities: string[]; medium: { value: string | null; provenance: 'explicit' | 'context' | 'assumption' | 'unknown' }; positives: Array<{ text: string; strength: 'hard' | 'soft' }>; negatives: Array<{ text: string; strength: 'hard' | 'soft' }>; expansionScope: 'identity-preserving' | 'subcategories' | 'associations' }
+export interface GeneralSearchProposal { query: string; purpose: string; branch: string; strategy: 'identity-preserving' | 'subcategory' | 'association'; preserves: string[] }
+export interface GeneralSearchInterpretation { searchSpace: GeneralSearchSpace; proposals: GeneralSearchProposal[] }
 export interface GeneralRelease {
   releaseId: string; title: string; indexer: string; size: number | null; seeders: number | null;
   leechers: number | null; age: number; protocol: 'unknown' | 'usenet' | 'torrent';
@@ -8,6 +11,7 @@ export interface GeneralSearchResponse {
   status: 'clarification-needed' | 'selection-required'; query: string; queries: string[];
   question: string; searchId: string | null; expiresAt: string | null; confirmationToken: string | null;
   releases: GeneralRelease[]; destination: { name: string; protocol: 'usenet' | 'torrent' } | null;
+  searchInterpretation?: GeneralSearchInterpretation;
   dryRun: boolean; actionsAllowed: boolean; blockedReason: string | null;
 }
 export interface GeneralGrabRequest { confirmationToken: string; releaseIds: string[]; confirmed: true }
@@ -62,7 +66,7 @@ export interface GeneralSearchConversationResponse extends Omit<GeneralSearchRes
 
 export type GeneralSearchProgressEvent =
   | { type: 'planning'; sequence: number; runId?: string; stageId?: string; message?: string }
-  | { type: 'queries'; sequence: number; runId?: string; stageId?: string; queries: string[] }
+  | { type: 'queries'; sequence: number; runId?: string; stageId?: string; queries: string[]; searchInterpretation?: GeneralSearchInterpretation }
   | { type: 'searching'; sequence: number; runId?: string; stageId?: string; query: string; index: number; total: number }
   | { type: 'results'; sequence: number; runId?: string; stageId?: string; releases: GeneralConversationRelease[]; provisional?: true }
   | { type: 'curation'; sequence: number; runId?: string; stageId?: string; processed: number; total: number }

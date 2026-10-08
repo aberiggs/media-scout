@@ -3,7 +3,6 @@ import type { OpenRouter } from '@openrouter/sdk';
 import { OpenRouterError } from '@openrouter/sdk/models/errors';
 import { ApiError } from '../http';
 
-const JSON_DEADLINE_MS = 60_000;
 const RETRY_INITIAL_INTERVAL_MS = 500;
 const RETRY_MAX_INTERVAL_MS = 10_000;
 const RETRY_EXPONENT = 1.5;
@@ -70,8 +69,6 @@ export class OpenRouterLLM implements LLMClient {
     private readonly deps: {
       client: OpenRouter;
       model: string;
-      /** Test seam; production calls use the fixed one-minute JSON deadline. */
-      timeoutMs?: number;
     },
   ) {}
 
@@ -85,8 +82,6 @@ export class OpenRouterLLM implements LLMClient {
     signal?: AbortSignal;
   }): Promise<T> {
     const controller = new AbortController();
-    const timeoutMs = this.deps.timeoutMs ?? JSON_DEADLINE_MS;
-    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     let rejectAbort!: (error: unknown) => void;
     const cancelled = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
     const abortFromCaller = () => {
@@ -99,15 +94,6 @@ export class OpenRouterLLM implements LLMClient {
     };
     args.signal?.addEventListener('abort', abortFromCaller, { once: true });
     if (args.signal?.aborted) abortFromCaller();
-    const deadline = new Promise<never>((_resolve, reject) => {
-      deadlineTimer = setTimeout(() => {
-        const error = Object.assign(new Error(`LLM request timed out after ${timeoutMs}ms`), { code: 'llm-timeout' });
-        error.name = 'TimeoutError';
-        controller.abort(error);
-        reject(error);
-      }, timeoutMs);
-    });
-
     const operation = (async () => {
       for (let attempt = 0; ; attempt++) {
         if (controller.signal.aborted) throw controller.signal.reason;
@@ -138,9 +124,8 @@ export class OpenRouterLLM implements LLMClient {
       }
     })();
     try {
-      return await Promise.race([operation, deadline, cancelled]);
+      return await Promise.race([operation, cancelled]);
     } finally {
-      if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
       args.signal?.removeEventListener('abort', abortFromCaller);
     }
   }
@@ -206,14 +191,12 @@ export class OpenRouterLLM implements LLMClient {
     onAttempt: ((attempt: { logicalAttempt: number; transportAttempt: number }) => void) | undefined,
     logicalAttempt: number,
   ): Promise<Awaited<ReturnType<OpenRouter['chat']['send']>>> {
-    const startedAt = Date.now();
     let retryIndex = 0;
     for (;;) {
       if (signal.aborted) throw signal.reason;
       try {
         onAttempt?.({ logicalAttempt, transportAttempt: retryIndex });
-        // The SDK's backoff sleeps cannot be aborted. Keep its configured retry
-        // behavior for recognized HTTP errors here so the JSON deadline also bounds waits.
+        // Keep retries explicit so backoff remains abortable and attempts observable.
         return await this.deps.client.chat.send({ chatRequest }, {
           signal,
           retries: { strategy: 'none' },
@@ -223,9 +206,7 @@ export class OpenRouterLLM implements LLMClient {
         if (!(error instanceof OpenRouterError) || error.statusCode < 500 || error.statusCode >= 600) {
           throw error;
         }
-        // Match the SDK's maxElapsedTime check: stop once a failed attempt returns
-        // after the configured window; the enclosing deadline is the hard bound.
-        if (Date.now() - startedAt > JSON_DEADLINE_MS) throw error;
+        if (retryIndex >= 10) throw error;
         const interval = Math.min(
           retryAfterMs(error) ?? RETRY_INITIAL_INTERVAL_MS * Math.pow(retryIndex, RETRY_EXPONENT) + Math.random() * 1000,
           RETRY_MAX_INTERVAL_MS,

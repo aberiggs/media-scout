@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import nock from 'nock';
 import { z } from 'zod';
 import { OpenRouter } from '@openrouter/sdk';
@@ -286,10 +286,15 @@ describe('OpenRouterLLM.json', () => {
     expect(calls).toBe(1);
   });
 
-  it('returns a typed deadline outcome without exposing provider details', async () => {
+  it('allows provider completion after the former 60-second deadline', async () => {
+    vi.useFakeTimers();
     const stub = { chat: { send: async () => new Promise<never>(() => {}) } } as unknown as OpenRouter;
-    const llm = new OpenRouterLLM({ client: stub, model: MODEL, timeoutMs: 5 });
-    await expect(llm.json({ system: 's', user: 'u', schema, label: 'picker' })).rejects.toMatchObject({ code: 'llm-timeout', name: 'TimeoutError' });
+    const llm = new OpenRouterLLM({ client: stub, model: MODEL });
+    const controller = new AbortController();
+    const pending = llm.json({ system: 's', user: 'u', schema, label: 'picker', signal: controller.signal });
+    await vi.advanceTimersByTimeAsync(60_001);
+    controller.abort(Object.assign(new Error('cancelled'), { code: 'aborted' }));
+    await expect(pending).rejects.toMatchObject({ code: 'aborted' });
   });
 
   it('aborts an active provider request promptly and does not start correction or another attempt', async () => {

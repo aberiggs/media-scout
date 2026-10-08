@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { compileSearchPlan, hasMeaningfulClarification } from '../src/core/search-planning';
+import { adaptationJsonSchema, compileSearchAdaptation, compileSearchPlan, hasMeaningfulClarification } from '../src/core/search-planning';
 
 function plan(query: string, overrides: Record<string, unknown> = {}): any {
   return {
@@ -11,6 +11,28 @@ function plan(query: string, overrides: Record<string, unknown> = {}): any {
 }
 
 describe('search plan compilation', () => {
+  it('defaults omitted new anchors for old plans and permits one matching alternative', () => {
+    const raw = plan('Batman films'); raw.searchSpace.identityAnchors = []; raw.searchSpace.alternativeAnchors = ['Spider-Man', 'Batman'];
+    (raw.proposals[0] as { preserves: string[] }).preserves = ['Batman'];
+    expect(compileSearchPlan(raw).searchSpace.alternativeAnchors).toEqual(['Spider-Man', 'Batman']);
+    const old = plan('Spider-Man 2 (2004)'); delete old.searchSpace.alternativeAnchors; delete old.searchSpace.referenceEntities;
+    expect(compileSearchPlan(old).searchSpace.referenceEntities).toEqual([]);
+    const unrelated = plan('Superhero films'); unrelated.searchSpace.identityAnchors = []; unrelated.searchSpace.alternativeAnchors = ['Spider-Man', 'Batman'];
+    (unrelated.proposals[0] as { preserves: string[] }).preserves = [];
+    expect(() => compileSearchPlan(unrelated)).toThrow();
+  });
+  it('keeps all genuine conjunction anchors mandatory and references out of query matching', () => {
+    const raw = plan('Spider-Man 2 (2004) film'); raw.searchSpace.identityAnchors = ['Spider-Man 2', '2004']; raw.searchSpace.referenceEntities = ['Alien'];
+    (raw.proposals[0] as { preserves: string[] }).preserves = ['Spider-Man 2', '2004'];
+    expect(compileSearchPlan(raw).searchSpace.referenceEntities).toEqual(['Alien']);
+  });
+  it('adapts only strict proposal lists, including empty results', () => {
+    const space = compileSearchPlan(plan('Spider-Man 2 (2004)')).searchSpace;
+    expect(compileSearchAdaptation({ proposals: [] }, space)).toEqual({ proposals: [] });
+    expect(compileSearchAdaptation({ proposals: [plan('Spider-Man 2 (2004)').proposals[0], plan('Spider-Man 2 (2004)').proposals[0]] }, space).proposals).toHaveLength(1);
+    expect(() => compileSearchAdaptation({ proposals: [], question: 'clarify' }, space)).toThrow();
+    expect(adaptationJsonSchema.required).toEqual(['proposals']);
+  });
   it('preserves literal title/year and meaningful Unicode punctuation', () => {
     expect(compileSearchPlan(plan('Spider-Man 2 (2004), the film')).proposals[0]?.query).toBe('Spider-Man 2 (2004), the film');
     const named = plan('Amélie: Le Fabuleux Destin');

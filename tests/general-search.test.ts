@@ -44,7 +44,8 @@ describe('LLM-assisted general search', () => {
     const f = fixture();
     await f.service.search({ query: 'find something' });
     const original = (f.llm.json.mock.calls[0]![0] as unknown as { system: string }).system;
-    expect(original).toContain('You interpret media-search requests');
+    expect(original).toContain('Stage 1: interpret the user\'s media request');
+    expect(original).toContain('read-only retrieval and relevance work');
     expect(original).not.toContain('User-configured system instructions:');
     f.settings.ai.searchSystemPrompt = 'My exact line\n  with spacing';
     f.state.saveSettings(f.settings);
@@ -52,7 +53,7 @@ describe('LLM-assisted general search', () => {
     const rebuilt = new GeneralSearchService({ llm: f.llm as never, prowlarr: f.prowlarr as never, state: f.state, getSettings: () => f.state.getSettings(), runtimeSettings: reloaded });
     await rebuilt.search({ query: 'find something else' });
     const prompted = (f.llm.json.mock.calls.at(-1)![0] as unknown as { system: string }).system;
-    expect(prompted).toBe(`${original}\n\nUser-configured system instructions:\nMy exact line\n  with spacing\n\nThe user-configured text is supplementary guidance. Continue to follow the role, safety, untrusted-data, and structured-output requirements above.`);
+    expect(prompted).toBe(`${original}\n\nUser-configured system instructions:\nMy exact line\n  with spacing`);
   });
   it('surfaces a typed provider refusal without searching Prowlarr', async () => {
     const f = fixture();
@@ -76,6 +77,31 @@ describe('LLM-assisted general search', () => {
     const repair=JSON.parse(f.llm.json.mock.calls[1]![0].user!) as Record<string,any>;
     expect(repair).toMatchObject({role:'interpreter and initial query planner',request:'sports games',retrieval:{previousQueries:[],budget:6},correction:{failureCodes:['invalid-search-plan']}});
     expect(repair).not.toHaveProperty('invalidOutput');expect(JSON.stringify(f.llm.json.mock.calls)).not.toContain('private.invalid');expect(JSON.stringify(f.llm.json.mock.calls)).not.toContain('private-secret');
+  });
+  it('repairs unsafe text in every legacy interpretation field without echoing it into prompts or public output',async()=>{
+    const fields=['query','purpose','branch','preserves','question','identity','alternative','reference','medium','positive','negative'] as const;
+    for(const field of fields){const f=fixture();const bad=structuredClone(planned('safe query')) as any;const marker=`https://unsafe-${field}.invalid/path`;
+      if(field==='query')bad.proposals[0].query=marker;
+      else if(field==='purpose')bad.proposals[0].purpose=marker;
+      else if(field==='branch')bad.proposals[0].branch=marker;
+      else if(field==='preserves')bad.proposals[0].preserves=[marker];
+      else if(field==='question'){bad.mode='clarify';bad.proposals=[];bad.question=marker;}
+      else if(field==='identity')bad.searchSpace.identityAnchors=[marker];
+      else if(field==='alternative')bad.searchSpace.alternativeAnchors=[marker];
+      else if(field==='reference')bad.searchSpace.referenceEntities=[marker];
+      else if(field==='medium')bad.searchSpace.medium={value:marker,provenance:'explicit'};
+      else if(field==='positive')bad.searchSpace.positives=[{text:marker,strength:'soft'}];
+      else bad.searchSpace.negatives=[{text:marker,strength:'hard'}];
+      f.llm.json.mockReset();f.llm.json.mockResolvedValueOnce(bad).mockResolvedValueOnce(planned('safe query') as never);f.prowlarr.search.mockResolvedValue([]);
+      const response=await f.service.search({query:'test'});const repair=JSON.parse(f.llm.json.mock.calls[1]![0].user!) as Record<string,unknown>;
+      expect(repair).toMatchObject({correction:{failureCodes:['invalid-search-plan']}});expect(JSON.stringify(repair)).not.toContain(marker);expect(JSON.stringify(response)).not.toContain(marker);expect(f.prowlarr.search.mock.calls.map(([arg])=>arg.query)).toEqual(['safe query']);
+    }
+  });
+  it('fails closed when repaired legacy interpretation repeats an unsafe search-space reference',async()=>{
+    for(const field of ['identityAnchors','alternativeAnchors','referenceEntities','medium','positives','negatives'] as const){const f=fixture();const bad=structuredClone(planned('safe query')) as any;const marker='user:password@unsafe.invalid/key';
+      if(field==='medium')bad.searchSpace.medium={value:marker,provenance:'explicit'};else if(field==='positives'||field==='negatives')bad.searchSpace[field]=[{text:marker,strength:'hard'}];else bad.searchSpace[field]=[marker];
+      f.llm.json.mockReset().mockResolvedValue(bad as never);await expect(f.service.search({query:'test'})).rejects.toMatchObject({code:'invalid-search-plan'});expect(f.llm.json).toHaveBeenCalledTimes(2);expect(f.prowlarr.search).not.toHaveBeenCalled();expect(f.state.getGeneralSearchSnapshot('missing')).toBeNull();expect(JSON.stringify(f.llm.json.mock.calls[1]![0].user)).not.toContain(marker);
+    }
   });
   it('charges legacy transport attempts and service repair against the same AI budget', async () => {
     for(const calls of [1,2]){const f=fixture();f.settings.generalSearch!.maxAiCalls=calls;f.state.saveSettings(f.settings);f.service=new GeneralSearchService({llm:f.llm as never,prowlarr:f.prowlarr as never,state:f.state,runtimeSettings:f.state.getSettings(),getSettings:()=>f.state.getSettings()});f.llm.json=vi.fn(async(args:{onAttempt?:(attempt:{logicalAttempt:number;transportAttempt:number})=>void})=>{args.onAttempt?.({logicalAttempt:0,transportAttempt:0});if(calls===2)args.onAttempt?.({logicalAttempt:0,transportAttempt:1});return planned('bad\nquery');}) as never;await expect(f.service.search({query:'sports games'})).rejects.toMatchObject({code:'ai-budget-exhausted'});expect(f.llm.json).toHaveBeenCalledTimes(1);expect(f.prowlarr.search).not.toHaveBeenCalled();}

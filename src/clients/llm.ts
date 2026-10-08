@@ -18,6 +18,7 @@ export interface LLMClient {
     /** Explicit provider-compatible JSON Schema for refinements/nullable wire fields. */
     jsonSchema?: { name: string; schema: Record<string, unknown> };
     onAttempt?: (attempt: { logicalAttempt: number; transportAttempt: number }) => void;
+    signal?: AbortSignal;
   }): Promise<T>;
 }
 
@@ -81,10 +82,23 @@ export class OpenRouterLLM implements LLMClient {
     label: string;
     jsonSchema?: { name: string; schema: Record<string, unknown> };
     onAttempt?: (attempt: { logicalAttempt: number; transportAttempt: number }) => void;
+    signal?: AbortSignal;
   }): Promise<T> {
     const controller = new AbortController();
     const timeoutMs = this.deps.timeoutMs ?? JSON_DEADLINE_MS;
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+    let rejectAbort!: (error: unknown) => void;
+    const cancelled = new Promise<never>((_resolve, reject) => { rejectAbort = reject; });
+    const abortFromCaller = () => {
+      const reason = args.signal?.reason;
+      const error = reason && typeof reason === 'object' && 'code' in reason
+        ? reason
+        : Object.assign(new Error('LLM request aborted'), { code: 'aborted' });
+      controller.abort(error);
+      rejectAbort(error);
+    };
+    args.signal?.addEventListener('abort', abortFromCaller, { once: true });
+    if (args.signal?.aborted) abortFromCaller();
     const deadline = new Promise<never>((_resolve, reject) => {
       deadlineTimer = setTimeout(() => {
         const error = Object.assign(new Error(`LLM request timed out after ${timeoutMs}ms`), { code: 'llm-timeout' });
@@ -96,6 +110,7 @@ export class OpenRouterLLM implements LLMClient {
 
     const operation = (async () => {
       for (let attempt = 0; ; attempt++) {
+        if (controller.signal.aborted) throw controller.signal.reason;
         const content = await this.complete(
           args.system,
           args.user,
@@ -123,9 +138,10 @@ export class OpenRouterLLM implements LLMClient {
       }
     })();
     try {
-      return await Promise.race([operation, deadline]);
+      return await Promise.race([operation, deadline, cancelled]);
     } finally {
       if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+      args.signal?.removeEventListener('abort', abortFromCaller);
     }
   }
 
@@ -139,6 +155,7 @@ export class OpenRouterLLM implements LLMClient {
     onAttempt: ((attempt: { logicalAttempt: number; transportAttempt: number }) => void) | undefined,
     logicalAttempt: number,
   ): Promise<string> {
+    if (signal.aborted) throw signal.reason;
     const generatedSchema = jsonSchema?.schema ?? withoutMetaSchema(z.toJSONSchema(schema));
     let completion: Awaited<ReturnType<OpenRouter['chat']['send']>>;
     try {
@@ -165,6 +182,7 @@ export class OpenRouterLLM implements LLMClient {
         provider: { requireParameters: true },
       }, signal, onAttempt, logicalAttempt);
     } catch (error) {
+      if (signal.aborted) throw signal.reason ?? error;
       throw normalizeOpenRouterError(error);
     }
     if (completion instanceof ReadableStream) {

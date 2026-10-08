@@ -1,77 +1,30 @@
-# General search improvement proposal
+# General search improvement plan
 
-**Status: discussion proposal only, except the separately requested saved prompt setting.** This document consolidates design and engineering recommendations for review; it is not approval to implement a broader redesign, an implementation commitment, or evidence that proposed behavior exists. The bounded, durable observations and issue statuses are tracked in [Search improvement issues](search-improvement-issues.md). The saved custom search prompt is implemented with backend and UI regression tests; this does not establish that provider refusals or retrieval-quality problems are solved.
+**Status:** Approved Phase 1–3 work is implemented. Phase 1/2 gates passed; Phase 3 was accepted by the parent after focused verification at the user's expressly authorized narrow scope adjustment (unauthenticated first-run continuation guard and JSON/NDJSON tests). This is not an unconditional Oracle Gate 3 pass. Retrieval quality is not proven. See the [verification record](search-improvement-verification.md) and [issue log](search-improvement-issues.md). The older [rewrite verification record](general-search-rewrite-verification.md) remains historical and is not overwritten.
 
-## Product direction
+## Product direction and interaction
 
-Keep general search **search-first, results-dominant, with optional conversational refinement**. It should not become a transcript-centric chatbot. Users come to discover and review results; conversation is a lightweight means to disambiguate or refine. Do not persist transcripts as a new product feature without separate approval. Preserve explicit review before submission, destination routing checks, protocol matching, per-release expiry, and the existing uncertain-outcome protections.
+General search is search-first and results-focused, with optional refinement rather than a transcript-centric chatbot. The current web interface uses one auto-growing search input, a canonical progress area, Stop/New search controls, and advanced settings in a labeled **Search settings** disclosure (not a gear). The saved search prompt remains user-authored and search-specific. Do not persist transcripts or add new lifecycle semantics by implication. Explicit review, routing/protocol checks, expiry, and uncertain-submission safeguards remain separate from search progress.
 
-The user experience should distinguish a successful empty search from failure, expose useful progress without turning internal reasoning into a transcript, and allow refinement without repeating stale or cosmetic queries. A user must always understand what has been searched, what is known about results, what remains in progress, and whether any action could submit a download.
+Progress is a current status, not an accumulating transcript. Query proposals keep the catalog `query` separate from their short public `purpose`; do not expose hidden reasoning. Provisional results are not final; incomplete-run partials are nonselectable. Event `runId` and `stageId` are optional additive fields for legacy tolerance, with monotonically sequenced events in a run. Cancellation of a search does not prove rollback of any upstream operation and does not alter independent submission reconciliation.
 
-## Proposed interaction
+## Implemented planning and retrieval contract
 
-Use one auto-growing search textarea with a single focus border and aligned submit action. Omit manual resize handles; growth should follow content within sensible limits. Provide a clearly labeled **Search settings** gear. Separate ordinary user controls (for example, search behavior and the saved prompt) from advanced ceilings; do not make critical controls undiscoverable or expose every backend bound as an ordinary preference.
+The structured planner schema in `src/core/search-planning.ts` describes focus (`unique-title`, `head-entity`, `category`, `mood`, `mixed`), identity anchors, medium/provenance, positive and negative hard/soft constraints, and expansion scope. A plan chooses search or clarification and can return at most five proposals; each proposal has separate query, public purpose, branch, strategy, and preserved anchors. Query values are validated, bounded to 300 characters, normalized, conservatively deduplicated, and checked for identity preservation. Non-identity-preserving queries over 80 characters are rejected. Do not describe this as an 80-character universal limit.
 
-Place **New search** in the header. During a run, expose **Stop** and keep **New search** enabled. Starting a new search must establish new run ownership and must not accidentally submit, cancel, or reconcile a prior download operation. Keep submission reconciliation separate from search-run lifecycle. Old-run progress, errors, results, and `finally` cleanup must never overwrite a newer run.
+The service performs bounded iterative retrieval based on sanitized results and a search ledger, curates candidate batches, reassesses when intent changes, and preserves safety/expiry behavior. Budget ceilings and a 120-second overall run deadline are enforced. Search failure can include incomplete diagnostics and safe partial findings; partials remain nonselectable. The optional user-authored 16,000-character search prompt supplements planner/curator system messages, including the legacy planner; it does not guarantee provider acceptance or retrieval quality. There is no ordinary/direct-search fallback or automatic model switch.
 
-Show compact current status, updated by stage and query/batch IDs, rather than appending every state snapshot. Offer expandable query chips/details with a short public purpose, not chain-of-thought. Respect responsive layout, keyboard operation, visible focus, and assistive-technology labels. A mobile or narrow view must not hide the primary search action, current run status, or safety-relevant submission state.
+## Phase status
 
-## Query and intent contract
+| Phase | Scope | Status |
+| --- | --- | --- |
+| 1 | Validated intent/query contract, user-authored prompt scope, typed failures | Implemented; Gate 1 passed at `9c8ad2f`. |
+| 2 | Bounded ledger-driven iteration, refinement/reassessment, candidate and snapshot safety | Implemented; Gate 2 passed at `02d5235`. |
+| 3 | Search lifecycle cancellation, progress metadata, search-first web presentation | Implemented and automated-checked; parent accepted after focused verification of the user-authorized narrow unauthenticated-first-run continuation fix. Not an unconditional Oracle Gate 3 pass; no visual review claim. |
+| 4 | Capability-aware retrieval and refinement beyond existing turn bounds | Deferred. Needs separate approval and representative deployed-source evidence. |
 
-Represent search space across focus (unique title, head-entity/franchise, category, mood, or mixed), identity anchors, medium and its provenance, explicit positive/negative hard/soft constraints, expansion scope, and material ambiguity. A franchise or named entity is not necessarily a unique title; preserve identity and assess ambiguity rather than assuming a unique match. Do not ask needless clarification merely because a request is broad; an episode request without a season may merit a question when it cannot otherwise be resolved. Detailed prompt/query architecture remains a follow-up pending research; see the [search prompt design blueprint](search-prompt-design.md).
+## Not established / future evaluation
 
-Keep query data separate from any public rationale in the structured planner response. Require non-empty, valid queries for search mode and a meaningful question for clarification mode. As a tentative discovery constraint, generate approximately 1–5 terms, each at most 80 characters; tune against fixtures. Exact mode may need a more generous allowance to preserve literal identifiers. Normalize whitespace, deduplicate, and reject URLs, multiline prose, or malformed query values. Do not blindly truncate or autocorrect names, years, episode identifiers, or user terms. Permit bounded schema repair, then return a clear error; never bypass validation or switch to direct search.
+Do not claim that all empty-result causes are identified, provider refusals are resolved, or retrieval precision/recall/performance has improved from automated orchestration tests. Source inventory is still reported as not available; diagnostics do expose observed retrieval/filter/assessment/budget/deadline counts. Per-request lower budget overrides are implemented. Optional depth/breadth presets, indexer capability selection, Torznab-specific syntax, unlimited/longer turns, query-level source selection, and live quality benchmarking remain future work. Existing bounded turns remain. No direct-search fallback, automatic model change, transcript persistence, or action lifecycle redesign is proposed here.
 
-Keep the saved `ai.searchSystemPrompt` user-authored, persisted, and bounded at 16,000 characters. It supplements the planner and curator prompts (including the legacy planner) only; it must not affect monitoring or unrelated AI tasks. Code-enforced structured-output, resource, and untrusted-metadata contracts remain authoritative. A custom instruction cannot guarantee that a model/provider will accept a catalog metadata search or override provider policy. Report a refusal safely rather than suggesting that prompt text or a different automatic pathway will bypass it.
-
-Use typed, safe outcomes for provider refusal, HTTP timeout, invalid model output, and exhausted budget. Offer explicit user choices to retry, edit the request/prompt, or select among configured models if that capability exists. Never expose raw provider bodies, credentials, or secrets. There is no ordinary/direct-search fallback and no automatic model switch, ever.
-
-## Bounded retrieval and refinement
-
-Maintain a retrieval ledger with raw results, new results, duplicates, filtered results by reason, assessment counts, and source/query outcomes. Adapt terms using observed yield; do not repeat cosmetically different queries with no new value. Stop when there are sufficient matches, no novelty, two low-yield iterations, or the run reaches a deadline/resource bound. A 120-second run deadline and a target of 20 relevant results are provisional design parameters, not commitments; validate them with real workloads. Existing ceilings (6 queries, 200 candidates, 12 AI calls, batch size 20 by default) remain ceilings, not targets to exhaust. Reserve enough assessment budget for candidates already retrieved and count actual provider attempts, including repair/retry attempts.
-
-Represent follow-up input as structured positives, exclusions, hard/soft constraints, and selected inspirations, with a version or equivalent provenance. Reassess previously seen candidates when constraints change. Relevance rejection should be reversible when a later instruction changes the criteria. Keep unsafe reference, protocol incompatibility, availability, relevance, and unassessed status distinct. Preserve stable candidate IDs and original expiry; refinement must never renew an existing release’s expiry.
-
-If a run fails after valid candidates were assessed, retain those partial findings for review, but mark the run incomplete. Candidates without an authenticated completed snapshot remain nonselectable, including assessed partial findings; unassessed candidates must never be admitted as verified results. Propagate `AbortSignal` through LLM, HTTP, and Prowlarr calls. Use both client generation ownership and server `runID`/sequence ownership so a late completion from run A cannot affect run B. Cancellation is not proof that an upstream action was rolled back; submission state remains independently reconciled under existing safeguards.
-
-Zero-result diagnosis must state only what evidence supports. Distinguish no enabled/available sources, source failures, zero raw results, candidates filtered by deterministic rules, candidates rejected by curation, budget exhaustion, and provider refusal. Do not claim that a title is absent from an indexer or inventory unless the system actually has evidence for that claim.
-
-## Retrieval integration boundaries
-
-The current Prowlarr adapter uses generic query/type search. The referenced API schema documents aggregate fields such as `query`, `type`, `indexerIds`, `categories`, `limit`, and `offset`; schema exposure is not a guarantee of deployed behavior or support by every source. Defer Torznab-specific season/episode/ID syntax and capability-aware query branching until the request path is tested against the actual adapter and representative indexers. Do not encode undocumented assumptions as guaranteed search behavior.
-
-## Phases and acceptance criteria
-
-### Phase 0 — evidence and approval
-
-Reproduce and triage the open items in [the issue log](search-improvement-issues.md), gather sanitized traces, approve product behavior and safety boundaries, and agree on fixtures/metrics. **Accept when** the proposal’s scope, event contracts, outcome taxonomy, and non-negotiable no-fallback rule are explicitly reviewed. This phase does not authorize a broad implementation by itself.
-
-### Phase 1 — query, prompt, and failure contracts
-
-Specify intent-mode schemas, query validation/repair limits, typed failure outcomes, and prompt composition boundaries. Add deterministic tests before UI wiring. **Accept when** exact, discovery, ambiguity, provider refusal, malformed output, timeout, and budget outcomes are distinguishable; no invalid response bypasses validation; blank custom prompt leaves existing messages unchanged; and the setting remains confined to search planner/curator tasks. The separately requested saved-prompt UI and persistence are already implemented and test-verified; the other work in this phase remains proposed.
-
-### Phase 2 — bounded iteration and refinement
-
-Implement ledger-based adaptation, budget reservation, structured constraints, reversible relevance assessment, partial findings, and stop conditions. **Accept when** iteration is bounded under every path, previously assessed candidates are reevaluated when appropriate, expiry and stable identity are preserved, and partial findings cannot accidentally make unassessed releases selectable.
-
-### Phase 3 — lifecycle and progress UX
-
-The specific UI corrections in the issue log may proceed independently once the run/progress contracts are agreed; do not wait for every retrieval feature. Implement search-first layout, concise stage/query/batch progress, expandable query details, Stop/New search ownership, responsive/accessibility behavior, and robust NDJSON parsing. **Accept when** fragmented, unterminated, duplicated, stale, and out-of-order progress events are handled safely; run A cannot mutate run B’s visible state; cancellation works; and search lifecycle never conflates with submission reconciliation.
-
-### Phase 4 — capability-aware retrieval and longer refinement
-
-Only after validating the deployed Prowlarr path, explore source capabilities, pagination, and query syntax. Longer refinement beyond the existing five-follow-up limit is a separate design decision. **Accept when** capability behavior is demonstrated against representative sources, unsupported syntax is not assumed, and any expanded conversation state has explicit privacy, expiry, and resource rules.
-
-## Verification strategy
-
-Add deterministic planner, service, API, and UI tests for exact title/franchise requests; broad media, sports, game, and topic interests; multilingual requests; underspecified episode requests; model/provider refusal; zero raw results; all-filtered results; duplicates; changing constraints; reversible relevance rejection; cancellation; late run-A completion during run B; malformed/fragmented/unterminated NDJSON; budget exhaustion; valid partial findings; and submission safety regressions. Evaluate retrieval precision and recall separately on a curated catalog fixture set from orchestration correctness. Optional approved live checks must be read-only and must never issue grabs. No test should rely on provider prose or expose secrets.
-
-## References and what they establish
-
-- [Prowlarr search API reference](https://github.com/Prowlarr/Prowlarr/blob/develop/_autodocs/api-reference/search.md) and [Prowlarr types](https://github.com/Prowlarr/Prowlarr/blob/develop/_autodocs/types.md): useful references for exposed API shape and fields; they do not prove behavior or capability of each configured indexer.
-- [Torznab/Newznab supported parameters](https://github.com/torznab/torznab-docs/blob/develop/docs/source/revisions/1.1-Newznab-supportedParams.rst): protocol-level parameter reference; not proof that the current generic Prowlarr path or every provider honors a given parameter.
-- Nielsen Norman Group, [Search: No Results](https://www.nngroup.com/articles/search-no-results-serp/): UX guidance for useful empty-result states; supports evidence-based recovery and diagnosis, not claims about unseen catalog contents.
-- Nielsen Norman Group, [Visibility of System Status](https://www.nngroup.com/articles/visibility-system-status/): general usability guidance for timely, understandable status feedback; it does not prescribe the proposed event schema.
-- Nielsen Norman Group, [AI Chatbots: UX Guidelines](https://www.nngroup.com/articles/ai-chatbots-design-guidelines/): chatbot UX guidance relevant to clear limits and user control; it does not imply that this search product should become a chatbot.
-
-These references inform design questions but do not validate implementation or replace local behavior tests. Arbitrary MCP agents, remote MCP, Jellyfin integration/media management, and transcript persistence remain out of scope for this proposal; do not infer that search details imply general log visibility or that AI search implies remote MCP.
+Before any future retrieval change, evaluate neutral fixtures for exact-title/year and head-entity preservation, category coverage, Unicode names, exclusions, ambiguity, and refinement. Compare semantic quality separately from orchestration correctness. Any live evaluation requires explicit authorization and must be read-only; no grabs.

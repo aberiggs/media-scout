@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import nock from 'nock';
 import { ApiError, Http } from '../src/http';
 
@@ -16,6 +16,7 @@ const catchAs = async (p: Promise<unknown>): Promise<ApiError> => {
 };
 
 afterEach(() => nock.cleanAll());
+afterEach(() => vi.unstubAllGlobals());
 
 describe('Http.getJson', () => {
   it('sends X-Api-Key, repeated-key array params, and parses the JSON body', async () => {
@@ -104,6 +105,13 @@ describe('Http.getJson', () => {
     const err = await catchAs(http.getJson('/api/v1/search', { query: 'x' }));
     expect(err).toBeInstanceOf(ApiError);
     expect(err.status).toBe(0);
+  });
+
+  it('propagates caller cancellation to an active fetch without disguising it as a timeout ApiError', async () => {
+    let entered!:()=>void;const started=new Promise<void>(resolve=>{entered=resolve;});let requestSignal:AbortSignal|undefined;
+    vi.stubGlobal('fetch',vi.fn(async(_input:unknown,init:RequestInit)=>new Promise<Response>((_resolve,reject)=>{requestSignal=init.signal as AbortSignal;entered();requestSignal.addEventListener('abort',()=>reject(requestSignal?.reason),{once:true});})));
+    const controller=new AbortController(),http=new Http({baseUrl:BASE,apiKey:KEY,timeoutMs:5000});const pending=http.getJson('/api/v1/search',{query:'active'},controller.signal);await started;
+    controller.abort(Object.assign(new Error('caller cancelled'),{code:'aborted'}));await expect(pending).rejects.toMatchObject({code:'aborted'});expect(requestSignal?.aborted).toBe(true);
   });
 });
 

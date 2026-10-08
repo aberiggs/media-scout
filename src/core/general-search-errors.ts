@@ -3,6 +3,7 @@ const SAFE_GENERAL_SEARCH_CODES = new Set([
   'invalid-confirmation','invalid-release-selection','settings-changed','destination-changed',
   'operation-not-found','operation-stopped','aborted','provider-refusal','llm-timeout',
   'invalid-llm-output','llm-provider-failure','invalid-search-plan','ai-budget-exhausted',
+  'search-deadline',
 ]);
 
 export function safeGeneralSearchErrorCode(error: unknown): string | null {

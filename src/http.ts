@@ -48,13 +48,13 @@ export class Http {
   }
 
   /** GET path with apikey auth; returns parsed JSON; throws ApiError on failure. */
-  async getJson<T = unknown>(path: string, params?: QueryParams): Promise<T> {
-    return this.request<T>('GET', path, params, undefined);
+  async getJson<T = unknown>(path: string, params?: QueryParams, signal?: AbortSignal): Promise<T> {
+    return this.request<T>('GET', path, params, undefined, signal);
   }
 
   /** POST path with a JSON body; returns parsed JSON; throws ApiError on failure. */
-  async postJson<T = unknown>(path: string, body: unknown): Promise<T> {
-    return this.request<T>('POST', path, undefined, body);
+  async postJson<T = unknown>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
+    return this.request<T>('POST', path, undefined, body, signal);
   }
 
   private async request<T>(
@@ -62,6 +62,7 @@ export class Http {
     path: string,
     params: QueryParams | undefined,
     body: unknown,
+    callerSignal?: AbortSignal,
   ): Promise<T> {
     // String concat, not new URL(): a baseUrl path prefix must survive.
     const base = this.deps.baseUrl.replace(/\/+$/, '');
@@ -80,38 +81,46 @@ export class Http {
     };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
 
-    let res: Response;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    const abortCaller = () => controller.abort(callerSignal?.reason);
+    callerSignal?.addEventListener('abort', abortCaller, { once: true });
+    if (callerSignal?.aborted) abortCaller();
+    const throwCallerAbort = (): never => {
+      const reason = callerSignal?.reason;
+      if (reason && typeof reason === 'object' && 'code' in reason) throw reason;
+      throw Object.assign(new Error('Request aborted'), { code: 'aborted' });
+    };
     try {
-      res = await fetch(url, {
-        method,
-        headers,
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(this.timeoutMs),
-      });
-    } catch (cause) {
-      // status 0: the request never got a response (timeout/DNS/refused).
-      throw new ApiError(0, url.toString(), String(cause));
-    }
-
-    let text: string;
-    try {
-      text = await res.text();
-    } catch (cause) {
-      // Body read failed or the timeout aborted mid-body: we never had a complete response.
-      throw new ApiError(0, url.toString(), String(cause));
-    }
-    if (!res.ok) {
-      throw new ApiError(
-        res.status,
-        url.toString(),
-        text,
-        parseRetryAfter(res.headers.get('retry-after')),
-      );
-    }
-    try {
-      return JSON.parse(text) as T;
-    } catch {
-      throw new ApiError(res.status, url.toString(), `invalid JSON body: ${text.slice(0, 200)}`);
+      let res: Response;
+      try {
+        res = await fetch(url, {
+          method,
+          headers,
+          body: body === undefined ? undefined : JSON.stringify(body),
+          signal: controller.signal,
+        });
+      } catch (cause) {
+        if (callerSignal?.aborted) throwCallerAbort();
+        throw new ApiError(0, url.toString(), String(cause));
+      }
+      let text: string;
+      try {
+        text = await res.text();
+      } catch (cause) {
+        if (callerSignal?.aborted) throwCallerAbort();
+        throw new ApiError(0, url.toString(), String(cause));
+      }
+      if (callerSignal?.aborted) throwCallerAbort();
+      if (!res.ok) throw new ApiError(res.status, url.toString(), text, parseRetryAfter(res.headers.get('retry-after')));
+      try {
+        return JSON.parse(text) as T;
+      } catch {
+        throw new ApiError(res.status, url.toString(), `invalid JSON body: ${text.slice(0, 200)}`);
+      }
+    } finally {
+      clearTimeout(timeout);
+      callerSignal?.removeEventListener('abort', abortCaller);
     }
   }
 }

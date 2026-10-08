@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import nock from 'nock';
 import { z } from 'zod';
 import { OpenRouter } from '@openrouter/sdk';
+import { OpenRouterError } from '@openrouter/sdk/models/errors';
 import { OpenRouterLLM } from '../src/clients/llm';
 import { ApiError } from '../src/http';
 
@@ -289,6 +290,23 @@ describe('OpenRouterLLM.json', () => {
     const stub = { chat: { send: async () => new Promise<never>(() => {}) } } as unknown as OpenRouter;
     const llm = new OpenRouterLLM({ client: stub, model: MODEL, timeoutMs: 5 });
     await expect(llm.json({ system: 's', user: 'u', schema, label: 'picker' })).rejects.toMatchObject({ code: 'llm-timeout', name: 'TimeoutError' });
+  });
+
+  it('aborts an active provider request promptly and does not start correction or another attempt', async () => {
+    let entered!:()=>void;const started=new Promise<void>(resolve=>{entered=resolve;});let sends=0,received:AbortSignal|undefined;
+    const stub={chat:{send:async(_input:unknown,options:{signal:AbortSignal})=>{sends++;received=options.signal;entered();return new Promise<never>((_resolve,reject)=>options.signal.addEventListener('abort',()=>reject(options.signal.reason),{once:true}));}}} as unknown as OpenRouter;
+    const llm=new OpenRouterLLM({client:stub,model:MODEL});const controller=new AbortController();const attempts:Array<{logicalAttempt:number;transportAttempt:number}>=[];
+    const pending=llm.json({system:'s',user:'u',schema,label:'cancelled',signal:controller.signal,onAttempt:attempt=>attempts.push(attempt)});await started;controller.abort(Object.assign(new Error('caller cancelled'),{code:'aborted'}));
+    await expect(pending).rejects.toMatchObject({code:'aborted'});expect(received?.aborted).toBe(true);expect(sends).toBe(1);expect(attempts).toEqual([{logicalAttempt:0,transportAttempt:0}]);
+  });
+
+  it('cancellation during transport backoff prevents another paid provider attempt', async () => {
+    let firstAttempt!:()=>void;const entered=new Promise<void>(resolve=>{firstAttempt=resolve;});let sends=0;
+    const serverError=Object.assign(Object.create(OpenRouterError.prototype),{statusCode:503,headers:new Headers()}) as OpenRouterError;
+    const stub={chat:{send:async()=>{sends++;throw serverError;}}} as unknown as OpenRouter;const llm=new OpenRouterLLM({client:stub,model:MODEL});const controller=new AbortController();
+    const attempts:Array<{logicalAttempt:number;transportAttempt:number}>=[];const pending=llm.json({system:'s',user:'u',schema,label:'cancel retry',signal:controller.signal,onAttempt:attempt=>{attempts.push(attempt);if(attempt.transportAttempt===0)firstAttempt();}});
+    await entered;controller.abort(Object.assign(new Error('caller cancelled'),{code:'aborted'}));await expect(pending).rejects.toMatchObject({code:'aborted'});
+    expect(sends).toBe(1);expect(attempts).toHaveLength(1);
   });
 
   it('preserves shared ApiError status and Retry-After transport metadata for non-search callers', async () => {

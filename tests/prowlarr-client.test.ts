@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import nock from 'nock';
 import { ApiError, Http } from '../src/http';
 import { ProwlarrClient } from '../src/clients/prowlarr';
@@ -17,6 +17,12 @@ const makeClient = (): ProwlarrClient =>
 afterEach(() => nock.cleanAll());
 
 describe('ProwlarrClient.search', () => {
+  it('passes caller cancellation through to the active HTTP search', async () => {
+    let entered!:()=>void;const started=new Promise<void>(resolve=>{entered=resolve;});let requestSignal:AbortSignal|undefined;
+    const http={getJson:vi.fn((_path:string,_params:unknown,signal?:AbortSignal)=>{requestSignal=signal;entered();return new Promise<unknown>((_resolve,reject)=>signal?.addEventListener('abort',()=>reject(signal.reason),{once:true}));})};
+    const controller=new AbortController(),client=new ProwlarrClient(http as never);const pending=client.search({query:'active',categories:[]},controller.signal);await started;controller.abort(Object.assign(new Error('caller cancelled'),{code:'aborted'}));
+    await expect(pending).rejects.toMatchObject({code:'aborted'});expect(http.getJson).toHaveBeenCalledWith('/api/v1/search',expect.any(Object),controller.signal);expect(requestSignal?.aborted).toBe(true);
+  });
   it('GETs /api/v1/search with repeated-key array params and parses releases', async () => {
     const scope = nock(BASE)
       .get('/api/v1/search')

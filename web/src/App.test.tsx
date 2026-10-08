@@ -941,7 +941,7 @@ describe('general search conversation', () => {
     assert.equal(first.originalQuery, 'space documentaries'); assert.equal(second.originalQuery, 'space documentaries')
     assert.deepEqual(second.turns.map((x: any) => x.content), ['space documentaries', 'What period?', 'early spaceflight'])
     assert.equal(second.action, 'follow-up')
-    assert.equal(screen.getAllByText('space documentaries').length, 2); assert.ok(screen.getAllByText('early spaceflight').length >= 1)
+    assert.equal(screen.getAllByText('space documentaries').length, 1); assert.equal(screen.queryByLabelText('Search conversation'), null)
     assert.ok(screen.getByText('Possible match'))
   })
   it('renders truthful NDJSON progress and preserves suggestions when finding more', async () => {
@@ -960,6 +960,270 @@ describe('general search conversation', () => {
     assert.ok(screen.getByRole('checkbox', { name: 'Select A Space Documentary' }))
     assert.ok(screen.getByText('deep space'))
     assert.equal(JSON.parse(String(calls[1].init.body)).action, 'find-more')
+  })
+  it('uses a multiline auto-growing prompt and keyboard-focusable search settings', async () => {
+    window.history.replaceState(null,'','/#search');render(<App />)
+    const prompt=await screen.findByLabelText('Describe what you’re looking for') as HTMLTextAreaElement
+    assert.equal(prompt.rows,1)
+    Object.defineProperty(prompt,'scrollHeight',{configurable:true,value:100})
+    fireEvent.change(prompt,{target:{value:'first line\nsecond line'}})
+    assert.equal(prompt.style.height,'100px')
+    Object.defineProperty(prompt,'scrollHeight',{configurable:true,value:360})
+    fireEvent.change(prompt,{target:{value:'many lines\n'.repeat(20)}})
+    assert.equal(prompt.style.height,'180px')
+    assert.equal(prompt.style.overflowY,'auto')
+    const settings=screen.getByText('Search settings').closest('summary')!
+    settings.focus();assert.equal(document.activeElement,settings)
+    fireEvent.click(settings)
+    assert.ok(screen.getByLabelText('Search terms'))
+  })
+  it('keeps New search and Stop search separate and ignores a late result from the prior run', async () => {
+    let resolveFirst!: (r:Response)=>void
+    let stopStream!: ReadableStreamDefaultController<Uint8Array>
+    let calls=0
+    globalThis.fetch=async(input)=>{
+      if(String(input)==='/api/settings')return jsonResponse(envelope)
+      calls++
+      if(calls===1)return new Promise<Response>(resolve=>{resolveFirst=resolve})
+      if(calls===2)return jsonResponse(response([release('new','New run release')]))
+      const early=release('early','Early stop candidate')
+      return new Response(new ReadableStream<Uint8Array>({start(controller){stopStream=controller;controller.enqueue(new TextEncoder().encode(JSON.stringify({type:'results',sequence:0,runId:'stop-run',provisional:true,releases:[early]})+'\n'))}}),{headers:{'Content-Type':'application/x-ndjson'}})
+    }
+    window.history.replaceState(null,'','/#search');render(<App />)
+    const query=await screen.findByLabelText('Describe what you’re looking for')
+    fireEvent.change(query,{target:{value:'first run'}});fireEvent.click(screen.getByRole('button',{name:'Search'}))
+    assert.ok(screen.getByRole('button',{name:'Stop search'}))
+    fireEvent.click(screen.getByRole('button',{name:'New search'}))
+    fireEvent.change(screen.getByLabelText('Describe what you’re looking for'),{target:{value:'second run'}})
+    fireEvent.click(screen.getByRole('button',{name:'Search'}))
+    await screen.findByText('New run release')
+    resolveFirst(jsonResponse(response([release('old','Stale run release')])))
+    await new Promise(resolve=>setTimeout(resolve,0))
+    assert.equal(screen.queryByRole('heading',{name:'Stale run release'}),null)
+    fireEvent.click(screen.getByRole('button',{name:'New search'}))
+    fireEvent.change(screen.getByLabelText('Describe what you’re looking for'),{target:{value:'stoppable'}})
+    fireEvent.click(screen.getByRole('button',{name:'Search'}))
+    await screen.findByText('Early stop candidate')
+    fireEvent.click(screen.getByRole('button',{name:'Stop search'}))
+    assert.ok(screen.getByText('Search stopped'))
+    assert.ok(screen.getByText('Partial results · search stopped'))
+    assert.equal(screen.queryByRole('checkbox',{name:'Select Early stop candidate'}),null)
+    stopStream.close()
+    assert.ok(screen.getByRole('button',{name:'New search'}))
+  })
+  it('upserts curation progress and keeps partial error results nonselectable', async () => {
+    const partial=release('partial','Early candidate')
+    const diagnostics={complete:false,stopReason:'source-failure',sourceInventory:'not-reported',ledger:{raw:1,added:1,duplicates:0,reactivated:0,reassessed:0,filtered:{},assessed:{match:0,possible:0,unrelated:0,unassessed:1},outcomes:[{query:'neutral query',outcome:'failed',raw:0,added:0}]}}
+    const events=[
+      {type:'planning',sequence:0,runId:'run-1',stageId:'planning'},
+      {type:'curation',sequence:1,runId:'run-1',stageId:'curation:batch-1',processed:0,total:1},
+      {type:'curation',sequence:2,runId:'run-1',stageId:'curation:batch-1',processed:1,total:1},
+      {type:'results',sequence:3,runId:'run-1',stageId:'results',provisional:true,releases:[partial]},
+      {type:'error',sequence:4,runId:'run-1',stageId:'error',code:'source-failure',message:'Search ended before completion.',partialReleases:[partial],diagnostics},
+    ]
+    globalThis.fetch=async(input)=>String(input)==='/api/settings'?jsonResponse(envelope):new Response(events.map(x=>JSON.stringify(x)).join('\n'),{headers:{'Content-Type':'application/x-ndjson'}})
+    window.history.replaceState(null,'','/#search');const view=render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'neutral query'}})
+    fireEvent.click(screen.getByRole('button',{name:'Search'}))
+    await screen.findByText('Early candidate')
+    assert.equal(screen.queryByRole('checkbox',{name:'Select Early candidate'}),null)
+    fireEvent.click(await screen.findByText('Search ended early'))
+    await screen.findByText(/One or more searches failed/)
+    assert.ok(screen.getByText(/neutral query: search failed/))
+    assert.ok(screen.getByText(/Assessment: 0 matches, 0 possible matches/))
+    const curationRows=view.container.querySelectorAll('.activity-details li')
+    assert.equal([...curationRows].filter(row=>row.textContent?.includes('Checking relevance')).length,1)
+  })
+  it('reads fragmented and unterminated NDJSON while ignoring duplicate sequence numbers', async () => {
+    const events=[
+      {type:'planning',sequence:0,runId:'fragment-run',stageId:'planning'},
+      {type:'queries',sequence:1,runId:'fragment-run',stageId:'queries',queries:['one neutral term']},
+      {type:'queries',sequence:1,runId:'fragment-run',stageId:'queries',queries:['duplicate term']},
+      {type:'complete',sequence:2,runId:'fragment-run',stageId:'complete',response:response()},
+    ].map(x=>JSON.stringify(x)).join('\n')
+    const bytes=new TextEncoder().encode(events)
+    const stream=new ReadableStream<Uint8Array>({start(controller){controller.enqueue(bytes.slice(0,13));controller.enqueue(bytes.slice(13,61));controller.enqueue(bytes.slice(61));controller.close()}})
+    globalThis.fetch=async(input)=>String(input)==='/api/settings'?jsonResponse(envelope):new Response(stream,{headers:{'Content-Type':'application/x-ndjson'}})
+    window.history.replaceState(null,'','/#search');render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'fragmented query'}})
+    fireEvent.click(screen.getByRole('button',{name:'Search'}))
+    await screen.findByRole('heading',{name:'Releases to review'})
+    assert.ok(screen.getByText('one neutral term'))
+    assert.equal(screen.queryByText('duplicate term'),null)
+  })
+  it('turns malformed known progress events into a safe alert', async () => {
+    globalThis.fetch=async(input)=>String(input)==='/api/settings'?jsonResponse(envelope):new Response('{"type":"queries","sequence":"bad","queries":[]}\n',{headers:{'Content-Type':'application/x-ndjson'}})
+    window.history.replaceState(null,'','/#search');render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'malformed query'}})
+    fireEvent.click(screen.getByRole('button',{name:'Search'}))
+    assert.ok(await screen.findByRole('alert'))
+    assert.ok(screen.getByText('Search activity was incomplete. Try again.'))
+    cleanup();window.history.replaceState(null,'','/#search')
+    globalThis.fetch=async(input)=>String(input)==='/api/settings'?jsonResponse(envelope):new Response('{"type":"complete"',{headers:{'Content-Type':'application/x-ndjson'}})
+    render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'malformed JSON'}})
+    fireEvent.click(screen.getByRole('button',{name:'Search'}))
+    assert.ok(await screen.findByText('Search activity could not be read. Try again.'))
+  })
+  it('rejects diagnostics that omit ledger fields rather than trusting a completion token', async () => {
+    const malformed={...response(),diagnostics:{complete:false,stopReason:'source-failure',sourceInventory:'not-reported',ledger:{raw:1,added:1,duplicates:0,reactivated:0,reassessed:0,filtered:{},assessed:{match:1,possible:0,unrelated:0,unassessed:0}}}}
+    globalThis.fetch=async(input)=>String(input)==='/api/settings'?jsonResponse(envelope):new Response(JSON.stringify({type:'complete',sequence:0,response:malformed}),{headers:{'Content-Type':'application/x-ndjson'}})
+    window.history.replaceState(null,'','/#search');render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'malformed diagnostics'}})
+    fireEvent.click(screen.getByRole('button',{name:'Search'}))
+    assert.ok(await screen.findByText('Search activity was incomplete. Try again.'))
+    assert.equal(screen.queryByRole('checkbox',{name:'Select A Space Documentary'}),null)
+  })
+  it('keeps continuation authentication paired across an incomplete NDJSON completion', async () => {
+    const diagnostics={complete:false,stopReason:'budget-exhausted',sourceInventory:'not-reported',ledger:{raw:0,added:0,duplicates:0,reactivated:0,reassessed:0,filtered:{},assessed:{match:0,possible:0,unrelated:0,unassessed:0},outcomes:[]}}
+    const requests:any[]=[]
+    globalThis.fetch=async(input,init)=>{
+      if(String(input)==='/api/settings')return jsonResponse(envelope)
+      const body=JSON.parse(String(init?.body));requests.push(body)
+      if(requests.length===1)return jsonResponse(response())
+      if(requests.length===2)return new Response(JSON.stringify({type:'complete',sequence:0,response:{...response(),searchId:'half-new-id',confirmationToken:'half-new-token',diagnostics}}),{headers:{'Content-Type':'application/x-ndjson'}})
+      return jsonResponse(response())
+    }
+    window.history.replaceState(null,'','/#search');render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'original request'}});fireEvent.click(screen.getByRole('button',{name:'Search'}));await screen.findByRole('heading',{name:'Releases to review'})
+    fireEvent.change(screen.getByLabelText('Refine your search'),{target:{value:'narrow the request'}});fireEvent.click(screen.getByRole('button',{name:'Update search'}));await screen.findByText('Search ended early',{selector:'summary'})
+    assert.equal((screen.getByRole('checkbox',{name:'Select A Space Documentary'}) as HTMLInputElement).disabled,true)
+    fireEvent.change(screen.getByLabelText('Refine your search'),{target:{value:'continue narrowing'}});fireEvent.click(screen.getByRole('button',{name:'Update search'}));await waitFor(()=>assert.equal(requests.length,3))
+    assert.equal(requests[2].previousSearchId,'snap-1')
+    assert.equal(requests[2].confirmationToken,'confirm-1')
+    assert.equal(requests[2].previousSearchId==='half-new-id'||requests[2].confirmationToken==='half-new-token',false)
+  })
+  it('omits both continuation credentials after an incomplete first response', async () => {
+    const diagnostics={complete:false,stopReason:'budget-exhausted',sourceInventory:'not-reported',ledger:{raw:0,added:0,duplicates:0,reactivated:0,reassessed:0,filtered:{},assessed:{match:0,possible:0,unrelated:0,unassessed:0},outcomes:[]}}
+    const requests:any[]=[]
+    globalThis.fetch=async(input,init)=>{
+      if(String(input)==='/api/settings')return jsonResponse(envelope)
+      const body=JSON.parse(String(init?.body));requests.push(body)
+      if(requests.length===1)return jsonResponse({...response(),searchId:'incomplete-id',confirmationToken:'incomplete-token',diagnostics})
+      return jsonResponse(response())
+    }
+    window.history.replaceState(null,'','/#search');render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'first request'}});fireEvent.click(screen.getByRole('button',{name:'Search'}));await screen.findByRole('heading',{name:'Releases to review'})
+    assert.equal((screen.getByRole('checkbox',{name:'Select A Space Documentary'}) as HTMLInputElement).disabled,true)
+    for(const name of ['Find more','More like these','Try other terms']){
+      const button=screen.getByRole('button',{name}) as HTMLButtonElement
+      assert.equal(button.disabled,true)
+      fireEvent.click(button)
+    }
+    assert.equal(requests.length,1)
+    fireEvent.change(screen.getByLabelText('Refine your search'),{target:{value:'try a more focused request'}});fireEvent.click(screen.getByRole('button',{name:'Update search'}));await waitFor(()=>assert.equal(requests.length,2))
+    assert.equal('previousSearchId' in requests[1],false)
+    assert.equal('confirmationToken' in requests[1],false)
+    assert.deepEqual(requests[1].turns.map((turn:any)=>turn.role),['user','assistant','user'])
+  })
+  it('blocks discovery actions after an incomplete first NDJSON response but allows a credential-free composer follow-up', async () => {
+    const diagnostics={complete:false,stopReason:'budget-exhausted',sourceInventory:'not-reported',ledger:{raw:0,added:0,duplicates:0,reactivated:0,reassessed:0,filtered:{},assessed:{match:0,possible:0,unrelated:0,unassessed:0},outcomes:[]}}
+    const requests:any[]=[]
+    globalThis.fetch=async(input,init)=>{
+      if(String(input)==='/api/settings')return jsonResponse(envelope)
+      const body=JSON.parse(String(init?.body));requests.push(body)
+      if(requests.length===1)return new Response(JSON.stringify({type:'complete',sequence:0,response:{...response(),searchId:'ndjson-incomplete-id',confirmationToken:'ndjson-incomplete-token',diagnostics}}),{headers:{'Content-Type':'application/x-ndjson'}})
+      return jsonResponse(response())
+    }
+    window.history.replaceState(null,'','/#search');render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'first streamed request'}});fireEvent.click(screen.getByRole('button',{name:'Search'}));await screen.findByRole('heading',{name:'Releases to review'})
+    for(const name of ['Find more','More like these','Try other terms']){
+      const button=screen.getByRole('button',{name}) as HTMLButtonElement
+      assert.equal(button.disabled,true)
+      fireEvent.click(button)
+    }
+    assert.equal(requests.length,1)
+    fireEvent.change(screen.getByLabelText('Refine your search'),{target:{value:'recover with full context'}});fireEvent.click(screen.getByRole('button',{name:'Update search'}));await waitFor(()=>assert.equal(requests.length,2))
+    assert.equal('previousSearchId' in requests[1],false)
+    assert.equal('confirmationToken' in requests[1],false)
+    assert.deepEqual(requests[1].turns.map((turn:any)=>turn.role),['user','assistant','user'])
+  })
+  it('explains budget exhaustion before any query without claiming that a source returned nothing', async () => {
+    const diagnostics={complete:false,stopReason:'budget-exhausted',sourceInventory:'not-reported',ledger:{raw:0,added:0,duplicates:0,reactivated:0,reassessed:0,filtered:{},assessed:{match:0,possible:0,unrelated:0,unassessed:0},outcomes:[]}}
+    globalThis.fetch=async(input)=>String(input)==='/api/settings'?jsonResponse(envelope):jsonResponse({...response([]),diagnostics})
+    window.history.replaceState(null,'','/#search');render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'budget-limited search'}});fireEvent.click(screen.getByRole('button',{name:'Search'}))
+    assert.ok(await screen.findByRole('heading',{name:'No results to show'}))
+    assert.equal(screen.queryByText('No matching releases'),null)
+    fireEvent.click(screen.getByText('Search ended early'))
+    assert.ok(screen.getByText(/Search limits were reached/))
+    assert.equal(screen.queryByText(/no sources|no indexers/i),null)
+  })
+  it('invalidates prior release authority after a failed refinement and keeps conversation turns alternating', async () => {
+    const diagnostics={complete:true,stopReason:'sufficient-results',sourceInventory:'not-reported',ledger:{raw:1,added:1,duplicates:0,reactivated:0,reassessed:0,filtered:{},assessed:{match:1,possible:0,unrelated:0,unassessed:0},outcomes:[{query:'first request',outcome:'success',raw:1,added:1}]}}
+    const refusal={...diagnostics,complete:false,stopReason:'provider-refusal',ledger:{...diagnostics.ledger,raw:0,added:0,assessed:{match:0,possible:0,unrelated:0,unassessed:0},outcomes:[]}}
+    const calls:any[]=[]
+    globalThis.fetch=async(input,init)=>{
+      if(String(input)==='/api/settings')return jsonResponse(envelope)
+      const body=JSON.parse(String(init?.body));calls.push(body)
+      if(calls.length===1)return jsonResponse({...response(),diagnostics})
+      if(calls.length===2)return new Response(JSON.stringify({type:'error',sequence:0,runId:'refusal-run',code:'provider-refusal',message:'The search could not continue.',diagnostics:refusal}),{headers:{'Content-Type':'application/x-ndjson'}})
+      if(calls.length===4)return new Promise<Response>(()=>{})
+      return jsonResponse({...response([release('fresh','Fresh refinement result')]),diagnostics})
+    }
+    window.history.replaceState(null,'','/#search');render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'first request'}})
+    fireEvent.click(screen.getByRole('button',{name:'Search'}))
+    const oldBox=await screen.findByRole('checkbox',{name:'Select A Space Documentary'}) as HTMLInputElement
+    assert.equal(oldBox.disabled,false)
+    fireEvent.change(screen.getByLabelText('Refine your search'),{target:{value:'exclude one category'}})
+    fireEvent.click(screen.getByRole('button',{name:'Update search'}))
+    await screen.findByRole('alert')
+    assert.equal((screen.getByRole('checkbox',{name:'Select A Space Documentary'}) as HTMLInputElement).disabled,true)
+    assert.equal((screen.getByRole('button',{name:/Review 0 selected/}) as HTMLButtonElement).disabled,true)
+    fireEvent.click(screen.getByText('Search ended early'))
+    assert.ok(screen.getByText(/The AI service declined to continue/))
+    fireEvent.change(screen.getByLabelText('Refine your search'),{target:{value:'try another direction'}})
+    fireEvent.click(screen.getByRole('button',{name:'Update search'}))
+    await screen.findByText('Fresh refinement result')
+    assert.deepEqual(calls[2].turns.map((t:any)=>t.role),['user','assistant','user','assistant','user'])
+    assert.deepEqual(calls[2].turns.filter((t:any)=>t.role==='user').map((t:any)=>t.content),['first request','exclude one category','try another direction'])
+    fireEvent.change(screen.getByLabelText('Refine your search'),{target:{value:'stop this refinement'}});fireEvent.click(screen.getByRole('button',{name:'Update search'}));assert.ok(screen.getByRole('button',{name:'Stop search'}));fireEvent.click(screen.getByRole('button',{name:'Stop search'}))
+    assert.equal((screen.getByRole('checkbox',{name:'Select Fresh refinement result'}) as HTMLInputElement).disabled,true)
+    fireEvent.change(screen.getByLabelText('Refine your search'),{target:{value:'continue after stop'}});fireEvent.click(screen.getByRole('button',{name:'Update search'}));await screen.findByText('Fresh refinement result')
+    assert.deepEqual(calls[4].turns.map((t:any)=>t.role),['user','assistant','user','assistant','user','assistant','user','assistant','user'])
+  })
+  it('rejects malformed nested completions and disables selectable releases from incomplete complete responses', async () => {
+    const partialResponse={...response(),releases:[{...release('bad','Bad release'),title:null,apiKey:'must-not-be-rendered'}]}
+    globalThis.fetch=async(input)=>String(input)==='/api/settings'?jsonResponse(envelope):new Response(JSON.stringify({type:'complete',sequence:0,response:partialResponse}),{headers:{'Content-Type':'application/x-ndjson'}})
+    window.history.replaceState(null,'','/#search');render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'bad nested result'}})
+    fireEvent.click(screen.getByRole('button',{name:'Search'}))
+    assert.ok(await screen.findByText('Search activity was incomplete. Try again.'))
+    assert.equal(screen.queryByRole('checkbox',{name:'Select Bad release'}),null)
+
+    cleanup();window.history.replaceState(null,'','/#search')
+    const incomplete={...response(),diagnostics:{complete:false,stopReason:'budget-exhausted',sourceInventory:'not-reported',ledger:{raw:1,added:1,duplicates:0,reactivated:0,reassessed:0,filtered:{},assessed:{match:1,possible:0,unrelated:0,unassessed:0},outcomes:[]}}}
+    globalThis.fetch=async(input)=>String(input)==='/api/settings'?jsonResponse(envelope):new Response(JSON.stringify({type:'complete',sequence:0,response:incomplete}),{headers:{'Content-Type':'application/x-ndjson'}})
+    render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'incomplete run'}})
+    fireEvent.click(screen.getByRole('button',{name:'Search'}))
+    const disabled=await screen.findByRole('checkbox',{name:'Select A Space Documentary'}) as HTMLInputElement
+    assert.equal(disabled.disabled,true)
+    assert.equal((screen.getByRole('button',{name:/Review 0 selected/}) as HTMLButtonElement).disabled,true)
+    assert.ok(screen.getByText('Search ended early',{selector:'summary'}))
+  })
+  it('shows unterminated provisional results and rejects conflicting terminal events without enabling them', async () => {
+    const early=release('early','Unconfirmed release')
+    let payload=JSON.stringify({type:'results',sequence:0,runId:'partial-run',provisional:true,releases:[early]})
+    globalThis.fetch=async(input)=>String(input)==='/api/settings'?jsonResponse(envelope):new Response(payload,{headers:{'Content-Type':'application/x-ndjson'}})
+    window.history.replaceState(null,'','/#search');render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'early search'}});fireEvent.click(screen.getByRole('button',{name:'Search'}))
+    await screen.findByText('Unconfirmed release')
+    assert.ok(await screen.findByText('The search ended without a complete result.'))
+    assert.equal(screen.queryByRole('checkbox',{name:'Select Unconfirmed release'}),null)
+
+    cleanup();window.history.replaceState(null,'','/#search')
+    payload=[
+      {type:'results',sequence:0,runId:'conflict-run',provisional:true,releases:[early]},
+      {type:'complete',sequence:1,runId:'conflict-run',response:response()},
+      {type:'error',sequence:2,runId:'conflict-run',code:'late-error',message:'conflicting terminal'},
+    ].map(x=>JSON.stringify(x)).join('\n')
+    render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'conflicting search'}});fireEvent.click(screen.getByRole('button',{name:'Search'}))
+    assert.ok(await screen.findByText(/conflicting completion updates/))
+    assert.equal(screen.queryByRole('checkbox',{name:'Select A Space Documentary'}),null)
+    assert.equal(screen.queryByRole('checkbox',{name:'Select Unconfirmed release'}),null)
   })
   it('reviews the complete selected manifest in an inert, keyboard-trapped modal', async () => {
     const many = Array.from({ length: 12 }, (_, i) => release(`r${i}`, `Release ${i}`))
@@ -1013,7 +1277,7 @@ describe('general search conversation', () => {
     assert.equal((screen.getByRole('button',{name:'Find more'}) as HTMLButtonElement).disabled,true)
     assert.ok(screen.getByText(/five follow-up limit/))
     const final=JSON.parse(String(calls.at(-1).init.body));assert.equal(final.turns.filter((t:any)=>t.role==='user').length,6)
-    fireEvent.click(screen.getByRole('button',{name:'Start a new conversation'}))
+    fireEvent.click(screen.getByRole('button',{name:'New search'}))
     assert.ok(await screen.findByLabelText('Describe what you’re looking for'))
   })
   it('reconciles a lost create response by read-only status and never creates twice', async () => {
@@ -1026,6 +1290,53 @@ describe('general search conversation', () => {
     assert.equal(calls.filter(x=>String(x.input).endsWith('/operations')).length,1)
     assert.equal(calls.filter(x=>x.init?.method==='POST'&&String(x.input).endsWith('/step')).length,0)
     assert.ok(calls.some(x=>String(x.input).startsWith('/api/general-operations/')&&x.init?.method===undefined))
+    fireEvent.click(screen.getByRole('button',{name:'New search'}))
+    assert.ok(screen.getByRole('heading',{name:'Outcome unknown'}))
+    const beforeStatus=calls.filter(x=>String(x.input).startsWith('/api/general-operations/')).length
+    fireEvent.click(screen.getByRole('button',{name:'Check status'}))
+    await waitFor(()=>assert.ok(calls.filter(x=>String(x.input).startsWith('/api/general-operations/')).length>beforeStatus))
+    assert.ok(screen.getByRole('heading',{name:'Outcome unknown'}))
+  })
+  it('allows a fresh search after an operation completes without clearing or resubmitting its outcome', async () => {
+    const calls:any[]=[];let searches=0
+    globalThis.fetch=async(input,init)=>{
+      if(String(input)==='/api/settings')return jsonResponse(envelope)
+      calls.push({input,init})
+      if(String(input).includes('/conversation/stream')){searches++;return jsonResponse(response([release(`r${searches}`,searches===1?'Submitted release':'Fresh search release')]))}
+      if(String(input).endsWith('/operations')){const request=JSON.parse(String(init?.body));return jsonResponse({operationId:request.operationId,releases:request.releaseIds.map((releaseId:string)=>({releaseId,status:'dry-run',code:null})),mode:'dry-run',destination:{name:'General Client',protocol:'torrent'},expiresAt:'2099-01-01T00:00:00.000Z',nextOrdinal:1,stopped:false,complete:true})}
+      return jsonResponse({error:'Unexpected request'},404)
+    }
+    window.history.replaceState(null,'','/#search');render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'first search'}});fireEvent.click(screen.getByRole('button',{name:'Search'}));await screen.findByRole('heading',{name:'Releases to review'})
+    fireEvent.click(screen.getByRole('checkbox',{name:'Select Submitted release'}));fireEvent.click(screen.getByRole('button',{name:/Review 1 selected/}));fireEvent.click(screen.getByRole('button',{name:'Confirm full selection'}));await screen.findByRole('heading',{name:'Operation complete'})
+    fireEvent.click(screen.getByRole('button',{name:'New search'}));fireEvent.change(screen.getByLabelText('Describe what you’re looking for'),{target:{value:'fresh search'}});fireEvent.click(screen.getByRole('button',{name:'Search'}))
+    await screen.findByText('Fresh search release')
+    assert.ok(screen.getByRole('heading',{name:'Operation complete'}))
+    assert.equal(calls.filter(x=>String(x.input).endsWith('/operations')).length,1)
+    assert.equal(calls.filter(x=>String(x.input).endsWith('/step')).length,0)
+    assert.equal(calls.filter(x=>String(x.input).endsWith('/stop')).length,0)
+  })
+  it('keeps an active frozen operation while allowing a new root search', async () => {
+    const calls:any[]=[];let resolveCreate!:(r:Response)=>void;let opId=''
+    globalThis.fetch=async(input,init)=>{
+      if(String(input)==='/api/settings')return jsonResponse(envelope)
+      calls.push({input,init})
+      if(String(input).includes('/conversation/stream'))return jsonResponse(response([release('r1',calls.filter(x=>String(x.input).includes('/conversation/stream')).length===1?'Frozen release':'Fresh root release')]))
+      if(String(input).endsWith('/operations')){opId=JSON.parse(String(init?.body)).operationId;return new Promise(resolve=>{resolveCreate=resolve})}
+      if(String(input).endsWith('/step'))return jsonResponse({operationId:opId,releases:[{releaseId:'r1',status:'dry-run',code:null}],mode:'dry-run',destination:{name:'General Client',protocol:'torrent'},expiresAt:'2099-01-01T00:00:00.000Z',nextOrdinal:1,stopped:false,complete:true})
+      return jsonResponse({error:'Unexpected request'},404)
+    }
+    window.history.replaceState(null,'','/#search');render(<App />)
+    fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'first root'}});fireEvent.click(screen.getByRole('button',{name:'Search'}));await screen.findByRole('heading',{name:'Releases to review'})
+    fireEvent.click(screen.getByRole('checkbox',{name:'Select Frozen release'}));fireEvent.click(screen.getByRole('button',{name:/Review 1 selected/}));fireEvent.click(screen.getByRole('button',{name:'Confirm full selection'}));await waitFor(()=>assert.ok(resolveCreate))
+    fireEvent.click(screen.getByRole('button',{name:'New search'}));fireEvent.change(screen.getByLabelText('Describe what you’re looking for'),{target:{value:'new root'}});fireEvent.click(screen.getByRole('button',{name:'Search'}))
+    await screen.findByText('Fresh root release')
+    assert.ok(screen.getByRole('heading',{name:'Outcome not confirmed'}))
+    resolveCreate(jsonResponse({operationId:opId,releases:[{releaseId:'r1',status:'pending',code:null}],mode:'dry-run',destination:{name:'General Client',protocol:'torrent'},expiresAt:'2099-01-01T00:00:00.000Z',nextOrdinal:0,stopped:false,complete:false}))
+    await screen.findByRole('heading',{name:'Operation complete'})
+    assert.equal(calls.filter(x=>String(x.input).endsWith('/operations')).length,1)
+    assert.equal(calls.filter(x=>String(x.input).endsWith('/step')).length,1)
+    assert.equal(calls.filter(x=>String(x.input).endsWith('/stop')).length,0)
   })
   it('accepts a stopped status with an already-attempted ordinal and a held not-attempted tail', async () => {
     const calls:any[]=[], items=[release('r1','First release'),release('r2','Held release')]
@@ -1063,10 +1374,18 @@ describe('general search conversation', () => {
   })
   it('does not issue another step after navigation while an ordinal response is pending', async () => {
     let resolveStep!:(r:Response)=>void;let id='';const calls:any[]=[]
-    globalThis.fetch=(input,init)=>{if(String(input)==='/api/settings')return Promise.resolve(jsonResponse(envelope));calls.push({input,init});if(String(input).includes('/conversation/stream'))return Promise.resolve(jsonResponse(response()));if(String(input).endsWith('/operations')){id=JSON.parse(String(init?.body)).operationId;return Promise.resolve(jsonResponse({operationId:id,releases:[{releaseId:'r1',status:'pending',code:null}],mode:'dry-run',destination:{name:'General Client',protocol:'torrent'},expiresAt:'2099-01-01T00:00:00.000Z',nextOrdinal:0,stopped:false,complete:false}))}if(String(input).endsWith('/step'))return new Promise(resolve=>{resolveStep=resolve});return Promise.resolve(defaultOperationResponse(input))}
-    window.history.replaceState(null,'','/#search');render(<App />);fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'query'}});fireEvent.click(screen.getByRole('button',{name:'Search'}));await screen.findByRole('heading',{name:'Releases to review'});fireEvent.click(screen.getByRole('checkbox',{name:'Select A Space Documentary'}));fireEvent.click(screen.getByRole('button',{name:/Review 1 selected/}));fireEvent.click(screen.getByRole('button',{name:'Confirm full selection'}));await waitFor(()=>assert.ok(resolveStep))
+    globalThis.fetch=(input,init)=>{if(String(input)==='/api/settings')return Promise.resolve(jsonResponse(envelope));calls.push({input,init});if(String(input).includes('/conversation/stream'))return Promise.resolve(jsonResponse(response([release('r1','First release'),release('r2','Second release')])));if(String(input).endsWith('/operations')){id=JSON.parse(String(init?.body)).operationId;return Promise.resolve(jsonResponse({operationId:id,releases:[{releaseId:'r1',status:'pending',code:null},{releaseId:'r2',status:'pending',code:null}],mode:'dry-run',destination:{name:'General Client',protocol:'torrent'},expiresAt:'2099-01-01T00:00:00.000Z',nextOrdinal:0,stopped:false,complete:false}))}if(String(input).endsWith('/step'))return new Promise(resolve=>{resolveStep=resolve});return Promise.resolve(defaultOperationResponse(input))}
+    window.history.replaceState(null,'','/#search');render(<App />);fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'query'}});fireEvent.click(screen.getByRole('button',{name:'Search'}));await screen.findByRole('heading',{name:'Releases to review'});fireEvent.click(screen.getByRole('checkbox',{name:'Select First release'}));fireEvent.click(screen.getByRole('checkbox',{name:'Select Second release'}));fireEvent.click(screen.getByRole('button',{name:/Review 2 selected/}));fireEvent.click(screen.getByRole('button',{name:'Confirm full selection'}));await waitFor(()=>assert.ok(resolveStep))
     fireEvent.click(screen.getByRole('link',{name:'Settings'}));await waitFor(()=>assert.equal(screen.getByRole('link',{name:'Settings'}).getAttribute('aria-current'),'page'))
-    resolveStep(jsonResponse({operationId:id,releases:[{releaseId:'r1',status:'dry-run',code:null}],mode:'dry-run',destination:{name:'General Client',protocol:'torrent'},expiresAt:'2099-01-01T00:00:00.000Z',nextOrdinal:1,stopped:false,complete:true}));await new Promise(resolve=>setTimeout(resolve,20))
+    resolveStep(jsonResponse({operationId:id,releases:[{releaseId:'r1',status:'dry-run',code:null},{releaseId:'r2',status:'pending',code:null}],mode:'dry-run',destination:{name:'General Client',protocol:'torrent'},expiresAt:'2099-01-01T00:00:00.000Z',nextOrdinal:1,stopped:false,complete:false}));await new Promise(resolve=>setTimeout(resolve,20))
     assert.equal(calls.filter(x=>String(x.input).endsWith('/step')).length,1)
+  })
+  it('does not start steps when navigation invalidates a pending operation-create response', async () => {
+    let resolveCreate!:(r:Response)=>void;let id='';const calls:any[]=[]
+    globalThis.fetch=(input,init)=>{if(String(input)==='/api/settings')return Promise.resolve(jsonResponse(envelope));calls.push({input,init});if(String(input).includes('/conversation/stream'))return Promise.resolve(jsonResponse(response()));if(String(input).endsWith('/operations')){id=JSON.parse(String(init?.body)).operationId;return new Promise(resolve=>{resolveCreate=resolve})}if(String(input).endsWith('/step'))return Promise.resolve(jsonResponse({}));return Promise.resolve(defaultOperationResponse(input))}
+    window.history.replaceState(null,'','/#search');render(<App />);fireEvent.change(await screen.findByLabelText('Describe what you’re looking for'),{target:{value:'query'}});fireEvent.click(screen.getByRole('button',{name:'Search'}));await screen.findByRole('heading',{name:'Releases to review'});fireEvent.click(screen.getByRole('checkbox',{name:'Select A Space Documentary'}));fireEvent.click(screen.getByRole('button',{name:/Review 1 selected/}));fireEvent.click(screen.getByRole('button',{name:'Confirm full selection'}));await waitFor(()=>assert.ok(resolveCreate))
+    fireEvent.click(screen.getByRole('link',{name:'Settings'}));await waitFor(()=>assert.equal(screen.getByRole('link',{name:'Settings'}).getAttribute('aria-current'),'page'))
+    resolveCreate(jsonResponse({operationId:id,releases:[{releaseId:'r1',status:'pending',code:null}],mode:'dry-run',destination:{name:'General Client',protocol:'torrent'},expiresAt:'2099-01-01T00:00:00.000Z',nextOrdinal:0,stopped:false,complete:false}));await new Promise(resolve=>setTimeout(resolve,20))
+    assert.equal(calls.filter(x=>String(x.input).endsWith('/step')).length,0)
   })
 })

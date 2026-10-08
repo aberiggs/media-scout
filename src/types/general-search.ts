@@ -61,13 +61,13 @@ export interface GeneralSearchConversationResponse extends Omit<GeneralSearchRes
 }
 
 export type GeneralSearchProgressEvent =
-  | { type: 'planning'; sequence: number; message?: string }
-  | { type: 'queries'; sequence: number; queries: string[] }
-  | { type: 'searching'; sequence: number; query: string; index: number; total: number }
-  | { type: 'results'; sequence: number; releases: GeneralConversationRelease[]; provisional?: true }
-  | { type: 'curation'; sequence: number; processed: number; total: number }
-  | { type: 'complete'; sequence: number; response: GeneralSearchConversationResponse }
-  | { type: 'error'; sequence: number; code: string; message: string; partialReleases?: GeneralConversationRelease[]; diagnostics?: GeneralSearchDiagnostics };
+  | { type: 'planning'; sequence: number; runId?: string; stageId?: string; message?: string }
+  | { type: 'queries'; sequence: number; runId?: string; stageId?: string; queries: string[] }
+  | { type: 'searching'; sequence: number; runId?: string; stageId?: string; query: string; index: number; total: number }
+  | { type: 'results'; sequence: number; runId?: string; stageId?: string; releases: GeneralConversationRelease[]; provisional?: true }
+  | { type: 'curation'; sequence: number; runId?: string; stageId?: string; processed: number; total: number }
+  | { type: 'complete'; sequence: number; runId?: string; stageId?: string; response: GeneralSearchConversationResponse }
+  | { type: 'error'; sequence: number; runId?: string; stageId?: string; code: string; message: string; partialReleases?: GeneralConversationRelease[]; diagnostics?: GeneralSearchDiagnostics };
 
 export interface GeneralSearchBudgets {
   queryCount: number;

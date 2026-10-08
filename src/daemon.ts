@@ -91,7 +91,7 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
       if (!['planning','queries','searching','results','curation','complete','error'].includes(String(type))) return;
       const terminal = type === 'complete' || type === 'error';
       const output = type === 'error'
-        ? { type: 'error', sequence: sequence++, code: safeGeneralErrorCode({ code: event.code }), message: safeGeneralErrorCode({ code: event.code }) }
+        ? { type: 'error', sequence: sequence++, ...(typeof event.runId==='string'?{runId:event.runId}:{}), ...(typeof event.stageId==='string'?{stageId:event.stageId}:{}), code: safeGeneralErrorCode({ code: event.code }), message: safeGeneralErrorCode({ code: event.code }), ...(event.diagnostics&&typeof event.diagnostics==='object'?{diagnostics:event.diagnostics}:{}), ...(Array.isArray(event.partialReleases)?{partialReleases:event.partialReleases}:{} ) }
         : { ...event, sequence: sequence++ };
       if (terminal) terminalEvent = true;
       reply.raw.write(`${JSON.stringify(output)}\n`);

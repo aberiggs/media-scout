@@ -360,6 +360,7 @@ describe('mcp server tools', () => {
     for(const error of [
       Object.assign(new Error('LLM completion included a refusal: private payload'),{code:'provider-refusal'}),
       Object.assign(new Error('private timeout details'),{name:'TimeoutError',code:'llm-timeout'}),
+      Object.assign(new Error('search deadline expired; private upstream response'),{code:'search-deadline'}),
     ]) {
       stack.createSnapshot=(settings)=>({ ...originalSnapshot(settings), generalSearch:{ ...originalSnapshot(settings).generalSearch, search:async()=>{throw error;} } }) as unknown as Stack;
       const text=await callErrorText('ma_general_search',{query:'sports games'});

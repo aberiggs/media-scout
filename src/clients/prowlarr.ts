@@ -20,7 +20,7 @@ export class ProwlarrClient {
     categories: number[];
     indexerIds?: number[];
     limit?: number;
-  }): Promise<Release[]> {
+  }, signal?: AbortSignal): Promise<Release[]> {
     const query: Record<string, string | number | (string | number)[]> = {
       query: params.query,
       type: 'search',
@@ -29,7 +29,7 @@ export class ProwlarrClient {
     if (params.indexerIds !== undefined) query.indexerIds = params.indexerIds;
     if (params.limit !== undefined) query.limit = params.limit;
     return releaseListSchema.parse(
-      await this.http.getJson('/api/v1/search', query),
+      await this.http.getJson('/api/v1/search', query, signal),
     );
   }
 
@@ -46,9 +46,9 @@ export class ProwlarrClient {
   }
 
   /** Download-client entries resolved by name to route grabs (D6). */
-  async getDownloadClients(): Promise<DownloadClient[]> {
+  async getDownloadClients(signal?: AbortSignal): Promise<DownloadClient[]> {
     return downloadClientListSchema.parse(
-      await this.http.getJson('/api/v1/downloadclient'),
+      await this.http.getJson('/api/v1/downloadclient', undefined, signal),
     );
   }
 

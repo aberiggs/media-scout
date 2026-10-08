@@ -36,6 +36,23 @@ describe('general-search additive HTTP integration', () => {
     expect(calls.search).toHaveBeenCalledTimes(1);
   });
 
+  it('preserves a typed search-deadline error on the JSON endpoint without exposing its message', async () => {
+    const {app,calls}=await fixture();calls.search.mockRejectedValueOnce(Object.assign(new Error('deadline crossed at https://private.invalid/key'),{code:'search-deadline'}));
+    const response=await app.inject({method:'POST',url:'/api/search/conversation',payload:{}});
+    expect(response.statusCode).toBe(502);expect(response.json()).toEqual({error:'general search unavailable',code:'search-deadline'});expect(response.body).not.toContain('private.invalid');
+  });
+
+  it('preserves typed deadline diagnostics and safe nonselectable partials in the NDJSON terminal event', async () => {
+    const {app,calls}=await fixture();const error=Object.assign(new Error('deadline crossed with private provider data'),{code:'search-deadline'});
+    calls.search.mockImplementationOnce(async(_raw,onEvent)=>{
+      onEvent?.({type:'error',code:'search-deadline',message:'search-deadline',diagnostics:{complete:false,stopReason:'deadline',sourceInventory:'not-reported',ledger:{raw:1,added:1,duplicates:0,reactivated:0,reassessed:0,filtered:{},assessed:{match:0,possible:0,unrelated:0,unassessed:1},outcomes:[{query:'safe term',outcome:'success',raw:1,added:1}]}},partialReleases:[{releaseId:'safe-release-id',title:'Safe partial title',indexer:'Safe indexer',selectable:false,unavailableReason:'destination-unavailable',expiresAt:'2026-10-01T00:00:00.000Z'}]});
+      throw error;
+    });
+    const response=await app.inject({method:'POST',url:'/api/search/conversation/stream',payload:{}});const events=response.body.split('\n').filter(Boolean).map(line=>JSON.parse(line));
+    expect(events).toHaveLength(1);expect(events[0]).toMatchObject({type:'error',code:'search-deadline',message:'search-deadline',diagnostics:{complete:false,stopReason:'deadline'},partialReleases:[{releaseId:'safe-release-id',title:'Safe partial title',selectable:false}]});
+    expect(response.body).not.toContain('private provider data');expect(response.body).not.toContain('private.invalid');
+  });
+
   it.each([
     ['throws before progress', async (calls: Awaited<ReturnType<typeof fixture>>['calls']) => { calls.search.mockImplementationOnce(async () => { throw Object.assign(new Error('private upstream URL must not escape'), { code: 'search-expired' }); }); }, 'search-expired'],
     ['preserves a typed refusal', async (calls: Awaited<ReturnType<typeof fixture>>['calls']) => { calls.search.mockImplementationOnce(async () => { throw Object.assign(new Error('secret provider body'), { code: 'provider-refusal' }); }); }, 'provider-refusal'],
@@ -64,6 +81,19 @@ describe('general-search additive HTTP integration', () => {
     const events=response.body.split('\n').filter(Boolean).map(line=>JSON.parse(line));
     expect(events).toEqual([{type:'complete',sequence:0,response:{answer:'done'}}]);
     expect(response.body).not.toContain('private');
+  });
+
+  it('forwards safe run/stage metadata, diagnostics, and nonselectable partials in terminal NDJSON errors', async () => {
+    const { app, calls } = await fixture();
+    calls.search.mockImplementationOnce(async (_raw,onEvent) => {
+      onEvent?.({type:'planning',runId:'run-safe',stageId:'planning:1'});
+      onEvent?.({type:'error',runId:'run-safe',stageId:'terminal:error',code:'provider-refusal',message:'private provider body',diagnostics:{complete:false,stopReason:'provider-refusal',sourceInventory:'not-reported',ledger:{raw:1,added:1}},partialReleases:[{releaseId:'release-id',title:'Safe title',selectable:false}]});
+      throw Object.assign(new Error('private provider body'),{code:'provider-refusal'});
+    });
+    const response=await app.inject({method:'POST',url:'/api/search/conversation/stream',payload:{}});const events=response.body.split('\n').filter(Boolean).map(line=>JSON.parse(line));
+    expect(events).toHaveLength(2);expect(events[0]).toMatchObject({type:'planning',runId:'run-safe',stageId:'planning:1'});
+    expect(events[1]).toMatchObject({type:'error',runId:'run-safe',stageId:'terminal:error',code:'provider-refusal',message:'provider-refusal',diagnostics:{complete:false,stopReason:'provider-refusal'},partialReleases:[{releaseId:'release-id',selectable:false}]});
+    expect(response.body).not.toContain('private provider body');
   });
 
   it('aborts conversation work after a real TCP stream disconnect, not request-body completion', async () => {

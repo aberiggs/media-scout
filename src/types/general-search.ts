@@ -43,20 +43,31 @@ export interface GeneralConversationRelease extends GeneralRelease {
   viability?: GeneralReleaseViability;
   /** Preserve the original snapshot expiry when results accumulate; never extend on follow-up. */
   expiresAt: string;
+  /** Assessment is constraint-versioned; rejected relevance is reversible on later refinement. */
+  assessment?: { status: 'match' | 'possible-match' | 'rejected' | 'unassessed'; constraintVersion: string };
+}
+export type GeneralSearchStopReason = 'sufficient-results' | 'no-novelty' | 'low-yield' | 'budget-exhausted' | 'deadline' | 'proposals-exhausted' | 'completed' | 'provider-refusal' | 'source-failure';
+export interface GeneralSearchDiagnostics {
+  complete: boolean;
+  stopReason: GeneralSearchStopReason;
+  /** Aggregate Prowlarr search does not report an authoritative enabled-source inventory. */
+  sourceInventory: 'not-reported';
+  ledger: { raw: number; added: number; duplicates: number; reactivated: number; reassessed: number; filtered: Record<string, number>; assessed: { match: number; possible: number; unrelated: number; unassessed: number }; outcomes: Array<{ query: string; outcome: 'success' | 'failed'; raw: number; added: number }> };
 }
 export interface GeneralSearchConversationResponse extends Omit<GeneralSearchResponse, 'releases'> {
   releases: GeneralConversationRelease[];
   /** Search and query history belongs to this sanitized snapshot, not a persisted transcript. */
+  diagnostics?: GeneralSearchDiagnostics;
 }
 
 export type GeneralSearchProgressEvent =
   | { type: 'planning'; sequence: number; message?: string }
   | { type: 'queries'; sequence: number; queries: string[] }
   | { type: 'searching'; sequence: number; query: string; index: number; total: number }
-  | { type: 'results'; sequence: number; releases: GeneralConversationRelease[] }
+  | { type: 'results'; sequence: number; releases: GeneralConversationRelease[]; provisional?: true }
   | { type: 'curation'; sequence: number; processed: number; total: number }
   | { type: 'complete'; sequence: number; response: GeneralSearchConversationResponse }
-  | { type: 'error'; sequence: number; code: string; message: string };
+  | { type: 'error'; sequence: number; code: string; message: string; partialReleases?: GeneralConversationRelease[]; diagnostics?: GeneralSearchDiagnostics };
 
 export interface GeneralSearchBudgets {
   queryCount: number;

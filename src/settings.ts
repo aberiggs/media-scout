@@ -14,7 +14,7 @@ export const settingsSchema = z.object({
     sonarr: z.object({ url: optionalHttpUrl, apiKey: text }).strict(),
     radarr: z.object({ url: optionalHttpUrl, apiKey: text }).strict(),
   }).strict(),
-  ai: z.object({ apiKey: text, model: text.min(1), baseUrl: optionalHttpUrl, preferences: text.trim().max(4000) }).strict(),
+  ai: z.object({ apiKey: text, model: text.min(1), baseUrl: optionalHttpUrl, preferences: text.trim().max(4000), searchSystemPrompt: text.max(16000).default('') }).strict(),
   monitoring: z.object({
     enabled: z.boolean(), intervalMinutes: z.number().int().min(1).max(35_791), minRetryHours: z.number().int().min(1),
     failureBackoffMinMinutes: z.number().int().min(1), failureBackoffMaxMinutes: z.number().int().min(1), queueGraceMinutes: z.number().int().min(1),
@@ -34,7 +34,7 @@ export type Settings = Omit<z.infer<typeof settingsSchema>, 'integrations' | 'ge
 export const defaultSettings: Settings = {
   version: 1,
   integrations: { prowlarr: { url: '', apiKey: '', tvClient: '', movieClient: '', generalClient: '' }, sonarr: { url: '', apiKey: '' }, radarr: { url: '', apiKey: '' } },
-  ai: { apiKey: '', model: 'z-ai/glm-5.3-flash', baseUrl: 'https://openrouter.ai/api/v1', preferences: '' },
+  ai: { apiKey: '', model: 'z-ai/glm-5.3-flash', baseUrl: 'https://openrouter.ai/api/v1', preferences: '', searchSystemPrompt: '' },
   monitoring: { enabled: false, intervalMinutes: 5, minRetryHours: 6, failureBackoffMinMinutes: 5, failureBackoffMaxMinutes: 60, queueGraceMinutes: 30 },
   safety: { dryRun: true, allowOperatorActions: false },
   generalSearch: { maxQueries: 6, maxCandidates: 200, maxAiCalls: 12, batchSize: 20, displayLimit: 40, hideZeroSeeders: true },

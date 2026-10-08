@@ -122,6 +122,36 @@ describe('settings experience', () => {
     assert.ok(screen.getByText(/These preferences guide release ranking/))
   })
 
+  it('loads, saves, and clears the search system prompt exactly', async () => {
+    const saved = envelopeWithModel(envelope.settings.ai.model)
+    saved.settings.ai.searchSystemPrompt = 'Use precise episode numbering.\nKeep the search terms concise.'
+    globalThis.fetch = async (input, init) => {
+      if (String(input) === '/api/settings' && init?.method === 'PUT') {
+        requests.push({ input, init })
+        return jsonResponse({ ...saved, settings: JSON.parse(String(init.body)) })
+      }
+      if (String(input) === '/api/settings') { requests.push({ input, init }); return jsonResponse(saved) }
+      return Promise.resolve(defaultOperationResponse(input))
+    }
+    renderSettings()
+    const prompt = await screen.findByLabelText('Search system prompt') as HTMLTextAreaElement
+    assert.equal(prompt.value, saved.settings.ai.searchSystemPrompt)
+    assert.ok(screen.getByText(/not release ranking/))
+
+    const edited = 'Treat an exact episode request literally.\nDo not broaden it.'
+    fireEvent.change(prompt, { target: { value: edited } })
+    fireEvent.click(screen.getAllByRole('button', { name: 'Save changes' })[0])
+    await waitFor(() => assert.ok(requests.some(({ init }) => init?.method === 'PUT')))
+    let payload = JSON.parse(String(requests.find(({ init }) => init?.method === 'PUT')?.init?.body))
+    assert.equal(payload.ai.searchSystemPrompt, edited)
+
+    fireEvent.change(screen.getByLabelText('Search system prompt'), { target: { value: '' } })
+    fireEvent.click(screen.getAllByRole('button', { name: 'Save changes' })[0])
+    await waitFor(() => assert.equal(requests.filter(({ init }) => init?.method === 'PUT').length, 2))
+    payload = JSON.parse(String(requests.filter(({ init }) => init?.method === 'PUT')[1].init?.body))
+    assert.equal(payload.ai.searchSystemPrompt, '')
+  })
+
   it('caps the monitoring check interval at the backend limit', async () => {
     renderSettings()
     await screen.findByLabelText('OpenRouter API key')

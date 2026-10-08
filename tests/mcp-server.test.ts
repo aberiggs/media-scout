@@ -138,7 +138,7 @@ function testConfigFromEnv(env: Record<string, string>) {
       sonarr: { url: env.SONARR_URL ?? SONARR, apiKey: env.SONARR_API_KEY ?? 'sonarr-key' },
       radarr: { url: env.RADARR_URL ?? RADARR, apiKey: env.RADARR_API_KEY ?? 'radarr-key' },
     },
-    ai: { apiKey: env.LLM_API_KEY ?? 'llm-key', model: env.LLM_MODEL ?? defaults.ai.model, baseUrl: env.LLM_BASE_URL ?? defaults.ai.baseUrl, preferences: env.MEDIA_PREFERENCES ?? '' },
+    ai: { apiKey: env.LLM_API_KEY ?? 'llm-key', model: env.LLM_MODEL ?? defaults.ai.model, baseUrl: env.LLM_BASE_URL ?? defaults.ai.baseUrl, preferences: env.MEDIA_PREFERENCES ?? '', searchSystemPrompt: '' },
     monitoring: { ...defaults.monitoring, intervalMinutes: n('CYCLE_INTERVAL_MIN', 5), minRetryHours: n('MIN_RETRY_HOURS', 6), failureBackoffMinMinutes: n('FAILURE_BACKOFF_MIN', 5), failureBackoffMaxMinutes: n('FAILURE_BACKOFF_MAX_MIN', 60), queueGraceMinutes: n('QUEUE_GRACE_MIN', 30) },
     safety: { dryRun: env.DRY_RUN !== 'false', allowOperatorActions: env.ALLOW_OPERATOR_ACTIONS === 'true' },
   });
@@ -347,6 +347,27 @@ describe('mcp server tools', () => {
     expect(grabTool?.description).toContain('separate explicit approval');
     expect(grabTool?.annotations).toMatchObject({readOnlyHint:false,destructiveHint:true,openWorldHint:true});
     expect(grabTool?.inputSchema.properties?.releaseIds).toMatchObject({ maxItems: 1000 });
+  });
+
+  it('preserves only allowlisted typed search failures through MCP diagnostics', async () => {
+    await connect(new FakeLLM());
+    const originalSnapshot=stack.createSnapshot;
+    stack.createSnapshot=(settings)=>({ ...originalSnapshot(settings), generalSearch:{ ...originalSnapshot(settings).generalSearch, search:async()=>{throw Object.assign(new Error('private provider body https://private.invalid/key'),{code:'provider-refusal'});} } }) as unknown as Stack;
+    const refusal=await callErrorText('ma_general_search',{query:'sports games'});
+    expect(refusal).toContain('provider-refusal');expect(refusal).not.toContain('private provider body');expect(refusal).not.toContain('private.invalid');
+    stack.createSnapshot=(settings)=>({ ...originalSnapshot(settings), generalSearch:{ ...originalSnapshot(settings).generalSearch, search:async()=>{throw Object.assign(new Error('private'),{code:'ai-budget-exhausted'});} } }) as unknown as Stack;
+    expect(await callErrorText('ma_general_search',{query:'sports games'})).toContain('ai-budget-exhausted');
+    for(const error of [
+      Object.assign(new Error('LLM completion included a refusal: private payload'),{code:'provider-refusal'}),
+      Object.assign(new Error('private timeout details'),{name:'TimeoutError',code:'llm-timeout'}),
+    ]) {
+      stack.createSnapshot=(settings)=>({ ...originalSnapshot(settings), generalSearch:{ ...originalSnapshot(settings).generalSearch, search:async()=>{throw error;} } }) as unknown as Stack;
+      const text=await callErrorText('ma_general_search',{query:'sports games'});
+      expect(text).toContain(error.code);expect(text).not.toContain('private');
+      stack.createSnapshot=(settings)=>({ ...originalSnapshot(settings), generalSearchConversation:{ ...originalSnapshot(settings).generalSearchConversation, search:async()=>{throw error;} } }) as unknown as Stack;
+      const conversation=await callErrorText('ma_general_conversation_search',{originalQuery:'sports games',turns:[{role:'user',content:'sports games'}],action:'search'});
+      expect(conversation).toContain(error.code);expect(conversation).not.toContain('private');
+    }
   });
 
   it('ma_status reports config + open review count', async () => {

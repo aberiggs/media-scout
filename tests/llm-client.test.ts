@@ -3,6 +3,7 @@ import nock from 'nock';
 import { z } from 'zod';
 import { OpenRouter } from '@openrouter/sdk';
 import { OpenRouterLLM } from '../src/clients/llm';
+import { ApiError } from '../src/http';
 
 const BASE = 'http://llm.test';
 const MODEL = 'z-ai/glm-5.3-flash';
@@ -146,9 +147,7 @@ describe('OpenRouterLLM.json', () => {
       .post('/chat/completions')
       .reply(200, replyBody('still broken'));
     const { llm } = build();
-    await expect(llm.json({ system: 's', user: 'u', schema, label: 'verdict' })).rejects.toThrow(
-      /unparseable JSON after retry/,
-    );
+    await expect(llm.json({ system: 's', user: 'u', schema, label: 'verdict' })).rejects.toThrow(/unparseable JSON after retry/);
     expect(first.isDone()).toBe(true);
     expect(second.isDone()).toBe(true);
   });
@@ -199,9 +198,7 @@ describe('OpenRouterLLM.json', () => {
     nock(BASE).post('/chat/completions').reply(200, replyBody('nope'));
     nock(BASE).post('/chat/completions').reply(200, replyBody('still nope'));
     const { llm } = build();
-    await expect(llm.json({ system: 's', user: 'u', schema, label: 'verdict' })).rejects.toThrow(
-      /verdict/,
-    );
+    await expect(llm.json({ system: 's', user: 'u', schema, label: 'verdict' })).rejects.toThrow(/verdict/);
   });
 
   it('never interprets prose verdicts as structured decisions', async () => {
@@ -209,9 +206,7 @@ describe('OpenRouterLLM.json', () => {
     nock(BASE).post('/chat/completions').reply(200, replyBody(prose));
     nock(BASE).post('/chat/completions').reply(200, replyBody(prose));
     const { llm } = build();
-    await expect(llm.json({ system: 's', user: 'u', schema, label: 'picker' })).rejects.toThrow(
-      /unparseable JSON after retry/,
-    );
+    await expect(llm.json({ system: 's', user: 'u', schema, label: 'picker' })).rejects.toThrow(/unparseable JSON after retry/);
   });
 
   it('throws the zod error on schema-invalid JSON without retry', async () => {
@@ -219,9 +214,7 @@ describe('OpenRouterLLM.json', () => {
       .post('/chat/completions')
       .reply(200, replyBody('{"verdict":"maybe"}'));
     const { llm } = build();
-    await expect(llm.json({ system: 's', user: 'u', schema, label: 'verdict' })).rejects.toThrow(
-      /Invalid option/i,
-    );
+    await expect(llm.json({ system: 's', user: 'u', schema, label: 'verdict' })).rejects.toThrow(/Invalid option/i);
     expect(scope.isDone()).toBe(true);
   });
 
@@ -232,9 +225,7 @@ describe('OpenRouterLLM.json', () => {
       chat: { send: async () => new ReadableStream() },
     } as unknown as OpenRouter;
     const llm = new OpenRouterLLM({ client: stub, model: MODEL });
-    await expect(llm.json({ system: 's', user: 'u', schema, label: 'verdict' })).rejects.toThrow(
-      /stream/i,
-    );
+    await expect(llm.json({ system: 's', user: 'u', schema, label: 'verdict' })).rejects.toThrow(/stream/i);
   });
 
   it('throws safely on no-content instead of inventing a JSON decision', async () => {
@@ -249,9 +240,7 @@ describe('OpenRouterLLM.json', () => {
         }],
       });
     const { llm } = build();
-    await expect(llm.json({ system: 's', user: 'u', schema, label: 'picker' })).rejects.toThrow(
-      /no string message content/,
-    );
+    await expect(llm.json({ system: 's', user: 'u', schema, label: 'picker' })).rejects.toThrow(/no string message content/);
     expect(scope.isDone()).toBe(true);
   });
 
@@ -275,6 +264,7 @@ describe('OpenRouterLLM.json', () => {
       caught = error;
     }
     expect(caught).toBeInstanceOf(Error);
+    expect((caught as {code:string}).code).toBe('provider-refusal');
     expect((caught as Error).message).toBe('LLM completion included a refusal');
     expect((caught as Error).message).not.toContain(refusal);
     expect(scope.isDone()).toBe(true);
@@ -291,9 +281,23 @@ describe('OpenRouterLLM.json', () => {
       },
     } as unknown as OpenRouter;
     const llm = new OpenRouterLLM({ client: stub, model: MODEL });
-    await expect(llm.json({ system: 's', user: 'u', schema, label: 'picker' })).rejects.toThrow(
-      'provider unavailable',
-    );
+    await expect(llm.json({ system: 's', user: 'u', schema, label: 'picker' })).rejects.toThrow('provider unavailable');
     expect(calls).toBe(1);
+  });
+
+  it('returns a typed deadline outcome without exposing provider details', async () => {
+    const stub = { chat: { send: async () => new Promise<never>(() => {}) } } as unknown as OpenRouter;
+    const llm = new OpenRouterLLM({ client: stub, model: MODEL, timeoutMs: 5 });
+    await expect(llm.json({ system: 's', user: 'u', schema, label: 'picker' })).rejects.toMatchObject({ code: 'llm-timeout', name: 'TimeoutError' });
+  });
+
+  it('preserves shared ApiError status and Retry-After transport metadata for non-search callers', async () => {
+    nock(BASE).post('/chat/completions').reply(429, 'private provider body', { 'Retry-After': '120' });
+    const { llm } = build();
+    let caught: unknown;
+    try { await llm.json({ system: 's', user: 'u', schema, label: 'monitoring planner' }); } catch (error) { caught = error; }
+    expect(caught).toBeInstanceOf(ApiError);
+    expect(caught).toMatchObject({ status: 429, retryAfter: 120 });
+    expect((caught as Error).message).not.toContain('private provider body');
   });
 });

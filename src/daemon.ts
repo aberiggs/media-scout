@@ -9,6 +9,7 @@ import { loadConfig } from './config';
 import { missingSettings, settingsSchema, type Settings } from './settings';
 import type { CycleSummary } from './core/runner';
 import { OperationsDashboard } from './core/operations';
+import { safeGeneralSearchErrorCode } from './core/general-search-errors';
 import type { WorkAction } from './core/state';
 import { z } from 'zod';
 
@@ -288,8 +289,7 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
 }
 
 function safeGeneralErrorCode(error: unknown): string {
-  const code = error && typeof error === 'object' && 'code' in error && typeof (error as {code?:unknown}).code === 'string' ? (error as {code:string}).code : '';
-  return ['invalid-request','invalid-budget','search-unavailable','operator-actions-disabled','search-expired','invalid-confirmation','invalid-release-selection','settings-changed','destination-changed','operation-not-found','operation-stopped','aborted'].includes(code) ? code : 'operation-failed';
+  return safeGeneralSearchErrorCode(error) ?? 'operation-failed';
 }
 
 export async function startDaemon(stack: Stack): Promise<void> {

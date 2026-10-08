@@ -69,7 +69,7 @@ describe('OpenRouterLLM.json deadline', () => {
     expect(requestSignal?.aborted).toBe(true);
     const outcome = await result;
     expect(outcome.ok).toBe(false);
-    if (!outcome.ok) expect(outcome.error).toMatchObject({ name: 'TimeoutError' });
+    if (!outcome.ok) expect(outcome.error).toMatchObject({ code: 'llm-timeout' });
   });
 
   it('cancels a response whose body stalls after headers arrive', async () => {
@@ -102,7 +102,7 @@ describe('OpenRouterLLM.json deadline', () => {
     expect(requestSignal?.aborted).toBe(true);
     const outcome = await result;
     expect(outcome.ok).toBe(false);
-    if (!outcome.ok) expect(outcome.error).toMatchObject({ name: 'TimeoutError' });
+    if (!outcome.ok) expect(outcome.error).toMatchObject({ code: 'llm-timeout' });
   });
 
   it('shares the deadline with the corrective JSON request and cancels that request', async () => {
@@ -137,7 +137,7 @@ describe('OpenRouterLLM.json deadline', () => {
     expect(correctiveSignal?.aborted).toBe(true);
     const outcome = await result;
     expect(outcome.ok).toBe(false);
-    if (!outcome.ok) expect(outcome.error).toMatchObject({ name: 'TimeoutError' });
+    if (!outcome.ok) expect(outcome.error).toMatchObject({ code: 'llm-timeout' });
   });
 
   it('consumes a transport rejection that arrives after the public call timed out', async () => {
@@ -154,7 +154,7 @@ describe('OpenRouterLLM.json deadline', () => {
     await vi.advanceTimersByTimeAsync(TIMEOUT_MS);
     const outcome = await result;
     expect(outcome.ok).toBe(false);
-    if (!outcome.ok) expect(outcome.error).toMatchObject({ name: 'TimeoutError' });
+    if (!outcome.ok) expect(outcome.error).toMatchObject({ code: 'llm-timeout' });
 
     rejectTransport(new Error('late transport rejection'));
     await vi.advanceTimersByTimeAsync(0);
@@ -196,7 +196,7 @@ describe('OpenRouterLLM.json deadline', () => {
     expect(vi.getTimerCount()).toBe(0);
     const outcome = await result;
     expect(outcome.ok).toBe(false);
-    if (!outcome.ok) expect(outcome.error).toMatchObject({ name: 'TimeoutError' });
+    if (!outcome.ok) expect(outcome.error).toMatchObject({ code: 'llm-timeout' });
   });
 
   it.each([

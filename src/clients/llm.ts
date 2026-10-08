@@ -87,7 +87,7 @@ export class OpenRouterLLM implements LLMClient {
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<never>((_resolve, reject) => {
       deadlineTimer = setTimeout(() => {
-        const error = new Error(`LLM request timed out after ${timeoutMs}ms`);
+        const error = Object.assign(new Error(`LLM request timed out after ${timeoutMs}ms`), { code: 'llm-timeout' });
         error.name = 'TimeoutError';
         controller.abort(error);
         reject(error);
@@ -172,7 +172,7 @@ export class OpenRouterLLM implements LLMClient {
     }
     const message = completion.choices[0]?.message;
     if (typeof message?.refusal === 'string' && message.refusal.trim() !== '') {
-      throw new Error('LLM completion included a refusal');
+      throw Object.assign(new Error('LLM completion included a refusal'), { code: 'provider-refusal' });
     }
     const content = message?.content;
     if (typeof content !== 'string') {

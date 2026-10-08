@@ -38,6 +38,9 @@ describe('general-search additive HTTP integration', () => {
 
   it.each([
     ['throws before progress', async (calls: Awaited<ReturnType<typeof fixture>>['calls']) => { calls.search.mockImplementationOnce(async () => { throw Object.assign(new Error('private upstream URL must not escape'), { code: 'search-expired' }); }); }, 'search-expired'],
+    ['preserves a typed refusal', async (calls: Awaited<ReturnType<typeof fixture>>['calls']) => { calls.search.mockImplementationOnce(async () => { throw Object.assign(new Error('secret provider body'), { code: 'provider-refusal' }); }); }, 'provider-refusal'],
+    ['preserves exhausted planning budget', async (calls: Awaited<ReturnType<typeof fixture>>['calls']) => { calls.search.mockImplementationOnce(async () => { throw Object.assign(new Error('secret'), { code: 'ai-budget-exhausted' }); }); }, 'ai-budget-exhausted'],
+    ['preserves invalid planner output', async (calls: Awaited<ReturnType<typeof fixture>>['calls']) => { calls.search.mockImplementationOnce(async () => { throw Object.assign(new Error('secret'), { code: 'invalid-search-plan' }); }); }, 'invalid-search-plan'],
     ['returns without a terminal event', async (calls: Awaited<ReturnType<typeof fixture>>['calls']) => { calls.search.mockImplementationOnce(async () => ({ answer: 'ignored' })); }, 'operation-failed'],
   ])('emits one sequenced safe terminal error when service %s', async (_case, prepare, expectedCode) => {
     const { app, calls } = await fixture(); await prepare(calls);
@@ -45,6 +48,8 @@ describe('general-search additive HTTP integration', () => {
     const events = response.body.split('\n').filter(Boolean).map((line) => JSON.parse(line));
     expect(events).toHaveLength(1);expect(events[0]).toMatchObject({ type:'error',sequence:0,code:expectedCode,message:expectedCode });
     expect(response.body).not.toContain('private upstream URL');
+    expect(response.body).not.toContain('secret provider body');
+    expect(response.body).not.toContain('secret');
   });
 
   it('ignores events and exceptions after the first terminal event', async () => {

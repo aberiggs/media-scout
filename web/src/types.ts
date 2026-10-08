@@ -5,7 +5,7 @@ export interface Settings {
     sonarr: { url: string; apiKey: string }
     radarr: { url: string; apiKey: string }
   }
-  ai: { apiKey: string; model: string; baseUrl: string; preferences: string }
+  ai: { apiKey: string; model: string; baseUrl: string; preferences: string; searchSystemPrompt: string }
   monitoring: {
     enabled: boolean
     intervalMinutes: number
@@ -41,6 +41,7 @@ export const defaults: Settings = {
     model: 'z-ai/glm-5.3-flash',
     baseUrl: 'https://openrouter.ai/api/v1',
     preferences: '',
+    searchSystemPrompt: '',
   },
   monitoring: {
     enabled: false,

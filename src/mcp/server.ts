@@ -7,6 +7,7 @@ import { buildStack, type Stack } from '../compose';
 import { loadConfig } from '../config';
 import { missingSettings } from '../settings';
 import { ApiError } from '../http';
+import { safeGeneralSearchErrorCode } from '../core/general-search-errors';
 import type { Release } from '../types/prowlarr';
 
 /**
@@ -47,10 +48,17 @@ export function createMcpServer(stack: Stack): McpServer {
     }
   };
   const safeGeneralOperation = async <T>(call: () => Promise<T>): Promise<T> => {
-    try { return await withSafeUpstreamErrors(call); }
+    try { return await withSafeUpstreamErrors(async () => {
+      try { return await call(); }
+      catch (error) {
+        const code = safeGeneralSearchErrorCode(error);
+        if (code) throw Object.assign(new Error(code), { code });
+        throw error;
+      }
+    }); }
     catch (error) {
-      const code = error && typeof error === 'object' && 'code' in error && typeof (error as { code?: unknown }).code === 'string' ? (error as { code: string }).code : '';
-      if (['invalid-request','invalid-budget','search-unavailable','operator-actions-disabled','search-expired','invalid-confirmation','invalid-release-selection','settings-changed','destination-changed','operation-not-found','operation-stopped','aborted'].includes(code)) throw new Error(code);
+      const code = safeGeneralSearchErrorCode(error);
+      if (code) throw new Error(code);
       throw new Error('General search unavailable');
     }
   };

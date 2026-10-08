@@ -66,6 +66,7 @@ const issueFieldLabels: Record<string, string> = {
   'ai.model': 'Model',
   'ai.baseUrl': 'API base URL',
   'ai.preferences': 'Release preferences',
+  'ai.searchSystemPrompt': 'Search system prompt',
   'monitoring.enabled': 'Automatic monitoring',
   'monitoring.intervalMinutes': 'Check interval',
   'monitoring.minRetryHours': 'Minimum retry delay',
@@ -381,6 +382,10 @@ function App() {
                       <Field className="span-two" label="Release preferences" htmlFor="ai-preferences" hint="Optional guidance, up to 4,000 characters. These preferences guide release ranking; they aren’t hard filters.">
                         <textarea id="ai-preferences" rows={4} maxLength={4000} value={settings.ai.preferences} onChange={(e) => updateAi('preferences', e.target.value)} placeholder="Prefer 1080p, English audio, and smaller files." />
                         <div className="textarea-meta"><span>Keep it broad or get specific.</span><span>{settings.ai.preferences.length.toLocaleString()} / 4,000</span></div>
+                      </Field>
+                      <Field className="span-two" label="Search system prompt" htmlFor="ai-search-system-prompt" hint="Optional extra system instructions for AI search. These guide search planning and relevance review, not release ranking for monitoring. Leave empty to use the standard instructions.">
+                        <textarea id="ai-search-system-prompt" rows={6} maxLength={16000} value={settings.ai.searchSystemPrompt} onChange={(e) => updateAi('searchSystemPrompt', e.target.value)} placeholder="" />
+                        <div className="textarea-meta"><span>Saved with your settings.</span><span>{settings.ai.searchSystemPrompt.length.toLocaleString()} / 16,000</span></div>
                       </Field>
                     </div>
                   </Section>

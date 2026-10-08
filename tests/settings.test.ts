@@ -25,12 +25,14 @@ describe('persisted UI settings', () => {
     const configured = { ...defaultSettings, integrations: {
       prowlarr: { url: 'http://prowlarr.local:9696', apiKey: 'secret-prowlarr', tvClient: 'tv', movieClient: 'movie' },
       sonarr: { url: 'http://sonarr.local:8989', apiKey: 'secret-sonarr' }, radarr: { url: 'http://radarr.local:7878', apiKey: 'secret-radarr' },
-    }, ai: { ...defaultSettings.ai, apiKey: 'secret-ai', preferences: 'Prefer HD' }, monitoring: { ...defaultSettings.monitoring, enabled: true, intervalMinutes: 17 } };
+    }, ai: { ...defaultSettings.ai, apiKey: 'secret-ai', preferences: 'Prefer HD', searchSystemPrompt: 'First line\n  Preserve  spacing\nThird line' }, monitoring: { ...defaultSettings.monitoring, enabled: true, intervalMinutes: 17 } };
     const first = State.open(path);
     first.saveSettings(configured);
     first.close();
     const second = State.open(path);
     expect(second.getSettings()).toEqual({ ...configured, integrations: { ...configured.integrations, prowlarr: { ...configured.integrations.prowlarr, generalClient: '' } } });
+    const cleared = second.getSettings(); cleared.ai.searchSystemPrompt = ''; second.saveSettings(cleared);
+    expect(second.getSettings().ai.searchSystemPrompt).toBe('');
     second.close();
     rmSync(dir, { recursive: true, force: true });
   });
@@ -42,6 +44,9 @@ describe('persisted UI settings', () => {
     const longPreferences = structuredClone(defaultSettings);
     longPreferences.ai.preferences = 'x'.repeat(4001);
     expect(settingsSchema.safeParse(longPreferences).success).toBe(false);
+    const longPrompt = structuredClone(defaultSettings);
+    longPrompt.ai.searchSystemPrompt = 'x'.repeat(16001);
+    expect(settingsSchema.safeParse(longPrompt).success).toBe(false);
     const invertedBackoff = structuredClone(defaultSettings);
     invertedBackoff.monitoring.failureBackoffMinMinutes = 61;
     expect(settingsSchema.safeParse(invertedBackoff).success).toBe(false);
@@ -59,6 +64,12 @@ describe('persisted UI settings', () => {
     expect(settingsSchema.parse(legacy).generalSearch).toEqual(defaultSettings.generalSearch);
     legacy.generalSearch = { ...defaultSettings.generalSearch, maxQueries: 21 };
     expect(settingsSchema.safeParse(legacy).success).toBe(false);
+  });
+
+  it('defaults an omitted search system prompt in previously stored settings', () => {
+    const legacy = structuredClone(defaultSettings) as Record<string, any>;
+    delete legacy.ai.searchSystemPrompt;
+    expect(settingsSchema.parse(legacy).ai.searchSystemPrompt).toBe('');
   });
 
   it('bounds timer intervals to the largest safe whole-minute Node timeout', () => {

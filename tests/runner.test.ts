@@ -3,7 +3,7 @@ import nock from 'nock';
 import { readFileSync } from 'node:fs';
 import Database from 'better-sqlite3';
 import type { ZodType } from 'zod';
-import { Http } from '../src/http';
+import { ApiError, Http } from '../src/http';
 import { ProwlarrClient } from '../src/clients/prowlarr';
 import { SonarrClient } from '../src/clients/sonarr';
 import { RadarrClient } from '../src/clients/radarr';
@@ -78,9 +78,13 @@ class FakeLLM implements LLMClient {
   readonly picks = new Map<string, PickVerdict>();
   readonly groupPicks = new Map<string, GroupSelection>();
   readonly throwLabels = new Set<string>();
+  readonly failures = new Map<string, Error>();
+  plannerFailure?: Error;
 
   async json<T>(args: { system: string; user: string; schema: ZodType<T>; label: string }): Promise<T> {
     this.calls.push({ label: args.label, user: args.user });
+    if(args.label.startsWith('planner:')&&this.plannerFailure)throw this.plannerFailure;
+    const scriptedFailure=this.failures.get(args.label);if(scriptedFailure)throw scriptedFailure;
     if (this.throwLabels.has(args.label)) throw new Error('scripted LLM failure');
     if (args.label.startsWith('planner:group:')) {
       const groupKey = args.label.slice('planner:group:'.length);
@@ -1684,6 +1688,14 @@ describe('Runner.cycle', () => {
     await stack.runner.cycle();
     expect(earlySearch.isDone()).toBe(false);
     expect(llm.callsFor('planner:')).toHaveLength(1);
+  });
+
+  it('honors a preserved LLM ApiError Retry-After in monitoring planner backoff', async () => {
+    const llm=new FakeLLM();llm.plannerFailure=new ApiError(429,'https://provider.invalid/private','private body',1800);
+    mockDiscovery({series:[tvSeries(1,'Show',11)]});
+    const stack=buildStack(llm,{failureBackoffMin:5,failureBackoffMaxMin:12});
+    await stack.runner.cycle();
+    expect(stack.state.getWorkItem('sonarr:1:s1')).toMatchObject({status:'backoff',nextSearchAt:'2026-09-29T00:30:00.000Z'});
   });
 
   it('records a late positive POST receipt after lease expiry and intervening active observation without overwriting newer scheduling', async () => {

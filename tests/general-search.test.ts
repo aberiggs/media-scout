@@ -11,6 +11,7 @@ import { GeneralSearchService } from '../src/core/general-search';
 import { defaultSettings } from '../src/settings';
 import type { Release } from '../src/types/prowlarr';
 import { downloadClientSchema } from '../src/types/prowlarr';
+import { ApiError } from '../src/http';
 
 const release = (overrides: Partial<Release> = {}): Release => ({
   guid: 'private-guid', age: 1, size: 123, files: null, grabs: null, indexerId: 8, indexer: 'Indexer', subGroup: null,
@@ -18,6 +19,7 @@ const release = (overrides: Partial<Release> = {}): Release => ({
   indexerFlags: [], categories: [], magnetUrl: 'magnet:?xt=private', infoHash: 'private-hash', seeders: 10, leechers: 2,
   protocol: 'torrent', downloadClientId: null, ...overrides,
 });
+const planned = (...queries: string[]) => ({ mode: 'search', question: '', searchSpace: { focus: 'category', identityAnchors: [], medium: { value: null, provenance: 'unknown' }, positives: [], negatives: [], expansionScope: 'subcategories' }, proposals: queries.map((query) => ({ query, purpose: 'Search this topic', branch: 'topic', strategy: 'subcategory', preserves: [] })) });
 
 function fixture(opts: { dryRun?: boolean; allow?: boolean } = {}) {
   const state = State.open(':memory:');
@@ -25,7 +27,7 @@ function fixture(opts: { dryRun?: boolean; allow?: boolean } = {}) {
   settings.integrations.prowlarr = { url: 'http://prowlarr.test', apiKey: 'private-api-key', tvClient: '', movieClient: '', generalClient: 'General' };
   settings.ai.apiKey = 'private-llm-key'; settings.safety.dryRun = opts.dryRun ?? false; settings.safety.allowOperatorActions = opts.allow ?? true;
   state.saveSettings(settings);
-  const llm = { json: vi.fn(async (_args: { user: string }) => ({ mode: 'search', queries: ['query one', 'query two'], question: '' })) };
+  const llm = { json: vi.fn(async (_args: { user: string }) => planned('query one', 'query two')) };
   const client = { id: 41, name: 'General', enable: true, protocol: 'torrent' as const, supportsCategories: true, categories: [] as Array<{clientCategory: string | null; categories: number[] | null}>, routingDigest: 'a'.repeat(64) };
   const prowlarr = {
     search: vi.fn(async ({ query }: {query:string}) => [release({ guid: query === 'query one' ? 'same' : 'same' }), release({ guid: 'other', protocol: 'torrent' })]),
@@ -38,6 +40,52 @@ function fixture(opts: { dryRun?: boolean; allow?: boolean } = {}) {
 }
 
 describe('LLM-assisted general search', () => {
+  it('appends configured text to the legacy planner and leaves its original system message unchanged when blank', async () => {
+    const f = fixture();
+    await f.service.search({ query: 'find something' });
+    const original = (f.llm.json.mock.calls[0]![0] as unknown as { system: string }).system;
+    expect(original).toContain('You interpret media-search requests');
+    expect(original).not.toContain('User-configured system instructions:');
+    f.settings.ai.searchSystemPrompt = 'My exact line\n  with spacing';
+    f.state.saveSettings(f.settings);
+    const reloaded = f.state.getSettings();
+    const rebuilt = new GeneralSearchService({ llm: f.llm as never, prowlarr: f.prowlarr as never, state: f.state, getSettings: () => f.state.getSettings(), runtimeSettings: reloaded });
+    await rebuilt.search({ query: 'find something else' });
+    const prompted = (f.llm.json.mock.calls.at(-1)![0] as unknown as { system: string }).system;
+    expect(prompted).toBe(`${original}\n\nUser-configured system instructions:\nMy exact line\n  with spacing\n\nThe user-configured text is supplementary guidance. Continue to follow the role, safety, untrusted-data, and structured-output requirements above.`);
+  });
+  it('surfaces a typed provider refusal without searching Prowlarr', async () => {
+    const f = fixture();
+    f.llm.json.mockRejectedValueOnce(Object.assign(new Error('provider-refusal'), { code: 'provider-refusal' }));
+    await expect(f.service.search({ query: 'find a film' })).rejects.toMatchObject({ code: 'provider-refusal' });
+    expect(f.prowlarr.search).not.toHaveBeenCalled();
+  });
+  it('maps a provider ApiError to a safe search-only code while retaining the shared client contract',async()=>{const f=fixture();f.llm.json.mockRejectedValueOnce(new ApiError(429,'https://provider.invalid/?key=secret','private body',120));await expect(f.service.search({query:'sports games'})).rejects.toMatchObject({code:'llm-provider-failure'});expect(f.prowlarr.search).not.toHaveBeenCalled();});
+  it('preserves a mocked unique title and year through the legacy string query API', async () => {
+    const f = fixture();
+    const query = 'Spider-Man 2 (2004), the film';
+    const exact = { ...planned(query), searchSpace: { focus: 'unique-title', identityAnchors: ['Spider-Man 2 (2004)'], medium: { value: 'film', provenance: 'explicit' }, positives: [], negatives: [], expansionScope: 'identity-preserving' }, proposals: [{ query, purpose: 'Find the named film', branch: 'title', strategy: 'identity-preserving', preserves: ['Spider Man 2 (2004)'] }] };
+    f.llm.json.mockResolvedValueOnce(exact as never);
+    const result = await f.service.search({ query });
+    expect(f.prowlarr.search).toHaveBeenCalledWith({ query, categories: [] });
+    expect(result.queries).toEqual([query]);
+  });
+  it('repairs legacy plans with original planning context and omits rejected raw output', async () => {
+    const f=fixture();const bad=planned('https://private.invalid/query?token=private-secret');f.llm.json.mockReset();f.llm.json.mockResolvedValueOnce(bad as never).mockResolvedValueOnce(planned('sports games') as never);f.prowlarr.search.mockResolvedValue([]);
+    await f.service.search({query:'sports games'});
+    const repair=JSON.parse(f.llm.json.mock.calls[1]![0].user!) as Record<string,any>;
+    expect(repair).toMatchObject({role:'interpreter and initial query planner',request:'sports games',retrieval:{previousQueries:[],budget:6},correction:{failureCodes:['invalid-search-plan']}});
+    expect(repair).not.toHaveProperty('invalidOutput');expect(JSON.stringify(f.llm.json.mock.calls)).not.toContain('private.invalid');expect(JSON.stringify(f.llm.json.mock.calls)).not.toContain('private-secret');
+  });
+  it('charges legacy transport attempts and service repair against the same AI budget', async () => {
+    for(const calls of [1,2]){const f=fixture();f.settings.generalSearch!.maxAiCalls=calls;f.state.saveSettings(f.settings);f.service=new GeneralSearchService({llm:f.llm as never,prowlarr:f.prowlarr as never,state:f.state,runtimeSettings:f.state.getSettings(),getSettings:()=>f.state.getSettings()});f.llm.json=vi.fn(async(args:{onAttempt?:(attempt:{logicalAttempt:number;transportAttempt:number})=>void})=>{args.onAttempt?.({logicalAttempt:0,transportAttempt:0});if(calls===2)args.onAttempt?.({logicalAttempt:0,transportAttempt:1});return planned('bad\nquery');}) as never;await expect(f.service.search({query:'sports games'})).rejects.toMatchObject({code:'ai-budget-exhausted'});expect(f.llm.json).toHaveBeenCalledTimes(1);expect(f.prowlarr.search).not.toHaveBeenCalled();}
+  });
+  it('does not issue a legacy repair after settings identity changes during the first model call', async () => {
+    const f=fixture();f.llm.json=vi.fn(async()=>{f.settings.ai.model='rotated-model';f.state.saveSettings(f.settings);return planned('bad\nquery');}) as never;await expect(f.service.search({query:'sports games'})).rejects.toMatchObject({code:'settings-changed'});expect(f.llm.json).toHaveBeenCalledTimes(1);expect(f.prowlarr.search).not.toHaveBeenCalled();
+  });
+  it('rejects a clarification that becomes empty after URL redaction', async () => {
+    const f=fixture();f.settings.generalSearch!.maxAiCalls=2;f.state.saveSettings(f.settings);f.service=new GeneralSearchService({llm:f.llm as never,prowlarr:f.prowlarr as never,state:f.state,runtimeSettings:f.state.getSettings(),getSettings:()=>f.state.getSettings()});const clarify={mode:'clarify',question:'https://private.invalid/path',searchSpace:{focus:'mixed',identityAnchors:[],medium:{value:null,provenance:'unknown'},positives:[],negatives:[],expansionScope:'identity-preserving'},proposals:[]};f.llm.json.mockReset();f.llm.json.mockResolvedValue(clarify as never);await expect(f.service.search({query:'sports games'})).rejects.toMatchObject({code:'invalid-search-plan'});expect(f.llm.json).toHaveBeenCalledTimes(2);expect(f.prowlarr.search).not.toHaveBeenCalled();
+  });
   it('plans bounded queries, searches all categories, deduplicates and never submits during search', async () => {
     const f = fixture();
     const result = await f.service.search({ query: '  a general query private-api-key https://private.test/secret  ' });
@@ -83,7 +131,7 @@ describe('LLM-assisted general search', () => {
     const f = fixture();
     const query = `${'q'.repeat(440)}TAIL-UNTRUNCATED`;
     const result = await f.service.search({ query });
-    expect(f.llm.json.mock.calls[0]?.[0].user).toBe(query);
+    expect(JSON.parse(f.llm.json.mock.calls[0]![0].user!).request).toBe(query);
     expect(result.query).toBe(query);
     f.state.close();
   });
@@ -138,7 +186,7 @@ describe('LLM-assisted general search', () => {
     f.client.name = f.settings.integrations.prowlarr.generalClient;
     f.state.saveSettings(f.settings);
     f.service = new GeneralSearchService({ llm: f.llm as never, prowlarr: f.prowlarr as never, state: f.state, runtimeSettings: f.state.getSettings(), getSettings: () => f.state.getSettings() });
-    f.llm.json.mockResolvedValueOnce({ mode: 'search', queries: ['title radarr-secret-key ftp://user:pass@host/private'], question: 'sonarr-secret-key' });
+    f.llm.json.mockResolvedValueOnce({ ...planned('title radarr-secret-key ftp://user:pass@host/private'), proposals: [{ query: 'title radarr-secret-key ftp://user:pass@host/private', purpose: 'Search', branch: 'title', strategy: 'subcategory', preserves: [] }] });
     f.prowlarr.search.mockImplementation(async () => [release({ title: `${'x'.repeat(295)}radarr-secret-key ftp://user:ftp-secret@host/private`, indexer: 'https://sonarr-secret-key@private.test' })]);
     const input = `${'q'.repeat(275)}radarr-secret-key ftp://user:password@host/private sonarr-secret-key`;
     const response = await f.service.search({ query: input });

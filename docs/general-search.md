@@ -2,6 +2,8 @@
 
 General search is a chat-first, open-ended discovery flow outside the Sonarr/Radarr work queue. Use the single composer for an original request, answer a genuine clarification, or refine results; the original request and up to five follow-up turns remain in page memory. The planner can issue bounded iterative Prowlarr queries based on actual sanitized results, then a separate curation step classifies supplied candidates as match, possible match, or clearly unrelated. Planning and curation do not select or submit releases. See the [rewrite verification record](general-search-rewrite-verification.md) for implementation evidence and limits.
 
+The AI settings include an optional **Search system prompt** text field, limited to 16,000 characters. When non-empty, its authored text is appended to the existing system message for conversational planning, candidate curation, and the backward-compatible general-search planner. It is not applied to monitoring or other AI tasks. Blank text leaves the built-in prompts unchanged; the built-in structured-output and data-handling contract remains in effect.
+
 ## Configure a destination
 
 In **Settings → Integrations → Prowlarr**, configure the Prowlarr URL and API key, then enter the exact name of one enabled download-client entry in **General download client** to make protocol-matched releases selectable. If the destination is missing or ambiguous, safe recognized-protocol discovery may still be shown, but results remain nonselectable. General search does not require Sonarr or Radarr configuration, or either of their client names.

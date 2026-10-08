@@ -14,6 +14,8 @@ describe('persisted UI settings', () => {
     expect(settings.monitoring.enabled).toBe(false);
     expect(settings.safety.dryRun).toBe(true);
     expect(settings.generalSearch).toEqual({ maxQueries: 6, maxCandidates: 200, maxAiCalls: 12, batchSize: 20, displayLimit: 40, hideZeroSeeders: true });
+    expect(settings.ai.providerOrder).toEqual([]);
+    expect(settings.ai.allowProviderFallbacks).toBe(false);
     expect(missingSettings(settings)).toContain('integrations.sonarr.apiKey');
     expect(missingSettings(settings)).not.toContain('integrations.prowlarr.generalClient');
     state.close();
@@ -70,6 +72,38 @@ describe('persisted UI settings', () => {
     const legacy = structuredClone(defaultSettings) as Record<string, any>;
     delete legacy.ai.searchSystemPrompt;
     expect(settingsSchema.parse(legacy).ai.searchSystemPrompt).toBe('');
+  });
+
+  it('defaults omitted provider routing on old version-one settings and normalizes validated slugs', () => {
+    const legacy = structuredClone(defaultSettings) as Record<string, any>;
+    delete legacy.ai.providerOrder;
+    delete legacy.ai.allowProviderFallbacks;
+    expect(settingsSchema.parse(legacy).ai).toMatchObject({ providerOrder: [], allowProviderFallbacks: false });
+    legacy.ai.providerOrder = ['  Provider/A  ', 'endpoint-2'];
+    legacy.ai.allowProviderFallbacks = true;
+    expect(settingsSchema.parse(legacy).ai.providerOrder).toEqual(['Provider/A', 'endpoint-2']);
+    expect(settingsSchema.parse(legacy).ai.allowProviderFallbacks).toBe(true);
+  });
+
+  it.each([
+    ['too many', Array.from({ length: 9 }, (_, i) => `provider-${i}`)],
+    ['blank', ['   ']], ['too long', ['x'.repeat(121)]], ['URL', ['https://provider.example']],
+    ['comma', ['provider-a,provider-b']], ['spaces', ['provider name']], ['control', ['provider\nname']],
+    ['case-insensitive duplicate', ['Provider-A', 'provider-a']],
+  ])('rejects invalid provider order (%s)', (_name, order) => {
+    const invalid = structuredClone(defaultSettings);
+    invalid.ai.providerOrder = order;
+    expect(settingsSchema.safeParse(invalid).success).toBe(false);
+  });
+
+  it('persists provider routing in the version-one saved settings snapshot', () => {
+    const state = State.open(':memory:');
+    const settings = structuredClone(defaultSettings);
+    settings.ai.providerOrder = [' provider-one ', 'provider/two'];
+    settings.ai.allowProviderFallbacks = true;
+    state.saveSettings(settings);
+    expect(state.getSettings().ai).toMatchObject({ providerOrder: ['provider-one', 'provider/two'], allowProviderFallbacks: true });
+    state.close();
   });
 
   it('bounds timer intervals to the largest safe whole-minute Node timeout', () => {

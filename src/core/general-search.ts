@@ -36,7 +36,7 @@ export class GeneralSearchService {
     this.capturedSettings = structuredClone(deps.runtimeSettings ?? deps.getSettings());
   }
   private runtimeSettings(): Settings { return this.capturedSettings; }
-  private runtimeFingerprint(s: Settings) { return sha(JSON.stringify([s.integrations.prowlarr.url, s.integrations.prowlarr.apiKey, s.integrations.prowlarr.generalClient ?? '', s.ai.baseUrl, s.ai.apiKey, s.ai.model, s.ai.searchSystemPrompt])); }
+  private runtimeFingerprint(s: Settings) { return sha(JSON.stringify([s.integrations.prowlarr.url, s.integrations.prowlarr.apiKey, s.integrations.prowlarr.generalClient ?? '', s.ai.baseUrl, s.ai.apiKey, s.ai.model, s.ai.searchSystemPrompt, s.ai.providerOrder, s.ai.allowProviderFallbacks])); }
   private prowlarrFingerprint(s: Settings) { return sha(JSON.stringify([s.integrations.prowlarr.url, s.integrations.prowlarr.apiKey, s.integrations.prowlarr.generalClient ?? ''])); }
   private now() { return (this.deps.now ?? (() => new Date()))(); }
   private fingerprint(s: Settings) { return sha(JSON.stringify([s.integrations.prowlarr.url, s.integrations.prowlarr.apiKey, s.integrations.prowlarr.generalClient ?? '', s.safety.dryRun, s.safety.allowOperatorActions])); }

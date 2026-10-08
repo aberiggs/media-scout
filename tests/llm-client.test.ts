@@ -5,19 +5,24 @@ import { OpenRouter } from '@openrouter/sdk';
 import { OpenRouterError } from '@openrouter/sdk/models/errors';
 import { OpenRouterLLM } from '../src/clients/llm';
 import { ApiError } from '../src/http';
+import pino from 'pino';
+import { buildStack } from '../src/compose';
+import { configWithSettings, loadConfig } from '../src/config';
+import { State } from '../src/core/state';
+import { defaultSettings } from '../src/settings';
 
 const BASE = 'http://llm.test';
 const MODEL = 'z-ai/glm-5.3-flash';
 const schema = z.object({ verdict: z.enum(['grab', 'manual', 'skip']) });
 
 /** Fresh SDK client per test: no retries (determinism) and the full-base serverURL seam. */
-const build = () => {
+const build = (providerOrder?: string[], allowProviderFallbacks = false) => {
   const sdk = new OpenRouter({
     apiKey: 'test-key',
     serverURL: BASE,
     retryConfig: { strategy: 'none' },
   });
-  return { sdk, llm: new OpenRouterLLM({ client: sdk, model: MODEL }) };
+  return { sdk, llm: new OpenRouterLLM({ client: sdk, model: MODEL, providerOrder, allowProviderFallbacks }) };
 };
 
 const replyBody = (content: string) => ({
@@ -67,6 +72,50 @@ describe('OpenRouterLLM.json', () => {
     });
     expect(out).toEqual({ verdict: 'grab' });
     expect(scope.isDone()).toBe(true);
+  });
+
+  it.each([
+    { providerOrder: ['provider-z', 'provider-a'], allow: false },
+    { providerOrder: ['provider-z', 'provider-a'], allow: true },
+  ])('sends ordered provider preferences with explicit fallback setting: $allow', async ({ providerOrder, allow }) => {
+    const scope = nock(BASE).post('/chat/completions', (body) => {
+      expect(body.provider).toEqual({ require_parameters: true, order: providerOrder, allow_fallbacks: allow });
+      return true;
+    }).reply(200, replyBody('{"verdict":"skip"}'));
+    const { llm } = build(providerOrder, allow);
+    await expect(llm.json({ system: 's', user: 'u', schema, label: 'routing' })).resolves.toEqual({ verdict: 'skip' });
+    expect(scope.isDone()).toBe(true);
+  });
+
+  it('preserves provider routing on transport retries and corrective JSON requests', async () => {
+    const provider = { require_parameters: true, order: ['provider-first', 'provider-second'], allow_fallbacks: true };
+    const check = (body: Record<string, any>) => { expect(body.provider).toEqual(provider); return true; };
+    nock(BASE).post('/chat/completions', check).reply(503, { error: 'retry' }, { 'retry-after-ms': '1' });
+    nock(BASE).post('/chat/completions', check).reply(200, replyBody('not json'));
+    nock(BASE).post('/chat/completions', check).reply(503, { error: 'retry correction' }, { 'retry-after-ms': '1' });
+    nock(BASE).post('/chat/completions', check).reply(200, replyBody('{"verdict":"skip"}'));
+    const { llm } = build(['provider-first', 'provider-second'], true);
+    await expect(llm.json({ system: 's', user: 'u', schema, label: 'routed correction' })).resolves.toEqual({ verdict: 'skip' });
+  });
+
+  it('uses immutable saved provider settings through the composition root', async () => {
+    const state = State.open(':memory:');
+    const settings = structuredClone(defaultSettings);
+    settings.ai.apiKey = 'test-key';
+    settings.ai.baseUrl = BASE;
+    settings.ai.providerOrder = ['saved-provider'];
+    settings.ai.allowProviderFallbacks = true;
+    state.saveSettings(settings);
+    const saved = state.getSettings();
+    const stack = buildStack({ config: configWithSettings(loadConfig({ DB_PATH: ':memory:' }), saved), state, logger: pino({ level: 'silent' }) });
+    saved.ai.providerOrder[0] = 'mutated-after-compose';
+    const scope = nock(BASE).post('/chat/completions', (body) => {
+      expect(body.provider).toEqual({ require_parameters: true, order: ['saved-provider'], allow_fallbacks: true });
+      return true;
+    }).reply(200, replyBody('{"verdict":"skip"}'));
+    await expect(stack.llm.json({ system: 's', user: 'u', schema, label: 'composed routing' })).resolves.toEqual({ verdict: 'skip' });
+    expect(scope.isDone()).toBe(true);
+    state.close();
   });
 
   it('strips bare fences (``` ... ``` without json tag)', async () => {

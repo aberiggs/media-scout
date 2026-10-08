@@ -122,6 +122,74 @@ describe('settings experience', () => {
     assert.ok(screen.getByText(/These preferences guide release ranking/))
   })
 
+  it('loads legacy provider settings with automatic routing defaults', async () => {
+    const legacy = JSON.parse(JSON.stringify(envelope))
+    delete legacy.settings.ai.providerOrder
+    delete legacy.settings.ai.allowProviderFallbacks
+    globalThis.fetch = async input => String(input) === '/api/settings' ? jsonResponse(legacy) : defaultOperationResponse(input)
+    renderSettings()
+    await screen.findByLabelText('Preferred providers')
+    assert.equal((screen.getByLabelText('Preferred providers') as HTMLInputElement).value, '')
+    assert.equal((screen.getByLabelText('Allow other providers as fallback') as HTMLInputElement).checked, false)
+    assert.equal((screen.getByLabelText('Allow other providers as fallback') as HTMLInputElement).disabled, true)
+    assert.ok(screen.getByText(/automatic routing remains enabled/))
+  })
+
+  it('saves trimmed provider order and fallback preference, and clears back to automatic routing', async () => {
+    const saves: any[] = []
+    globalThis.fetch = async (input, init) => {
+      if (String(input) === '/api/settings' && init?.method === 'PUT') {
+        const payload = JSON.parse(String(init.body)); saves.push(payload)
+        return jsonResponse({ ...envelope, settings: payload })
+      }
+      if (String(input) === '/api/settings') return jsonResponse(envelope)
+      return defaultOperationResponse(input)
+    }
+    renderSettings()
+    const providers = await screen.findByLabelText('Preferred providers') as HTMLInputElement
+    const fallback = screen.getByLabelText('Allow other providers as fallback') as HTMLInputElement
+    fireEvent.change(providers, { target: { value: ' deepinfra, fireworks, ' } })
+    assert.equal(providers.value, ' deepinfra, fireworks, ')
+    assert.equal(fallback.disabled, false)
+    assert.ok(screen.getByText(/Only the listed providers will be used/))
+    fireEvent.click(fallback)
+    assert.ok(screen.getByText(/OpenRouter may use another provider/))
+    fireEvent.click(screen.getAllByRole('button', { name: 'Save changes' })[0])
+    await waitFor(() => assert.equal(saves.length, 1))
+    assert.deepEqual(saves[0].ai.providerOrder, ['deepinfra', 'fireworks'])
+    assert.equal(saves[0].ai.allowProviderFallbacks, true)
+
+    fireEvent.change(providers, { target: { value: '' } })
+    assert.equal(fallback.disabled, true)
+    fireEvent.click(screen.getAllByRole('button', { name: 'Save changes' })[0])
+    await waitFor(() => assert.equal(saves.length, 2))
+    assert.deepEqual(saves[1].ai.providerOrder, [])
+    assert.equal(saves[1].ai.allowProviderFallbacks, false)
+    assert.ok(screen.getByText(/automatic routing remains enabled/))
+  })
+
+  it('validates provider slugs and case-insensitive duplicates before saving', async () => {
+    const puts: unknown[] = []
+    globalThis.fetch = async (input, init) => {
+      if (String(input) === '/api/settings' && init?.method === 'PUT') { puts.push(init.body); return jsonResponse(envelope) }
+      if (String(input) === '/api/settings') return jsonResponse(envelope)
+      return defaultOperationResponse(input)
+    }
+    renderSettings()
+    const providers = await screen.findByLabelText('Preferred providers') as HTMLInputElement
+    for (const [index, value] of ['deepinfra, DeepInfra', 'https://user:secret@example.com/path', 'bad slug'].entries()) {
+      fireEvent.change(providers, { target: { value } })
+      assert.ok(screen.getByRole('alert'))
+      assert.equal((screen.getAllByRole('button', { name: 'Save changes' })[0] as HTMLButtonElement).disabled, true)
+      assert.equal((screen.getAllByRole('button', { name: 'Save changes' })[1] as HTMLButtonElement).disabled, true)
+      assert.equal(providers.getAttribute('aria-invalid'), 'true')
+      if (index === 1) assert.doesNotMatch(screen.getByRole('alert').textContent ?? '', /secret|example\.com/)
+    }
+    assert.equal(puts.length, 0)
+    fireEvent.change(providers, { target: { value: 'deepinfra, fireworks' } })
+    assert.equal(providers.getAttribute('aria-invalid'), 'false')
+  })
+
   it('loads, saves, and clears the search system prompt exactly', async () => {
     const saved = envelopeWithModel(envelope.settings.ai.model)
     saved.settings.ai.searchSystemPrompt = 'Use precise episode numbering.\nKeep the search terms concise.'

@@ -339,6 +339,9 @@ h1 { color: #f0f2ef; font-family: var(--display); font-size: clamp(2.125rem, 3.5
 .icon-button.copied { color: var(--mint); }
 .service-divider { height: 1px; margin: 17px 0; background: #282d29; }
 .textarea-meta { display: flex; justify-content: space-between; margin-top: 2px; color: #939d95; font-size: var(--type-small); }
+.provider-fallback-toggle { display:flex; align-items:center; gap:8px; margin-top:10px; color:var(--text-secondary); font-size:var(--type-small); }
+.provider-fallback-toggle input { accent-color:var(--mint); }
+.provider-order-error { display:block; margin-top:5px; color:#e39b8f; font-size:var(--type-small); }
 
 .right-rail { position: sticky; top: 84px; display: grid; gap: 12px; }
 .rail-card { padding: 15px; border: 1px solid #2c322e; border-radius: 8px; background: #171a18; box-shadow: 0 8px 24px rgba(0,0,0,.08), 0 1px 0 rgba(255,255,255,.025) inset; }

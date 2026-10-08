@@ -7,6 +7,23 @@ const optionalHttpUrl = z.string().refine((value) => value === '' || (() => {
   } catch { return false; }
 })(), 'must be an http(s) URL without embedded credentials or empty');
 const text = z.string();
+const providerSlug = z.string().trim().min(1).max(120).regex(/^[A-Za-z0-9][A-Za-z0-9._/-]*$/);
+const aiSettings = z.object({
+  apiKey: text,
+  model: text.min(1),
+  baseUrl: optionalHttpUrl,
+  preferences: text.trim().max(4000),
+  searchSystemPrompt: text.max(16000).default(''),
+  providerOrder: z.array(providerSlug).max(8).default([]),
+  allowProviderFallbacks: z.boolean().default(false),
+}).strict().superRefine((ai, ctx) => {
+  const seen = new Set<string>();
+  ai.providerOrder.forEach((provider, index) => {
+    const normalized = provider.toLocaleLowerCase('en-US');
+    if (seen.has(normalized)) ctx.addIssue({ code: 'custom', path: ['providerOrder', index], message: 'providerOrder entries must be unique ignoring case' });
+    seen.add(normalized);
+  });
+});
 export const settingsSchema = z.object({
   version: z.literal(1),
   integrations: z.object({
@@ -14,7 +31,7 @@ export const settingsSchema = z.object({
     sonarr: z.object({ url: optionalHttpUrl, apiKey: text }).strict(),
     radarr: z.object({ url: optionalHttpUrl, apiKey: text }).strict(),
   }).strict(),
-  ai: z.object({ apiKey: text, model: text.min(1), baseUrl: optionalHttpUrl, preferences: text.trim().max(4000), searchSystemPrompt: text.max(16000).default('') }).strict(),
+  ai: aiSettings,
   monitoring: z.object({
     enabled: z.boolean(), intervalMinutes: z.number().int().min(1).max(35_791), minRetryHours: z.number().int().min(1),
     failureBackoffMinMinutes: z.number().int().min(1), failureBackoffMaxMinutes: z.number().int().min(1), queueGraceMinutes: z.number().int().min(1),
@@ -34,7 +51,7 @@ export type Settings = Omit<z.infer<typeof settingsSchema>, 'integrations' | 'ge
 export const defaultSettings: Settings = {
   version: 1,
   integrations: { prowlarr: { url: '', apiKey: '', tvClient: '', movieClient: '', generalClient: '' }, sonarr: { url: '', apiKey: '' }, radarr: { url: '', apiKey: '' } },
-  ai: { apiKey: '', model: 'z-ai/glm-5.3-flash', baseUrl: 'https://openrouter.ai/api/v1', preferences: '', searchSystemPrompt: '' },
+  ai: { apiKey: '', model: 'z-ai/glm-5.3-flash', baseUrl: 'https://openrouter.ai/api/v1', preferences: '', searchSystemPrompt: '', providerOrder: [], allowProviderFallbacks: false },
   monitoring: { enabled: false, intervalMinutes: 5, minRetryHours: 6, failureBackoffMinMinutes: 5, failureBackoffMaxMinutes: 60, queueGraceMinutes: 30 },
   safety: { dryRun: true, allowOperatorActions: false },
   generalSearch: { maxQueries: 6, maxCandidates: 200, maxAiCalls: 12, batchSize: 20, displayLimit: 40, hideZeroSeeders: true },

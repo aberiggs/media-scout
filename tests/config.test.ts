@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { loadConfig } from '../src/config';
+import { configWithSettings, loadConfig } from '../src/config';
+import { defaultSettings } from '../src/settings';
 
 describe('loadConfig', () => {
   it('reads only bootstrap values; integrations are empty and monitoring safely disabled by default', () => {
@@ -32,5 +33,16 @@ describe('loadConfig', () => {
     expect(cfg.HTTP_HOST).toBe('127.0.0.1');
     expect(cfg.LOG_LEVEL).toBe('debug');
     expect(cfg.settings.integrations.prowlarr.apiKey).toBe('');
+  });
+
+  it('keeps provider routing in the validated saved-settings snapshot, not environment aliases', () => {
+    const settings = structuredClone(defaultSettings);
+    settings.ai.providerOrder = ['provider-a', 'provider/b'];
+    settings.ai.allowProviderFallbacks = true;
+    const config = configWithSettings(loadConfig({}), settings);
+    expect(config.settings.ai.providerOrder).toEqual(['provider-a', 'provider/b']);
+    expect(config.settings.ai.allowProviderFallbacks).toBe(true);
+    expect(loadConfig({ LLM_PROVIDER_ORDER: 'attacker', LLM_ALLOW_PROVIDER_FALLBACKS: 'true' }).settings.ai.providerOrder).toEqual([]);
+    expect(loadConfig({ LLM_PROVIDER_ORDER: 'attacker', LLM_ALLOW_PROVIDER_FALLBACKS: 'true' }).settings.ai.allowProviderFallbacks).toBe(false);
   });
 });

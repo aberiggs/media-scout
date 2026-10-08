@@ -66,11 +66,21 @@ function normalizeOpenRouterError(error: unknown): unknown {
 
 export class OpenRouterLLM implements LLMClient {
   constructor(
-    private readonly deps: {
+    deps: {
       client: OpenRouter;
       model: string;
+      providerOrder?: readonly string[];
+      allowProviderFallbacks?: boolean;
     },
-  ) {}
+  ) {
+    this.deps = {
+      ...deps,
+      providerOrder: deps.providerOrder ? [...deps.providerOrder] : [],
+      allowProviderFallbacks: deps.allowProviderFallbacks ?? false,
+    };
+  }
+
+  private readonly deps: { client: OpenRouter; model: string; providerOrder: readonly string[]; allowProviderFallbacks: boolean };
 
   async json<T>(args: {
     system: string;
@@ -164,7 +174,12 @@ export class OpenRouterLLM implements LLMClient {
             schema: generatedSchema,
           },
         },
-        provider: { requireParameters: true },
+        provider: {
+          requireParameters: true,
+          ...(this.deps.providerOrder.length > 0
+            ? { order: [...this.deps.providerOrder], allowFallbacks: this.deps.allowProviderFallbacks }
+            : {}),
+        },
       }, signal, onAttempt, logicalAttempt);
     } catch (error) {
       if (signal.aborted) throw signal.reason ?? error;

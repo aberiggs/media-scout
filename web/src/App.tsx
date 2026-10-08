@@ -149,9 +149,22 @@ function errorText(error: unknown, settings: Settings): string {
   return redactSecrets(message, settings)
 }
 
+function parseProviderOrder(value: string): { providers: string[]; error: string } {
+  const trimmed=value.trim()
+  if(!trimmed)return { providers:[], error:'' }
+  const parts=trimmed.split(',').map(part=>part.trim())
+  if(parts.at(-1)==='')parts.pop() // A trailing separator is a normal in-progress edit.
+  if(parts.some(part=>!part))return { providers:[], error:'Remove empty entries between provider names.' }
+  if(parts.length>8)return { providers:[], error:'Enter no more than 8 providers.' }
+  if(parts.some(part=>part.length>120||!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(part)))return { providers:[], error:'Use provider slugs made of letters, numbers, dots, underscores, slashes, or hyphens.' }
+  if(new Set(parts.map(part=>part.toLowerCase())).size!==parts.length)return { providers:[], error:'Each provider can appear only once.' }
+  return { providers:parts, error:'' }
+}
+
 function App() {
   const [page, setPage] = useState<Page>(() => currentPage())
   const [settings, setSettings] = useState<Settings | null>(null)
+  const [providerOrderDraft, setProviderOrderDraft] = useState('')
   const [savedSnapshot, setSavedSnapshot] = useState('')
   const [status, setStatus] = useState<SettingsStatus | null>(null)
   const [loading, setLoading] = useState(true)
@@ -160,7 +173,8 @@ function App() {
   const loadSequence = useRef(0)
   const activeLoad = useRef<{ sequence: number; controller: AbortController } | null>(null)
 
-  const isDirty = useMemo(() => Boolean(settings && JSON.stringify(settings) !== savedSnapshot), [settings, savedSnapshot])
+  const parsedProviderOrder = useMemo(() => parseProviderOrder(providerOrderDraft), [providerOrderDraft])
+  const isDirty = useMemo(() => Boolean(settings && (JSON.stringify(settings) !== savedSnapshot || Boolean(parsedProviderOrder.error) || JSON.stringify(parsedProviderOrder.providers) !== JSON.stringify(settings.ai.providerOrder))), [settings, savedSnapshot, parsedProviderOrder])
 
   const loadSettings = useCallback(async () => {
     const sequence = ++loadSequence.current
@@ -175,6 +189,7 @@ function App() {
       if (sequence !== loadSequence.current || controller.signal.aborted) return
       const next = mergeSettings(envelope.settings)
       setSettings(next)
+      setProviderOrderDraft(next.ai.providerOrder.join(', '))
       setSavedSnapshot(JSON.stringify(next))
       setStatus(envelope.status)
     } catch (error) {
@@ -214,17 +229,19 @@ function App() {
   const handleSave = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     if (!settings || !isDirty || saving || loading) return
+    if (parsedProviderOrder.error) return
     setSaving(true)
     setNotice(null)
     try {
       const response = await fetch('/api/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(settings),
+        body: JSON.stringify({ ...settings, ai: { ...settings.ai, providerOrder: parsedProviderOrder.providers, allowProviderFallbacks: parsedProviderOrder.providers.length ? settings.ai.allowProviderFallbacks : false } }),
       })
       const envelope = await readEnvelope(response)
       const next = mergeSettings(envelope.settings)
       setSettings(next)
+      setProviderOrderDraft(next.ai.providerOrder.join(', '))
       setSavedSnapshot(JSON.stringify(next))
       setStatus(envelope.status)
       setNotice({ kind: 'success', text: 'Settings saved. Changes apply on the next cycle.' })
@@ -253,6 +270,7 @@ function App() {
   const updateAi = (field: keyof Settings['ai'], value: string) => {
     update((current) => ({ ...current, ai: { ...current.ai, [field]: value } }))
   }
+  const updateProviderFallbacks = (allowProviderFallbacks: boolean) => update((current) => ({ ...current, ai: { ...current.ai, allowProviderFallbacks } }))
 
   const updateMonitoring = (field: keyof Settings['monitoring'], value: boolean | number) => {
     update((current) => ({ ...current, monitoring: { ...current.monitoring, [field]: value } }))
@@ -295,7 +313,7 @@ function App() {
           <div className="crumb"><span>Workspace</span><span className="crumb-divider">/</span><strong>{pageLabels[page]}</strong></div>
           <div className="topbar-right">
             {page === 'settings' && status && <span className={`connection-chip ${status.ready ? 'is-ready' : 'needs-setup'}`}><span className="sr-only">Instance status: </span><span className="chip-dot" />{status.ready ? 'Ready' : 'Setup needed'}</span>}
-            {page === 'settings' && <button className="button button-primary top-save" type="submit" form="settings-form" disabled={!isDirty || loading || saving}>
+            {page === 'settings' && <button className="button button-primary top-save" type="submit" form="settings-form" disabled={!isDirty || loading || saving || Boolean(parsedProviderOrder.error)}>
               {saving ? <LoaderCircle className="spin" size={16} /> : isDirty ? <Save size={16} /> : <Check size={16} />}
               <span>{saveLabel}</span>
             </button>}
@@ -376,6 +394,12 @@ function App() {
                       <Field label="Model" htmlFor="ai-model" hint="Use an OpenRouter model ID">
                         <input id="ai-model" value={settings.ai.model} onChange={(e) => updateAi('model', e.target.value)} placeholder="z-ai/glm-5.3-flash" />
                       </Field>
+                      <Field className="span-two" label="Preferred providers" htmlFor="ai-provider-order" hint="Leave blank for automatic routing. Providers are tried in this order. Use OpenRouter provider slugs, separated by commas (for example: deepinfra, fireworks). This setting applies to search and monitoring requests.">
+                        <input id="ai-provider-order" value={providerOrderDraft} onChange={(e) => setProviderOrderDraft(e.target.value)} placeholder="deepinfra, fireworks" aria-invalid={Boolean(parsedProviderOrder.error)} aria-describedby="ai-provider-order-hint ai-provider-order-error" />
+                        <span id="ai-provider-order-hint" className="field-hint">{!parsedProviderOrder.providers.length ? 'This fallback setting matters only when preferred providers are listed; automatic routing remains enabled.' : settings.ai.allowProviderFallbacks ? 'OpenRouter may use another provider if these are unavailable.' : 'Only the listed providers will be used; unavailable or incompatible providers can make requests fail.'}</span>
+                        {parsedProviderOrder.error&&<span id="ai-provider-order-error" className="provider-order-error" role="alert">{parsedProviderOrder.error}</span>}
+                        <label className="provider-fallback-toggle"><input type="checkbox" checked={settings.ai.allowProviderFallbacks} disabled={!parsedProviderOrder.providers.length} onChange={(e) => updateProviderFallbacks(e.target.checked)} /> Allow other providers as fallback</label>
+                      </Field>
                       <Field className="span-two" label="API base URL" htmlFor="ai-base-url" hint="Use http(s); don’t include a username or password in the URL.">
                         <input id="ai-base-url" type="url" value={settings.ai.baseUrl} onChange={(e) => updateAi('baseUrl', e.target.value)} placeholder="https://openrouter.ai/api/v1" />
                       </Field>
@@ -424,7 +448,7 @@ function App() {
 
                   <div className="form-footer">
                     <span className="footer-hint"><LockKeyhole size={14} /> Your configuration stays on this instance.</span>
-                    <button className="button button-primary" type="submit" disabled={!isDirty || loading || saving}>
+                    <button className="button button-primary" type="submit" disabled={!isDirty || loading || saving || Boolean(parsedProviderOrder.error)}>
                       {saving ? <LoaderCircle className="spin" size={16} /> : isDirty ? <Save size={16} /> : <Check size={16} />}
                       {saveLabel}
                     </button>

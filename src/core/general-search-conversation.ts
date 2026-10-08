@@ -64,7 +64,7 @@ export class GeneralSearchConversationService {
     this.settings = structuredClone(deps.runtimeSettings ?? deps.getSettings());
   }
   private now() { return (this.deps.now ?? (()=>new Date()))(); }
-  private runtimeKey(s:Settings) { return hash(JSON.stringify([s.integrations.prowlarr.url,s.integrations.prowlarr.apiKey,s.integrations.prowlarr.generalClient??'',s.ai.baseUrl,s.ai.apiKey,s.ai.model,s.ai.searchSystemPrompt])); }
+  private runtimeKey(s:Settings) { return hash(JSON.stringify([s.integrations.prowlarr.url,s.integrations.prowlarr.apiKey,s.integrations.prowlarr.generalClient??'',s.ai.baseUrl,s.ai.apiKey,s.ai.model,s.ai.searchSystemPrompt,s.ai.providerOrder,s.ai.allowProviderFallbacks])); }
   private sourceKey(s:Settings,id:number,guid:string) { const u=new URL(s.integrations.prowlarr.url);u.pathname=u.pathname.replace(/\/+$/,'');u.search='';u.hash='';return hash(JSON.stringify([u.toString(),id,guid])); }
   private legacyKey(s:Settings,id:number,guid:string) { return hash(JSON.stringify([s.integrations.prowlarr.url,s.integrations.prowlarr.apiKey,id,guid])); }
   private check(signal?:AbortSignal) { if(signal?.aborted) throw failure('aborted'); if(this.runtimeKey(this.deps.getSettings())!==this.runtimeKey(this.settings)) throw failure('settings-changed'); }

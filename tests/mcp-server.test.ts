@@ -138,7 +138,7 @@ function testConfigFromEnv(env: Record<string, string>) {
       sonarr: { url: env.SONARR_URL ?? SONARR, apiKey: env.SONARR_API_KEY ?? 'sonarr-key' },
       radarr: { url: env.RADARR_URL ?? RADARR, apiKey: env.RADARR_API_KEY ?? 'radarr-key' },
     },
-    ai: { apiKey: env.LLM_API_KEY ?? 'llm-key', model: env.LLM_MODEL ?? defaults.ai.model, baseUrl: env.LLM_BASE_URL ?? defaults.ai.baseUrl, preferences: env.MEDIA_PREFERENCES ?? '', searchSystemPrompt: '' },
+    ai: { apiKey: env.LLM_API_KEY ?? 'llm-key', model: env.LLM_MODEL ?? defaults.ai.model, baseUrl: env.LLM_BASE_URL ?? defaults.ai.baseUrl, preferences: env.MEDIA_PREFERENCES ?? '', searchSystemPrompt: '', providerOrder: [], allowProviderFallbacks: false },
     monitoring: { ...defaults.monitoring, intervalMinutes: n('CYCLE_INTERVAL_MIN', 5), minRetryHours: n('MIN_RETRY_HOURS', 6), failureBackoffMinMinutes: n('FAILURE_BACKOFF_MIN', 5), failureBackoffMaxMinutes: n('FAILURE_BACKOFF_MAX_MIN', 60), queueGraceMinutes: n('QUEUE_GRACE_MIN', 30) },
     safety: { dryRun: env.DRY_RUN !== 'false', allowOperatorActions: env.ALLOW_OPERATOR_ACTIONS === 'true' },
   });

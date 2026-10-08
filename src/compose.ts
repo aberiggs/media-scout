@@ -88,6 +88,8 @@ export function buildStack(deps: BuildStackDeps): Stack {
         retryConfig: { strategy: 'none' },
       }),
       model: config.LLM_MODEL,
+      providerOrder: config.settings.ai.providerOrder,
+      allowProviderFallbacks: config.settings.ai.allowProviderFallbacks,
     });
 
   const planner = new Planner({ llm });

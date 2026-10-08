@@ -5,7 +5,7 @@ export interface Settings {
     sonarr: { url: string; apiKey: string }
     radarr: { url: string; apiKey: string }
   }
-  ai: { apiKey: string; model: string; baseUrl: string; preferences: string; searchSystemPrompt: string }
+  ai: { apiKey: string; model: string; baseUrl: string; preferences: string; searchSystemPrompt: string; providerOrder: string[]; allowProviderFallbacks: boolean }
   monitoring: {
     enabled: boolean
     intervalMinutes: number
@@ -42,6 +42,8 @@ export const defaults: Settings = {
     baseUrl: 'https://openrouter.ai/api/v1',
     preferences: '',
     searchSystemPrompt: '',
+    providerOrder: [],
+    allowProviderFallbacks: false,
   },
   monitoring: {
     enabled: false,
@@ -63,7 +65,7 @@ export function mergeSettings(input: Settings): Settings {
       sonarr: { ...defaults.integrations.sonarr, ...input.integrations?.sonarr },
       radarr: { ...defaults.integrations.radarr, ...input.integrations?.radarr },
     },
-    ai: { ...defaults.ai, ...input.ai },
+    ai: { ...defaults.ai, ...input.ai, providerOrder: Array.isArray(input.ai?.providerOrder) ? input.ai.providerOrder.filter((value): value is string => typeof value === 'string') : [], allowProviderFallbacks: typeof input.ai?.allowProviderFallbacks === 'boolean' ? input.ai.allowProviderFallbacks : false },
     monitoring: { ...defaults.monitoring, ...input.monitoring },
     safety: { ...defaults.safety, ...input.safety },
   }

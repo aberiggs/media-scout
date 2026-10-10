@@ -1,0 +1,16 @@
+schema: spec-driven
+context: |
+  GitHub issues are the backlog; link scoped changes to their issue rather than
+  creating a second backlog. Investigation and proposals are planning-only;
+  implementation requires an explicit apply request.
+  Runtime experiments must use isolated state and must not mutate production
+  libraries, queues, or download clients. Dry-run still contacts LLMs/indexers.
+  Live model evaluation must be opt-in, budget-bounded, and use approved,
+  sanitized data without credentials or private upstream URLs.
+rules:
+  proposal:
+    - Distinguish confirmed source behavior from unverified production hypotheses.
+    - State scope, non-goals, and any required runtime evidence.
+  tasks:
+    - Include focused regression checks and the applicable broader checks from AGENTS.md.
+    - Separate deterministic offline checks from explicitly authorized live evaluation.

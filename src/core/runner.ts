@@ -10,7 +10,7 @@ import type { Picker, Candidate, PickVerdict } from './picker';
 import type { Planner } from './planner';
 import { parseReleaseTitle } from './parser';
 import { isGrabbable, verifyRelease } from './guardrails';
-import { reviewEvidenceMatchesWorkKey, type State } from './state';
+import { reviewEvidenceMatchesWorkKey, WORK_OBSERVATION_STALE_AFTER_MS, type State } from './state';
 import type { IntentCoverage, IntentStatus, QueueRead, WorkItem } from './work-queue-types';
 import { candidateOverlapsQueue, reconcileWork, type QueueReads, type ReconciledWork } from './work-queue';
 import { eligibleWorkUnits, type LibrarySnapshot, type Watcher, type WorkUnit } from './watcher';
@@ -1102,7 +1102,24 @@ export class Runner {
         const workObservedAt = work ? parseReviewObservationTime(work.lastObservedAt) : null;
         if (work && (workObservedAt === null || snapshotObservedAt < workObservedAt)) continue;
         const evidence = current.targetEvidence;
-        if (current.targetEvidenceKind === 'legacy-ineligible') continue;
+        if (current.targetEvidenceKind === 'legacy-ineligible') {
+          // Lost historical targets are not a permanent human task. Discard the obsolete
+          // title warning once the current, identity-matched season is positively complete.
+          // This does not fulfill or release intents, nor infer their historical coverage.
+          if (!work || nowMs - snapshotObservedAt > WORK_OBSERVATION_STALE_AFTER_MS ||
+            work.blockedReason === 'content-identity-changed' || this.deps.state.hasOpenManualReview(current.workKey, 'content-identity-changed') ||
+            work.unit.kind !== 'tv' || work.unit.arr !== 'sonarr' || !snapshot.sonarr.known) continue;
+          const key = /^sonarr:(0|[1-9]\d*):s(0|[1-9]\d*)$/.exec(current.workKey);
+          if (!key || !Number.isSafeInteger(Number(key[1])) || !Number.isSafeInteger(Number(key[2])) ||
+            Number(key[1]) !== work.unit.serviceId || Number(key[2]) !== work.unit.season?.seasonNumber) continue;
+          const observed = snapshot.sonarr.series.find(({ series }) => series.id === work.unit.serviceId);
+          if (!observed?.known || !observed.episodes || observed.series.tvdbId !== work.unit.externalId) continue;
+          const inventory = observed.episodes.filter(({ seasonNumber }) => seasonNumber === work.unit.season!.seasonNumber);
+          if (!inventory.length || !inventory.every(({ hasFile, seriesId }) => hasFile && seriesId === work.unit.serviceId) ||
+            !work.unit.season.missing.every(({ episodeId }) => observed.episodes!.some((ep) => ep.id === episodeId && ep.seriesId === work.unit.serviceId && ep.hasFile))) continue;
+          this.deps.state.deleteIneligibleUnparseableReview({ id: current.id, workKey: current.workKey, token, now: now.toISOString() });
+          continue;
+        }
         if (evidence) {
           if (!reviewEvidenceMatchesWorkKey(current.workKey, evidence)) continue;
           if (current.targetEvidenceKind === 'legacy' && (!work || work.blockedReason === 'content-identity-changed' || this.deps.state.hasOpenManualReview(current.workKey, 'content-identity-changed'))) continue;

@@ -994,7 +994,7 @@ describe('Runner.cycle', () => {
     expect(fulfilled.state.listManualReview(true)[0]?.resolvedAt).toEqual(expect.any(String));
   });
 
-  it('keeps an orphan review ineligible across missing, filed, and repeated polls', async () => {
+  it('cleans an initially orphaned title review once durable identity and complete season files are observed', async () => {
     let current = [episode(1, { id: 101, hasFile: false })];
     const { state, runner } = await runCleanupPoll({ episodeProvider: () => current });
     const marker = state.getManualReview(1);
@@ -1002,7 +1002,7 @@ describe('Runner.cycle', () => {
     current = [episode(1, { id: 101, hasFile: true })];
     await runner.cycle();
     await runner.cycle();
-    expect(state.getManualReview(1)).toMatchObject({ targetEvidenceKind: 'legacy-ineligible', resolvedAt: null });
+    expect(state.getManualReview(1)).toBeNull();
   });
 
   it('retains legacy [101,102] anchor after missing101 and filed101 polls', async () => {

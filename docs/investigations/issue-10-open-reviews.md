@@ -1,5 +1,64 @@
 # Issue #10: completed season with open reviews
 
+## Approved follow-up: automatic removal of obsolete legacy warnings
+
+The operator rejected permanent non-actionable legacy reviews and approved a
+cleanup fix after the investigation below. The original recommendation to
+require individual acknowledgement is **superseded**.
+
+Normal library reconciliation now deletes open, unlinked TV title reviews
+tagged `legacy-ineligible` once a fresh, known observation confirms matching
+durable service/external identity and a nonempty, fully filed inventory for the
+exact season. Any remaining saved work targets must also be positively filed.
+NULL legacy evidence is initialized and can be cleaned up in the same poll;
+already-tagged rows are equally eligible. No per-row operator action is needed.
+
+Deletion is deliberately limited to these obsolete warnings, under an
+owner-checked work claim. It does not reconstruct or pretend to prove old
+target generations, fulfill/release intents, or alter reservations, dedupe,
+decisions, associations, or audit history. Captured-target reviews keep their
+existing resolution behavior. Linked reviews, other reasons, actual orphans
+without durable identity, identity holds, empty/unknown/incomplete reads, stale
+or out-of-order observations, and held claims are not swept up. A new missing
+target under the same season key can still create a fresh review.
+
+Production is not modified or deployed by this checkpoint. The behavior takes
+effect on a successful normal library poll after deploying the fix. The
+investigation's source references and results below describe the **pre-fix**
+baseline, not the new policy.
+
+### Follow-up verification
+
+- Red: `npm test -- tests/issue-10-review-replay.test.ts` failed five cases with
+  21 rows remaining where deletion was required, before implementation.
+- Green: the cleanup suite now has 24 passing cases, including deletion and
+  API counts, captured history, incomplete/unknown/stale evidence, ownership,
+  linked reviews, saved targets omitted/unfiled/moved to another season, and a
+  subsequent target generation. Updated the old orphan-poll test to require
+  cleanup after a durable identity is established and the season imports.
+- `npm test`: **43 files, 674 passed**. `npm run typecheck`,
+  `npm --prefix web run typecheck`, `npm --prefix web test` (**36 passed**),
+  `npm run build`, and `git diff --check` passed.
+- Replayed cleanup twice on a separate copy of the private snapshot with the
+  bounded observed Sonarr evidence: **21 open rows deleted, zero open reviews**.
+  All 49 previously resolved rows and all work/intent/dedupe/decision/association/
+  audit rows stayed byte-for-byte equal at the SQL row level. Actual loopback
+  HTTP reads reported `openReviewCount: 0`, review total 0, and unchanged
+  fulfilled work. The listener was closed; no outbound fetch/LLM calls were allowed.
+- `docker buildx build --platform linux/amd64 --load -f docker/Dockerfile -t
+  media-scout:issue-10-local .` passed. The CI-equivalent SQLite native-addon
+  smoke command ran with `--rm --network none` on that image and passed.
+  No image was published and no daemon was started by the container check.
+- Independent review found no blocking implementation issues; its saved-target
+  coverage gap was addressed with the omitted/unfiled/moved-target cases above.
+
+The local Buildx builder does not advertise ARM64 support, so the ARM64 build/
+native-addon smoke remains a PR CI check, not a local pass. The container frontend
+install reported the same seven dependency advisories documented in the baseline;
+no dependency auto-fixes were run. No production deployment or mutation occurred.
+
+## Original investigation (pre-fix)
+
 Investigation of [issue #10](https://github.com/aberiggs/media-scout/issues/10),
 2026-10-10. Source baseline: `c0c37f6` (branched from `origin/main`).
 This is an investigation/characterization checkpoint, **not an application fix or

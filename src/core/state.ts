@@ -528,6 +528,18 @@ export class State {
     })();
   }
 
+  /** Deletes obsolete legacy title noise only; never removes linked reviews or safety state. */
+  deleteIneligibleUnparseableReview(input: { id: number; workKey: string; token: string; now: string }): boolean {
+    return this.db.transaction(() => {
+      this.assertClaim(input.workKey, input.token, input.now);
+      const review = this.getManualReview(input.id);
+      if (!review || review.workKey !== input.workKey || review.reason !== 'unparseable-title' || review.resolvedAt !== null ||
+        review.subjectKind || review.subjectKey || review.targetEvidenceInvalid || review.targetEvidenceKind !== 'legacy-ineligible') return false;
+      return this.db.prepare("DELETE FROM manual_review WHERE id=? AND work_key=? AND reason='unparseable-title' AND resolved_at IS NULL AND subject_kind IS NULL AND subject_key IS NULL")
+        .run(input.id, input.workKey).changes === 1;
+    })();
+  }
+
   /** Records a review explicitly linked by trusted reconciliation to one actual intent. */
   flagManualReviewLinked(input: { workKey: string; reason: string; details?: string; intentId: string; at?: Date }): void {
     const at = input.at ?? new Date();

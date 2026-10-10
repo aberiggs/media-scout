@@ -21,6 +21,8 @@ Retry and Reset are gated by **Safety → Allow operator actions**, which is off
 
 ## Review recovery
 
+Completed-season legacy title warnings are cleaned up automatically on a normal successful library poll, not by Retry/Reset or a dashboard dismiss action. Once fresh, identity-matched evidence confirms the exact season is fully imported, obsolete unlinked `legacy-ineligible` title rows are deleted from SQLite and stop contributing to open-review counts. Captured-target title reviews retain their existing evidence-based resolution behavior. Intent/queue-linked reviews and unresolved download holds are not removed by this cleanup. See [operations](operations.md#queue-and-manual-review) for evidence requirements.
+
 Association and reservation release use a separate prepare/commit flow. Prepare reads the current library and complete Sonarr/Radarr queues and returns a short-lived preview, explicit choices, and an exact challenge. Review the affected targets and queue evidence before committing; changed or stale evidence requires a fresh preview. Association commits only the explicit supplied selection.
 
 Reservation release requires confirmation that all relevant download clients and the original submission routing were inspected, followed by the exact challenge text. An empty *arr queue by itself is not proof that a download is inactive. The recovery lane does not search, grab, invoke the LLM, or mutate a download client.

@@ -26,7 +26,7 @@ All behavioral work uses regression-first development. Record commands, red/gree
 
 ## 4. Truthful episode and season visibility
 
-- [ ] 4.1 Add safe additive operations summaries and paginated episode details, plus consistent MCP status meanings. Verify caught-up versus fully imported versus lifecycle-unknown states, unique coverage counts, timing/retry reasons, unknown/stale observations, old-client fields, pagination, read-only behavior, and redaction with `npm test -- tests/operations-state.test.ts tests/operations-api.test.ts tests/mcp-server.test.ts tests/daemon.test.ts`; document contracts in `docs/operations-dashboard.md`.
+- [x] 4.1 Add safe additive operations summaries and paginated episode details, plus consistent MCP status meanings. Verify caught-up versus fully imported versus lifecycle-unknown states, unique coverage counts, timing/retry reasons, unknown/stale observations, old-client fields, pagination, read-only behavior, and redaction with `npm test -- tests/operations-state.test.ts tests/operations-api.test.ts tests/mcp-server.test.ts tests/daemon.test.ts`; document contracts in `docs/operations-dashboard.md`.
 - [ ] 4.2 Update existing Queue/Reviews UI and API types to show season progress, expandable/paginated episode detail, next airtime/retry, and explicit scoped hold explanations without changing action gates. Add component tests and verify with `npm --prefix web test` and `npm --prefix web run typecheck`, plus rendered narrow/wide-screen and keyboard/accessibility review using synthetic local data; document operator interpretation in `docs/operations-dashboard.md`.
 
 ## 5. Cross-cutting verification and review

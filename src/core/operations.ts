@@ -1,5 +1,7 @@
-import { WORK_OBSERVATION_STALE_AFTER_MS, type State, type WorkAction } from './state';
-import type { IntentCoverage, WorkItem, WorkStatus } from './work-queue-types';
+import { WORK_OBSERVATION_STALE_AFTER_MS, type PersistedQueueObservation, type State, type WorkAction } from './state';
+import type { GrabIntent, IntentCoverage, WorkItem, WorkStatus } from './work-queue-types';
+import { projectEpisodes, type EpisodeSummary, type EpisodeRow } from './episode-progress-view';
+export type { EpisodeSummary, EpisodeRow } from './episode-progress-view';
 
 const STATUSES: WorkStatus[] = ['ready', 'waiting-release', 'searching', 'cooldown', 'backoff', 'manual', 'fulfilled', 'inactive'];
 const RETRY_REASONS = new Set(['picker-manual', 'no-suitable-release', 'repeated-operation-failure', 'missing-download-client', 'reverify-failed', 'unparseable-title']);
@@ -13,6 +15,7 @@ export interface WorkRow {
   queueObservationKnown: boolean; queueObservedAt: string | null;
   observationState: 'known' | 'unknown' | 'stale'; coverage: { observed: number; reserved: number };
   actions: Record<WorkAction, { allowed: boolean; reason?: string }>;
+  episodeProgress?: EpisodeSummary;
 }
 export interface ReviewRow {
   id: number; workKey: string; title: string; mediaType: 'movie' | 'tv' | 'unknown'; season?: number; reason: string; summary: string; createdAt: string; resolvedAt: string | null;
@@ -32,6 +35,9 @@ export class OperationsDashboard {
     const workByKey = new Map(work.map((item) => [item.workKey, item]));
     const persistedQueue = this.state.listWorkQueueObservations();
     const reservations = this.state.listGrabIntents().filter((intent) => !intent.releasedAt && !['failed', 'fulfilled'].includes(intent.status));
+    const episodeRows = this.state.listEpisodeProgress();
+    const reviews = this.state.listManualReview(false);
+    const blocking = blockingReviewKeys(reviews);
     const requestedScope = input.scope ?? 'active';
     const countScope: OperationsScope = requestedScope === 'all' || (input.status !== undefined && TERMINAL_STATUSES.has(input.status as WorkStatus)) ? 'all' : 'active';
     const visibleWork = work.filter((item) => !item.resetPendingAt && (countScope === 'all' || !TERMINAL_STATUSES.has(item.status)));
@@ -57,13 +63,28 @@ export class OperationsDashboard {
         nextSearchAt: item.nextSearchAt, lastSearchAt: item.lastSearchAt, holdReason: item.blockedReason === null ? null : SAFE_HOLDS.has(item.blockedReason) ? item.blockedReason : 'blocked',
         observedAt: item.lastObservedAt, queueObservationKnown: item.queueObservationKnown, queueObservedAt: item.lastQueueObservedAt, observationState,
         coverage: { observed: observedIds.size, reserved: reservedIds.size }, actions: action,
+        ...(movie ? {} : { episodeProgress: projectEpisodes({ work: item, episodes: episodeRows, now: nowMs,
+          knowledge: observationState, ...episodeCoverage(item, workByKey, persistedQueue, reservations),
+          blockingReview: blocking.has(item.workKey), safeTitle }).summary }),
       };
     });
     return {
       items: projected, total: rows.length, counts,
-      openReviewCount: this.state.listManualReview(false).length, generatedAt, scope: requestedScope, countScope,
+      openReviewCount: reviews.length, generatedAt, scope: requestedScope, countScope,
       freshness: { staleAfterHours: WORK_OBSERVATION_STALE_AFTER_MS / 3_600_000 },
     };
+  }
+
+  episodes(workKey: string, limit: number, offset: number, responseNow: Date = this.now()): { workKey: string; items: EpisodeRow[]; total: number; generatedAt: string; summary: EpisodeSummary } | null {
+    const work = this.state.getWorkItem(workKey);
+    if (!work || work.unit.kind !== 'tv') return null;
+    const now = Number.isFinite(responseNow.getTime()) ? responseNow : new Date();
+    const workByKey = new Map(this.state.listWorkItems().map((item) => [item.workKey, item]));
+    const reservations = this.state.listGrabIntents().filter((intent) => !intent.releasedAt && !['failed', 'fulfilled'].includes(intent.status));
+    const { items, summary } = projectEpisodes({ work, episodes: this.state.listEpisodeProgress(workKey), now: now.getTime(),
+      knowledge: observationFreshness(work, now.getTime()), ...episodeCoverage(work, workByKey, this.state.listWorkQueueObservations(), reservations),
+      blockingReview: blockingReviewKeys(this.state.listManualReview(false)).has(workKey), safeTitle });
+    return { workKey, items: items.slice(offset, offset + limit), total: items.length, generatedAt: now.toISOString(), summary };
   }
 
   reviews(input: { resolved: boolean; q?: string; limit: number; offset: number }, operatorEnabled: boolean, responseNow: Date = this.now()): Page<ReviewRow> & { generatedAt: string } {
@@ -128,6 +149,18 @@ function coverageTargets(coverage: IntentCoverage, target: WorkItem, workByKey: 
   if (source.unit.kind !== 'tv' || coverage.episodeIds === null) return [];
   const currentIds = new Set(target.unit.season?.missing.map(({ episodeId }) => episodeId) ?? []);
   return coverage.episodeIds.filter((id) => currentIds.has(id)).map(String);
+}
+function episodeCoverage(work: WorkItem, workByKey: Map<string, WorkItem>, observations: PersistedQueueObservation[], reservations: GrabIntent[]) {
+  return {
+    observed: new Set(observations.flatMap((observation) => observation.coverage.flatMap((coverage) => coverageTargets(coverage, work, workByKey)))),
+    reserved: new Set(reservations.flatMap((intent) => intent.coverage.flatMap((coverage) => coverageTargets(coverage, work, workByKey)))),
+    uncertain: new Set(reservations.filter((intent) => ['uncertain', 'import-blocked'].includes(intent.status))
+      .flatMap((intent) => intent.coverage.flatMap((coverage) => coverageTargets(coverage, work, workByKey)))),
+  };
+}
+function blockingReviewKeys(reviews: Array<{ workKey: string; reason: string }>): Set<string> {
+  return new Set(reviews.filter((review) => ['picker-manual', 'missing-download-client', 'reverify-failed', 'queue-review',
+    'content-identity-changed', 'no-suitable-release', 'repeated-operation-failure'].includes(review.reason)).map((review) => review.workKey));
 }
 
 function safeTitle(value: string): string {

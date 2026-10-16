@@ -1,5 +1,12 @@
 # Progress
 
+## Recovered session: episode projections (task 4.1)
+
+- Recovered the existing topic branch and inherited uncommitted API/MCP implementation; preserved unrelated `docs/sprocket-feedback.md`. Read issue #11 and all active change artifacts. No historical red evidence survives for the inherited projection tests; existing work was preserved rather than deleted.
+- Shared read-only season/episode projection exposes conservative completion/lifecycle, independent timing/retry labels, unique observed/reserved coverage, broad versus exact uncertainty, stable pagination, sanitized titles, and matching coarse MCP summary.
+- `npm test -- tests/episode-progress-api.test.ts tests/operations-state.test.ts tests/operations-api.test.ts tests/mcp-server.test.ts tests/daemon.test.ts`: 5 files, 60 passed. `npm run typecheck`: passed. `npm test`: 48 files, 778 passed. `git diff --check`: passed.
+- Independent read-only reviewer found no blocking issues. Additional runner-to-projection uncertainty, mixed-observation/renumbering, and MCP uncertainty agreement cases remain cross-cutting verification gaps for task 5.1. Progress 12/17; continuing UI work. No push/deployment; higher-priority local-only checkpoint instruction controls over project automatic publication.
+
 ## Continuous implementation instruction
 
 The user rejected self-imposed execution-budget stops. Global Dev guidance now

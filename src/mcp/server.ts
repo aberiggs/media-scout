@@ -7,6 +7,7 @@ import { buildStack, type Stack } from '../compose';
 import { loadConfig } from '../config';
 import { missingSettings } from '../settings';
 import { ApiError } from '../http';
+import { OperationsDashboard } from '../core/operations';
 import type { Release } from '../types/prowlarr';
 
 /**
@@ -48,14 +49,22 @@ export function createMcpServer(stack: Stack): McpServer {
   };
 
   server.registerTool('ma_status', { description: 'Config snapshot, open manual-review count, and safe queue-work status.' }, async () =>
-    jsonResult((() => { const current = snapshot(); return {
+    jsonResult((() => {
+      const current = snapshot();
+      const now = new Date();
+      const queue = state.getWorkQueueStatus();
+      const progress = new Map(new OperationsDashboard(state).work({ scope: 'all', limit: queue.items.length, offset: 0 }, false, now)
+        .items.map((row) => [row.workKey, row.episodeProgress]));
+      return {
       dryRun: current.config.DRY_RUN,
       model: current.config.LLM_MODEL,
       cycleIntervalMin: current.config.CYCLE_INTERVAL_MIN,
       ready: missingSettings(current.config.settings).length === 0,
       missing: missingSettings(current.config.settings),
       openManualReviews: state.listManualReview(false).length,
-      workQueue: state.getWorkQueueStatus(),
+      workQueue: { ...queue, items: queue.items.map((row) => ({ ...row,
+        ...(progress.get(row.workKey) ? { episodeProgress: progress.get(row.workKey) } : {}),
+      })) },
     }; })()),
   );
 

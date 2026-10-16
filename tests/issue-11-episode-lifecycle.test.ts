@@ -10,6 +10,7 @@ import type { LibrarySnapshot } from '../src/core/watcher';
 import type { WorkGroup } from '../src/core/group-types';
 import type { Release } from '../src/types/prowlarr';
 import { ApiError } from '../src/http';
+import Database from 'better-sqlite3';
 
 const fixture = JSON.parse(readFileSync(new URL('./fixtures/prowlarr-release.json', import.meta.url), 'utf8')) as Release;
 const series = seriesSchema.parse({ id: 1, tvdbId: 123, title: 'Synthetic Show', titleSlug: 'synthetic', monitored: true, seriesType: 'standard', seasons: [], alternateTitles: [], status: 'continuing' });
@@ -32,11 +33,12 @@ function replay() {
   let queueUnknown = false;
   let planError: Error | null = null;
   let pickerError: Error | null = null;
+  let snapshotTime: string | null = null;
   const plannedTargets: number[][] = [];
   const searches: string[] = [];
   const makeRunner = () => new Runner({
     state, now: () => now, logger: pino({ enabled: false }),
-    watcher: { getSnapshot: async (): Promise<LibrarySnapshot> => ({ observedAt: now.toISOString(), sonarr: libraryMode === 'source-unknown'
+    watcher: { getSnapshot: async (): Promise<LibrarySnapshot> => ({ observedAt: snapshotTime ?? now.toISOString(), sonarr: libraryMode === 'source-unknown'
       ? { known: false, series: [] } : { known: true, series: [{ series, known: libraryMode === 'known', episodes: libraryMode === 'known' ? episodes : null }] }, radarr: { known: true, movies: [] } }) },
     sonarr: { getQueue: async () => { if (queueUnknown) throw new Error('synthetic queue unavailable'); return queue; } }, radarr: { getQueue: async () => [] },
     planner: { planGroup: async ({ group }: { group: WorkGroup }) => {
@@ -64,12 +66,92 @@ function replay() {
     setEmptyResults(value: boolean) { emptyResults = value; },
     setLibraryMode(value: typeof libraryMode) { libraryMode = value; }, setQueueUnknown(value: boolean) { queueUnknown = value; },
     failPlan(error: Error | null) { planError = error; }, failPicker(error: Error | null) { pickerError = error; },
+    setSnapshotTime(value: string | null) { snapshotTime = value; },
+    protectedHistory() {
+      const db = new Database(path, { readonly: true });
+      try { return ['grab_intents', 'seen_releases', 'seen_hashes', 'queue_associations', 'operator_audit', 'work_action_audit', 'decisions'].map((table) => db.prepare(`SELECT * FROM ${table}`).all()); } finally { db.close(); }
+    },
+    seedLegacyAvailability(linked = false) {
+      const work = state.getWorkItem('sonarr:1:s2')!;
+      state.flagManualReview(work.workKey, 'no-suitable-release', undefined, now);
+      const token = state.claimUnit(work.workKey, now)!;
+      state.finishSearch({ key: work.workKey, token, status: 'manual', nextSearchAt: null, failCount: 0, outcome: 'no-suitable-release', now: now.toISOString() });
+      state.releaseClaim(work.workKey, token);
+      if (linked) {
+        const db = new Database(path);
+        try { db.prepare("UPDATE manual_review SET subject_kind='intent',subject_key='synthetic-intent' WHERE work_key=? AND reason='no-suitable-release'").run(work.workKey); } finally { db.close(); }
+      }
+    },
     async poll() { return makeRunner().cycle(); },
+    async manualPick() { return makeRunner().manualPick('sonarr:1:s2', 0); },
     restart() { state.close(); state = State.open(path); }, close() { state.close(); },
   };
 }
 
 describe('issue #11 persisted weekly episode lifecycle', () => {
+  it('converts a safe legacy empty-search hold into a finite retry without inventing a search or import', async () => {
+    const run = replay();
+    try {
+      await run.poll();
+      run.seedLegacyAvailability();
+      run.state.recordRelease(8, 'synthetic-historical-release', 'sonarr:1:s1', new Date('2026-10-14T00:00:00Z'));
+      run.state.recordDecision({ workKey: 'sonarr:1:s2', verdict: 'manual', grabbed: false }, new Date('2026-10-14T00:00:00Z'));
+      const history = run.protectedHistory();
+      run.at('2026-10-15T23:00:00.000Z');
+      await run.poll();
+      expect(run.searches).toEqual([]);
+      expect(run.state.listManualReview()).toEqual([]);
+      expect(run.state.listManualReview(true)).toMatchObject([{ reason: 'no-suitable-release', resolvedAt: '2026-10-15T23:00:00.000Z' }]);
+      expect(run.protectedHistory()).toEqual(history);
+      expect(run.state.listEpisodeProgress('sonarr:1:s2')).toMatchObject([
+        { episodeId: 101, hasFile: false, lastSearchAt: null, nextSearchAt: '2026-10-16T05:00:00.000Z', lastOutcome: 'legacy-availability' },
+        { episodeId: 102, hasFile: false, lastSearchAt: null, nextSearchAt: null },
+      ]);
+      run.restart();
+      run.at('2026-10-16T05:00:00.000Z');
+      await run.poll();
+      expect(run.plannedTargets).toEqual([[101]]);
+      expect(run.state.listGrabIntents()).toEqual([]);
+    } finally { run.close(); }
+  });
+
+  it.each(['linked', 'configuration', 'queue-held', 'unscoped-queue', 'library-unknown', 'queue-unknown', 'stale-library', 'identity-changed'] as const)('preserves a legacy availability review when %s prevents safe conversion', async (hold) => {
+    const run = replay();
+    try {
+      await run.poll();
+      run.seedLegacyAvailability(hold === 'linked');
+      if (hold === 'configuration') run.state.flagManualReview('sonarr:1:s2', 'missing-download-client');
+      if (hold === 'queue-held') run.setQueue([{ downloadId: 'synthetic', seriesId: 1, episodeId: 101, seasonNumber: 2, status: 'downloading' }]);
+      if (hold === 'unscoped-queue') run.setQueue([{ id: 55, title: 'Synthetic unidentified job', status: 'downloading' }]);
+      if (hold === 'library-unknown') run.setLibraryMode('episodes-unknown');
+      if (hold === 'queue-unknown') run.setQueueUnknown(true);
+      if (hold === 'stale-library') run.setSnapshotTime('2026-10-15T00:00:00.000Z');
+      if (hold === 'identity-changed') {
+        const saved = run.state.getWorkItem('sonarr:1:s2')!;
+        const token = run.state.claimUnit(saved.workKey, new Date('2026-10-15T00:01:00.000Z'))!;
+        run.state.applyWorkReconciliation({ key: saved.workKey, token, work: { ...saved, contentIdentity: 'different-content', unit: { ...saved.unit, externalId: 999 } }, intentUpdates: [] });
+        run.state.releaseClaim(saved.workKey, token);
+      }
+      run.at('2026-10-15T23:00:00.000Z');
+      await run.poll();
+      expect(run.state.listManualReview().some((review) => review.reason === 'no-suitable-release')).toBe(true);
+      if (hold === 'unscoped-queue') {
+        expect(run.state.listManualReview()).toEqual(expect.arrayContaining([expect.objectContaining({ reason: 'queue-review' })]));
+        expect(run.state.getWorkItem('sonarr:1:s2')!.blockedReason).toBe('queue-ambiguous');
+      }
+      expect(run.searches).toEqual([]);
+      expect(run.state.listEpisodeProgress('sonarr:1:s2').every((row) => row.lastSearchAt === null)).toBe(true);
+    } finally { run.close(); }
+  });
+
+  it('does not allow a manual pick to bypass future airtime eligibility', async () => {
+    const run = replay();
+    try {
+      await expect(run.manualPick()).rejects.toThrow(/held|eligible|actionable/);
+      expect(run.searches).toEqual([]);
+      expect(run.state.listGrabIntents()).toEqual([]);
+    } finally { run.close(); }
+  });
   it.each([
     ['planner', false, '2026-10-22T23:05:00.000Z'], ['picker', false, '2026-10-22T23:05:00.000Z'],
     ['planner', true, '2026-10-22T23:20:00.000Z'], ['picker', true, '2026-10-22T23:20:00.000Z'],

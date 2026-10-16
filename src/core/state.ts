@@ -595,6 +595,45 @@ export class State {
     };
   }
 
+  /** Convert only an ordinary legacy TV availability hold; never infer historical search targets or release evidence. */
+  convertLegacyTvAvailability(input: { key: string; token: string; contentIdentity: string; now: string; retryAt: string }): boolean {
+    validIso(input.now, 'now');
+    validIso(input.retryAt, 'retryAt');
+    if (input.retryAt < input.now) throw new Error('Legacy availability retry precedes conversion');
+    return this.db.transaction(() => {
+      this.assertClaim(input.key, input.token, input.now);
+      const work = this.getWorkItem(input.key);
+      if (!work || work.unit.kind !== 'tv' || work.status !== 'manual' || work.contentIdentity !== input.contentIdentity ||
+        this.workActionBlockReason(input.key, 'retry', input.now, input.token) !== null) return false;
+      const reviews = this.listManualReview().filter((review) => review.workKey === input.key);
+      if (reviews.some((review) => review.subjectKind || review.subjectKey || !['no-suitable-release', 'unparseable-title'].includes(review.reason))) return false;
+      const ordinary = reviews.filter((review) => review.reason === 'no-suitable-release');
+      if (!ordinary.length) return false;
+      const inventory = new Map(work.unit.season!.missing.map((episode) => [episode.episodeId, episode]));
+      const eligible = this.listEpisodeProgress(input.key).filter((episode) => {
+        const target = inventory.get(episode.episodeId);
+        const at = episodeEligibilityTime(episode);
+        return episode.serviceId === work.unit.serviceId && episode.externalId === work.unit.externalId &&
+          episode.lastObservedAt === work.lastObservedAt && episode.monitored && !episode.hasFile && target &&
+          target.episodeNumber === episode.episodeNumber && target.absoluteEpisodeNumber === episode.absoluteEpisodeNumber &&
+          at !== null && at.getTime() <= Date.parse(input.now);
+      });
+      if (!eligible.length) return false;
+      const update = this.db.prepare(`UPDATE episode_progress SET next_search_at=?,last_outcome='legacy-availability'
+        WHERE work_key=? AND service_id=? AND external_id=? AND episode_id=?`);
+      const deadlines = eligible.map((episode) => {
+        const deadline = [input.retryAt, work.nextSearchAt, episode.nextSearchAt].filter((value): value is string => value !== null).sort().at(-1)!;
+        update.run(deadline, input.key, work.unit.serviceId, work.unit.externalId, episode.episodeId);
+        return deadline;
+      });
+      this.db.prepare("UPDATE work_items SET status='cooldown',next_search_at=?,fail_count=0,last_outcome='legacy-availability',blocked_reason=NULL WHERE work_key=?")
+        .run(deadlines.sort()[0], input.key);
+      const resolve = this.db.prepare("UPDATE manual_review SET resolved_at=? WHERE id=? AND resolved_at IS NULL AND reason='no-suitable-release' AND subject_kind IS NULL AND subject_key IS NULL");
+      for (const review of ordinary) if (resolve.run(input.now, review.id).changes !== 1) throw new Error('Legacy availability review changed during conversion');
+      return true;
+    })();
+  }
+
   /**
    * Claim-checked operator scheduling action. Only ordinary scheduling/review state changes;
    * durable queue coverage, reservations, identity, receipts, decisions and source markers survive.
@@ -616,6 +655,12 @@ export class State {
         reset_pending_at=CASE WHEN ?='reset' THEN ? ELSE reset_pending_at END WHERE work_key=?`)
         .run(input.action, input.action, input.action === 'reset' ? input.now : null, input.workKey);
       if (result.changes !== 1) throw new Error('Work action raced with another update');
+      if (work.unit.kind === 'tv') {
+        this.db.prepare(`UPDATE episode_progress SET next_search_at=NULL,last_outcome=NULL,
+          last_search_at=CASE WHEN ?='reset' THEN NULL ELSE last_search_at END
+          WHERE work_key=? AND service_id=? AND external_id=?`)
+          .run(input.action, input.workKey, work.unit.serviceId, work.unit.externalId);
+      }
       this.db.prepare('UPDATE manual_review SET resolved_at=? WHERE work_key=? AND resolved_at IS NULL AND reason IN (?,?,?,?,?,?)')
         .run(input.now, input.workKey, ...ORDINARY_REVIEW_REASONS);
       this.db.prepare('INSERT INTO work_action_audit(work_key,action,occurred_at) VALUES(?,?,?)').run(input.workKey, input.action, input.now);

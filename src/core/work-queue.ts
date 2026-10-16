@@ -823,7 +823,8 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
     }
     const unsupportedAssocHold = ambiguousQueue || activeQueue.some((row) => row.status === 'uncertain');
     if (unsupportedAssocHold) {
-      blockedReason = blockedReason ?? 'queue-ambiguous';
+      // An ordinary review must not hide a concurrent safety hold in persisted policy state.
+      if (blockedReason === null || blockedReason === 'manual-review') blockedReason = 'queue-ambiguous';
       manualReviewReason = manualReviewReason ?? 'queue-review';
     }
     else if (heldQueueCoverage.length > 0) blockedReason = blockedReason ?? 'queue-active';
@@ -842,7 +843,7 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
       const progress = (input.episodeProgress ?? []).filter((episode) => episode.workKey === key &&
         episode.serviceId === current.serviceId && episode.externalId === current.externalId);
       // Before the first episode-level attempt, retain conservative legacy season scheduling.
-      if (progress.some((episode) => episode.lastSearchAt !== null)) {
+      if (progress.some((episode) => episode.lastSearchAt !== null || episode.nextSearchAt !== null)) {
         const clocks = new Map(progress.map((episode) => [episode.episodeId, episode]));
         const due = residual.season!.missing.filter((episode) => {
           const deadline = clocks.get(episode.episodeId)?.nextSearchAt;

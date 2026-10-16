@@ -1020,7 +1020,13 @@ export class Runner {
         });
          this.deps.state.applyWorkReconciliation({ key, token, work: row.work, intentUpdates: related,
            episodeObservations: this.episodeObservations(row.work, snapshot) });
-          this.deps.state.applyWorkQueueObservation({ key, token, observedAt: queueRead.observedAt, known: row.work.queueObservationKnown && queueRead.kind === 'known', coverage: row.queueCoverage, failedQueueRefs: row.queueFailureRefs });
+           this.deps.state.applyWorkQueueObservation({ key, token, observedAt: queueRead.observedAt, known: row.work.queueObservationKnown && queueRead.kind === 'known', coverage: row.queueCoverage, failedQueueRefs: row.queueFailureRefs });
+         if (persisted?.contentIdentity === row.work.contentIdentity && row.blockedReason === 'manual-review' && row.manualReviewReason === null &&
+           this.deps.state.convertLegacyTvAvailability({ key, token, contentIdentity: row.work.contentIdentity,
+             now: this.now().toISOString(), retryAt: this.dateAfter(this.deps.config.minRetryHours * 60) })) {
+           rows.push({ ...row, work: this.deps.state.getWorkItem(key)!, eligibleUnit: null, blockedReason: null, manualReviewReason: null });
+           continue;
+         }
          if (row.manualReviewReason && !(deferAssociationReview && row.blockedReason === 'queue-ambiguous')) {
            const reviewNow = this.now().toISOString();
            const linkedUncertain = queueRead.kind === 'known' && intents.find((intent) => intent.status === 'uncertain' && !intent.releasedAt && intent.confirmedAt === null && Date.parse(intent.queueDeadlineAt) <= Date.parse(reviewNow) && intent.coverage.some((capture) => capture.workKey === key));

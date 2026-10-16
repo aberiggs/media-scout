@@ -102,12 +102,89 @@ describe('episode progress state', () => {
   });
 
   it.each([
+    { action: 'retry' as const, search: now },
+    { action: 'reset' as const, search: null },
+  ])('clears current identity episode scheduling for $action and preserves observed facts', ({ action, search }) => {
+    const { db, state, token, observe } = setup();
+    const actionAt = '2026-01-01T00:01:00.000Z';
+    state.recordEpisodeAttempt({ key: work.workKey, token, episodeIds: [1], now, nextSearchAt: '2026-01-02T00:00:00.000Z', outcome: 'release-unavailable' });
+    state.applyWorkQueueObservation({ key: work.workKey, token, observedAt: now, known: true, coverage: [], failedQueueRefs: [] });
+    observe([episode], { ...work, status: 'cooldown', nextSearchAt: '2026-01-02T00:00:00.000Z', lastOutcome: 'release-unavailable', lastObservedAt: '2026-01-01T00:01:00.000Z' });
+    // Create a row from another durable identity sharing this season work key.
+    db.prepare(`INSERT INTO episode_progress (service_id,external_id,episode_id,work_key,season_number,episode_number,title,monitored,has_file,last_observed_at,last_search_at,next_search_at,last_outcome)
+      VALUES (4,55,9,?,1,9,'Old identity',1,0,?,?,?,'release-unavailable')`).run(work.workKey, now, now, '2026-01-02T00:00:00.000Z');
+    state.releaseClaim(work.workKey, token);
+    const lease = state.claimUnits({ keys: [work.workKey, 'group:sonarr:4'], now: new Date(actionAt) })!;
+    state.applyWorkAction({ workKey: work.workKey, action, ownerToken: lease.ownerToken, claimKeys: lease.keys, now: actionAt });
+    expect(state.listEpisodeProgress(work.workKey).find((row) => row.episodeId === 1)).toMatchObject({lastSearchAt:search,nextSearchAt:null,lastOutcome:null,monitored:true,hasFile:false,lastObservedAt:actionAt});
+    expect(state.listEpisodeProgress(work.workKey).find((row) => row.episodeId === 9)).toMatchObject({externalId:55,lastSearchAt:now,nextSearchAt:'2026-01-02T00:00:00.000Z',lastOutcome:'release-unavailable'});
+  });
+
+  it.each([
     { hasFile: true }, { monitored: false }, { airDateUtc: '2026-02-01T00:00:00Z' },
   ])('does not record attempts for ineligible targets %j', (change) => {
     const { state, observe, attempt } = setup();
     observe([{ ...episode, ...change }], { ...work, lastObservedAt: '2026-01-01T00:01:00.000Z' });
     expect(() => attempt([1], { now: '2026-01-01T00:02:00.000Z' })).toThrow();
     expect(state.listEpisodeProgress()[0]!.lastSearchAt).toBeNull();
+  });
+
+  it('does not clear episode clocks without complete owned group claims or with unknown coverage', () => {
+    const { state, token, attempt } = setup();
+    attempt();
+    const before = state.listEpisodeProgress();
+    expect(() => state.applyWorkAction({ workKey: work.workKey, action: 'retry', ownerToken: 'foreign', claimKeys: [work.workKey, 'group:sonarr:4'], now })).toThrow();
+    expect(() => state.applyWorkAction({ workKey: work.workKey, action: 'retry', ownerToken: token, claimKeys: [work.workKey], now })).toThrow();
+    state.releaseClaim(work.workKey, token);
+    const claims = state.claimUnits({ keys: [work.workKey, 'group:sonarr:4'], now: new Date(now) })!;
+    expect(() => state.applyWorkAction({ workKey: work.workKey, action: 'reset', ownerToken: claims.ownerToken, claimKeys: claims.keys, now })).toThrow(/unknown/);
+    expect(state.listEpisodeProgress()).toEqual(before);
+  });
+
+  it('converts only under a live owner and preserves an existing later deadline and actual search time', () => {
+    const { state, token, attempt, observe } = setup();
+    attempt();
+    observe([episode], { ...work, status: 'manual', blockedReason: 'manual-review', nextSearchAt: '2026-01-03T00:00:00.000Z' });
+    state.applyWorkQueueObservation({ key: work.workKey, token, observedAt: now, known: true, coverage: [] });
+    state.flagManualReview(work.workKey, 'no-suitable-release', undefined, new Date(now));
+    const input = { key: work.workKey, token, contentIdentity: work.contentIdentity, now, retryAt: '2026-01-01T06:00:00.000Z' };
+    const before = state.listEpisodeProgress();
+    expect(() => state.convertLegacyTvAvailability({ ...input, token: 'foreign' })).toThrow();
+    expect(state.convertLegacyTvAvailability({ ...input, contentIdentity: 'different' })).toBe(false);
+    expect(state.listEpisodeProgress()).toEqual(before);
+    expect(state.convertLegacyTvAvailability(input)).toBe(true);
+    expect(state.listEpisodeProgress()[0]).toMatchObject({ lastSearchAt: now, nextSearchAt: '2026-01-03T00:00:00.000Z', hasFile: false });
+    expect(state.listManualReview(true)).toMatchObject([{ reason: 'no-suitable-release', resolvedAt: now }]);
+  });
+
+  it('does not convert a legacy review from stale library and queue evidence even under a new owner', () => {
+    const { state, token, observe } = setup();
+    observe([episode], { ...work, status: 'manual', blockedReason: 'manual-review' });
+    state.applyWorkQueueObservation({ key: work.workKey, token, observedAt: now, known: true, coverage: [] });
+    state.flagManualReview(work.workKey, 'no-suitable-release', undefined, new Date(now));
+    state.releaseClaim(work.workKey, token);
+    const later = '2026-01-03T00:00:00.000Z';
+    const owner = state.claimUnit(work.workKey, new Date(later))!;
+    const before = state.listEpisodeProgress();
+    expect(state.convertLegacyTvAvailability({ key: work.workKey, token: owner, contentIdentity: work.contentIdentity, now: later, retryAt: '2026-01-03T06:00:00.000Z' })).toBe(false);
+    expect(state.listEpisodeProgress()).toEqual(before);
+    expect(state.listManualReview()).toHaveLength(1);
+  });
+
+  it('preserves a populated reservation and linked review byte-for-byte instead of converting them', () => {
+    const { db, state, token, observe } = setup();
+    const capture = state.beginGrab({ key: work.workKey, token, fingerprint: work.missingFingerprint,
+      release: { arr: 'sonarr', indexerId: 5, guid: 'synthetic-reserved', infoHash: null, releaseTitle: 'Show.S01E01' },
+      coverage: [{ workKey: work.workKey, episodeIds: [1], basis: 'explicit-episodes' }], now,
+      deadline: '2026-01-01T00:30:00.000Z' });
+    if (!capture.ok) throw new Error(capture.reason);
+    state.flagManualReviewLinked({ workKey: work.workKey, reason: 'no-suitable-release', intentId: capture.intentId, at: new Date(now) });
+    observe([episode], { ...work, status: 'manual', blockedReason: 'manual-review' });
+    state.applyWorkQueueObservation({ key: work.workKey, token, observedAt: now, known: true, coverage: [] });
+    const rows = () => ['grab_intents', 'manual_review', 'seen_releases', 'seen_hashes', 'queue_associations', 'operator_audit', 'episode_progress'].map((table) => db.prepare(`SELECT * FROM ${table}`).all());
+    const before = rows();
+    expect(state.convertLegacyTvAvailability({ key: work.workKey, token, contentIdentity: work.contentIdentity, now, retryAt: '2026-01-01T06:00:00.000Z' })).toBe(false);
+    expect(rows()).toEqual(before);
   });
 
   it('rejects an invalid batch atomically and preserves clocks across fresh observations', () => {

@@ -17,6 +17,13 @@ permission/continuation requirement. Application query caps remain unchanged.
 - Independent read-only acquisition review found no blocking issues. Addressed its additional live partial-selection and multi-season verification gaps with passing tests. `npm test -- tests/staged-acquisition.test.ts tests/group-coverage.test.ts tests/guardrails.test.ts tests/queue-intent-linking.test.ts tests/gate2-runtime-regressions.test.ts tests/runner.test.ts tests/group-planning.test.ts tests/review-policy.test.ts tests/issue-11-episode-lifecycle.test.ts`: 9 files, 247 passed. `npm run typecheck`: passed. `npm test`: 47 files, 758 passed.
 - Tasks 2.3, 3.2, 3.3 complete; progress 10/17. Continuing with stage diagnostics and episode progress projections/UI, then final acceptance and container verification. This is a recovery checkpoint, not a stopping point or approval gate.
 
+## Stage diagnostics (task 3.4)
+
+- Added optional bounded, allowlisted activity scope with primary/fallback stage and exact season/episode-number attribution. Additive migration retains legacy activity rows without scope. A capacity-deferral event explicitly states no query executed, carries unknown result count and the deferred count, and never changes episode attempt clocks or paid-search counters.
+- Two initial staged diagnostics assertions failed on missing scope before implementation. Tests now cover real failed fallback attribution, six-query plus separate no-query deferral history, legacy schema upgrade/idempotent reads, privacy rejection, and bounds (20 work references/100 numbers per reference with full episode count retained). Raw release/queue payloads are not recorded.
+- `npm test -- tests/staged-acquisition.test.ts tests/operations-state.test.ts tests/operations-api.test.ts tests/runner.test.ts`: 4 files, 132 passed. `npm run typecheck`: passed. `npm test`: 47 files, 760 passed. Independent read-only diagnostic review: no blocking findings; added explicit reference-cap assertion from its verification note.
+- Progress 11/17; continuing directly into episode progress API/MCP/UI work.
+
 ## Planning checkpoint
 
 - Issue: https://github.com/aberiggs/media-scout/issues/11

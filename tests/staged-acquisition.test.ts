@@ -147,6 +147,11 @@ describe('bounded staged TV acquisition', () => {
     expect(run.queries).toEqual(['pack-0', 'pack-1', 'pack-2', 'episode-1', 'episode-2', 'episode-3']);
     expect(run.state.listEpisodeProgress().map((episode) => episode.lastSearchAt)).toEqual([at, at, at, null, null, null]);
     expect(run.state.getWorkItem('sonarr:1:s2')!.status).toBe('ready');
+    const activity = run.state.listSearchActivity(at).reverse();
+    expect(activity.filter((entry) => entry.query !== 'No query: capacity deferred').map((entry) => entry.scope?.stage))
+      .toEqual(['pack-batch', 'pack-batch', 'pack-batch', 'episodes', 'episodes', 'episodes']);
+    expect(activity.at(-1)).toMatchObject({ scope: { event: 'capacity-deferred', fallback: true, deferredEpisodeCount: 3,
+      targets: [{ seasonNumber: 2, episodeNumbers: [4, 5, 6] }] } });
     run.restart();
     await run.runner.cycle();
     expect(run.queries.slice(6)).toEqual(['pack-0', 'pack-1', 'pack-2', 'episode-4', 'episode-5', 'episode-6']);
@@ -161,6 +166,7 @@ describe('bounded staged TV acquisition', () => {
     expect(run.grabs).toEqual([]);
     expect(run.state.listEpisodeProgress().map((episode) => episode.lastSearchAt)).toEqual([at, null, null, null, null]);
     expect(run.state.getWorkItem('sonarr:1:s2')).toMatchObject({ status: 'backoff', lastOutcome: 'rate-limited', nextSearchAt: '2026-10-15T23:15:00.000Z' });
+    expect(run.state.listSearchActivity(at)[0]).toMatchObject({ query: 'episode-2', outcome: 'error', scope: { stage: 'episodes', fallback: true, event: 'search', targets: [{ episodeNumbers: [2] }] } });
   });
 
   it('does not post an accepted primary choice when fallback is interrupted by a rate limit', async () => {

@@ -10,7 +10,7 @@ import type { Picker, Candidate, PickVerdict } from './picker';
 import { validateGroupPlan, type Planner } from './planner';
 import { parseReleaseTitle } from './parser';
 import { isGrabbable, verifyRelease } from './guardrails';
-import { reviewEvidenceMatchesWorkKey, WORK_OBSERVATION_STALE_AFTER_MS, type State } from './state';
+import { reviewEvidenceMatchesWorkKey, WORK_OBSERVATION_STALE_AFTER_MS, type ActivityScope, type State } from './state';
 import type { IntentCoverage, IntentStatus, QueueRead, WorkItem } from './work-queue-types';
 import { candidateOverlapsQueue, reconcileWork, type QueueReads, type ReconciledWork } from './work-queue';
 import { eligibleWorkUnits, type LibrarySnapshot, type Watcher, type WorkUnit } from './watcher';
@@ -269,10 +269,17 @@ export class Runner {
     return eligibleWorkUnits(snapshot).some((unit) => unit.key === workKey);
   }
 
-  private async recordedSearch(query: string, categories: number[], indexerIds: number[], units: WorkUnit[], source: 'cycle' | 'manual' = 'cycle'): Promise<Release[]> {
+  private activityScope(stage: ActivityScope['stage'], units: WorkUnit[], fallback = false, deferredEpisodeCount = 0): ActivityScope {
+    return { stage, event: deferredEpisodeCount ? 'capacity-deferred' : 'search', fallback, deferredEpisodeCount,
+      targets: units.map((unit) => ({ workKey: unit.key, seasonNumber: unit.season?.seasonNumber ?? null,
+        episodeNumbers: unit.season?.missing.map((episode) => episode.episodeNumber) ?? [], episodeCount: unit.season?.missing.length ?? 0 })) };
+  }
+
+  private async recordedSearch(query: string, categories: number[], indexerIds: number[], units: WorkUnit[], source: 'cycle' | 'manual' = 'cycle', stage?: AcquisitionStage, fallback = false): Promise<Release[]> {
     let activityId: number | undefined;
     try {
-      activityId = this.deps.state.startSearchActivity({ source, query, media: units.map(({ key, title }) => ({ workKey: key, title })), now: this.now().toISOString() });
+      activityId = this.deps.state.startSearchActivity({ source, query, media: units.map(({ key, title }) => ({ workKey: key, title })),
+        scope: this.activityScope(source === 'manual' ? 'manual' : stage ?? 'movie', units, fallback), now: this.now().toISOString() });
     } catch { /* Activity is an independent bounded projection and never gates a decision. */ }
     try {
       const releases = await this.deps.prowlarr.search({ query, categories, indexerIds });
@@ -544,6 +551,7 @@ export class Runner {
     let queryCount = 0;
     let resultCount = 0;
     let plannedOnce = false;
+    let fallbackRan = false;
     let reason = 'No admitted release';
     const physical = (candidate: GroupCandidate) => candidate.release.infoHash
       ? `hash:${candidate.release.infoHash.toLowerCase()}` : JSON.stringify([candidate.release.indexerId, candidate.release.guid]);
@@ -552,8 +560,9 @@ export class Runner {
       this.deps.state.recordEpisodeAttempt({ key: unit.key, token, episodeIds: unit.season!.missing.map((episode) => episode.episodeId),
         now: this.now().toISOString(), nextSearchAt: this.dateAfter(this.deps.config.minRetryHours * 60), outcome });
     };
-    const run = async (scope: WorkGroup, acquisitionStage?: AcquisitionStage) => {
+    const run = async (scope: WorkGroup, acquisitionStage?: AcquisitionStage, fallback = false) => {
       if (!scope.targets.length || selected.length >= 3) return;
+      if (fallback) fallbackRan = true;
       onStage('planner');
       const planned = await this.deps.planner.planGroup({ group: scope, context, stage: acquisitionStage });
       validateGroupPlan({ group: scope, stage: acquisitionStage }, planned);
@@ -565,7 +574,7 @@ export class Runner {
       for (const query of planned) {
         const targets = queryTargets(scope, query, acquisitionStage);
         queryCount += 1;
-        const results = await this.recordedSearch(query.query, query.categories, allowlist, targets);
+        const results = await this.recordedSearch(query.query, query.categories, allowlist, targets, 'cycle', acquisitionStage, fallback);
         resultCount += results.length;
         releases.push(...results);
         if (acquisitionStage === 'episodes') for (const target of targets) {
@@ -615,7 +624,7 @@ export class Runner {
     else if (count < 3) await run(episodeStage(due, this.deps.state.listEpisodeProgress(), 3, new Set(), new Set()), 'episodes');
     else {
       await run(due, 'pack-batch');
-      if (selected.length < 3) await run(episodeStage(due, this.deps.state.listEpisodeProgress(), 3 - selected.length, chosenIds, manualKeys), 'episodes');
+      if (selected.length < 3) await run(episodeStage(due, this.deps.state.listEpisodeProgress(), 3 - selected.length, chosenIds, manualKeys), 'episodes', true);
     }
     if (tv) for (const target of due.targets) {
       const missing = target.season!.missing.filter((episode) => chosenIds.has(episode.episodeId) && !attemptedIds.has(episode.episodeId));
@@ -625,6 +634,16 @@ export class Runner {
     for (const target of due.targets) if (manualKeys.has(target.key)) for (const episode of target.season?.missing ?? []) authorized.add(episode.episodeId);
     const finalGroup = tv ? acquisitionTargets(due, authorized) : due;
     const pendingKeys = new Set(due.targets.filter((unit) => unit.kind === 'tv' && !manualKeys.has(unit.key) && unit.season!.missing.some((episode) => !authorized.has(episode.episodeId))).map((unit) => unit.key));
+    if (pendingKeys.size) {
+      const pending = due.targets.filter((unit) => pendingKeys.has(unit.key)).map((unit) => ({ ...unit,
+        season: { ...unit.season!, missing: unit.season!.missing.filter((episode) => !authorized.has(episode.episodeId)) } }));
+      const count = pending.reduce((total, unit) => total + unit.season.missing.length, 0);
+      try {
+        const id = this.deps.state.startSearchActivity({ source: 'cycle', query: 'No query: capacity deferred',
+          media: pending.map((unit) => ({ workKey: unit.key, title: unit.title })), scope: this.activityScope('episodes', pending, fallbackRan, count), now: this.now().toISOString() });
+        this.deps.state.finishSearchActivity({ id, now: this.now().toISOString(), resultCount: null });
+      } catch { /* Diagnostics must not change scheduling or submission safety. */ }
+    }
     return { group: finalGroup, candidates, pendingKeys, resultCount, selection: {
       verdict: selected.length ? 'grab' : manualKeys.size ? 'manual' : 'skip', releaseIndices: selected,
       manualTargetIndices: finalGroup.targets.flatMap((unit, index) => manualKeys.has(unit.key) ? [index] : []),

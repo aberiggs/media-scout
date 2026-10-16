@@ -8,6 +8,8 @@ Refreshing Queue, Reviews, or Search history reads the local SQLite projection; 
 
 **Search history** records bounded search activity for seven days, up to 2,000 entries. Query terms can reveal what you are looking for; this is an operational view, not raw server logs.
 
+New activity entries include `scope`: stage (`pack-batch`, `episodes`, `movie`, or `manual`), whether it was fallback, and season/episode-number attribution. Scope summaries retain at most 20 work references and the first 100 episode numbers per reference, with each reference's full episode count. Older rows without scope remain readable. `scope.event: capacity-deferred` is explicitly **not a search**: no query was executed and no attempt clock was advanced for those deferred episodes. Its query label says `No query: capacity deferred`, its result count is unknown, and `deferredEpisodeCount` identifies outstanding work. Failed stage searches keep their attributed scope and safe error code; raw release or queue payloads are never added to diagnostics.
+
 ## Retry and Reset
 
 Actions are offered only when the work is safe to change. Live worker/group claims, open reservations, persisted queue coverage, unsafe review reasons, unknown or stale observations, and an active rate-limit deadline keep actions unavailable. TV actions also require the same-series group lease.

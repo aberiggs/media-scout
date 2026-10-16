@@ -78,6 +78,13 @@ export interface PersistedQueueObservation {
 }
 
 export type WorkAction = 'retry' | 'reset';
+export interface ActivityScope {
+  stage: 'pack-batch' | 'episodes' | 'movie' | 'manual';
+  event: 'search' | 'capacity-deferred';
+  fallback: boolean;
+  deferredEpisodeCount: number;
+  targets: Array<{ workKey: string; seasonNumber: number | null; episodeNumbers: number[]; episodeCount: number }>;
+}
 export interface ActivityRecord {
   id: number;
   source: 'cycle' | 'manual';
@@ -88,6 +95,7 @@ export interface ActivityRecord {
   resultCount: number | null;
   outcome: 'running' | 'success' | 'error';
   errorCode?: string;
+  scope?: ActivityScope;
 }
 
 const DDL = `
@@ -230,7 +238,8 @@ CREATE TABLE IF NOT EXISTS search_activity (
   media_json TEXT NOT NULL CHECK (json_valid(media_json)),
   result_count INTEGER,
   outcome TEXT NOT NULL CHECK (outcome IN ('running','success','error')),
-  error_code TEXT
+  error_code TEXT,
+  scope_json TEXT CHECK (scope_json IS NULL OR json_valid(scope_json))
 );
 CREATE TABLE IF NOT EXISTS app_settings (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -248,6 +257,23 @@ export const WORK_OBSERVATION_STALE_AFTER_MS = 24 * 60 * 60_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function safeActivityScope(value: unknown): ActivityScope {
+  if (!isRecord(value) || Object.keys(value).some((key) => !['stage', 'event', 'fallback', 'deferredEpisodeCount', 'targets'].includes(key)) ||
+    !['pack-batch', 'episodes', 'movie', 'manual'].includes(String(value.stage)) || !['search', 'capacity-deferred'].includes(String(value.event)) ||
+    typeof value.fallback !== 'boolean' || !Number.isSafeInteger(value.deferredEpisodeCount) || Number(value.deferredEpisodeCount) < 0 || !Array.isArray(value.targets)) throw new Error('Invalid acquisition activity scope');
+  for (const target of value.targets) {
+    if (!isRecord(target) || Object.keys(target).some((key) => !['workKey', 'seasonNumber', 'episodeNumbers', 'episodeCount'].includes(key)) ||
+      typeof target.workKey !== 'string' || target.workKey.length > 160 || !/^(?:sonarr:\d+:s\d+|radarr:\d+)$/.test(target.workKey) ||
+      (target.seasonNumber !== null && (!Number.isSafeInteger(target.seasonNumber) || Number(target.seasonNumber) < 0)) ||
+      !Array.isArray(target.episodeNumbers) || !target.episodeNumbers.every((number) => Number.isSafeInteger(number) && Number(number) >= 0) ||
+      !Number.isSafeInteger(target.episodeCount) || Number(target.episodeCount) < target.episodeNumbers.length) throw new Error('Invalid acquisition target scope');
+  }
+  return { stage: value.stage as ActivityScope['stage'], event: value.event as ActivityScope['event'], fallback: value.fallback,
+    deferredEpisodeCount: Number(value.deferredEpisodeCount), targets: (value.targets as ActivityScope['targets']).slice(0, 20).map((target) => ({
+      workKey: target.workKey, seasonNumber: target.seasonNumber, episodeNumbers: target.episodeNumbers.slice(0, 100), episodeCount: target.episodeCount,
+    })) };
 }
 
 function validateReviewEvidence(value: unknown): UnparseableTargetEvidence {
@@ -668,13 +694,14 @@ export class State {
   }
 
   /** Append one bounded search event, independent of the decision/review history. */
-  startSearchActivity(input: { source: 'cycle' | 'manual'; query: string; media: Array<{ workKey: string; title: string }>; now: string }): number {
+  startSearchActivity(input: { source: 'cycle' | 'manual'; query: string; media: Array<{ workKey: string; title: string }>; now: string; scope?: ActivityScope }): number {
     validIso(input.now, 'activity start');
     if ((input.source !== 'cycle' && input.source !== 'manual') || typeof input.query !== 'string' || !input.query.trim()) throw new Error('Invalid search activity');
     const query = safeActivityText(input.query, 500);
     const media = input.media.slice(0, 20).map(({ workKey, title }) => ({ workKey: safeActivityText(String(workKey), 160), title: safeActivityText(String(title), 120) }));
-    const inserted = this.db.prepare(`INSERT INTO search_activity(source,started_at,query,media_json,outcome) VALUES(?,?,?,?, 'running')`)
-      .run(input.source, input.now, query, JSON.stringify(media));
+    const scope = input.scope === undefined ? null : JSON.stringify(safeActivityScope(input.scope));
+    const inserted = this.db.prepare(`INSERT INTO search_activity(source,started_at,query,media_json,outcome,scope_json) VALUES(?,?,?,?, 'running',?)`)
+      .run(input.source, input.now, query, JSON.stringify(media), scope);
     const id = Number(inserted.lastInsertRowid);
     this.pruneSearchActivity(input.now);
     return id;
@@ -702,6 +729,7 @@ export class State {
         finishedAt: row.finished_at === null ? null : String(row.finished_at), query: String(row.query), media: media as ActivityRecord['media'],
         resultCount: row.result_count === null ? null : Number(row.result_count), outcome: row.outcome as ActivityRecord['outcome'],
         ...(row.error_code === null ? {} : { errorCode: String(row.error_code) }),
+        ...(row.scope_json == null ? {} : { scope: safeActivityScope(JSON.parse(String(row.scope_json)) as unknown) }),
       };
     });
   }
@@ -1641,6 +1669,8 @@ export class State {
   private ensureOperationsColumns(): void {
     const columns = new Set((this.db.prepare('PRAGMA table_info(work_items)').all() as Array<{ name: string }>).map((column) => column.name));
     if (!columns.has('reset_pending_at')) this.db.exec('ALTER TABLE work_items ADD COLUMN reset_pending_at TEXT');
+    const activityColumns = new Set((this.db.prepare('PRAGMA table_info(search_activity)').all() as Array<{ name: string }>).map((column) => column.name));
+    if (!activityColumns.has('scope_json')) this.db.exec('ALTER TABLE search_activity ADD COLUMN scope_json TEXT CHECK (scope_json IS NULL OR json_valid(scope_json))');
   }
 
   private ensureGroupAssociationColumns(): void {

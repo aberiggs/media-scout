@@ -76,6 +76,20 @@ export interface PlanningContext {
   openWork: OpenWorkSummary[];
   activeDownloads: ActiveDownloadSummary[];
   sourceKnowledge: SourceKnowledge[];
+  seasonProgress?: SeasonPlanningProgress[];
+}
+
+export type AcquisitionStage = 'pack-batch' | 'episodes';
+
+export interface SeasonPlanningProgress {
+  workKey: string;
+  seasonNumber: number;
+  lifecycle: 'scheduled' | 'airing' | 'finished' | 'unknown';
+  lifecycleEvidence: 'future-schedule' | 'finale' | 'series-ended' | 'unknown';
+  counts: { imported: number; airedMissing: number; future: number; timingUnknown: number; downloadHeld: number } | null;
+  nextEligibilityAt: string | null;
+  episodes: Array<{ episodeNumber: number; absoluteEpisodeNumber: number | null; eligibleAt: string | null;
+    timingBasis: 'utc' | 'date-only' | 'unknown'; state: 'imported' | 'unmonitored' | 'future' | 'timing-unknown' | 'aired-missing' }>;
 }
 
 export interface TargetCoverage {

@@ -19,7 +19,9 @@ function snapshot(at: Date): LibrarySnapshot {
     id: 1,
     tvdbId: 123,
     title: 'Example Show',
+    titleSlug: 'example-show',
     monitored: true,
+    seasons: [],
     alternateTitles: [],
     seriesType: 'standard',
   };

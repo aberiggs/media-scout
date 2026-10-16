@@ -11,6 +11,7 @@ import type { WorkGroup } from '../src/core/group-types';
 import type { Release } from '../src/types/prowlarr';
 import { ApiError } from '../src/http';
 import Database from 'better-sqlite3';
+import { OperationsDashboard } from '../src/core/operations';
 
 const fixture = JSON.parse(readFileSync(new URL('./fixtures/prowlarr-release.json', import.meta.url), 'utf8')) as Release;
 const series = seriesSchema.parse({ id: 1, tvdbId: 123, title: 'Synthetic Show', titleSlug: 'synthetic', monitored: true, seriesType: 'standard', seasons: [], alternateTitles: [], status: 'continuing' });
@@ -26,6 +27,7 @@ function replay() {
   const path = join(directory, 'isolated.db');
   let state = State.open(path);
   let now = new Date('2026-10-15T00:01:00.000Z');
+  let currentSeries = series;
   let episodes = [episode(11, 1, 1, '2025-01-01T23:00:00Z', true), episode(101, 2, 1, '2026-10-15T23:00:00Z'), episode(102, 2, 2, '2026-10-22T23:00:00Z')];
   let queue: SonarrQueueRecord[] = [];
   let emptyResults = false;
@@ -34,16 +36,24 @@ function replay() {
   let planError: Error | null = null;
   let pickerError: Error | null = null;
   let snapshotTime: string | null = null;
+  let duringPlan: (() => void) | null = null;
   const plannedTargets: number[][] = [];
   const searches: string[] = [];
   const makeRunner = () => new Runner({
     state, now: () => now, logger: pino({ enabled: false }),
-    watcher: { getSnapshot: async (): Promise<LibrarySnapshot> => ({ observedAt: snapshotTime ?? now.toISOString(), sonarr: libraryMode === 'source-unknown'
-      ? { known: false, series: [] } : { known: true, series: [{ series, known: libraryMode === 'known', episodes: libraryMode === 'known' ? episodes : null }] }, radarr: { known: true, movies: [] } }) },
+    watcher: { getSnapshot: async (): Promise<LibrarySnapshot> => ({
+      observedAt: snapshotTime ?? now.toISOString(),
+      sonarr: libraryMode === 'source-unknown' ? { known: false, series: [] } : {
+        known: true,
+        series: [{ series: currentSeries, known: libraryMode === 'known', episodes: libraryMode === 'known' ? episodes : null }],
+      },
+      radarr: { known: true, movies: [] },
+    }) },
     sonarr: { getQueue: async () => { if (queueUnknown) throw new Error('synthetic queue unavailable'); return queue; } }, radarr: { getQueue: async () => [] },
     planner: { planGroup: async ({ group, stage }: { group: WorkGroup; stage?: string }) => {
       const ids = group.targets.flatMap((unit) => unit.season?.missing.map((target) => target.episodeId) ?? []);
       plannedTargets.push(ids);
+      duringPlan?.();
       if (planError) throw planError;
       return [{ query: `Synthetic Show targets ${ids.join(',')}`, categories: [5000], targetIndices: group.dueTargetIndices,
         ...(stage === 'episodes' ? { episodeTargets: group.dueTargetIndices.map((targetIndex) => ({ targetIndex, episodeIndices: group.targets[targetIndex]!.season!.missing.map((_, index) => index) })) } : {}),
@@ -64,6 +74,8 @@ function replay() {
   return {
     get state() { return state; }, get episodes() { return episodes; }, plannedTargets, searches,
     at(value: string) { now = new Date(value); },
+    setSeries(value: typeof series) { currentSeries = value; },
+    onPlan(callback: (() => void) | null) { duringPlan = callback; },
     setEpisodes(value: Episode[]) { episodes = value; }, setQueue(value: SonarrQueueRecord[]) { queue = value; },
     setEmptyResults(value: boolean) { emptyResults = value; },
     setLibraryMode(value: typeof libraryMode) { libraryMode = value; }, setQueueUnknown(value: boolean) { queueUnknown = value; },
@@ -143,6 +155,9 @@ describe('issue #11 persisted weekly episode lifecycle', () => {
       }
       expect(run.searches).toEqual([]);
       expect(run.state.listEpisodeProgress('sonarr:1:s2').every((row) => row.lastSearchAt === null)).toBe(true);
+      run.restart();
+      expect(run.state.listManualReview().some((review) => review.reason === 'no-suitable-release')).toBe(true);
+      if (hold === 'unscoped-queue') expect(run.state.getWorkItem('sonarr:1:s2')!.blockedReason).toBe('queue-ambiguous');
     } finally { run.close(); }
   });
 
@@ -152,6 +167,154 @@ describe('issue #11 persisted weekly episode lifecycle', () => {
       await expect(run.manualPick()).rejects.toThrow(/held|eligible|actionable/);
       expect(run.searches).toEqual([]);
       expect(run.state.listGrabIntents()).toEqual([]);
+    } finally { run.close(); }
+  });
+
+  it('discovers a newly added same-season episode on a later poll and persists its attribution across reopen', async () => {
+    const run = replay();
+    try {
+      run.setEmptyResults(true);
+      run.at('2026-10-15T23:00:00Z');
+      await run.poll();
+      run.setEpisodes([...run.episodes, episode(103, 2, 3, '2026-10-16T23:00:00Z')]);
+      run.at('2026-10-16T23:00:00Z');
+      await run.poll();
+      expect(run.plannedTargets).toEqual([[101], [101, 103]]);
+      expect(run.state.listEpisodeProgress('sonarr:1:s2')).toMatchObject([
+        { episodeId: 101, lastSearchAt: '2026-10-16T23:00:00.000Z' },
+        { episodeId: 102, lastSearchAt: null },
+        { episodeId: 103, lastSearchAt: '2026-10-16T23:00:00.000Z' },
+      ]);
+      run.restart();
+      expect(run.plannedTargets).toEqual([[101], [101, 103]]);
+      expect(run.state.listManualReview()).toEqual([]);
+      expect(run.state.listEpisodeProgress('sonarr:1:s2').map((row) => row.episodeId)).toEqual([101, 102, 103]);
+    } finally { run.close(); }
+  });
+
+  it('discovers a later season on a subsequent poll without turning prior imports into search targets', async () => {
+    const run = replay();
+    try {
+      await run.poll();
+      run.setEpisodes([...run.episodes, episode(201, 3, 1, '2026-10-16T23:00:00Z')]);
+      run.at('2026-10-16T23:00:00Z');
+      await run.poll();
+      expect(run.plannedTargets).toEqual([[101, 201]]);
+      expect(run.searches).toEqual(['Synthetic Show targets 101,201']);
+      expect(run.state.listManualReview()).toEqual([]);
+      expect(run.state.getWorkItem('sonarr:1:s3')?.unit.season?.missing.map((target) => target.episodeId)).toEqual([201]);
+      run.restart();
+      await run.poll();
+      expect(run.plannedTargets).toEqual([[101, 201]]);
+      expect(run.state.listEpisodeProgress('sonarr:1:s3')).toMatchObject([{ episodeId: 201, hasFile: false, nextSearchAt: '2026-10-17T05:00:00.000Z' }]);
+      expect(run.state.listGrabIntents()).toEqual([]);
+    } finally { run.close(); }
+  });
+
+  it('reconciles monitoring changes and numbering metadata across polls without transferring episode identity', async () => {
+    const run = replay();
+    try {
+      await run.poll();
+      run.setEpisodes(run.episodes.map((target) => target.id === 101 ? { ...target, monitored: false } : target));
+      run.at('2026-10-15T23:00:00Z');
+      await run.poll();
+      expect(run.plannedTargets).toEqual([]);
+      expect(run.state.listEpisodeProgress('sonarr:1:s2').find((row) => row.episodeId === 101)).toMatchObject({ monitored: false, hasFile: false });
+      run.setEpisodes(run.episodes.map((target) => target.id === 101 ? { ...target, monitored: true, episodeNumber: 7, absoluteEpisodeNumber: 70 } : target));
+      run.at('2026-10-16T00:00:00Z');
+      await run.poll();
+      expect(run.plannedTargets).toEqual([[101]]);
+      run.restart();
+      expect(run.state.listEpisodeProgress('sonarr:1:s2').find((row) => row.episodeId === 101)).toMatchObject({ episodeNumber: 7, absoluteEpisodeNumber: 70 });
+      expect(run.state.listManualReview()).toEqual([]);
+    } finally { run.close(); }
+  });
+
+  it('holds identity changes across restart while preserving prior intent and dedupe evidence', async () => {
+    const run = replay();
+    try {
+      await run.poll();
+      const work = run.state.getWorkItem('sonarr:1:s2')!;
+      const token = run.state.claimUnit(work.workKey, new Date('2026-10-15T00:01:00Z'))!;
+      const capture = run.state.beginGrab({ key: work.workKey, token, fingerprint: work.missingFingerprint,
+        release: { arr: 'sonarr', indexerId: 5, guid: 'identity-reservation', infoHash: null, releaseTitle: 'Synthetic S02E01' },
+        coverage: [{ workKey: work.workKey, episodeIds: [101], basis: 'explicit-episodes' }], now: '2026-10-15T00:01:00Z', deadline: '2026-10-15T00:31:00Z' });
+      if (!capture.ok) throw new Error(capture.reason);
+      run.state.confirmGrab({ intentId: capture.intentId, ownerToken: token, now: '2026-10-15T00:01:00Z' });
+      run.state.recordRelease(5, 'identity-dedupe', work.workKey, new Date('2026-10-15T00:01:00Z'));
+      run.state.releaseClaim(work.workKey, token);
+      const history = run.protectedHistory();
+      run.setSeries({ ...series, tvdbId: 999, title: 'Different identity' });
+      run.at('2026-10-15T23:00:00Z');
+      await run.poll();
+      expect(run.searches).toEqual([]);
+      expect(run.state.listManualReview().length).toBeGreaterThan(0);
+      run.restart();
+      expect(run.protectedHistory()).toEqual(history);
+      expect(run.state.listGrabIntents()).toMatchObject([{ status: 'awaiting-queue', coverage: [{ episodeIds: [101] }] }]);
+    } finally { run.close(); }
+  });
+
+  it('reconsiders an episode discovered during planning only on the next safe poll', async () => {
+    const run = replay();
+    try {
+      await run.poll();
+      run.setEpisodes(run.episodes.filter((target) => target.id !== 102));
+      run.onPlan(() => {
+        run.onPlan(null);
+        run.setEpisodes([...run.episodes, episode(202, 3, 1, '2026-10-16T23:00:00Z')]);
+      });
+      run.at('2026-10-16T23:00:00Z');
+      await run.poll();
+      expect(run.plannedTargets.flat()).not.toContain(202);
+      run.restart();
+      await run.poll();
+      expect(run.plannedTargets.flat()).toContain(202);
+      expect(run.state.listEpisodeProgress('sonarr:1:s3')).toMatchObject([{ episodeId: 202, lastSearchAt: '2026-10-16T23:00:00.000Z' }]);
+    } finally { run.close(); }
+  });
+
+  it('does not infer an import from an omitted tracked target and recovers its independent deadline after reopen', async () => {
+    const run = replay();
+    try {
+      run.setEmptyResults(true);
+      run.at('2026-10-22T22:00:00Z');
+      await run.poll();
+      const completeInventory = run.episodes;
+      run.setEpisodes(completeInventory.filter((target) => target.id !== 101));
+      run.at('2026-10-22T22:01:00Z');
+      await run.poll();
+      expect(run.plannedTargets).toEqual([[101]]);
+      expect(run.state.getWorkItem('sonarr:1:s2')!.status).not.toBe('fulfilled');
+      expect(run.state.listEpisodeProgress('sonarr:1:s2').find((row) => row.episodeId === 101)).toMatchObject({ hasFile: false, nextSearchAt: '2026-10-23T04:00:00.000Z' });
+      run.restart();
+      run.setEpisodes(completeInventory);
+      run.at('2026-10-22T23:00:00Z');
+      await run.poll();
+      expect(run.plannedTargets).toEqual([[101], [102]]);
+      expect(run.state.listManualReview()).toEqual([]);
+      expect(run.state.listGrabIntents()).toEqual([]);
+    } finally { run.close(); }
+  });
+
+  it('holds ordinary acquisition under ambiguous queue evidence and preserves the hold across reopen', async () => {
+    const run = replay();
+    try {
+      await run.poll();
+      run.setQueue([{ id: 55, title: 'Synthetic unidentified job', status: 'downloading' }]);
+      run.at('2026-10-15T23:00:00Z');
+      await run.poll();
+      expect(run.searches).toEqual([]);
+      expect(run.state.getWorkItem('sonarr:1:s2')).toMatchObject({ blockedReason: 'queue-ambiguous' });
+      expect(run.state.listManualReview()).toEqual(expect.arrayContaining([expect.objectContaining({ reason: 'queue-review' })]));
+      const history = run.protectedHistory();
+      run.restart();
+      run.at('2026-10-22T23:00:00Z');
+      await run.poll();
+      expect(run.searches).toEqual([]);
+      expect(run.protectedHistory()).toEqual(history);
+      const summary = new OperationsDashboard(run.state).episodes('sonarr:1:s2', 50, 0, new Date('2026-10-22T23:00:00Z'))!.summary;
+      expect(summary).toMatchObject({ counts: { held: 2, ready: 0 } });
     } finally { run.close(); }
   });
   it.each([
@@ -191,6 +354,8 @@ describe('issue #11 persisted weekly episode lifecycle', () => {
       expect(run.plannedTargets).toEqual([[101]]);
       expect(progress()).toEqual(before);
       expect(run.state.listGrabIntents()).toEqual([]);
+      run.restart();
+      expect(progress()).toEqual(before);
       run.setLibraryMode('known'); run.setQueueUnknown(false);
       run.at('2026-10-22T23:01:00.000Z');
       await run.poll();
@@ -209,6 +374,9 @@ describe('issue #11 persisted weekly episode lifecycle', () => {
       run.at('2026-10-22T23:00:00.000Z');
       await run.poll();
       expect(run.plannedTargets).toEqual([[102]]);
+      const healthyProjection = new OperationsDashboard(run.state, () => new Date('2026-10-22T23:00:00.000Z'))
+        .work({ scope: 'all', limit: 50, offset: 0 }, false, new Date('2026-10-22T23:00:00.000Z')).items[0]!.episodeProgress;
+      expect(healthyProjection).toMatchObject({ knowledge: 'known', counts: { downloading: 1, waitingRelease: 1, held: 0 } });
       run.setQueue([]);
       run.at('2026-10-23T06:00:00.000Z');
       await run.poll();
@@ -216,6 +384,9 @@ describe('issue #11 persisted weekly episode lifecycle', () => {
       expect(run.state.getWorkItem('sonarr:1:s2')).toMatchObject({ status: 'manual', blockedReason: 'queue-review' });
       expect(run.state.listManualReview()).toMatchObject([{ reason: 'queue-review' }]);
       expect(run.state.listWorkQueueObservations()[0]!.coverage).toMatchObject([{ episodeIds: [101] }]);
+      const projection = new OperationsDashboard(run.state, () => new Date('2026-10-23T06:00:00.000Z'))
+        .work({ scope: 'all', limit: 50, offset: 0 }, false, new Date('2026-10-23T06:00:00.000Z')).items[0]!.episodeProgress;
+      expect(projection).toMatchObject({ knowledge: 'known', counts: { downloading: 0, held: 2, ready: 0 } });
     } finally { run.close(); }
   });
 

@@ -296,6 +296,18 @@ h1 { color: #f0f2ef; font-family: var(--display); font-size: clamp(2.125rem, 3.5
 .status-quiet { border-color: #333a35; background: #1b1e1c; color: #929c94; }
 .ops-work-meta { display: flex; min-width: 0; flex-wrap: wrap; gap: 5px 15px; margin-top: 6px; color: #9ca79e; font-size: var(--type-small); line-height: 1.45; }
 .ops-work-schedule { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 7px; color: #9ca79e; font-size: var(--type-small); line-height: 1.45; }
+.ops-season-progress { display: grid; gap: 5px; margin-top: 10px; padding: 9px 11px; border-left: 2px solid #54765d; background: #151b17; color: #aeb9b0; font-size: var(--type-small); line-height: 1.45; }
+.ops-season-summary { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+.ops-season-summary strong { color: #c8dfce; font-weight: 600; }
+.ops-season-progress > p { color: #9ca79e; }
+.ops-episode-toggle { justify-self: start; min-height: 30px; }
+.ops-episode-detail { min-width: 0; border-top: 1px solid #303831; padding-top: 8px; }
+.ops-episode-list { display: grid; gap: 8px; }
+.ops-episode-list > li { display: grid; gap: 4px; padding: 8px 0; border-bottom: 1px solid #292f2b; }
+.ops-episode-list > li > div { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.ops-episode-list > li > div > strong { color: #d4ddd5; }
+.ops-episode-list > li > p { color: #9ca79e; overflow-wrap: anywhere; }
+.ops-review-episodes { display: grid; gap: 8px; }
 .ops-observation-summary { display: grid; justify-items: start; gap: 4px; margin-top: 9px; }
 .ops-observation-status { display: inline-flex; align-items: center; gap: 6px; color: #9eaa9f; font-size: var(--type-small); }
 .ops-observation-status .tiny-dot { background: #79c991; }

@@ -267,6 +267,113 @@ describe('operations dashboard', () => {
     assert.equal(screen.getByRole('link', { name: 'Queue' }).getAttribute('aria-current'), 'page')
   })
 
+  it('shows season progress and read-only paginated episode explanations', async () => {
+    const progress = { knowledge: 'known', lifecycle: 'airing', completion: 'caught-up', counts: { total: 26, imported: 25, airedMissing: 0, future: 1, timingUnknown: 0, unmonitored: 0, downloading: 0, held: 0, ready: 0, waitingRelease: 0 }, nextEligibilityAt: '2026-11-01T20:00:00.000Z', nextRetryAt: null }
+    globalThis.fetch = async (input, init) => {
+      if (String(input) === '/api/settings') return jsonResponse(envelope)
+      operationRequests.push({ input, init })
+      if (String(input).startsWith('/api/operations/work')) return workResponse({ items: [{ ...workItem, status: 'ready', holdReason: null, episodeProgress: progress }], total: 1, counts: { ready: 1 }, openReviewCount: 0, generatedAt: '2026-10-02T00:00:00.000Z' })
+      if (new URL(String(input), 'http://localhost').pathname === '/api/operations/episodes') {
+        const url = new URL(String(input), 'http://localhost')
+        const offset = Number(url.searchParams.get('offset'))
+        return jsonResponse({ workKey: workItem.workKey, total: 26, generatedAt: '2026-10-02T00:00:00.000Z', summary: progress, items: [{ episodeNumber: offset ? 26 : 1, absoluteEpisodeNumber: null, title: offset ? 'Last Light' : 'First Light', monitored: true, hasFile: true, eligibleAt: '2026-10-01T00:00:00.000Z', timingBasis: 'date-only', lastSearchAt: null, nextSearchAt: null, progress: 'imported', holdReason: null, observedAt: '2026-10-02T00:00:00.000Z', observationState: 'known' }] })
+      }
+      return defaultOperationResponse(input)
+    }
+    render(<App />)
+    await screen.findByRole('heading', { name: 'North Shore' })
+    assert.ok(screen.getByText('Caught up · awaiting airtime'))
+    assert.ok(screen.getByText(/Next airtime/))
+    assert.ok(screen.getByText(/0 timing unknown · 0 ready · 0 waiting for release/))
+    fireEvent.click(screen.getByRole('button', { name: /Episode details/ }))
+    await waitFor(() => assert.ok(operationRequests.some(({ input }) => String(input).startsWith('/api/operations/episodes'))))
+    await screen.findByText('Episode 1: First Light')
+    assert.ok(screen.getByText(/Airtime .*date-only/))
+    assert.ok(screen.getByText('Episodes 1–25 of 26'))
+    fireEvent.click(screen.getByRole('button', { name: 'Next episodes' }))
+    await screen.findByText('Episode 26: Last Light')
+    assert.ok(operationRequests.some(({ input }) => new URL(String(input), 'http://localhost').searchParams.get('offset') === '25' && new URL(String(input), 'http://localhost').searchParams.get('limit') === '25'))
+    assert.equal(screen.getByRole('button', { name: 'Hide episode details' }).getAttribute('aria-expanded'), 'true')
+    assert.ok(operationRequests.some(({ input }) => String(input).includes('/api/operations/episodes?workKey=')))
+    assert.equal(operationRequests.some(({ init }) => init?.method === 'POST'), false)
+  })
+
+  for (const trigger of ['refresh', 'retry'] as const) it(`reloads expanded episode details after queue ${trigger}`, async () => {
+    let imported = false
+    globalThis.fetch = async (input, init) => {
+      const url = new URL(String(input), 'http://localhost')
+      if (url.pathname === '/api/settings') return jsonResponse(envelope)
+      operationRequests.push({ input, init })
+      const progress = { knowledge: 'known', lifecycle: 'unknown', completion: imported ? 'imported' : 'incomplete', counts: { total: 1, imported: imported ? 1 : 0, airedMissing: imported ? 0 : 1, future: 0, timingUnknown: 0, unmonitored: 0, downloading: 0, held: 0, ready: 0, waitingRelease: imported ? 0 : 1 }, nextEligibilityAt: null, nextRetryAt: null }
+      if (url.pathname === '/api/operations/work') return workResponse({ items: [{ ...workItem, status: 'cooldown', holdReason: null, episodeProgress: progress }], total: 1, counts: { cooldown: 1 }, openReviewCount: 0, generatedAt: '2026-10-02T00:00:00.000Z' })
+      if (url.pathname === '/api/operations/episodes') return jsonResponse({ workKey: workItem.workKey, total: 1, generatedAt: '2026-10-02T00:00:00.000Z', summary: progress, items: [{ episodeNumber: 1, absoluteEpisodeNumber: null, title: imported ? 'Now imported' : 'Waiting for release', monitored: true, hasFile: imported, eligibleAt: '2026-10-01T00:00:00.000Z', timingBasis: 'utc', lastSearchAt: null, nextSearchAt: null, progress: imported ? 'imported' : 'waiting-release', holdReason: null, observedAt: '2026-10-02T00:00:00.000Z', observationState: 'known' }] })
+      return defaultOperationResponse(input)
+    }
+    render(<App />)
+    await screen.findByRole('heading', { name: 'North Shore' })
+    fireEvent.click(screen.getByRole('button', { name: 'Episode details' }))
+    await screen.findByText('Episode 1: Waiting for release')
+    imported = true
+    if (trigger === 'refresh') fireEvent.click(screen.getByRole('button', { name: 'Refresh view' }))
+    else {
+      fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+      fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Mark due' }))
+    }
+    await screen.findByText('Episode 1: Now imported')
+    assert.equal(screen.queryByText('Episode 1: Waiting for release'), null)
+    assert.equal(screen.getByRole('button', { name: 'Hide episode details' }).getAttribute('aria-expanded'), 'true')
+  })
+
+  it('labels saved file evidence stale instead of presenting it as a current import', async () => {
+    const staleRow = { episodeNumber: 1, absoluteEpisodeNumber: null, title: 'Last Seen', monitored: true, hasFile: true, eligibleAt: null, timingBasis: 'unknown', lastSearchAt: null, nextSearchAt: null, progress: 'stale', holdReason: null, observedAt: '2026-09-01T00:00:00.000Z', observationState: 'stale' }
+    globalThis.fetch = async (input, init) => {
+      if (String(input) === '/api/settings') return jsonResponse(envelope)
+      operationRequests.push({ input, init })
+      if (String(input).startsWith('/api/operations/work')) return workResponse({ items: [{ ...workItem, status: 'ready', holdReason: null, episodeProgress: { knowledge: 'stale', lifecycle: 'unknown', completion: 'unknown', counts: null, nextEligibilityAt: null, nextRetryAt: null } }], total: 1, counts: { ready: 1 }, openReviewCount: 0, generatedAt: '2026-10-02T00:00:00.000Z' })
+      if (new URL(String(input), 'http://localhost').pathname === '/api/operations/episodes') return jsonResponse({ workKey: workItem.workKey, total: 1, generatedAt: '2026-10-02T00:00:00.000Z', summary: { knowledge: 'stale', lifecycle: 'unknown', completion: 'unknown', counts: null, nextEligibilityAt: null, nextRetryAt: null }, items: [staleRow] })
+      return defaultOperationResponse(input)
+    }
+    render(<App />)
+    await screen.findByRole('heading', { name: 'North Shore' })
+    fireEvent.click(screen.getByRole('button', { name: /Episode details/ }))
+    await screen.findByText(/Last observed: file present · stale observation/)
+    assert.equal(screen.queryByText(/^Imported$/), null)
+  })
+
+  it('labels saved file evidence unknown rather than current when its observation is unknown', async () => {
+    globalThis.fetch = async (input, init) => {
+      if (String(input) === '/api/settings') return jsonResponse(envelope)
+      operationRequests.push({ input, init })
+      if (String(input).startsWith('/api/operations/work')) return workResponse({ items: [{ ...workItem, status: 'ready', holdReason: null, episodeProgress: { knowledge: 'unknown', lifecycle: 'unknown', completion: 'unknown', counts: null, nextEligibilityAt: null, nextRetryAt: null } }], total: 1, counts: { ready: 1 }, openReviewCount: 0, generatedAt: '2026-10-02T00:00:00.000Z' })
+      if (new URL(String(input), 'http://localhost').pathname === '/api/operations/episodes') return jsonResponse({ workKey: workItem.workKey, total: 1, generatedAt: '2026-10-02T00:00:00.000Z', summary: { knowledge: 'unknown', lifecycle: 'unknown', completion: 'unknown', counts: null, nextEligibilityAt: null, nextRetryAt: null }, items: [{ episodeNumber: 1, absoluteEpisodeNumber: null, title: 'Last Seen', monitored: true, hasFile: true, eligibleAt: null, timingBasis: 'unknown', lastSearchAt: null, nextSearchAt: null, progress: 'unknown', holdReason: null, observedAt: '2026-09-01T00:00:00.000Z', observationState: 'unknown' }] })
+      return defaultOperationResponse(input)
+    }
+    render(<App />)
+    await screen.findByRole('heading', { name: 'North Shore' })
+    fireEvent.click(screen.getByRole('button', { name: /Episode details/ }))
+    await screen.findByText(/Last observed: file present · unknown observation/)
+    assert.equal(screen.queryByText(/^Imported$/), null)
+  })
+
+  it('shows inventory errors and keeps review action gates unchanged while allowing read-only details', async () => {
+    globalThis.fetch = async (input, init) => {
+      if (String(input) === '/api/settings') return jsonResponse(envelope)
+      operationRequests.push({ input, init })
+      if (String(input).startsWith('/api/operations/reviews')) return jsonResponse({ items: [{ ...reviewItem, actions: { ...reviewItem.actions, retry: { allowed: false, reason: 'queue-review' }, reset: { allowed: false, reason: 'queue-review' } } }], total: 1, generatedAt: '2026-10-02T00:00:00.000Z' })
+      if (new URL(String(input), 'http://localhost').pathname === '/api/operations/episodes') return jsonResponse({ error: 'Synthetic episode inventory failure' }, 503)
+      return defaultOperationResponse(input)
+    }
+    render(<App />)
+    fireEvent.click(screen.getByRole('link', { name: 'Reviews' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Review details' }))
+    const dialog = screen.getByRole('dialog', { name: 'North Shore' })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Show episode details' }))
+    await within(dialog).findByText('Synthetic episode inventory failure')
+    assert.equal((within(dialog).getByRole('button', { name: 'Retry' }) as HTMLButtonElement).disabled, true)
+    assert.equal((within(dialog).getByRole('button', { name: 'Reset tracking' }) as HTMLButtonElement).disabled, true)
+    assert.equal(operationRequests.some(({ init }) => init?.method === 'POST'), false)
+  })
+
   it('shows the initial loading state until the first queue response arrives', async () => {
     let resolveQueue!: (response: Response) => void
     globalThis.fetch = (input, init) => {

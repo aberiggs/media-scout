@@ -41,11 +41,13 @@ function replay() {
     watcher: { getSnapshot: async (): Promise<LibrarySnapshot> => ({ observedAt: snapshotTime ?? now.toISOString(), sonarr: libraryMode === 'source-unknown'
       ? { known: false, series: [] } : { known: true, series: [{ series, known: libraryMode === 'known', episodes: libraryMode === 'known' ? episodes : null }] }, radarr: { known: true, movies: [] } }) },
     sonarr: { getQueue: async () => { if (queueUnknown) throw new Error('synthetic queue unavailable'); return queue; } }, radarr: { getQueue: async () => [] },
-    planner: { planGroup: async ({ group }: { group: WorkGroup }) => {
+    planner: { planGroup: async ({ group, stage }: { group: WorkGroup; stage?: string }) => {
       const ids = group.targets.flatMap((unit) => unit.season?.missing.map((target) => target.episodeId) ?? []);
       plannedTargets.push(ids);
       if (planError) throw planError;
-      return [{ query: `Synthetic Show targets ${ids.join(',')}`, categories: [5000], targetIndices: group.dueTargetIndices }];
+      return [{ query: `Synthetic Show targets ${ids.join(',')}`, categories: [5000], targetIndices: group.dueTargetIndices,
+        ...(stage === 'episodes' ? { episodeTargets: group.dueTargetIndices.map((targetIndex) => ({ targetIndex, episodeIndices: group.targets[targetIndex]!.season!.missing.map((_, index) => index) })) } : {}),
+      }];
     } },
     picker: { pickGroup: async () => { if (pickerError) throw pickerError; return { verdict: 'skip', releaseIndices: [], manualTargetIndices: [], deferredTargetIndices: [], reason: 'test evaluation complete' }; } },
     prowlarr: {

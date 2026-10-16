@@ -1,5 +1,22 @@
 # Progress
 
+## Continuous implementation instruction
+
+The user rejected self-imposed execution-budget stops. Global Dev guidance now
+explicitly treats local checkpoints as recovery points, not stopping points;
+continue the remaining approved tasks through completion or a genuine blocker.
+Earlier budget-stop notes below are historical and superseded, not an active
+permission/continuation requirement. Application query caps remain unchanged.
+
+## Bounded acquisition execution
+
+- Implemented executable episode-first / pack-first-plus-fallback stages with shared plan validation, exact local episode attribution, six-query/three-physical-release limits, oldest-unattempted fairness, and persisted capacity deferral. A pack miss alone no longer assigns all episodes an availability delay; only explicit episode searches or selected pack captures advance episode attempt clocks. Unattempted siblings and whole deferred seasons remain ready.
+- All choices remain provisional until both stages finish. Cross-stage full advertised footprints and physical identities are checked, the final authorized ID subset cannot widen at pre-grab refresh, and live submissions retain individual claim/reservation/receipt checks. A partial primary followed by fallback now has an actual three-POST isolated replay with three exact reservations.
+- Red: initial seven staged tests all failed under the single-batch runner. Expanded to 22 passing cases covering absent/rejected/full/manual/partial packs, query and selection caps, restart fairness, sibling-season remapping/manual holds, invalid attribution, rate-limit interruption with a provisional primary, overlapping and same-physical claims, in-flight eligibility/season discovery, and import/unmonitor/identity/numbering/unknown-read changes before POST.
+- Initial broader run exposed 70 fixture/contract failures because scripted planners lacked the now-required episode attribution. Updated five scripted model seams to emit actual stage-local attribution. Remaining failures were an obsolete stdio schema-name stub, a partial-coverage test lacking its newly required residual fallback response, and omitted safe work-key logging in the consolidated failure path; fixed without dropping safety assertions.
+- Independent read-only acquisition review found no blocking issues. Addressed its additional live partial-selection and multi-season verification gaps with passing tests. `npm test -- tests/staged-acquisition.test.ts tests/group-coverage.test.ts tests/guardrails.test.ts tests/queue-intent-linking.test.ts tests/gate2-runtime-regressions.test.ts tests/runner.test.ts tests/group-planning.test.ts tests/review-policy.test.ts tests/issue-11-episode-lifecycle.test.ts`: 9 files, 247 passed. `npm run typecheck`: passed. `npm test`: 47 files, 758 passed.
+- Tasks 2.3, 3.2, 3.3 complete; progress 10/17. Continuing with stage diagnostics and episode progress projections/UI, then final acceptance and container verification. This is a recovery checkpoint, not a stopping point or approval gate.
+
 ## Planning checkpoint
 
 - Issue: https://github.com/aberiggs/media-scout/issues/11

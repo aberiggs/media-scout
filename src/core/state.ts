@@ -1076,9 +1076,10 @@ export class State {
     apply();
   }
 
-  finishSearch(input: { key: string; token: string; status: 'cooldown' | 'backoff' | 'manual'; nextSearchAt: string | null; failCount: number; outcome: string; now: string; decision?: DecisionRecord; expectedStatus?: WorkStatus; episodeIds?: number[] }): boolean {
+  finishSearch(input: { key: string; token: string; status: 'ready' | 'cooldown' | 'backoff' | 'manual'; nextSearchAt: string | null; failCount: number; outcome: string; now: string; decision?: DecisionRecord; expectedStatus?: WorkStatus; episodeIds?: number[]; episodeNextSearchAt?: string | null }): boolean {
     validIso(input.now, 'now');
     if (input.nextSearchAt !== null) validIso(input.nextSearchAt, 'nextSearchAt');
+    if (input.episodeNextSearchAt !== undefined && input.episodeNextSearchAt !== null) validIso(input.episodeNextSearchAt, 'episodeNextSearchAt');
     nonnegativeFinite(input.failCount, 'failCount');
     if (typeof input.outcome !== 'string') throw new Error('Invalid search outcome');
     if (input.decision && input.decision.workKey !== input.key) throw new Error('Decision work key mismatch');
@@ -1094,7 +1095,7 @@ export class State {
         const update = this.db.prepare(`UPDATE episode_progress SET next_search_at=?,last_outcome=?
           WHERE work_key=? AND service_id=? AND external_id=? AND episode_id=?
           AND last_search_at>=? AND last_outcome='searched'`);
-        for (const id of input.episodeIds) update.run(input.nextSearchAt, input.outcome, input.key,
+        for (const id of input.episodeIds) update.run(input.episodeNextSearchAt === undefined ? input.nextSearchAt : input.episodeNextSearchAt, input.outcome, input.key,
           current.unit.serviceId, current.unit.externalId, id, current.lastSearchAt);
       }
       if (input.decision) this.insertDecision(input.decision, input.now);

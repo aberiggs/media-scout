@@ -123,6 +123,15 @@ export class Planner {
       label: `planner:group:${args.group.key}`,
     });
 
+    validateGroupPlan(args, result.queries);
+    return result.queries;
+  }
+}
+
+/** The runner also validates injected planner implementations before attributing paid work. */
+export function validateGroupPlan(args: { group: WorkGroup; stage?: AcquisitionStage }, queries: GroupPlannedQuery[]): void {
+    validateGroupTargets(args.group);
+    const result = groupPlanEnvelopeSchema.parse({ queries });
     const addressedDueTargets = new Set<number>();
     const addressedEpisodes = new Set<string>();
     for (const [queryIndex, planned] of result.queries.entries()) {
@@ -157,8 +166,6 @@ export class Planner {
         }
       }
     }
-    return result.queries;
-  }
 }
 
 const GROUP_SYSTEM_PROMPT = `You plan broad-recall Prowlarr searches for one supplied media group. The user data contains actual target indices, due target indices, global open-work context, active-download context, and source-read knowledge. Return one to three concise broad queries in the exact JSON envelope {"queries":[{"query":"...","categories":[5000],"targetIndices":[0]}]}. Every query must name its supplied targetIndices; include every dueTargetIndex in at least one query. Never invent or renumber a target. Related ready/cooldown targets may share a useful combined query. Search broadly and preserve alternatives rather than narrowing to one quality.

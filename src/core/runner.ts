@@ -7,15 +7,16 @@ import type { RadarrQueueRecord } from '../types/radarr';
 import type { Episode, SonarrQueueRecord } from '../types/sonarr';
 import { ApiError } from '../http';
 import type { Picker, Candidate, PickVerdict } from './picker';
-import type { Planner } from './planner';
+import { validateGroupPlan, type Planner } from './planner';
 import { parseReleaseTitle } from './parser';
 import { isGrabbable, verifyRelease } from './guardrails';
 import { reviewEvidenceMatchesWorkKey, WORK_OBSERVATION_STALE_AFTER_MS, type State } from './state';
 import type { IntentCoverage, IntentStatus, QueueRead, WorkItem } from './work-queue-types';
 import { candidateOverlapsQueue, reconcileWork, type QueueReads, type ReconciledWork } from './work-queue';
 import { eligibleWorkUnits, type LibrarySnapshot, type Watcher, type WorkUnit } from './watcher';
-import type { AssociationCacheEntry, AssociationDecision, GroupCandidate, PlanningContext, WorkGroup } from './group-types';
-import type { GroupSelection, GroupPlannedQuery } from '../types/group-llm';
+import type { AcquisitionStage, AssociationCacheEntry, AssociationDecision, GroupCandidate, PlanningContext, WorkGroup } from './group-types';
+import { acquisitionTargets, episodeStage, queryTargets } from './acquisition';
+import type { GroupSelection } from '../types/group-llm';
 import { buildAssociationRequests, QueueAssociator } from './queue-association';
 import { buildPlanningContext, buildWorkGroups } from './media-context';
 import { parseReleaseCoverage } from './parser';
@@ -364,11 +365,12 @@ export class Runner {
     let selection: GroupSelection | null = null;
     let actualProgress = false;
     let stage = 'observation';
+    let pendingKeys = new Set<string>();
     const backoffFailures = new Map<string, BackoffFailure>();
     try {
       const fresh = await this.refreshGroupObservation(claims);
       if (!fresh) { summary.skipped += initialGroup.dueTargetIndices.length; return 'processed'; }
-      const currentGroup = this.rebuildClaimedGroup(initialGroup, fresh.rows, claims.keys);
+      let currentGroup = this.rebuildClaimedGroup(initialGroup, fresh.rows, claims.keys);
       if (!currentGroup || currentGroup.members.some((member) => !claims.keys.includes(member.work.workKey))) {
         summary.skipped += initialGroup.dueTargetIndices.length;
         return 'processed';
@@ -388,65 +390,15 @@ export class Runner {
 
       stage = 'context';
       const context = buildPlanningContext({ snapshot: fresh.snapshot, rows: fresh.rows, queues: fresh.queues, intents: this.openGrabIntents(), associations });
-      let planned: GroupPlannedQuery[];
-      stage = 'planner';
-      try {
-        planned = await this.deps.planner.planGroup({ group: currentGroup, context });
-        summary.searched += 1;
-      } catch (error) {
-        await this.finishGroupBackoff(currentGroup, startedKeys, claims.ownerToken, error, summary, undefined, 'planner');
-        startedKeys = [];
-        summary.skipped += currentGroup.dueTargetIndices.length;
-        this.logger.warn({ groupKey: currentGroup.key, ...safeFailureMetadata('planner', error) }, 'group planning failure handled');
-        return 'processed';
-      }
-
-      const releases: Release[] = [];
-      stage = 'search';
-      try {
-        for (const query of planned) {
-          const seenTargets = new Set<number>();
-          const queryTargets = query.targetIndices.map((index) => {
-            if (!Number.isSafeInteger(index) || index < 0 || index >= currentGroup.targets.length || seenTargets.has(index)) throw new Error('planner group query has invalid target attribution');
-            seenTargets.add(index);
-            const target = currentGroup.targets[index];
-            if (!target) throw new Error('planner group query has invalid target attribution');
-            return target;
-          });
-          releases.push(...await this.recordedSearch(query.query, query.categories, allowlist, queryTargets));
-          for (const target of queryTargets) {
-            if (target.kind === 'tv') this.deps.state.recordEpisodeAttempt({
-              key: target.key, token: claims.ownerToken, episodeIds: target.season!.missing.map((episode) => episode.episodeId),
-              now: this.now().toISOString(), nextSearchAt: this.dateAfter(this.deps.config.minRetryHours * 60), outcome: 'searched',
-            });
-          }
-        }
-      } catch (error) {
-        await this.finishGroupBackoff(currentGroup, startedKeys, claims.ownerToken, error, summary, error instanceof ApiError ? error.retryAfter : undefined, 'search');
-        startedKeys = [];
-        summary.skipped += currentGroup.dueTargetIndices.length;
-        this.logger.warn({ workKey: currentGroup.targets[currentGroup.dueTargetIndices[0]!]?.key, ...safeFailureMetadata('search', error) }, 'Prowlarr group search batch aborted');
-        if (isRateLimited(error)) return 'rate-limited';
-        this.logger.warn({ groupKey: currentGroup.key, ...safeFailureMetadata('search', error) }, 'group search batch failure handled');
-        return 'processed';
-      }
-
-      stage = 'candidate-filter';
-      const candidates = this.buildGroupCandidates(currentGroup, context, releases, summary, fresh.snapshot, fresh.queues);
+      const acquisition = await this.planAcquisition(currentGroup, context, fresh, allowlist, claims.ownerToken, summary, (value) => { stage = value; });
+      currentGroup = acquisition.group;
+      const candidates = acquisition.candidates;
+      selection = acquisition.selection;
+      pendingKeys = acquisition.pendingKeys;
       if (candidates.length === 0) {
-        this.finishNoSuitableRelease(startedKeys, claims.ownerToken, releases.length, summary, currentGroup.targets);
+        this.finishNoSuitableRelease(startedKeys, claims.ownerToken, acquisition.resultCount, summary, currentGroup.targets, pendingKeys);
         startedKeys = [];
         summary.skipped += currentGroup.dueTargetIndices.length;
-        return 'processed';
-      }
-      stage = 'picker';
-      try {
-        selection = await this.deps.picker.pickGroup({ group: currentGroup, context, candidates });
-      } catch (error) {
-        await this.finishGroupBackoff(currentGroup, startedKeys, claims.ownerToken, error, summary, undefined, 'picker');
-        startedKeys = [];
-        summary.skipped += currentGroup.dueTargetIndices.length;
-        this.logger.warn({ groupKey: currentGroup.key, ...safeFailureMetadata('picker', error) }, 'group selection failure handled');
         return 'processed';
       }
       const fullFootprints = selection.releaseIndices.map((index) => {
@@ -468,14 +420,14 @@ export class Runner {
         if (this.flagReviewOnce(workKey, 'picker-manual', selection.reason)) newPickerReviews += 1;
       }
       if (selection.verdict === 'manual' || selection.verdict === 'skip') {
-        await this.finishGroupDecision(currentGroup, startedKeys, claims.ownerToken, selection, 'picker-manual', new Set(), new Map(), summary);
+        await this.finishGroupDecision(currentGroup, startedKeys, claims.ownerToken, selection, selection.verdict === 'manual' ? 'picker-manual' : 'picker-skip', new Set(), new Map(), summary, [], false, pendingKeys);
         startedKeys = [];
         if (selection.verdict === 'manual') summary.manualFlagged += newPickerReviews;
         else summary.skipped += currentGroup.dueTargetIndices.length;
         return 'processed';
       }
       if (this.deps.config.dryRun) {
-        await this.finishGroupDecision(currentGroup, startedKeys, claims.ownerToken, selection, 'dry-run', new Set(), new Map(), summary);
+        await this.finishGroupDecision(currentGroup, startedKeys, claims.ownerToken, selection, 'dry-run', new Set(), new Map(), summary, [], false, pendingKeys);
         startedKeys = [];
         summary.dryRunGrabs += selection.releaseIndices.length;
         for (const index of selection.releaseIndices) {
@@ -559,17 +511,125 @@ export class Runner {
           break;
         }
       }
-      await this.finishGroupDecision(currentGroup, startedKeys, claims.ownerToken, selection, actualProgress ? 'group-grabbed' : 'group-no-grab', backoffKeys, backoffFailures, summary, selectedForDeferral, actualProgress);
+      await this.finishGroupDecision(currentGroup, startedKeys, claims.ownerToken, selection, actualProgress ? 'group-grabbed' : 'group-no-grab', backoffKeys, backoffFailures, summary, selectedForDeferral, actualProgress, pendingKeys);
       startedKeys = [];
       return 'processed';
     } catch (error) {
       if (startedKeys.length) await this.finishGroupBackoff(initialGroup, startedKeys, claims.ownerToken, error, summary, undefined, stage);
-      this.logger.warn({ groupKey: initialGroup.key, ...safeFailureMetadata(stage, error) }, 'group processing failed; continuing cycle');
+      this.logger.warn({ groupKey: initialGroup.key, workKey: initialGroup.targets[initialGroup.dueTargetIndices[0]!]?.key,
+        ...safeFailureMetadata(stage, error) }, 'group processing failed; continuing cycle');
       summary.skipped += initialGroup.dueTargetIndices.length;
       return isRateLimited(error) ? 'rate-limited' : 'processed';
     } finally {
       try { this.deps.state.releaseClaims({ keys: claims.keys, ownerToken: claims.ownerToken }); } catch { /* Expiry or successor ownership is safe; stale cleanup never deletes another owner. */ }
     }
+  }
+
+  /** Select provisionally across bounded stages; no submission occurs until the complete set is validated. */
+  private async planAcquisition(group: WorkGroup, context: PlanningContext,
+    fresh: { snapshot: LibrarySnapshot; queues: QueueReads }, allowlist: number[], token: string,
+    summary: CycleSummary, onStage: (stage: string) => void,
+  ): Promise<{ group: WorkGroup; candidates: GroupCandidate[]; selection: GroupSelection; pendingKeys: Set<string>; resultCount: number }> {
+    const due = acquisitionTargets(group);
+    const tv = due.targets[0]?.kind === 'tv';
+    const candidates: GroupCandidate[] = [];
+    const selected: number[] = [];
+    const selectedFootprints: IntentCoverage[][] = [];
+    const selectedPhysical = new Set<string>();
+    const manualKeys = new Set<string>();
+    const deferredKeys = new Set<string>();
+    const attemptedIds = new Set<number>();
+    const chosenIds = new Set<number>();
+    const slots = new Map<string, number>();
+    let queryCount = 0;
+    let resultCount = 0;
+    let plannedOnce = false;
+    let reason = 'No admitted release';
+    const physical = (candidate: GroupCandidate) => candidate.release.infoHash
+      ? `hash:${candidate.release.infoHash.toLowerCase()}` : JSON.stringify([candidate.release.indexerId, candidate.release.guid]);
+    const record = (unit: WorkUnit, outcome: string) => {
+      if (unit.kind !== 'tv' || !unit.season!.missing.length) return;
+      this.deps.state.recordEpisodeAttempt({ key: unit.key, token, episodeIds: unit.season!.missing.map((episode) => episode.episodeId),
+        now: this.now().toISOString(), nextSearchAt: this.dateAfter(this.deps.config.minRetryHours * 60), outcome });
+    };
+    const run = async (scope: WorkGroup, acquisitionStage?: AcquisitionStage) => {
+      if (!scope.targets.length || selected.length >= 3) return;
+      onStage('planner');
+      const planned = await this.deps.planner.planGroup({ group: scope, context, stage: acquisitionStage });
+      validateGroupPlan({ group: scope, stage: acquisitionStage }, planned);
+      if (queryCount + planned.length > 6) throw new Error('Acquisition query cap exceeded');
+      if (!plannedOnce) { summary.searched += 1; plannedOnce = true; }
+      const releases: Release[] = [];
+      const episodeAttempts = new Set<number>();
+      onStage('search');
+      for (const query of planned) {
+        const targets = queryTargets(scope, query, acquisitionStage);
+        queryCount += 1;
+        const results = await this.recordedSearch(query.query, query.categories, allowlist, targets);
+        resultCount += results.length;
+        releases.push(...results);
+        if (acquisitionStage === 'episodes') for (const target of targets) {
+          record(target, 'searched');
+          for (const episode of target.season!.missing) { attemptedIds.add(episode.episodeId); episodeAttempts.add(episode.episodeId); }
+        }
+      }
+      onStage('candidate-filter');
+      const available = this.buildGroupCandidates(scope, context, releases, summary, fresh.snapshot, fresh.queues).filter((candidate) => {
+        if (selectedPhysical.has(physical(candidate))) return false;
+        const proof = verifyGroupCoverage({ originalUnits: group.members.map((member) => member.work.unit), actionableUnits: scope.targets, parsed: candidate.parsed });
+        return proof.kind === 'covered' && !this.groupFootprintsOverlap([...selectedFootprints, proof.requestedFootprint]);
+      });
+      for (const candidate of available) {
+        const identity = physical(candidate);
+        if (!slots.has(identity)) slots.set(identity, slots.size);
+        candidate.physicalSlot = slots.get(identity)!;
+      }
+      const admitted = new Set(available.flatMap((candidate) => candidate.capture.flatMap((capture) => capture.episodeIds ?? [])));
+      if (acquisitionStage === 'episodes') for (const target of scope.targets) {
+        const missing = target.season!.missing.filter((episode) => episodeAttempts.has(episode.episodeId) && !admitted.has(episode.episodeId));
+        if (missing.length) record({ ...target, season: { ...target.season!, missing } }, 'release-unavailable');
+      }
+      if (!available.length) return;
+      onStage('picker');
+      const choice = await this.deps.picker.pickGroup({ group: scope, context, candidates: available, selectionLimit: 3 - selected.length });
+      if (choice.releaseIndices.length > 3 - selected.length || new Set(choice.releaseIndices).size !== choice.releaseIndices.length) throw new Error('Invalid staged physical selection');
+      reason = choice.reason;
+      const offset = candidates.length;
+      candidates.push(...available);
+      for (const index of choice.releaseIndices) {
+        const candidate = available[index];
+        if (!candidate) throw new Error('Invalid staged release index');
+        const proof = verifyGroupCoverage({ originalUnits: group.members.map((member) => member.work.unit), actionableUnits: scope.targets, parsed: candidate.parsed });
+        if (proof.kind !== 'covered' || selectedPhysical.has(physical(candidate)) || this.groupFootprintsOverlap([...selectedFootprints, proof.requestedFootprint])) throw new Error('Overlapping staged selection');
+        selectedFootprints.push(proof.requestedFootprint);
+        selectedPhysical.add(physical(candidate));
+        selected.push(offset + index);
+        for (const capture of candidate.capture) for (const id of capture.episodeIds ?? []) chosenIds.add(id);
+      }
+      const manual = choice.verdict === 'manual' && !choice.manualTargetIndices.length ? scope.dueTargetIndices : choice.manualTargetIndices;
+      for (const index of manual) { const target = scope.targets[index]; if (!target) throw new Error('Invalid staged manual target'); manualKeys.add(target.key); }
+      for (const index of choice.deferredTargetIndices) { const target = scope.targets[index]; if (!target) throw new Error('Invalid staged deferred target'); deferredKeys.add(target.key); }
+    };
+    const count = due.targets.reduce((total, unit) => total + (unit.season?.missing.length ?? 0), 0);
+    if (!tv) await run(due);
+    else if (count < 3) await run(episodeStage(due, this.deps.state.listEpisodeProgress(), 3, new Set(), new Set()), 'episodes');
+    else {
+      await run(due, 'pack-batch');
+      if (selected.length < 3) await run(episodeStage(due, this.deps.state.listEpisodeProgress(), 3 - selected.length, chosenIds, manualKeys), 'episodes');
+    }
+    if (tv) for (const target of due.targets) {
+      const missing = target.season!.missing.filter((episode) => chosenIds.has(episode.episodeId) && !attemptedIds.has(episode.episodeId));
+      if (missing.length) record({ ...target, season: { ...target.season!, missing } }, 'searched');
+    }
+    const authorized = new Set([...attemptedIds, ...chosenIds]);
+    for (const target of due.targets) if (manualKeys.has(target.key)) for (const episode of target.season?.missing ?? []) authorized.add(episode.episodeId);
+    const finalGroup = tv ? acquisitionTargets(due, authorized) : due;
+    const pendingKeys = new Set(due.targets.filter((unit) => unit.kind === 'tv' && !manualKeys.has(unit.key) && unit.season!.missing.some((episode) => !authorized.has(episode.episodeId))).map((unit) => unit.key));
+    return { group: finalGroup, candidates, pendingKeys, resultCount, selection: {
+      verdict: selected.length ? 'grab' : manualKeys.size ? 'manual' : 'skip', releaseIndices: selected,
+      manualTargetIndices: finalGroup.targets.flatMap((unit, index) => manualKeys.has(unit.key) ? [index] : []),
+      deferredTargetIndices: finalGroup.targets.flatMap((unit, index) => deferredKeys.has(unit.key) && !selected.some((chosen) => candidates[chosen]!.capture.some((capture) => capture.workKey === unit.key)) ? [index] : []), reason,
+    } };
   }
 
   private async refreshGroupObservation(claims: import('./work-queue-types').ClaimSet): Promise<{ snapshot: LibrarySnapshot; queues: QueueReads; rows: ReconciledWork[] } | null> {
@@ -763,16 +823,21 @@ export class Runner {
     return false;
   }
 
-  private finishNoSuitableRelease(keys: string[], token: string, searchResultCount: number, summary: CycleSummary, targets: WorkUnit[]): void {
+  private finishNoSuitableRelease(keys: string[], token: string, searchResultCount: number, summary: CycleSummary, targets: WorkUnit[], pendingKeys = new Set<string>()): void {
     const details = JSON.stringify({ stage: 'candidate-filter', searchResultCount, candidateCount: 0 });
     for (const key of keys) {
       try {
         const target = targets.find((unit) => unit.key === key);
+        if (!target && this.deps.state.getWorkItem(key)?.unit.kind === 'tv') {
+          this.deps.state.finishSearch({ key, token, status: 'ready', nextSearchAt: null, failCount: 0,
+            outcome: 'capacity-deferred', now: this.now().toISOString(), expectedStatus: 'searching' });
+          continue;
+        }
         if (target?.kind === 'tv') {
           const nextSearchAt = this.dateAfter(this.deps.config.minRetryHours * 60);
           this.deps.state.recordEpisodeAttempt({ key, token, episodeIds: target.season!.missing.map((episode) => episode.episodeId),
             now: this.now().toISOString(), nextSearchAt, outcome: 'release-unavailable' });
-          this.deps.state.finishSearch({ key, token, status: 'cooldown', nextSearchAt, failCount: 0,
+          this.deps.state.finishSearch({ key, token, status: pendingKeys.has(key) ? 'ready' : 'cooldown', nextSearchAt: pendingKeys.has(key) ? null : nextSearchAt, failCount: 0,
             outcome: 'release-unavailable', now: this.now().toISOString(), expectedStatus: 'searching',
             decision: { workKey: key, verdict: 'skip', grabbed: false } });
           continue;
@@ -867,7 +932,7 @@ export class Runner {
     }
   }
 
-  private async finishGroupDecision(group: WorkGroup, keys: string[], token: string, selection: GroupSelection, outcome: string, backoffKeys: Set<string>, backoffFailures: Map<string, BackoffFailure>, summary: CycleSummary, deferred: number[] = [], actualProgress = false): Promise<void> {
+  private async finishGroupDecision(group: WorkGroup, keys: string[], token: string, selection: GroupSelection, outcome: string, backoffKeys: Set<string>, backoffFailures: Map<string, BackoffFailure>, summary: CycleSummary, deferred: number[] = [], actualProgress = false, pendingKeys = new Set<string>()): Promise<void> {
     const manualKeys = new Set(selection.manualTargetIndices.map((index) => group.targets[index]?.key).filter((key): key is string => Boolean(key)));
     const deferredKeys = new Set(deferred.map((index) => group.targets[index]?.key).filter((key): key is string => Boolean(key)));
     for (const key of keys) {
@@ -894,7 +959,9 @@ export class Runner {
         if (work.status !== 'searching') continue;
         const delay = actualProgress && deferredKeys.has(key) ? 5 : this.deps.config.minRetryHours * 60;
         const decision = outcome === 'group-grabbed' || outcome === 'group-no-grab' || outcome === 'group-release-failed' ? undefined : { workKey: key, verdict: selection.verdict, grabbed: false };
-        try { this.deps.state.finishSearch({ key, token, status: 'cooldown', nextSearchAt: this.dateAfter(delay), failCount: 0, outcome, now: this.now().toISOString(), decision, episodeIds }); } catch { /* Safe on expiry. */ }
+        const episodeDeadline = this.dateAfter(delay);
+        try { this.deps.state.finishSearch({ key, token, status: pendingKeys.has(key) ? 'ready' : 'cooldown', nextSearchAt: pendingKeys.has(key) ? null : episodeDeadline,
+          episodeNextSearchAt: episodeDeadline, failCount: 0, outcome, now: this.now().toISOString(), decision, episodeIds }); } catch { /* Safe on expiry. */ }
       }
     }
   }

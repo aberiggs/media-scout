@@ -493,6 +493,7 @@ export function serializeGroupPickerInput(input: {
   context: PlanningContext;
   candidates: GroupCandidate[];
   mediaPreferences?: string;
+  selectionLimit?: number;
 }): string {
   return JSON.stringify({
     targets: input.group.targets.map(publicTarget),
@@ -500,5 +501,6 @@ export function serializeGroupPickerInput(input: {
     context: publicContext(input.context),
     candidates: input.candidates.map((candidate, index) => safeRelease(candidate, index, input.group)),
     mediaPreferences: publicTitle(input.mediaPreferences ?? '') ?? '',
+    selectionLimit: input.selectionLimit ?? 3,
   });
 }

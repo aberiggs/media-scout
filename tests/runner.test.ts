@@ -84,7 +84,7 @@ class FakeLLM implements LLMClient {
     if (this.throwLabels.has(args.label)) throw new Error('scripted LLM failure');
     if (args.label.startsWith('planner:group:')) {
       const groupKey = args.label.slice('planner:group:'.length);
-      const input = JSON.parse(args.user) as { dueTargetIndices: number[]; targets: Array<{ seasonNumber: number | null }> };
+      const input = JSON.parse(args.user) as { searchStage?: string; dueTargetIndices: number[]; targets: Array<{ seasonNumber: number | null; expectedTargets: unknown[] }> };
       const byTarget = new Map<number, PlannedQuery[]>();
       for (const targetIndex of input.dueTargetIndices) {
         const season = input.targets[targetIndex]?.seasonNumber;
@@ -92,7 +92,9 @@ class FakeLLM implements LLMClient {
         byTarget.set(targetIndex, this.planner.get(key) ?? this.planner.get('*') ?? []);
       }
       if ([...byTarget.values()].some((queries) => queries.length === 0)) throw new Error(`no planner script for ${groupKey}`);
-      const queries = [...byTarget.entries()].flatMap(([targetIndex, planned]) => planned.map((query) => ({ ...query, targetIndices: [targetIndex] })));
+      const queries = [...byTarget.entries()].flatMap(([targetIndex, planned]) => planned.map((query) => ({ ...query, targetIndices: [targetIndex],
+        ...(input.searchStage === 'episodes' ? { episodeTargets: [{ targetIndex, episodeIndices: input.targets[targetIndex]!.expectedTargets.map((_, index) => index) }] } : {}),
+      })));
       return groupPlanEnvelopeSchema.parse({ queries: queries.slice(0, 3) }) as T;
     }
     if (args.label.startsWith('picker:group:')) {
@@ -1276,6 +1278,7 @@ describe('Runner.cycle', () => {
       },
     });
     mockSearch([release({ title: 'Show S01(E02-E03) 1080p.x265-GROUP' })]);
+    const residualSearch = mockSearch([]); // E7 gets its required explicit fallback before the provisional grab.
     const grabScope = mockGrab(grabBody);
     const { runner } = buildStack(llm, { dryRun: false });
 
@@ -1283,6 +1286,7 @@ describe('Runner.cycle', () => {
 
     expect(grabScope.isDone()).toBe(true);
     expect(summary.grabbed).toBe(1);
+    expect(residualSearch.isDone()).toBe(true);
     const pickerCall = llm.calls.find((call) => call.label === 'picker:group:sonarr:1');
     if (!pickerCall) throw new Error('picker was not called');
     const payload = JSON.parse(pickerCall.user) as { candidates: { capture: Array<{ targets: Array<{ episodeNumbers: number[]; basis: string }> }> }[] };

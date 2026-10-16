@@ -10,6 +10,7 @@ import { Runner, type RunnerDeps } from '../src/core/runner';
 import { State } from '../src/core/state';
 import type { LibrarySnapshot } from '../src/core/watcher';
 import type { GroupSelection } from '../src/types/group-llm';
+import type { WorkGroup } from '../src/core/group-types';
 
 const START = new Date('2026-09-29T00:00:00.000Z');
 const releaseFixture = JSON.parse(readFileSync(new URL('./fixtures/prowlarr-release.json', import.meta.url), 'utf8')) as Record<string, unknown>;
@@ -66,8 +67,10 @@ function makeRunner(options: {
   const logger = loggerMock as unknown as Logger;
   const deps: RunnerDeps = {
     watcher: { getSnapshot: vi.fn(snapshotAt) } as never,
-    planner: { planGroup: options.planGroup ?? vi.fn(async ({ group }: { group: { targets: unknown[]; dueTargetIndices: number[] } }) => [
-      { query: 'Example Show S01', categories: [5000], targetIndices: group.dueTargetIndices },
+    planner: { planGroup: options.planGroup ?? vi.fn(async ({ group, stage }: { group: WorkGroup; stage?: string }) => [
+      { query: 'Example Show S01', categories: [5000], targetIndices: group.dueTargetIndices,
+        ...(stage === 'episodes' ? { episodeTargets: group.dueTargetIndices.map((targetIndex) => ({ targetIndex, episodeIndices: group.targets[targetIndex]!.season!.missing.map((_, index) => index) })) } : {}),
+      },
     ]) } as never,
     picker: { pickGroup: options.pickGroup ?? vi.fn(async (): Promise<GroupSelection> => ({
       verdict: 'skip', releaseIndices: [], manualTargetIndices: [], deferredTargetIndices: [], reason: 'no selection',

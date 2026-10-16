@@ -102,7 +102,10 @@ class FakeLLM implements LLMClient {
       const key = args.label.slice('planner:group:'.length);
       const plan = this.groupPlanner.get(key) ?? this.groupPlanner.get('*');
       if (!plan) throw new Error(`no group planner script for ${key}`);
-      return args.schema.parse(plan);
+      const input = JSON.parse(args.user) as { searchStage?: string; targets: Array<{ expectedTargets: unknown[] }> };
+      return args.schema.parse({ queries: plan.queries.map((query) => ({ ...query,
+        ...(input.searchStage === 'episodes' ? { episodeTargets: query.targetIndices.map((targetIndex) => ({ targetIndex, episodeIndices: input.targets[targetIndex]!.expectedTargets.map((_, index) => index) })) } : {}),
+      })) });
     }
     if (args.label.startsWith('picker:group:')) {
       const key = args.label.slice('picker:group:'.length);
@@ -720,8 +723,8 @@ describe('stdio entry e2e (spawned process)', () => {
         const schemaName = JSON.parse(body).response_format?.json_schema?.name as string | undefined;
         const content = schemaName === 'group_picker_selection'
           ? '{"selection":{"verdict":"grab","releaseIndices":[0],"manualTargetIndices":[],"deferredTargetIndices":[],"reason":"best fit"}}'
-          : schemaName === 'group_planner_queries'
-            ? '{"queries":[{"query":"Frieren","categories":[5070],"targetIndices":[0]}]}'
+          : schemaName === 'group_planner_queries' || schemaName === 'group_episode_queries'
+            ? '{"queries":[{"query":"Frieren","categories":[5070],"targetIndices":[0],"episodeTargets":[{"targetIndex":0,"episodeIndices":[0]}]}]}'
             : '{}';
         res.end(JSON.stringify(llmReply(content)));
       });

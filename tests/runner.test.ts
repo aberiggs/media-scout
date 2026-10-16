@@ -562,11 +562,11 @@ describe('Runner.cycle', () => {
     const summary = await runner.cycle();
 
     expect(grabScope.isDone()).toBe(false);
-    expect(summary).toEqual({ units: 1, searched: 1, grabbed: 0, dryRunGrabs: 0, manualFlagged: 1, skipped: 1 });
+    expect(summary).toEqual({ units: 1, searched: 1, grabbed: 0, dryRunGrabs: 0, manualFlagged: 0, skipped: 1 });
     expect(llm.callsFor('picker:')).toHaveLength(0);
-    expect(decisionRow(state, 'sonarr:2:s1')).toMatchObject({ verdict: 'manual', grabbed: 0 });
-    expect(state.getWorkItem('sonarr:2:s1')).toMatchObject({ status: 'manual', failCount: 0, nextSearchAt: null, lastOutcome: 'no-suitable-release' });
-    expect(state.listManualReview()).toMatchObject([{ reason: 'no-suitable-release' }]);
+    expect(decisionRow(state, 'sonarr:2:s1')).toMatchObject({ verdict: 'skip', grabbed: 0 });
+    expect(state.getWorkItem('sonarr:2:s1')).toMatchObject({ status: 'cooldown', failCount: 0, lastOutcome: 'release-unavailable' });
+    expect(state.listManualReview()).toEqual([]);
     expect(state.lastDecisionAt('sonarr:2:s1')).not.toBeNull();
   });
 
@@ -662,10 +662,9 @@ describe('Runner.cycle', () => {
     const summary = await runner.cycle();
 
     expect(grabScope.isDone()).toBe(false);
-    expect(summary).toEqual({ units: 1, searched: 1, grabbed: 0, dryRunGrabs: 0, manualFlagged: 2, skipped: 1 });
+    expect(summary).toEqual({ units: 1, searched: 1, grabbed: 0, dryRunGrabs: 0, manualFlagged: 1, skipped: 1 });
     expect(state.listManualReview()).toEqual(expect.arrayContaining([
       expect.objectContaining({ workKey: 'sonarr:1:s1', reason: 'unparseable-title', details: 'Some.Random.Trash.Bag.mkv' }),
-      expect.objectContaining({ workKey: 'sonarr:1:s1', reason: 'no-suitable-release' }),
     ]));
     expect(state.lastDecisionAt('sonarr:1:s1')).not.toBeNull();
   });
@@ -1290,7 +1289,7 @@ describe('Runner.cycle', () => {
     expect(payload.candidates[0]).toMatchObject({ capture: [{ targets: [{ episodeNumbers: [2, 3], basis: 'explicit-episodes' }] }] });
   });
 
-  it('empty search results: manual hold recorded, picker not called', async () => {
+  it('empty TV search results: availability retry recorded, picker not called', async () => {
     const llm = new FakeLLM();
     llm.planner.set('sonarr:1:s1', [{ query: 'Frieren', categories: [5070] }]);
     mockDiscovery({ series: [tvSeries(1, "Frieren: Beyond Journey's End", 368013)] });
@@ -1299,15 +1298,15 @@ describe('Runner.cycle', () => {
 
     const summary = await runner.cycle();
 
-    expect(summary).toEqual({ units: 1, searched: 1, grabbed: 0, dryRunGrabs: 0, manualFlagged: 1, skipped: 1 });
+    expect(summary).toEqual({ units: 1, searched: 1, grabbed: 0, dryRunGrabs: 0, manualFlagged: 0, skipped: 1 });
     expect(llm.callsFor('picker:')).toHaveLength(0);
-    expect(decisionRow(state, 'sonarr:1:s1')).toMatchObject({ verdict: 'manual', grabbed: 0 });
-    expect(state.getWorkItem('sonarr:1:s1')).toMatchObject({ status: 'manual', failCount: 0, nextSearchAt: null, lastOutcome: 'no-suitable-release' });
+    expect(decisionRow(state, 'sonarr:1:s1')).toMatchObject({ verdict: 'skip', grabbed: 0 });
+    expect(state.getWorkItem('sonarr:1:s1')).toMatchObject({ status: 'cooldown', failCount: 0, lastOutcome: 'release-unavailable' });
     expect(state.lastDecisionAt('sonarr:1:s1')).not.toBeNull();
-    expect(state.listManualReview()).toMatchObject([{ reason: 'no-suitable-release' }]);
+    expect(state.listManualReview()).toEqual([]);
   });
 
-  it('persists no-results manual hold so an unchanged immediate second cycle makes no paid calls', async () => {
+  it('persists no-results cooldown so an unchanged immediate second cycle makes no paid calls', async () => {
     const llm = new FakeLLM();
     llm.planner.set('sonarr:1:s1', [{ query: 'Frieren', categories: [5070] }]);
     mockDiscovery({ series: [tvSeries(1, "Frieren: Beyond Journey's End", 368013)] });
@@ -1316,7 +1315,7 @@ describe('Runner.cycle', () => {
     const first = await stack.runner.cycle();
     expect(firstSearch.isDone()).toBe(true);
     expect(first.searched).toBe(1);
-    expect(first.manualFlagged).toBe(1);
+    expect(first.manualFlagged).toBe(0);
 
     nock.cleanAll();
     mockDiscovery({ series: [tvSeries(1, "Frieren: Beyond Journey's End", 368013)] });
@@ -1325,7 +1324,7 @@ describe('Runner.cycle', () => {
     expect(second.searched).toBe(0);
     expect(llm.callsFor('planner:')).toHaveLength(1);
     expect(repeatSearch.isDone()).toBe(false);
-    expect(stack.state.listManualReview()).toMatchObject([{ reason: 'no-suitable-release' }]);
+    expect(stack.state.listManualReview()).toEqual([]);
   });
 
   it('rechecks the latest schedule under the reconciliation claim before writing or planning', async () => {
@@ -1758,7 +1757,7 @@ describe('Runner.cycle', () => {
     const summary = await runner.cycle();
 
     expect(searchScope.isDone()).toBe(true);
-    expect(summary).toEqual({ units: 1, searched: 1, grabbed: 0, dryRunGrabs: 0, manualFlagged: 1, skipped: 1 });
+    expect(summary).toEqual({ units: 1, searched: 1, grabbed: 0, dryRunGrabs: 0, manualFlagged: 0, skipped: 1 });
   });
 
   it('I5 allowlist: all enabled indexers cooling → no search at all', async () => {
@@ -1784,7 +1783,7 @@ describe('Runner.cycle', () => {
     expect(state.listManualReview()).toHaveLength(0);
   });
 
-  it('unparseable-only result and no-suitable hold remain deduped across cycles', async () => {
+  it('unparseable-only review remains deduped while availability cooldown prevents repeat searches', async () => {
     const llm = new FakeLLM();
     llm.planner.set('sonarr:1:s1', [{ query: 'Frieren', categories: [5070] }]);
     const { runner, state } = buildStack(llm, { dryRun: false });
@@ -1792,7 +1791,7 @@ describe('Runner.cycle', () => {
     mockDiscovery({ series: [tvSeries(1, "Frieren: Beyond Journey's End", 368013)] });
     mockSearch([release({ guid: 'g-unparseable', title: 'Some.Random.Trash.Bag.mkv', infoHash: 'HASHUNPARSEABLE00000000000000000000' })]);
     const first = await runner.cycle();
-    expect(first).toEqual({ units: 1, searched: 1, grabbed: 0, dryRunGrabs: 0, manualFlagged: 2, skipped: 1 });
+    expect(first).toEqual({ units: 1, searched: 1, grabbed: 0, dryRunGrabs: 0, manualFlagged: 1, skipped: 1 });
 
     nock.cleanAll();
     mockDiscovery({ series: [tvSeries(1, "Frieren: Beyond Journey's End", 368013)] });
@@ -1801,12 +1800,11 @@ describe('Runner.cycle', () => {
 
     expect(second).toEqual({ units: 1, searched: 0, grabbed: 0, dryRunGrabs: 0, manualFlagged: 0, skipped: 1 });
     const rows = state.listManualReview();
-    expect(rows).toHaveLength(2);
+    expect(rows).toHaveLength(1);
     expect(rows).toEqual(expect.arrayContaining([
       expect.objectContaining({ workKey: 'sonarr:1:s1', reason: 'unparseable-title', details: 'Some.Random.Trash.Bag.mkv' }),
-      expect.objectContaining({ workKey: 'sonarr:1:s1', reason: 'no-suitable-release' }),
     ]));
-    expect(decisionRow(state, 'sonarr:1:s1')).toMatchObject({ verdict: 'manual', grabbed: 0 });
+    expect(decisionRow(state, 'sonarr:1:s1')).toMatchObject({ verdict: 'skip', grabbed: 0 });
     expect(state.lastDecisionAt('sonarr:1:s1')).not.toBeNull();
   });
 

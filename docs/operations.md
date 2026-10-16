@@ -12,7 +12,7 @@ Keep dry-run enabled while checking configuration and reviewing logs. Dry runs m
 
 ## Search, selection, and review
 
-- The watcher reads Sonarr/Radarr libraries and tracked queues. Search eligibility is per work unit and retry-window gated.
+- The watcher reads Sonarr/Radarr libraries and tracked queues. TV availability retries are per episode; the season entry groups planning and progress. Movie and operational-failure scheduling retain their work-unit retry gates.
 - TV episode eligibility prefers Sonarr's valid UTC `airDateUtc`. When it is absent or unusable, a valid `airDate` calendar day becomes eligible at midnight UTC on the following day; an absent or invalid date and timestamp remain timing-unknown and are not searched. Exact airtime overrides a conflicting calendar date.
 - The LLM plans Prowlarr queries and judges fuzzy identity and quality; deterministic code does not add title/quality matching heuristics.
 - TV guardrails require explicit episode coverage or a single matching-season-only pack claim. Inferred pack coverage is labeled inferred, not proof of torrent contents. Known wrong seasons and malformed/conflicting scopes are rejected.
@@ -23,7 +23,7 @@ Keep dry-run enabled while checking configuration and reviewing logs. Dry runs m
 ## Cadence and failure behavior
 
 - The UI interval defaults to 5 minutes and has a maximum of 35,791 minutes (the largest whole-minute interval within Node's timer limit). It is reconciliation cadence, not a promise to call the planner every interval. Saves apply to new operations; an in-progress cycle finishes with its original settings snapshot.
-- A picker `skip` or dry-run decision is cooled down by the UI retry window (default 6 hours). A successful search with no candidate admitted by guardrails instead creates a `no-suitable-release` manual hold; it is not an LLM picker skip. Only work whose next-search time is due is eligible for another paid plan/search.
+- A picker `skip` or dry-run decision is cooled down by the UI retry window (default 6 hours). For TV, a successful search with no candidate admitted by guardrails records `release-unavailable` for the attempted episodes and retries automatically after that same configured window. A newly aired sibling does not inherit or reset that episode's availability deadline. Movie empty searches still create a `no-suitable-release` manual hold. Rate limits, operational backoff, identity/configuration reviews, and uncertain downloads remain separate holds; a TV availability retry does not override them.
 - UI failure-backoff defaults are 5/60 minutes and cap exponential failure delay; a longer upstream `Retry-After` takes precedence. The third consecutive ordinary operational failure enters manual review; rate limits stay on backoff and do not escalate solely due to quota.
 - Diagnostics include safe stage, error code/type, HTTP status, and retry seconds, not exception messages, response bodies, or authenticated URLs.
 
@@ -75,3 +75,9 @@ Durable `(indexerId, guid)` release identity plus seen-infoHash dedupe is used w
 - **Arr imports do not appear:** verify the Prowlarr download-client entry/category, Sonarr/Radarr client category, root folder, and Completed Download Handling. Media Scout does not write directly to the download client or library.
 - **Repeatedly reaching `/cycle` from the LAN:** the default mapping is loopback-only because the endpoint is unauthenticated and can trigger paid LLM cycles/searches. Do not widen the bind address without a separately reviewed access-control design.
 - **Operator recovery:** read [operator recovery](operator-recovery.md) before enabling `allowOperatorActions` in the UI; do not release a reservation based on an empty *arr queue alone.
+
+## Episode progress persistence
+
+Episode progress is stored additively beside the existing season work, intent, and review identities. Before upgrading, stop every writer and take a consistent SQLite backup; do not run old and new writer versions together. Rollback requires stopping writers and restoring the pre-upgrade backup with its matching binary. There is no destructive down migration; post-upgrade observations are lost on restore.
+
+Known observations retain all episodes of a tracked season, including imported and future episodes. Episode availability deadlines determine the next searchable subset; the season work row remains the coordination and aggregate scheduling entry. Download reservations and queue coverage remain authoritative safety evidence rather than a second episode reservation ledger. Unknown/partial reads do not erase prior observations or prove imports, and an uncertain or vanished download can still conservatively hold the season. An operational retry changes only the successfully searched episodes from that attempt; it does not clear a sibling's availability deadline.

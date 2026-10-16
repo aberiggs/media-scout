@@ -4,6 +4,9 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { GrabIntent, IntentCoverage, IntentStatus, WorkItem, WorkQueueStatus, WorkStatus, ClaimSet } from './work-queue-types';
 import type { AssociationCacheEntry, AssociationDecision, AssociationRequest, ParsedReleaseCoverage } from './group-types';
+import { episodeListSchema, type Episode } from '../types/sonarr';
+import type { EpisodeProgress } from './work-queue-types';
+import { episodeEligibilityTime } from './episode-timing';
 import { defaultSettings, settingsSchema, type Settings } from '../settings';
 
 
@@ -143,6 +146,15 @@ CREATE TABLE IF NOT EXISTS work_items (
   queue_known INTEGER NOT NULL DEFAULT 0 CHECK (queue_known IN (0,1)),
   queue_failure_refs_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(queue_failure_refs_json))
 );
+CREATE TABLE IF NOT EXISTS episode_progress (
+ service_id INTEGER NOT NULL, external_id INTEGER NOT NULL, episode_id INTEGER NOT NULL,
+ work_key TEXT NOT NULL, season_number INTEGER NOT NULL, episode_number INTEGER NOT NULL,
+ absolute_episode_number INTEGER, title TEXT NOT NULL, monitored INTEGER NOT NULL CHECK(monitored IN (0,1)),
+ has_file INTEGER NOT NULL CHECK(has_file IN (0,1)), air_date TEXT, air_date_utc TEXT, finale_type TEXT,
+ last_observed_at TEXT NOT NULL, last_search_at TEXT, next_search_at TEXT, last_outcome TEXT,
+ PRIMARY KEY(service_id,external_id,episode_id)
+);
+CREATE INDEX IF NOT EXISTS episode_progress_work_key ON episode_progress(work_key);
 CREATE TABLE IF NOT EXISTS grab_intents (
   id TEXT PRIMARY KEY,
   owner_token TEXT NOT NULL,
@@ -844,6 +856,91 @@ export class State {
     return (this.db.prepare('SELECT * FROM work_items ORDER BY work_key').all() as Record<string, unknown>[]).map((row) => this.decodeWorkItem(row));
   }
 
+  listEpisodeProgress(workKey?: string): EpisodeProgress[] {
+    const rows = (workKey === undefined
+      ? this.db.prepare('SELECT * FROM episode_progress ORDER BY service_id,external_id,season_number,episode_number,episode_id').all()
+      : this.db.prepare('SELECT * FROM episode_progress WHERE work_key=? ORDER BY episode_id').all(workKey)) as Record<string, unknown>[];
+    return rows.map((row) => {
+      const episode = episodeListSchema.parse([{
+        id: row.episode_id, seriesId: row.service_id, seasonNumber: row.season_number,
+        episodeNumber: row.episode_number, absoluteEpisodeNumber: row.absolute_episode_number,
+        title: row.title, monitored: row.monitored === 1, hasFile: row.has_file === 1,
+        airDate: row.air_date, airDateUtc: row.air_date_utc, finaleType: row.finale_type,
+      }])[0]!;
+      for (const field of ['last_observed_at', 'last_search_at', 'next_search_at']) {
+        if (row[field] !== null) validIso(row[field], `episode ${field}`);
+      }
+      if (![0, 1].includes(Number(row.monitored)) || ![0, 1].includes(Number(row.has_file)) ||
+        !Number.isSafeInteger(row.external_id) || Number(row.external_id) < 0 ||
+        typeof row.work_key !== 'string' || (row.last_outcome !== null && typeof row.last_outcome !== 'string')) throw new Error('Corrupt episode progress');
+      return {
+        workKey: row.work_key, serviceId: episode.seriesId, externalId: Number(row.external_id),
+        episodeId: episode.id, seasonNumber: episode.seasonNumber, episodeNumber: episode.episodeNumber,
+        absoluteEpisodeNumber: episode.absoluteEpisodeNumber, title: episode.title,
+        monitored: episode.monitored, hasFile: episode.hasFile, airDate: episode.airDate,
+        airDateUtc: episode.airDateUtc ?? null, finaleType: episode.finaleType ?? null,
+        lastObservedAt: row.last_observed_at as string, lastSearchAt: row.last_search_at as string | null,
+        nextSearchAt: row.next_search_at as string | null, lastOutcome: row.last_outcome as string | null,
+      };
+    });
+  }
+
+  private observeEpisodeProgress(input: { key: string; token: string; episodes: Episode[]; observedAt: string; now: string }): void {
+    validIso(input.observedAt, 'observedAt');
+    validIso(input.now, 'now');
+    this.assertClaim(input.key, input.token, input.now);
+    const work = this.getWorkItem(input.key);
+    if (!work) throw new Error('Cannot observe episodes for unknown work item');
+    const unit = work.unit;
+    if (unit.kind !== 'tv' || !unit.season) throw new Error('Episode progress requires TV season work');
+    const ids = new Set<number>();
+    const episodes = episodeListSchema.parse(input.episodes);
+    for (const ep of episodes) {
+      if (!Number.isSafeInteger(ep.id) || ep.id <= 0 || ep.seriesId !== unit.serviceId || !Number.isSafeInteger(ep.seasonNumber) || ep.seasonNumber !== unit.season.seasonNumber || ids.has(ep.id)) throw new Error('Invalid or cross-season episode observation');
+      ids.add(ep.id);
+    }
+    const save = this.db.prepare(`INSERT INTO episode_progress
+      (service_id,external_id,episode_id,work_key,season_number,episode_number,absolute_episode_number,title,monitored,has_file,air_date,air_date_utc,finale_type,last_observed_at,last_search_at,next_search_at,last_outcome)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL)
+      ON CONFLICT(service_id,external_id,episode_id) DO UPDATE SET
+      work_key=excluded.work_key,season_number=excluded.season_number,episode_number=excluded.episode_number,
+      absolute_episode_number=excluded.absolute_episode_number,title=excluded.title,monitored=excluded.monitored,
+      has_file=excluded.has_file,air_date=excluded.air_date,air_date_utc=excluded.air_date_utc,
+      finale_type=excluded.finale_type,last_observed_at=excluded.last_observed_at
+      WHERE excluded.last_observed_at >= episode_progress.last_observed_at`);
+    for (const ep of episodes) save.run(unit.serviceId, unit.externalId, ep.id, input.key, ep.seasonNumber,
+      ep.episodeNumber, ep.absoluteEpisodeNumber, ep.title, ep.monitored ? 1 : 0, ep.hasFile ? 1 : 0,
+      ep.airDate, ep.airDateUtc ?? null, ep.finaleType ?? null, input.observedAt);
+  }
+
+  /** Records only actually searched, current episode targets. It never changes reservations or proves import. */
+  recordEpisodeAttempt(input: { key: string; token: string; episodeIds: number[]; now: string; nextSearchAt: string | null; outcome: string }): void {
+    validIso(input.now, 'now');
+    if (input.nextSearchAt !== null) {
+      validIso(input.nextSearchAt, 'nextSearchAt');
+      if (input.nextSearchAt < input.now) throw new Error('Invalid episode retry deadline');
+    }
+    if (!validPositiveIds(input.episodeIds) || input.episodeIds.length === 0 || !input.outcome) throw new Error('Invalid episode attempt');
+    this.db.transaction(() => {
+      this.assertClaim(input.key, input.token, input.now);
+      const work = this.getWorkItem(input.key);
+      if (!work || work.unit.kind !== 'tv' || ['fulfilled', 'inactive'].includes(work.status)) throw new Error('Episode attempt requires current TV work');
+      const current = new Map(this.listEpisodeProgress(input.key).filter((row) => row.serviceId === work.unit.serviceId && row.externalId === work.unit.externalId).map((row) => [row.episodeId, row]));
+      const inventory = new Map(work.unit.season!.missing.map((row) => [row.episodeId, row]));
+      for (const id of input.episodeIds) {
+        const row = current.get(id);
+        const target = inventory.get(id);
+        const eligibleAt = row ? episodeEligibilityTime(row) : null;
+        if (!row || !target || row.lastObservedAt !== work.lastObservedAt || !row.monitored || row.hasFile ||
+          row.seasonNumber !== work.unit.season!.seasonNumber || row.episodeNumber !== target.episodeNumber ||
+          row.absoluteEpisodeNumber !== target.absoluteEpisodeNumber || !eligibleAt || eligibleAt.getTime() > Date.parse(input.now) ||
+          (row.lastSearchAt !== null && row.lastSearchAt > input.now)) throw new Error('Episode attempt target is not eligible');
+      }
+      const update = this.db.prepare('UPDATE episode_progress SET last_search_at=?,next_search_at=?,last_outcome=? WHERE service_id=? AND external_id=? AND episode_id=?');
+      for (const id of input.episodeIds) update.run(input.now, input.nextSearchAt, input.outcome, work.unit.serviceId, work.unit.externalId, id);
+    })();
+  }
+
   listGrabIntents(): GrabIntent[] {
     return (this.db.prepare('SELECT * FROM grab_intents ORDER BY started_at, id').all() as Record<string, unknown>[]).map((row) => this.decodeIntent(row));
   }
@@ -885,11 +982,13 @@ export class State {
   }
 
   /** Persists one observed unit and its queue observations under its live claim. */
-  applyWorkReconciliation(input: { key: string; token: string; work: WorkItem; intentUpdates: Array<{ id: string; status: IntentStatus; lastSeenAt?: string | null; queueRefs?: string[] }> }): void {
+  applyWorkReconciliation(input: { key: string; token: string; work: WorkItem; intentUpdates: Array<{ id: string; status: IntentStatus; lastSeenAt?: string | null; queueRefs?: string[] }>; episodeObservations?: Episode[] }): void {
     validateWorkItem(input.work);
     if (input.work.workKey !== input.key) throw new Error('Work key does not match reconciliation key');
     const apply = this.db.transaction(() => {
       this.assertClaim(input.key, input.token, input.work.lastObservedAt);
+      const prior = this.getWorkItem(input.key);
+      if (input.episodeObservations !== undefined && prior && prior.lastObservedAt > input.work.lastObservedAt) return;
       this.initializeLegacyReviews(input.key);
       this.db.prepare(`INSERT INTO work_items (work_key,content_identity,missing_fingerprint,unit_json,status,last_search_at,next_search_at,fail_count,last_outcome,last_observed_at,blocked_reason,reset_pending_at)
         VALUES (@workKey,@contentIdentity,@missingFingerprint,@unitJson,@status,@lastSearchAt,@nextSearchAt,@failCount,@lastOutcome,@lastObservedAt,@blockedReason,@resetPendingAt)
@@ -899,6 +998,7 @@ export class State {
         nextSearchAt: input.work.nextSearchAt, failCount: input.work.failCount, lastOutcome: input.work.lastOutcome,
         lastObservedAt: input.work.lastObservedAt, blockedReason: input.work.blockedReason, resetPendingAt: input.work.resetPendingAt ?? null,
       });
+      if (input.episodeObservations !== undefined) this.observeEpisodeProgress({ key:input.key, token:input.token, episodes:input.episodeObservations, observedAt:input.work.lastObservedAt, now:input.work.lastObservedAt });
       for (const update of input.intentUpdates) {
         if (!INTENT_STATUSES.includes(update.status)) throw new Error('Invalid intent status');
         if (update.lastSeenAt !== undefined && update.lastSeenAt !== null) validIso(update.lastSeenAt, 'lastSeenAt');
@@ -931,12 +1031,13 @@ export class State {
     apply();
   }
 
-  finishSearch(input: { key: string; token: string; status: 'cooldown' | 'backoff' | 'manual'; nextSearchAt: string | null; failCount: number; outcome: string; now: string; decision?: DecisionRecord; expectedStatus?: WorkStatus }): boolean {
+  finishSearch(input: { key: string; token: string; status: 'cooldown' | 'backoff' | 'manual'; nextSearchAt: string | null; failCount: number; outcome: string; now: string; decision?: DecisionRecord; expectedStatus?: WorkStatus; episodeIds?: number[] }): boolean {
     validIso(input.now, 'now');
     if (input.nextSearchAt !== null) validIso(input.nextSearchAt, 'nextSearchAt');
     nonnegativeFinite(input.failCount, 'failCount');
     if (typeof input.outcome !== 'string') throw new Error('Invalid search outcome');
     if (input.decision && input.decision.workKey !== input.key) throw new Error('Decision work key mismatch');
+    if (input.episodeIds !== undefined && !validPositiveIds(input.episodeIds)) throw new Error('Invalid episode search scope');
     const apply = this.db.transaction(() => {
       this.assertClaim(input.key, input.token, input.now);
       const row = this.db.prepare('SELECT * FROM work_items WHERE work_key=?').get(input.key) as Record<string, unknown> | undefined;
@@ -944,6 +1045,13 @@ export class State {
       const current = this.decodeWorkItem(row);
       if (input.expectedStatus !== undefined && current.status !== input.expectedStatus) return false;
       this.db.prepare('UPDATE work_items SET status=?,next_search_at=?,fail_count=?,last_outcome=? WHERE work_key=?').run(input.status, input.nextSearchAt, input.failCount, input.outcome, input.key);
+      if (current.unit.kind === 'tv' && current.lastSearchAt !== null && input.episodeIds) {
+        const update = this.db.prepare(`UPDATE episode_progress SET next_search_at=?,last_outcome=?
+          WHERE work_key=? AND service_id=? AND external_id=? AND episode_id=?
+          AND last_search_at>=? AND last_outcome='searched'`);
+        for (const id of input.episodeIds) update.run(input.nextSearchAt, input.outcome, input.key,
+          current.unit.serviceId, current.unit.externalId, id, current.lastSearchAt);
+      }
       if (input.decision) this.insertDecision(input.decision, input.now);
       return true;
     });

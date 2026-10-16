@@ -4,7 +4,7 @@ import type { SonarrClient } from '../clients/sonarr';
 import type { RadarrClient } from '../clients/radarr';
 import type { Release } from '../types/prowlarr';
 import type { RadarrQueueRecord } from '../types/radarr';
-import type { SonarrQueueRecord } from '../types/sonarr';
+import type { Episode, SonarrQueueRecord } from '../types/sonarr';
 import { ApiError } from '../http';
 import type { Picker, Candidate, PickVerdict } from './picker';
 import type { Planner } from './planner';
@@ -257,6 +257,13 @@ export class Runner {
     return summary;
   }
 
+  private episodeObservations(work: WorkItem, snapshot: LibrarySnapshot): Episode[] | undefined {
+    if (work.unit.kind !== 'tv' || !snapshot.sonarr.known) return undefined;
+    const observed = snapshot.sonarr.series.find((entry) => entry.series.id === work.unit.serviceId);
+    if (!observed?.known || observed.episodes === null || observed.series.tvdbId !== work.unit.externalId) return undefined;
+    return observed.episodes.filter((episode) => episode.seasonNumber === work.unit.season!.seasonNumber);
+  }
+
   private snapshotHasEligible(snapshot: LibrarySnapshot, workKey: string): boolean {
     return eligibleWorkUnits(snapshot).some((unit) => unit.key === workKey);
   }
@@ -407,6 +414,12 @@ export class Runner {
             return target;
           });
           releases.push(...await this.recordedSearch(query.query, query.categories, allowlist, queryTargets));
+          for (const target of queryTargets) {
+            if (target.kind === 'tv') this.deps.state.recordEpisodeAttempt({
+              key: target.key, token: claims.ownerToken, episodeIds: target.season!.missing.map((episode) => episode.episodeId),
+              now: this.now().toISOString(), nextSearchAt: this.dateAfter(this.deps.config.minRetryHours * 60), outcome: 'searched',
+            });
+          }
         }
       } catch (error) {
         await this.finishGroupBackoff(currentGroup, startedKeys, claims.ownerToken, error, summary, error instanceof ApiError ? error.retryAfter : undefined, 'search');
@@ -421,7 +434,7 @@ export class Runner {
       stage = 'candidate-filter';
       const candidates = this.buildGroupCandidates(currentGroup, context, releases, summary, fresh.snapshot, fresh.queues);
       if (candidates.length === 0) {
-        this.finishNoSuitableRelease(startedKeys, claims.ownerToken, releases.length, summary);
+        this.finishNoSuitableRelease(startedKeys, claims.ownerToken, releases.length, summary, currentGroup.targets);
         startedKeys = [];
         summary.skipped += currentGroup.dueTargetIndices.length;
         return 'processed';
@@ -570,6 +583,7 @@ export class Runner {
     const applicableAssociations = this.applicableAssociationDecisions(snapshot, queues);
     const result = reconcileWork({
       snapshot, queues, existingWorkItems: existing, intents, associationDecisions: applicableAssociations,
+      episodeProgress: this.deps.state.listEpisodeProgress(),
       previousQueueCoverage: new Map(observations.map((entry) => [entry.workKey, entry.coverage])),
       previousQueueFailureRefs: new Map(observations.map((entry) => [entry.workKey, entry.failedQueueRefs])),
       now: this.now().toISOString(), minRetryHours: this.deps.config.minRetryHours,
@@ -588,7 +602,8 @@ export class Runner {
         const intent = intents.find((entry) => entry.id === update.id);
         return intent !== undefined && intentUpdateRelatesToWork(intent, row.work, existing, update.status);
       });
-      this.deps.state.applyWorkReconciliation({ key: row.work.workKey, token: claims.ownerToken, work: row.work, intentUpdates: related });
+      this.deps.state.applyWorkReconciliation({ key: row.work.workKey, token: claims.ownerToken, work: row.work, intentUpdates: related,
+        episodeObservations: this.episodeObservations(row.work, snapshot) });
       const queue = queues[row.work.unit.arr];
       this.deps.state.applyWorkQueueObservation({ key: row.work.workKey, token: claims.ownerToken, observedAt: queue.observedAt, known: row.work.queueObservationKnown && queue.kind === 'known', coverage: row.queueCoverage, failedQueueRefs: row.queueFailureRefs });
     }
@@ -748,10 +763,20 @@ export class Runner {
     return false;
   }
 
-  private finishNoSuitableRelease(keys: string[], token: string, searchResultCount: number, summary: CycleSummary): void {
+  private finishNoSuitableRelease(keys: string[], token: string, searchResultCount: number, summary: CycleSummary, targets: WorkUnit[]): void {
     const details = JSON.stringify({ stage: 'candidate-filter', searchResultCount, candidateCount: 0 });
     for (const key of keys) {
       try {
+        const target = targets.find((unit) => unit.key === key);
+        if (target?.kind === 'tv') {
+          const nextSearchAt = this.dateAfter(this.deps.config.minRetryHours * 60);
+          this.deps.state.recordEpisodeAttempt({ key, token, episodeIds: target.season!.missing.map((episode) => episode.episodeId),
+            now: this.now().toISOString(), nextSearchAt, outcome: 'release-unavailable' });
+          this.deps.state.finishSearch({ key, token, status: 'cooldown', nextSearchAt, failCount: 0,
+            outcome: 'release-unavailable', now: this.now().toISOString(), expectedStatus: 'searching',
+            decision: { workKey: key, verdict: 'skip', grabbed: false } });
+          continue;
+        }
         const result = this.deps.state.finishSearchWithReview({
           key,
           token,
@@ -770,8 +795,8 @@ export class Runner {
     }
   }
 
-  private async finishGroupBackoff(_group: WorkGroup, keys: string[], token: string, error: unknown, summary: CycleSummary, retryAfter?: number, stage = 'group-processing'): Promise<void> {
-    await this.finishOperationFailure(keys, token, error, stage, summary, retryAfter ?? (error instanceof ApiError ? error.retryAfter : undefined));
+  private async finishGroupBackoff(group: WorkGroup, keys: string[], token: string, error: unknown, summary: CycleSummary, retryAfter?: number, stage = 'group-processing'): Promise<void> {
+    await this.finishOperationFailure(keys, token, error, stage, summary, retryAfter ?? (error instanceof ApiError ? error.retryAfter : undefined), false, group.targets);
   }
 
   private async finishOperationFailure(
@@ -782,10 +807,12 @@ export class Runner {
     summary: CycleSummary,
     retryAfter?: number,
     alreadyCounted = false,
+    targets: WorkUnit[] = [],
   ): Promise<void> {
     for (const key of keys) {
       const work = this.deps.state.getWorkItem(key);
       if (!work) continue;
+      const episodeIds = targets.find((target) => target.key === key)?.season?.missing.map((episode) => episode.episodeId);
       const expectedStatus = alreadyCounted ? 'backoff' : 'searching';
       if (work.status !== expectedStatus) continue;
       const hasUnresolvedIntent = this.deps.state.listGrabIntents().some((intent) => !intent.releasedAt && intent.status !== 'failed' && intent.status !== 'fulfilled' && intent.coverage.some((coverage) => coverage.workKey === key));
@@ -797,7 +824,12 @@ export class Runner {
       if (alreadyCounted && work.lastOutcome !== failureKind) continue;
       const escalated = failureKind === 'operation-failure' && !hasUnresolvedIntent && failCount >= MAX_CONSECUTIVE_OPERATION_FAILURES;
       const finalOutcome = escalated ? 'repeated-operation-failure' : failureKind;
-      if (alreadyCounted && !escalated) continue; // rejectGrab already wrote the bounded backoff and counted exactly once.
+      if (alreadyCounted && !escalated) {
+        // Preserve rejectGrab's count and deadline, but apply them to this attempt's episode scope too.
+        try { this.deps.state.finishSearch({ key, token, status: 'backoff', nextSearchAt: work.nextSearchAt,
+          failCount: work.failCount, outcome: finalOutcome, now: this.now().toISOString(), expectedStatus, episodeIds }); } catch { /* Safe on expiry. */ }
+        continue;
+      }
       if (escalated) {
         try {
           const result = this.deps.state.finishSearchWithReview({
@@ -827,6 +859,7 @@ export class Runner {
           outcome: finalOutcome,
           now: this.now().toISOString(),
           expectedStatus,
+          episodeIds,
         });
       } catch (writeError) {
         this.logger.warn({ workKey: key, ...safeFailureMetadata('failure-schedule', writeError) }, 'could not persist operation failure schedule under the owned lease');
@@ -840,27 +873,28 @@ export class Runner {
     for (const key of keys) {
       const work = this.deps.state.getWorkItem(key);
       if (!work) continue;
+      const episodeIds = group.targets.find((target) => target.key === key)?.season?.missing.map((episode) => episode.episodeId);
       if (backoffKeys.has(key)) {
         const failure = backoffFailures.get(key) ?? { error: new Error('group release failed'), stage: 'grab' };
         if (failure.disposition === 'uncertain') {
           if (work.status !== 'searching') continue;
           try {
-            this.deps.state.finishSearch({ key, token, status: 'backoff', nextSearchAt: this.dateAfter(this.failureBaseMin), failCount: work.failCount, outcome: 'uncertain-grab', now: this.now().toISOString(), expectedStatus: 'searching' });
+            this.deps.state.finishSearch({ key, token, status: 'backoff', nextSearchAt: this.dateAfter(this.failureBaseMin), failCount: work.failCount, outcome: 'uncertain-grab', now: this.now().toISOString(), expectedStatus: 'searching', episodeIds });
           } catch (writeError) {
             this.logger.warn({ workKey: key, ...safeFailureMetadata('uncertain-grab', writeError) }, 'could not persist uncertain-grab hold under the owned lease');
           }
         } else {
-          await this.finishOperationFailure([key], token, failure.error, failure.stage, summary, failure.error instanceof ApiError ? failure.error.retryAfter : undefined, failure.disposition === 'already-counted');
+          await this.finishOperationFailure([key], token, failure.error, failure.stage, summary, failure.error instanceof ApiError ? failure.error.retryAfter : undefined, failure.disposition === 'already-counted', group.targets);
         }
         continue;
       } else if (manualKeys.has(key)) {
         if (work.status !== 'searching') continue;
-        try { this.deps.state.finishSearch({ key, token, status: 'manual', nextSearchAt: null, failCount: work.failCount, outcome: 'picker-manual', now: this.now().toISOString(), decision: { workKey: key, verdict: 'manual', grabbed: false } }); } catch { /* Safe on expiry. */ }
+        try { this.deps.state.finishSearch({ key, token, status: 'manual', nextSearchAt: null, failCount: work.failCount, outcome: 'picker-manual', now: this.now().toISOString(), decision: { workKey: key, verdict: 'manual', grabbed: false }, episodeIds }); } catch { /* Safe on expiry. */ }
       } else {
         if (work.status !== 'searching') continue;
         const delay = actualProgress && deferredKeys.has(key) ? 5 : this.deps.config.minRetryHours * 60;
         const decision = outcome === 'group-grabbed' || outcome === 'group-no-grab' || outcome === 'group-release-failed' ? undefined : { workKey: key, verdict: selection.verdict, grabbed: false };
-        try { this.deps.state.finishSearch({ key, token, status: 'cooldown', nextSearchAt: this.dateAfter(delay), failCount: 0, outcome, now: this.now().toISOString(), decision }); } catch { /* Safe on expiry. */ }
+        try { this.deps.state.finishSearch({ key, token, status: 'cooldown', nextSearchAt: this.dateAfter(delay), failCount: 0, outcome, now: this.now().toISOString(), decision, episodeIds }); } catch { /* Safe on expiry. */ }
       }
     }
   }
@@ -932,6 +966,7 @@ export class Runner {
     const initialManualKeys = this.manualReviewKeys(initialReviews, manual);
     const initial = reconcileWork({
       snapshot, queues, existingWorkItems: initialWork, intents: initialIntents, associationDecisions,
+      episodeProgress: this.deps.state.listEpisodeProgress(), ignoreEpisodeCooldown: manual,
       previousQueueCoverage: new Map(initialObservations.map((observation) => [observation.workKey, observation.coverage])),
       previousQueueFailureRefs: new Map(initialObservations.map((observation) => [observation.workKey, observation.failedQueueRefs])),
       now: this.now().toISOString(), minRetryHours: this.deps.config.minRetryHours,
@@ -960,6 +995,7 @@ export class Runner {
         }
         const fresh = reconcileWork({
           snapshot, queues, existingWorkItems: existing, intents, associationDecisions,
+          episodeProgress: this.deps.state.listEpisodeProgress(), ignoreEpisodeCooldown: manual,
           previousQueueCoverage: new Map(observations.map((observation) => [observation.workKey, observation.coverage])),
           previousQueueFailureRefs: new Map(observations.map((observation) => [observation.workKey, observation.failedQueueRefs])),
           now: this.now().toISOString(), minRetryHours: this.deps.config.minRetryHours,
@@ -982,7 +1018,8 @@ export class Runner {
           const intent = intents.find((entry) => entry.id === update.id);
           return intent !== undefined && intentUpdateRelatesToWork(intent, row.work, existing, update.status);
         });
-         this.deps.state.applyWorkReconciliation({ key, token, work: row.work, intentUpdates: related });
+         this.deps.state.applyWorkReconciliation({ key, token, work: row.work, intentUpdates: related,
+           episodeObservations: this.episodeObservations(row.work, snapshot) });
           this.deps.state.applyWorkQueueObservation({ key, token, observedAt: queueRead.observedAt, known: row.work.queueObservationKnown && queueRead.kind === 'known', coverage: row.queueCoverage, failedQueueRefs: row.queueFailureRefs });
          if (row.manualReviewReason && !(deferAssociationReview && row.blockedReason === 'queue-ambiguous')) {
            const reviewNow = this.now().toISOString();

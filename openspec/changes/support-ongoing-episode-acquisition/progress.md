@@ -26,3 +26,12 @@
 - Updated local OpenSpec proposal skill/command copies, dev routing, provenance/setup guide, and this project's AGENTS/OpenSpec context: explicit implementation approval carries through missing artifact creation; investigation/proposal-only requests still stop, and material scope decisions remain gated. Upstream generator fixture is not edited.
 - Read-only reviewer pressure-tested investigation-only, proposal-only, explicit implementation with missing artifacts, new material scope, and missing/unresolved project-root cases. No blocking findings; corrected its minor stale symlink provenance finding. Publication remains prohibited by the controlling session instructions despite project automatic-push wording; local checkpoints only.
 - Global configuration changes are outside this repository and are not copied into its commits. Project workflow correction is a separate checkpoint before application changes.
+
+## Timing increment (task 1.2; task 1.1 still partial)
+
+- Added shared strict UTC/calendar eligibility normalization and optional Sonarr timing/lifecycle fields, including seasonal airing statistics at their actual nested API location. Precise time wins; date-only eligibility is the following UTC midnight; invalid/absent timing does not authorize work.
+- Red evidence: worker watcher regression selected the same-day 23:00 episode at 00:01 before the fix. Parent helper tests then failed twice for rolled-over `2026-02-30T23:00:00Z` and date-only `2026-10-15Z` masquerading as timestamps; strict timestamp validation fixed both. Parent schema test failed for discarded nested season statistics before correcting their parsed location.
+- Added real isolated SQLite/Runner replay through E1 discovery, queue, positive import, database close/reopen, E2 just before/exactly at airtime, and query/target attribution. No live client/model calls or grabs.
+- `npm test -- tests/episode-timing.test.ts tests/types.test.ts tests/sonarr-client.test.ts tests/watcher.test.ts tests/issue-11-episode-lifecycle.test.ts`: 5 files, 43 tests passed.
+- `npm run typecheck`: passed. `npm test`: 45 files, 686 tests passed. `git diff --check`: passed. Independent read-only timing review: no blocking findings.
+- Task 1.1 remains unchecked: the persisted empty-search blocking reproduction and independent retry behavior are still to be added. No claim that all episode lifecycle behavior is fixed. Container/architecture checks remain pending for the integrated implementation.

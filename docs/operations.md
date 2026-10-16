@@ -13,6 +13,7 @@ Keep dry-run enabled while checking configuration and reviewing logs. Dry runs m
 ## Search, selection, and review
 
 - The watcher reads Sonarr/Radarr libraries and tracked queues. Search eligibility is per work unit and retry-window gated.
+- TV episode eligibility prefers Sonarr's valid UTC `airDateUtc`. When it is absent or unusable, a valid `airDate` calendar day becomes eligible at midnight UTC on the following day; an absent or invalid date and timestamp remain timing-unknown and are not searched. Exact airtime overrides a conflicting calendar date.
 - The LLM plans Prowlarr queries and judges fuzzy identity and quality; deterministic code does not add title/quality matching heuristics.
 - TV guardrails require explicit episode coverage or a single matching-season-only pack claim. Inferred pack coverage is labeled inferred, not proof of torrent contents. Known wrong seasons and malformed/conflicting scopes are rejected.
 - The picker sees at most 100 candidates. Media preferences are optional soft ranking guidance, not a filter, identity rule, or override of guardrails. For example, `Prefer 1080p over 4K.` can be entered in the UI. Saved settings apply to subsequent operations without container recreation.

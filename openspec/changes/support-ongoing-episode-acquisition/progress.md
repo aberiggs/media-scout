@@ -19,3 +19,10 @@
 - Independent read-only plan review: no blocking/material findings. The reviewer assessed the supplied issue summary; the parent read the full issue through `gh issue view 11 --repo aberiggs/media-scout --json title,body,comments` and mapped its broader monitoring/unknown-read/identity/in-flight acceptance matrix to task 5.1 and the lifecycle specs.
 - Planning changes only; no software tests rerun or new regression tests written during proposal creation. Implementation red/green evidence and actual software checks remain required during apply.
 - Explicit review defaults: date-only fallback at the following UTC day; existing configured retry window; backlog threshold of three due episodes; cap of six queries and three physical selections per group pass.
+
+## Apply started and workflow correction
+
+- User explicitly approved apply and requested removal of the redundant approval gate. Using change `support-ongoing-episode-acquisition` (spec-driven), initially 0/17 tasks complete.
+- Updated local OpenSpec proposal skill/command copies, dev routing, provenance/setup guide, and this project's AGENTS/OpenSpec context: explicit implementation approval carries through missing artifact creation; investigation/proposal-only requests still stop, and material scope decisions remain gated. Upstream generator fixture is not edited.
+- Read-only reviewer pressure-tested investigation-only, proposal-only, explicit implementation with missing artifacts, new material scope, and missing/unresolved project-root cases. No blocking findings; corrected its minor stale symlink provenance finding. Publication remains prohibited by the controlling session instructions despite project automatic-push wording; local checkpoints only.
+- Global configuration changes are outside this repository and are not copied into its commits. Project workflow correction is a separate checkpoint before application changes.

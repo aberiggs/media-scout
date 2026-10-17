@@ -11,10 +11,13 @@ import type {
   SourceKnowledge,
   TargetCoverage,
   WorkGroup,
+  AcquisitionStage,
+  SeasonPlanningProgress,
 } from './group-types';
 import type { GrabIntent, IntentCoverage, WorkStatus } from './work-queue-types';
 import type { QueueReads, ReconciledWork } from './work-queue';
 import { eligibleWorkUnits, type LibrarySnapshot, type WorkUnit } from './watcher';
+import { episodeEligibilityTime } from './episode-timing';
 
 const OPEN_STATUSES: readonly WorkStatus[] = ['ready', 'waiting-release', 'searching', 'cooldown', 'backoff', 'manual'];
 const SAFE_TARGET_BLOCKS = new Set([null, 'queue-active', 'active-intent']);
@@ -106,7 +109,11 @@ function openWorkSummary(row: ReconciledWork): OpenWorkSummary {
     seasonNumber: row.work.unit.season?.seasonNumber ?? null,
     missingCount,
     eligibleCount,
-    heldCount: Math.max(0, missingCount - eligibleCount),
+    heldCount: row.work.unit.kind === 'movie'
+      ? Number(row.activeCoverage.some((coverage) => coverage.workKey === row.work.workKey))
+      : new Set(row.activeCoverage.filter((coverage) => coverage.workKey === row.work.workKey)
+        .flatMap((coverage) => coverage.episodeIds ?? [])
+        .filter((id) => row.work.unit.season!.missing.some((episode) => episode.episodeId === id))).size,
     expectedTargets: expectedTargets(row.work.unit),
     status: row.work.status,
     nextSearchAt: row.work.nextSearchAt,
@@ -315,7 +322,41 @@ export function buildPlanningContext(input: {
     openWork,
     activeDownloads: activeSummaries({ ...input, associations: input.associations ?? [] }),
     sourceKnowledge: [knownSource('sonarr', input.snapshot, input.queues), knownSource('radarr', input.snapshot, input.queues)],
+    seasonProgress: input.rows.filter((row) => isOpen(row) && row.work.unit.kind === 'tv')
+      .map((row) => seasonPlanningProgress(row, input.snapshot)),
   };
+}
+
+function seasonPlanningProgress(row: ReconciledWork, snapshot: LibrarySnapshot): SeasonPlanningProgress {
+  const unit = row.work.unit;
+  const seasonNumber = unit.season!.seasonNumber;
+  const base: SeasonPlanningProgress = { workKey: unit.key, seasonNumber, lifecycle: 'unknown',
+    lifecycleEvidence: 'unknown', counts: null, nextEligibilityAt: null, episodes: [] };
+  const source = snapshot.sonarr.series.find((entry) => entry.series.id === unit.serviceId && entry.series.tvdbId === unit.externalId);
+  if (!snapshot.sonarr.known || !source?.known || source.episodes === null) return base;
+  const episodes = source.episodes.filter((episode) => episode.seasonNumber === seasonNumber);
+  const now = Date.parse(snapshot.observedAt);
+  const timings = episodes.map((episode) => ({ episode, at: episodeEligibilityTime(episode) }));
+  const details: SeasonPlanningProgress['episodes'] = timings.map(({ episode, at }) => ({
+    episodeNumber: episode.episodeNumber, absoluteEpisodeNumber: episode.absoluteEpisodeNumber,
+    eligibleAt: at?.toISOString() ?? null,
+    timingBasis: episodeEligibilityTime({ airDate: null, airDateUtc: episode.airDateUtc }) ? 'utc' : at ? 'date-only' : 'unknown',
+    state: episode.hasFile ? 'imported' : !episode.monitored ? 'unmonitored' : !at ? 'timing-unknown' : at.getTime() > now ? 'future' : 'aired-missing',
+  }));
+  const next = details.filter((episode) => episode.state === 'future').map((episode) => episode.eligibleAt!).sort()[0] ?? null;
+  const statsNext = episodeEligibilityTime({ airDate: null, airDateUtc: source.series.seasons.find((season) => season.seasonNumber === seasonNumber)?.statistics?.nextAiring });
+  const hasFuture = timings.some(({ at }) => at !== null && at.getTime() > now) || (statsNext !== null && statsNext.getTime() > now);
+  const allAired = timings.length > 0 && timings.every(({ at }) => at !== null && at.getTime() <= now);
+  const hasFinale = episodes.some((episode) => episode.finaleType === 'season' || episode.finaleType === 'series');
+  const airedAny = timings.some(({ episode, at }) => episode.hasFile || (at !== null && at.getTime() <= now));
+  const lifecycle = hasFuture ? airedAny ? 'airing' : 'scheduled' : allAired && (hasFinale || source.series.status === 'ended') ? 'finished' : 'unknown';
+  return { ...base, lifecycle,
+    lifecycleEvidence: hasFuture ? 'future-schedule' : lifecycle === 'finished' ? hasFinale ? 'finale' : 'series-ended' : 'unknown',
+    counts: { imported: details.filter((episode) => episode.state === 'imported').length,
+      airedMissing: details.filter((episode) => episode.state === 'aired-missing').length,
+      future: details.filter((episode) => episode.state === 'future').length,
+      timingUnknown: details.filter((episode) => episode.state === 'timing-unknown').length,
+      downloadHeld: openWorkSummary(row).heldCount }, nextEligibilityAt: next, episodes: details };
 }
 
 function sanitizeExpectedTarget(target: ExpectedTargetDescription, kind: WorkUnit['kind']): Record<string, unknown> {
@@ -368,6 +409,7 @@ function publicContext(context: PlanningContext): Record<string, unknown> {
       library: source.library,
       queue: source.queue,
     })),
+    seasonProgress: context.seasonProgress ?? [],
   };
 }
 
@@ -382,16 +424,17 @@ function publicTarget(unit: WorkUnit, targetIndex: number): Record<string, unkno
     tvdbId: unit.kind === 'tv' ? unit.externalId : null,
     seriesType: unit.seriesType ?? null,
     seasonNumber: unit.season?.seasonNumber ?? null,
-    expectedTargets: expectedTargets(unit).map((target) => sanitizeExpectedTarget(target, unit.kind)),
+    expectedTargets: expectedTargets(unit).map((target, episodeIndex) => ({ ...sanitizeExpectedTarget(target, unit.kind), episodeIndex })),
   };
 }
 
 /** Sanitized JSON text shared with the planner. Only supplied target indices can be addressed. */
-export function serializeGroupPlannerInput(input: { group: WorkGroup; context: PlanningContext }): string {
+export function serializeGroupPlannerInput(input: { group: WorkGroup; context: PlanningContext; stage?: AcquisitionStage }): string {
   return JSON.stringify({
     dueTargetIndices: [...input.group.dueTargetIndices],
     targets: input.group.targets.map(publicTarget),
     context: publicContext(input.context),
+    searchStage: input.stage ?? null,
   });
 }
 
@@ -450,6 +493,7 @@ export function serializeGroupPickerInput(input: {
   context: PlanningContext;
   candidates: GroupCandidate[];
   mediaPreferences?: string;
+  selectionLimit?: number;
 }): string {
   return JSON.stringify({
     targets: input.group.targets.map(publicTarget),
@@ -457,5 +501,6 @@ export function serializeGroupPickerInput(input: {
     context: publicContext(input.context),
     candidates: input.candidates.map((candidate, index) => safeRelease(candidate, index, input.group)),
     mediaPreferences: publicTitle(input.mediaPreferences ?? '') ?? '',
+    selectionLimit: input.selectionLimit ?? 3,
   });
 }

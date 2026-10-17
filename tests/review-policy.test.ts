@@ -10,6 +10,7 @@ import { Runner, type RunnerDeps } from '../src/core/runner';
 import { State } from '../src/core/state';
 import type { LibrarySnapshot } from '../src/core/watcher';
 import type { GroupSelection } from '../src/types/group-llm';
+import type { WorkGroup } from '../src/core/group-types';
 
 const START = new Date('2026-09-29T00:00:00.000Z');
 const releaseFixture = JSON.parse(readFileSync(new URL('./fixtures/prowlarr-release.json', import.meta.url), 'utf8')) as Record<string, unknown>;
@@ -19,7 +20,9 @@ function snapshot(at: Date): LibrarySnapshot {
     id: 1,
     tvdbId: 123,
     title: 'Example Show',
+    titleSlug: 'example-show',
     monitored: true,
+    seasons: [],
     alternateTitles: [],
     seriesType: 'standard',
   };
@@ -64,8 +67,10 @@ function makeRunner(options: {
   const logger = loggerMock as unknown as Logger;
   const deps: RunnerDeps = {
     watcher: { getSnapshot: vi.fn(snapshotAt) } as never,
-    planner: { planGroup: options.planGroup ?? vi.fn(async ({ group }: { group: { targets: unknown[]; dueTargetIndices: number[] } }) => [
-      { query: 'Example Show S01', categories: [5000], targetIndices: group.dueTargetIndices },
+    planner: { planGroup: options.planGroup ?? vi.fn(async ({ group, stage }: { group: WorkGroup; stage?: string }) => [
+      { query: 'Example Show S01', categories: [5000], targetIndices: group.dueTargetIndices,
+        ...(stage === 'episodes' ? { episodeTargets: group.dueTargetIndices.map((targetIndex) => ({ targetIndex, episodeIndices: group.targets[targetIndex]!.season!.missing.map((_, index) => index) })) } : {}),
+      },
     ]) } as never,
     picker: { pickGroup: options.pickGroup ?? vi.fn(async (): Promise<GroupSelection> => ({
       verdict: 'skip', releaseIndices: [], manualTargetIndices: [], deferredTargetIndices: [], reason: 'no selection',
@@ -103,7 +108,7 @@ function openRouterQuotaLLM(retryAfterSeconds: number) {
 describe('runner review and retry policy', () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it('holds no-suitable-release work once, stops paid searches, then resumes after explicit resolution', async () => {
+  it('cools down unavailable TV targets and resumes automatically at the retry deadline', async () => {
     let now = new Date(START);
     const validButDeduplicated = rejectedRelease({ guid: 'already-seen', title: 'Example.Show.S01E01.1080p' });
     const wrongSeason = rejectedRelease({ guid: 'wrong-season', title: 'Example.Show.S02E01.1080p' });
@@ -114,12 +119,9 @@ describe('runner review and retry policy', () => {
 
     const first = await runner.cycle();
 
-    expect(first).toMatchObject({ searched: 1, manualFlagged: 1, dryRunGrabs: 0 });
-    expect(state.getWorkItem('sonarr:1:s1')).toMatchObject({ status: 'manual', failCount: 0, nextSearchAt: null, lastOutcome: 'no-suitable-release' });
-    const review = state.listManualReview();
-    expect(review).toHaveLength(1);
-    expect(review[0]).toMatchObject({ workKey: 'sonarr:1:s1', reason: 'no-suitable-release' });
-    expect(() => JSON.parse(review[0]!.details ?? '')).not.toThrow();
+    expect(first).toMatchObject({ searched: 1, manualFlagged: 0, dryRunGrabs: 0 });
+    expect(state.getWorkItem('sonarr:1:s1')).toMatchObject({ status: 'cooldown', failCount: 0, nextSearchAt: '2026-09-29T06:00:00.000Z', lastOutcome: 'release-unavailable' });
+    expect(state.listManualReview()).toEqual([]);
     expect(state.lastDecisionAt('sonarr:1:s1')).not.toBeNull();
     expect(state.listGrabIntents()).toEqual([]);
     expect(state.hasRelease(5, 'wrong-season')).toBe(false);
@@ -131,8 +133,7 @@ describe('runner review and retry policy', () => {
     expect(search).toHaveBeenCalledTimes(1);
     expect(prowlarr.getIndexers).toHaveBeenCalledTimes(1); // no indexer lookup occurs when all work is held
 
-    expect(state.resolveManualReview(review[0]!.id, now)).toBe(true);
-    now = new Date(now.getTime() + 1_000);
+    now = new Date('2026-09-29T06:00:00.000Z');
     search.mockResolvedValueOnce([]);
     const resumed = await runner.cycle();
     expect(resumed.searched).toBe(1);

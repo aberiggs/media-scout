@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { State } from '../src/core/state';
+import { State, type ActivityScope } from '../src/core/state';
+import Database from 'better-sqlite3';
 import type { WorkItem } from '../src/core/work-queue-types';
 
 const NOW = '2026-10-01T00:00:00.000Z';
@@ -39,6 +40,43 @@ function seed(state: State): void {
 }
 
 describe('operational work actions', () => {
+  it('upgrades legacy activity rows idempotently and retains safe stage attribution through reopen', () => {
+    const db = new Database(':memory:');
+    db.exec(`CREATE TABLE search_activity(id INTEGER PRIMARY KEY AUTOINCREMENT,source TEXT NOT NULL,started_at TEXT NOT NULL,finished_at TEXT,query TEXT NOT NULL,media_json TEXT NOT NULL,result_count INTEGER,outcome TEXT NOT NULL,error_code TEXT);
+      INSERT INTO search_activity(source,started_at,query,media_json,outcome) VALUES('cycle','${NOW}','Legacy query','[]','running')`);
+    try {
+      const state = new State(db);
+      const scope: ActivityScope = { stage: 'episodes', event: 'search', fallback: true, deferredEpisodeCount: 0,
+        targets: [{ workKey: 'sonarr:4:s1', seasonNumber: 1, episodeNumbers: [2], episodeCount: 1 }] };
+      const id = state.startSearchActivity({ source: 'cycle', query: 'Show S01E02', media: [], scope, now: NOW });
+      state.finishSearchActivity({ id, now: LATER, resultCount: null, errorCode: 'http-429' });
+      const rows = new State(db).listSearchActivity(LATER);
+      expect(rows[0]).toMatchObject({ scope, outcome: 'error', errorCode: 'http-429' });
+      expect(rows[1]!.scope).toBeUndefined();
+    } finally { db.close(); }
+  });
+
+  it('bounds acquisition diagnostics and rejects private or malformed scope data before storage', () => {
+    const state = State.open(':memory:');
+    try {
+      const scope: ActivityScope = { stage: 'episodes', event: 'capacity-deferred', fallback: true, deferredEpisodeCount: 150,
+        targets: [{ workKey: 'sonarr:4:s1', seasonNumber: 1, episodeNumbers: Array.from({ length: 150 }, (_, index) => index), episodeCount: 150 }] };
+      expect(() => state.startSearchActivity({ source: 'cycle', query: 'No query', media: [], now: NOW,
+        scope: { ...scope, credentials: 'never-store' } as unknown as ActivityScope })).toThrow();
+      expect(() => state.startSearchActivity({ source: 'cycle', query: 'No query', media: [], now: NOW,
+        scope: { ...scope, targets: [{ ...scope.targets[0]!, workKey: 'https://synthetic.invalid/?apikey=never-store' }] } })).toThrow();
+      expect(state.listSearchActivity(NOW)).toEqual([]);
+      state.startSearchActivity({ source: 'cycle', query: 'No query: capacity deferred', media: [], scope: { ...scope,
+        targets: Array.from({ length: 25 }, (_, seasonNumber) => ({ ...scope.targets[0]!, workKey: `sonarr:4:s${seasonNumber}`, seasonNumber })),
+      }, now: NOW });
+      const saved = state.listSearchActivity(NOW)[0]!;
+      expect(saved.scope!.targets[0]!.episodeNumbers).toHaveLength(100);
+      expect(saved.scope!.targets[0]!.episodeCount).toBe(150);
+      expect(saved.scope!.targets).toHaveLength(20);
+      expect(JSON.stringify(saved)).not.toContain('never-store');
+    } finally { state.close(); }
+  });
+
   it('uses competing SQLite connections for lease exclusion and atomically resets only ordinary scheduling/review state', () => {
     const dir = mkdtempSync(join(tmpdir(), 'media-scout-operations-'));
     paths.push(dir);

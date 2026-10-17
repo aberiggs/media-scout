@@ -36,7 +36,10 @@ class ScriptedGroupLLM implements LLMClient {
   constructor(private readonly onPick: () => void, private readonly releaseIndices: number[] = [0]) {}
   async json<T>(args: { system: string; user: string; schema: ZodType<T>; label: string }): Promise<T> {
     if (args.label.startsWith('planner:group:')) {
-      return args.schema.parse({ queries: [{ query: 'Alpha', categories: [5000], targetIndices: [0] }] }) as T;
+      const input = JSON.parse(args.user) as { searchStage?: string; targets: Array<{ expectedTargets: unknown[] }> };
+      return args.schema.parse({ queries: [{ query: 'Alpha', categories: [5000], targetIndices: [0],
+        ...(input.searchStage === 'episodes' ? { episodeTargets: [{ targetIndex: 0, episodeIndices: input.targets[0]!.expectedTargets.map((_, index) => index) }] } : {}),
+      }] }) as T;
     }
     if (args.label.startsWith('picker:group:')) {
       this.onPick();

@@ -5,16 +5,21 @@ import {
 } from 'lucide-react'
 
 const PAGE_SIZE = 50
+const EPISODE_PAGE_SIZE = 25
 const WORK_STATUSES = ['ready', 'waiting-release', 'searching', 'cooldown', 'backoff', 'manual', 'fulfilled', 'inactive'] as const
 
 type WorkAction = { allowed: boolean; reason?: string }
 type WorkActions = { retry: WorkAction; reset: WorkAction }
+type EpisodeSummary = { knowledge: 'known' | 'unknown' | 'stale'; lifecycle: 'scheduled' | 'airing' | 'finished' | 'unknown'; completion: 'caught-up' | 'imported' | 'incomplete' | 'unknown'; counts: { total: number; imported: number; airedMissing: number; future: number; timingUnknown: number; unmonitored: number; downloading: number; held: number; ready: number; waitingRelease: number } | null; nextEligibilityAt: string | null; nextRetryAt: string | null }
+type EpisodeRow = { episodeNumber: number; absoluteEpisodeNumber: number | null; title: string; monitored: boolean; hasFile: boolean; eligibleAt: string | null; timingBasis: 'utc' | 'date-only' | 'unknown'; lastSearchAt: string | null; nextSearchAt: string | null; progress: string; holdReason: string | null; observedAt: string; observationState: 'known' | 'unknown' | 'stale' }
+type EpisodeResponse = { workKey: string; items: EpisodeRow[]; total: number; generatedAt: string; summary: EpisodeSummary }
 type WorkRow = {
   workKey: string; title: string; mediaType: 'movie' | 'tv'; season?: number; status: string
   missingCount: number; nextSearchAt: string | null; lastSearchAt: string | null; holdReason: string | null
   observedAt: string | null; observationState: 'known' | 'unknown' | 'stale'
   queueObservationKnown?: boolean; queueObservedAt?: string | null
   coverage: { observed: number; reserved: number }; actions: WorkActions
+  episodeProgress?: EpisodeSummary
 }
 type ReviewActionSet = WorkActions & { associate: WorkAction; release: WorkAction }
 type OperationsScope = 'active' | 'all'
@@ -126,7 +131,7 @@ function Dialog({ title, description, children, onClose, className = '', closeDi
   </div>
 }
 
-function useRemoteData<T>(url: string) {
+function useRemoteData<T>(url: string, revision?: unknown) {
   const [snapshot, setSnapshot] = useState<{ url: string; value: T } | null>(null)
   const snapshotRef = useRef<{ url: string; value: T } | null>(null)
   const [errorState, setErrorState] = useState<{ url: string; message: string } | null>(null)
@@ -157,7 +162,7 @@ function useRemoteData<T>(url: string) {
     } finally {
       if (current === sequence.current) { controller.current = null; setRefreshingUrl(null) }
     }
-  }, [url])
+  }, [url, revision])
   useEffect(() => {
     void refresh()
     return () => {
@@ -209,11 +214,18 @@ function holdReasonLabel(value: string): string {
     'queue-ambiguous': 'Queue coverage needs review',
     'active-intent': 'A download reservation is still active',
     'waiting-release': 'Waiting for the movie to become available or the requested episodes to air.',
-    'manual-review': 'A human review is needed',
+    'manual-review': 'This season is held for manual review; episode-level eligibility does not clear the work-wide hold.',
     'content-identity-changed': 'Library details changed; review is needed',
-    'queue-review': 'Queue coverage needs review',
+    'queue-review': 'This season is held for queue review; episode-level eligibility does not clear the work-wide hold.',
     'library-unknown': 'Library status is unknown',
     blocked: 'Held for safety',
+    'uncertain-download': 'This episode is held because its download coverage is uncertain.',
+    'timing-unknown': 'No reliable airtime is available; Scout will not search yet.',
+    'waiting-air-date': 'This episode is not eligible until its airtime.',
+    'rate-limited': 'The provider retry window is still active.',
+    'operation-backoff': 'A previous operation failed; retry is delayed.',
+    'unconfirmed-completion': 'A download was submitted, but import is not confirmed.',
+    'search-in-progress': 'A search pass is in progress.',
   }
   return labels[value] ?? 'Held for safety'
 }
@@ -393,11 +405,49 @@ function WorkCard({ row, onAction }: { row: WorkRow; onAction: (action: 'retry' 
     <div className="ops-media-icon">{row.mediaType === 'movie' ? <Film size={18} /> : <Tv size={18} />}</div>
     <div className="ops-work-main"><div className="ops-work-title"><h3>{row.title}</h3><StatusPill value={row.status} /></div><div className="ops-work-meta"><span>{row.mediaType === 'movie' ? 'Movie' : `TV${row.season === undefined ? '' : ` · Season ${row.season}`}`}</span><span>{row.missingCount} missing</span><span>Coverage: {row.coverage.observed} observed · {row.coverage.reserved} reserved</span></div>
       <WorkSchedule row={row} terminal={terminal} />
+      {row.mediaType === 'tv' && row.episodeProgress && <SeasonProgress row={row} />}
       <ObservationSummary row={row} id={observationId} />
       {holdCopy && <p className="ops-hold-reason" id={holdId}><ShieldAlert size={14} />{holdCopy}</p>}
     </div>
     <ActionControls actions={row.actions} onAction={onAction} observationState={row.observationState} observationId={observationId} holdCopy={holdCopy} holdId={holdId} terminalStatus={row.status === 'fulfilled' ? 'fulfilled' : row.status === 'inactive' ? 'inactive' : undefined} />
   </article>
+}
+
+function SeasonProgress({ row }: { row: WorkRow }) {
+  const [expanded, setExpanded] = useState(false)
+  const [offset, setOffset] = useState(0)
+  const summary = row.episodeProgress!
+  const counts = summary.counts
+  const label = summary.knowledge !== 'known' || !counts ? 'Episode inventory unavailable' : summary.completion === 'caught-up' ? 'Caught up · awaiting airtime' : summary.completion === 'imported' ? `Known inventory imported · ${counts.total} episodes` : `${counts.imported} of ${counts.total} imported · ${counts.airedMissing} aired missing`
+  const detail = expanded ? <EpisodeInventory workKey={row.workKey} offset={offset} onOffset={setOffset} revision={row} /> : null
+  return <section className="ops-season-progress" aria-label={`Season ${row.season ?? ''} episode progress`}>
+    <div className="ops-season-summary"><strong>{label}</strong>{counts && <span>{counts.future} future · {counts.timingUnknown} timing unknown · {counts.ready} ready · {counts.waitingRelease} waiting for release · {counts.held} held · {counts.downloading} downloading</span>}</div>
+    {summary.nextEligibilityAt && <p>Next airtime · {formatDate(summary.nextEligibilityAt)}</p>}
+    {summary.nextRetryAt && <p>Next retry · {formatDate(summary.nextRetryAt)}</p>}
+    {summary.lifecycle === 'finished' && <p>Season finished airing</p>}{summary.lifecycle === 'unknown' && <p>Airing status unknown</p>}
+    <button className="text-button ops-episode-toggle" type="button" aria-expanded={expanded} onClick={() => { setExpanded(!expanded); setOffset(0) }}>{expanded ? 'Hide episode details' : 'Episode details'}</button>
+    {detail}
+  </section>
+}
+
+function EpisodeInventory({ workKey, offset, onOffset, revision }: { workKey: string; offset: number; onOffset: (offset: number) => void; revision?: unknown }) {
+  const remote = useRemoteData<EpisodeResponse>(`/api/operations/episodes?workKey=${encodeURIComponent(workKey)}&limit=${EPISODE_PAGE_SIZE}&offset=${offset}`, revision)
+  if (remote.loading) return <div className="ops-episode-detail" role="status">Loading episode inventory…</div>
+  if (!remote.data) return <div className="ops-episode-detail">{remote.error ? <ErrorBanner message={remote.error} onRetry={() => void remote.refresh()} refreshing={remote.refreshing} /> : 'Episode inventory unavailable.'}</div>
+  const { items, total } = remote.data
+  return <div className="ops-episode-detail">{remote.error && <ErrorBanner message={remote.error} onRetry={() => void remote.refresh()} refreshing={remote.refreshing} />}{remote.refreshing && <p role="status">Updating episode inventory…</p>}<ul className="ops-episode-list">{items.map((episode) => <li key={`${episode.episodeNumber}-${episode.absoluteEpisodeNumber ?? ''}`}>
+    <div><strong>Episode {episode.episodeNumber}: {episode.title}</strong><span className="ops-status">{episode.progress.replace(/-/gu, ' ')}</span></div>
+    <p>{episode.observationState === 'known' ? episode.hasFile ? 'Imported' : episode.monitored ? 'Monitored' : 'Not monitored' : `Last observed: ${episode.hasFile ? 'file present' : episode.monitored ? 'monitored, no file' : 'not monitored'} · ${episode.observationState} observation`} · Airtime {episode.timingBasis === 'unknown' ? 'unknown' : `${formatDate(episode.eligibleAt)} (${episode.timingBasis})`}</p>
+    {episode.nextSearchAt && <p>{['waiting-release', 'cooldown', 'retry-backoff'].includes(episode.progress) ? 'Next retry' : 'Next eligible'} · {formatDate(episode.nextSearchAt)}</p>}
+    {episode.holdReason && <p className="ops-hold-reason"><ShieldAlert size={14} />{holdReasonLabel(episode.holdReason)}</p>}
+    {episode.observationState !== 'known' && <p>Episode observation {episode.observationState}</p>}
+  </li>)}</ul>{(total > EPISODE_PAGE_SIZE || offset > 0) && <div className="ops-pagination"><span>Episodes {offset + 1}–{Math.min(offset + EPISODE_PAGE_SIZE, total)} of {total}</span><div><button className="button button-secondary" type="button" onClick={() => onOffset(Math.max(0, offset - EPISODE_PAGE_SIZE))} disabled={offset === 0}><ArrowLeft size={15} /> Previous episodes</button><button className="button button-secondary" type="button" onClick={() => onOffset(offset + EPISODE_PAGE_SIZE)} disabled={offset + EPISODE_PAGE_SIZE >= total}>Next episodes <ArrowRight size={15} /></button></div></div>}</div>
+}
+
+function ReviewEpisodeDetails({ workKey }: { workKey: string }) {
+  const [expanded, setExpanded] = useState(false)
+  const [offset, setOffset] = useState(0)
+  return <section className="ops-review-episodes"><button className="text-button" type="button" aria-expanded={expanded} onClick={() => { setExpanded(!expanded); setOffset(0) }}>{expanded ? 'Hide episode details' : 'Show episode details'}</button>{expanded && <EpisodeInventory workKey={workKey} offset={offset} onOffset={setOffset} />}</section>
 }
 
 function WorkSchedule({ row, terminal }: { row: WorkRow; terminal: boolean }) {
@@ -579,6 +629,7 @@ function ReviewDialog({ row, onClose, onSuccess, actionError, setActionError }: 
       <div className="ops-dialog-head"><div><div className="eyebrow"><span className="eyebrow-mark" />REVIEW #{row.id}</div><h2 id="review-dialog-title">{row.title}</h2><p>{row.summary}</p></div><button className="icon-button" type="button" aria-label="Close review details" onClick={closeReview} disabled={busy || workActionConfirm !== null}><X size={18} /></button></div>
       <div className="ops-dialog-body ops-review-body">
         <div className="ops-review-facts"><span><strong>Media</strong>{reviewMediaLabel(row)}</span><span><strong>Created</strong>{formatDate(row.createdAt, true)}</span>{row.resolvedAt && <span><strong>Resolved</strong>{formatDate(row.resolvedAt, true)}</span>}</div>
+        {row.mediaType === 'tv' && <ReviewEpisodeDetails workKey={row.workKey} />}
         {actionError && <div className="ops-inline-error" role="alert">{actionError}</div>}
         {!prepared && <>
           <div className="ops-scope-note"><ShieldCheck size={17} /><span>Actions depend on fresh evidence. Scout supplies which operations are currently available.</span></div>

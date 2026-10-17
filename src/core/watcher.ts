@@ -2,6 +2,7 @@ import type { RadarrClient } from '../clients/radarr';
 import type { SonarrClient } from '../clients/sonarr';
 import type { Episode, Series } from '../types/sonarr';
 import type { Movie } from '../types/radarr';
+import { episodeEligibilityTime } from './episode-timing';
 
 export interface WorkUnit {
   key: string;
@@ -98,7 +99,8 @@ export function eligibleWorkUnits(snapshot: LibrarySnapshot): WorkUnit[] {
     if (!known || !series.monitored || episodes === null) return [];
     const bySeason = new Map<number, NonNullable<WorkUnit['season']>>();
     for (const episode of episodes) {
-      if (!(episode.monitored && !episode.hasFile && episode.airDate !== null && episode.airDate <= nowIso)) continue;
+      const eligibleAt = episodeEligibilityTime(episode);
+      if (!(episode.monitored && !episode.hasFile && eligibleAt !== null && eligibleAt.getTime() <= Date.parse(nowIso))) continue;
       const season = bySeason.get(episode.seasonNumber) ?? { seasonNumber: episode.seasonNumber, missing: [] };
       season.missing.push({ episodeId: episode.id, episodeNumber: episode.episodeNumber, absoluteEpisodeNumber: episode.absoluteEpisodeNumber ?? null, title: episode.title });
       bySeason.set(episode.seasonNumber, season);

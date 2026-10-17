@@ -16,6 +16,8 @@ import { configWithSettings, loadConfig } from '../src/config';
 import { defaultSettings } from '../src/settings';
 import { State } from '../src/core/state';
 import { createMcpServer } from '../src/mcp/server';
+import { OperationsDashboard } from '../src/core/operations';
+import type { WorkItem } from '../src/core/work-queue-types';
 import { ApiError } from '../src/http';
 import type { LLMClient } from '../src/clients/llm';
 import type { ZodType } from 'zod';
@@ -102,7 +104,10 @@ class FakeLLM implements LLMClient {
       const key = args.label.slice('planner:group:'.length);
       const plan = this.groupPlanner.get(key) ?? this.groupPlanner.get('*');
       if (!plan) throw new Error(`no group planner script for ${key}`);
-      return args.schema.parse(plan);
+      const input = JSON.parse(args.user) as { searchStage?: string; targets: Array<{ expectedTargets: unknown[] }> };
+      return args.schema.parse({ queries: plan.queries.map((query) => ({ ...query,
+        ...(input.searchStage === 'episodes' ? { episodeTargets: query.targetIndices.map((targetIndex) => ({ targetIndex, episodeIndices: input.targets[targetIndex]!.expectedTargets.map((_, index) => index) })) } : {}),
+      })) });
     }
     if (args.label.startsWith('picker:group:')) {
       const key = args.label.slice('picker:group:'.length);
@@ -250,6 +255,31 @@ async function callErrorText(name: string, args: Record<string, unknown>): Promi
 }
 
 describe('mcp server tools', () => {
+  it('uses the HTTP projection for known episode coverage and retry summaries without exposing episode detail', async () => {
+    await connect(new FakeLLM());
+    const at = new Date().toISOString();
+    const retryAt = new Date(Date.parse(at) + 6 * 3600000).toISOString();
+    const episodes = [1, 2].map((number) => episode(1, { id: 100 + number, episodeNumber: number, absoluteEpisodeNumber: null, title: 'Episode detail hidden', airDate: '2020-01-01' }));
+    const work: WorkItem = { workKey: 'sonarr:1:s1', contentIdentity: 'sonarr:1:123:tv', missingFingerprint: 'known-episodes',
+      unit: { key: 'sonarr:1:s1', kind: 'tv', arr: 'sonarr', serviceId: 1, externalId: 123, title: 'Synthetic Show', altTitles: [], season: { seasonNumber: 1,
+        missing: episodes.map((row) => ({ episodeId: row.id, episodeNumber: row.episodeNumber, absoluteEpisodeNumber: row.absoluteEpisodeNumber, title: row.title })) } },
+      status: 'ready', lastSearchAt: null, nextSearchAt: null, failCount: 0, lastOutcome: null, lastObservedAt: at,
+      lastQueueObservedAt: at, queueObservationKnown: true, blockedReason: 'queue-active' };
+    const token = stack.state.claimUnit(work.workKey, new Date(at))!;
+    stack.state.applyWorkReconciliation({ key: work.workKey, token, work, intentUpdates: [], episodeObservations: episodes });
+    stack.state.applyWorkQueueObservation({ key: work.workKey, token, observedAt: at, known: true,
+      coverage: [{ workKey: work.workKey, episodeIds: [101], basis: 'explicit-episodes' }] });
+    stack.state.recordEpisodeAttempt({ key: work.workKey, token, episodeIds: [102], now: at, nextSearchAt: retryAt, outcome: 'release-unavailable' });
+    stack.state.releaseClaim(work.workKey, token);
+    const expected = new OperationsDashboard(stack.state).work({ scope: 'all', limit: 50, offset: 0 }, false).items[0]!.episodeProgress;
+    const result = await client.callTool({ name: 'ma_status', arguments: {} });
+    const text = firstText(result);
+    const status = JSON.parse(text) as { workQueue: { items: Array<{ episodeProgress: unknown }> } };
+    expect(status.workQueue.items[0]!.episodeProgress).toEqual(expected);
+    expect(expected).toMatchObject({ knowledge: 'known', counts: { downloading: 1, waitingRelease: 1, ready: 0 } });
+    expect(text).not.toContain('Episode detail hidden');
+  });
+
   it('ma_status reports config + open review count', async () => {
     await connect(new FakeLLM());
     stack.state.flagManualReview('sonarr:1:s1', 'unparseable-title', 'Some.Trash.mkv', NOW);
@@ -342,6 +372,7 @@ describe('mcp server tools', () => {
         missingCount: 1,
         coveredEpisodeIds: [101],
         safeHoldReason: 'blocked',
+        episodeProgress: { knowledge: 'unknown', lifecycle: 'unknown', completion: 'unknown', counts: null, nextEligibilityAt: null, nextRetryAt: null },
       }],
       counts: { ready: 0, 'waiting-release': 1, searching: 0, cooldown: 0, backoff: 0, manual: 0, fulfilled: 0, inactive: 0 },
       openIntentCount: 1,
@@ -720,8 +751,8 @@ describe('stdio entry e2e (spawned process)', () => {
         const schemaName = JSON.parse(body).response_format?.json_schema?.name as string | undefined;
         const content = schemaName === 'group_picker_selection'
           ? '{"selection":{"verdict":"grab","releaseIndices":[0],"manualTargetIndices":[],"deferredTargetIndices":[],"reason":"best fit"}}'
-          : schemaName === 'group_planner_queries'
-            ? '{"queries":[{"query":"Frieren","categories":[5070],"targetIndices":[0]}]}'
+          : schemaName === 'group_planner_queries' || schemaName === 'group_episode_queries'
+            ? '{"queries":[{"query":"Frieren","categories":[5070],"targetIndices":[0],"episodeTargets":[{"targetIndex":0,"episodeIndices":[0]}]}]}'
             : '{}';
         res.end(JSON.stringify(llmReply(content)));
       });

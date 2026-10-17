@@ -1,8 +1,10 @@
 schema: spec-driven
 context: |
   GitHub issues are the backlog; link scoped changes to their issue rather than
-  creating a second backlog. Investigation and proposals are planning-only;
-  implementation requires an explicit apply request.
+  creating a second backlog. Investigation and proposal-only requests do not
+  authorize implementation. Explicit implementation approval carries through
+  artifact preparation into apply without requiring another message; material
+  new scope or product decisions still require approval.
   Runtime experiments must use isolated state and must not mutate production
   libraries, queues, or download clients. Dry-run still contacts LLMs/indexers.
   Live model evaluation must be opt-in, budget-bounded, and use approved,

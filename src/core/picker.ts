@@ -156,7 +156,9 @@ export class Picker {
   }
 
   /** Chooses a bounded, non-overlapping physical release set for one supplied group. */
-  async pickGroup(args: { group: WorkGroup; context: PlanningContext; candidates: GroupCandidate[] }): Promise<GroupSelection> {
+  async pickGroup(args: { group: WorkGroup; context: PlanningContext; candidates: GroupCandidate[]; selectionLimit?: number }): Promise<GroupSelection> {
+    const limit = args.selectionLimit ?? 3;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 3) throw new Error('Invalid group selection limit');
     validateGroupForPick(args.group);
     if (args.candidates.length === 0) throw new Error('group picker requires at least one candidate');
     for (const candidate of args.candidates) validateCandidateCoverage(args.group, candidate);
@@ -168,14 +170,14 @@ export class Picker {
       jsonSchema: { name: 'group_picker_selection', schema: groupSelectionJsonSchema },
       label: `picker:group:${args.group.key}`,
     });
-    validateGroupSelection(args.group, args.context, args.candidates, envelope.selection);
+    validateGroupSelection(args.group, args.context, args.candidates, envelope.selection, limit);
     return envelope.selection;
   }
 }
 
 const GROUP_PICKER_SYSTEM_PROMPT = `You judge releases for one supplied group of actual missing media targets. Return exactly {"selection":{"verdict":"grab","releaseIndices":[0],"manualTargetIndices":[],"deferredTargetIndices":[],"reason":"..."}}. The verdict must be exactly one of grab, manual, or skip. Choose a practical best plausible suitable non-overlapping set. Prefer a competitive combined multi-season pack over multiple releases when the evidence and size plausibility are comparable; separate releases are fine when they are better or needed. Ordinary quality ties, incomplete metadata, and lack of a perfect match do not by themselves require manual review. Use manual only for genuinely unresolved identity or ambiguous evidence; clearly wrong content must never be grabbed. Use skip when candidates are clearly unsuitable.
 
-At most three distinct physical releases may be selected. A single indexer/GUID, known infoHash, or physicalSlot denotes the same physical release even when observed titles differ; never select duplicates and never union their contradictory claims. Release indices must refer only to supplied candidates. Candidate coverage already distinguishes requestedFootprint from permitted capture: selected requested footprints must not overlap, and only capture is actionable. Active, uncertain, historical, or otherwise held targets are never candidates to grab; physical extra seasons are not a way around a held requested footprint. Do not create target keys or targets. manualTargetIndices and deferredTargetIndices refer only to supplied targets, are mutually exclusive and cannot overlap selected capture. Capacity deferral is allowed only after three physical releases are selected.
+Select at most the supplied selectionLimit distinct physical releases (never more than three). A single indexer/GUID, known infoHash, or physicalSlot denotes the same physical release even when observed titles differ; never select duplicates and never union their contradictory claims. Release indices must refer only to supplied candidates. Candidate coverage already distinguishes requestedFootprint from permitted capture: selected requested footprints must not overlap, and only capture is actionable. Active, uncertain, historical, or otherwise held targets are never candidates to grab; physical extra seasons are not a way around a held requested footprint. Do not create target keys or targets. manualTargetIndices and deferredTargetIndices refer only to supplied targets, are mutually exclusive and cannot overlap selected capture. Capacity deferral is allowed only after selectionLimit physical releases are selected.
 
 Coverage is evidence, not truth about torrent contents. Explicit subsets remain precise. An inferred season pack or whole-series claim is inferred, not verified; it may be incomplete and may contain episodes already owned. Consider the size against the full advertised scope, not only missing targets. Extra seasons are a soft ranking trade-off only; they do not create requests or fulfillment. ` +
 `Candidate target fields named expectedEpisodeTitle are library descriptions, not observed release filenames or independent identity evidence. Candidate observedReleaseTitle and parsedAdvertisedScope are separate evidence. Judge identity and quality using the supplied titles, IDs, year, season/scope and release details; do not apply deterministic identity heuristics. Null seeders, leechers, grabs, size, or IDs are unknown evidence, never automatic rejection. Weigh health/popularity softly without numeric cutoffs. ` +
@@ -311,7 +313,8 @@ function validateUniqueIndices(indices: number[], max: number, label: string): v
   }
 }
 
-function validateGroupSelection(group: WorkGroup, context: PlanningContext, candidates: GroupCandidate[], selection: GroupSelection): void {
+function validateGroupSelection(group: WorkGroup, context: PlanningContext, candidates: GroupCandidate[], selection: GroupSelection, limit = 3): void {
+  if (selection.releaseIndices.length > limit) throw new Error('group picker exceeds remaining physical selection limit');
   validateUniqueIndices(selection.releaseIndices, candidates.length, 'release');
   validateUniqueIndices(selection.manualTargetIndices, group.targets.length, 'manual target');
   validateUniqueIndices(selection.deferredTargetIndices, group.targets.length, 'deferred target');
@@ -326,7 +329,7 @@ function validateGroupSelection(group: WorkGroup, context: PlanningContext, cand
       if (samePhysicalRelease(physicalCandidates[left]!, physicalCandidates[right]!)) throw new Error('group picker selected the same physical release more than once');
     }
   }
-  if (selection.deferredTargetIndices.length > 0 && physicalCandidates.length !== 3) throw new Error('group picker capacity deferral requires three selected physical releases');
+  if (selection.deferredTargetIndices.length > 0 && physicalCandidates.length !== limit) throw new Error('group picker capacity deferral requires the full physical selection limit');
 
   const held = activeHoldAtoms(group, context);
   const heldSeasons = activeHeldSeasons(group, context);

@@ -151,6 +151,49 @@ function snapshot(episodes: Episode[], seriesOverrides: Partial<Series> = {}): L
 }
 
 describe('group planner and picker', () => {
+  it.each([undefined, 'episodes' as const])('submits provider-compatible strict object schemas for stage %s', async (stage) => {
+    const llm = new ScriptLLM({ queries: [{ query: 'Example episodes', categories: [5000], targetIndices: [0],
+      ...(stage ? { episodeTargets: [{ targetIndex: 0, episodeIndices: [0, 1] }] } : {}) }] });
+    await new Planner({ llm }).planGroup({ group: groupFixture(), context: planningContext(), stage });
+    // Strict providers reject optional object properties at the external schema boundary.
+    const check = (schema: Record<string, unknown>) => {
+      if (schema.type === 'object') {
+        const properties = schema.properties as Record<string, Record<string, unknown>>;
+        expect(new Set(schema.required as string[])).toEqual(new Set(Object.keys(properties)));
+        expect(schema.additionalProperties).toBe(false);
+        for (const child of Object.values(properties)) check(child);
+      }
+      if (schema.type === 'array') check(schema.items as Record<string, unknown>);
+    };
+    check(llm.calls[0]!.jsonSchema!.schema);
+  });
+
+  it('validates exact episode query attribution for an explicit episode stage', async () => {
+    const group = groupFixture();
+    const output = { queries: [
+      { query: 'The Example Show S01E01', categories: [5000], targetIndices: [0], episodeTargets: [{ targetIndex: 0, episodeIndices: [0] }] },
+      { query: 'The Example Show S01E02', categories: [5000], targetIndices: [0], episodeTargets: [{ targetIndex: 0, episodeIndices: [1] }] },
+    ] };
+    const planner = new Planner({ llm: new ScriptLLM(output) });
+    const args = { group, context: planningContext(), stage: 'episodes' as const };
+    expect(await planner.planGroup(args)).toEqual(output.queries);
+    const missingEpisode = new Planner({ llm: new ScriptLLM({ queries: [output.queries[0]] }) });
+    await expect(missingEpisode.planGroup(args)).rejects.toThrow(/episode/i);
+    const invented = new Planner({ llm: new ScriptLLM({ queries: [{ ...output.queries[0], episodeTargets: [{ targetIndex: 0, episodeIndices: [99] }] }] }) });
+    await expect(invented.planGroup(args)).rejects.toThrow(/episode/i);
+  });
+
+  it.each([
+    undefined,
+    [{ targetIndex: 0, episodeIndices: [0, 0] }],
+    [{ targetIndex: 1, episodeIndices: [0] }],
+    [{ targetIndex: 0, episodeIndices: [0] }, { targetIndex: 0, episodeIndices: [1] }],
+  ])('rejects missing, duplicate, or orphan episode attribution %j', async (episodeTargets) => {
+    const query = { query: 'Example episodes', categories: [5000], targetIndices: [0], ...(episodeTargets ? { episodeTargets } : {}) };
+    const planner = new Planner({ llm: new ScriptLLM({ queries: [query] }) });
+    await expect(planner.planGroup({ group: groupFixture(), context: planningContext(), stage: 'episodes' })).rejects.toThrow(/episode/i);
+  });
+
   it('plans broad queries with actual target intent, valid unique indices, and full compact context', async () => {
     const group = groupFixture();
     const context = planningContext();
@@ -269,6 +312,48 @@ describe('group planner and picker', () => {
 });
 
 describe('media context pure helpers', () => {
+  it.each([
+    { name: 'future date-only schedule', airDate: '2026-10-08', overrides: {}, series: {}, lifecycle: 'scheduled', basis: 'date-only', at: '2026-10-09T00:00:00.000Z' },
+    { name: 'ended series with aired inventory', airDate: '2020-01-01', overrides: {}, series: { status: 'ended' as const }, lifecycle: 'finished', basis: 'date-only', at: '2020-01-02T00:00:00.000Z' },
+    { name: 'midseason finale is not season completion', airDate: '2020-01-01', overrides: { finaleType: 'midSeason' }, series: {}, lifecycle: 'unknown', basis: 'date-only', at: '2020-01-02T00:00:00.000Z' },
+    { name: 'unknown timing even for an ended series', airDate: null, overrides: { finaleType: 'season' }, series: { status: 'ended' as const }, lifecycle: 'unknown', basis: 'unknown', at: null },
+    { name: 'season statistics retain future schedule evidence', airDate: '2020-01-01', overrides: {},
+      series: { seasons: [{ seasonNumber: 1, monitored: true, statistics: { episodeFileCount: 0, totalEpisodeCount: 2, nextAiring: '2026-10-08T23:00:00Z' } }] },
+      lifecycle: 'airing', basis: 'date-only', at: '2020-01-02T00:00:00.000Z' },
+  ])('uses conservative lifecycle evidence: $name', ({ airDate, overrides, series: seriesOverrides, lifecycle, basis, at }) => {
+    const inventory = snapshot([episode(101, 1, 1, airDate, overrides)], seriesOverrides);
+    const target = unit(1, [{ id: 101, number: 1, title: 'Episode' }]);
+    const context = buildPlanningContext({ snapshot: inventory, rows: [reconciled(target, 'ready')], queues: queues(), intents: [] });
+    expect(context.seasonProgress![0]).toMatchObject({ lifecycle, episodes: [{ timingBasis: basis, eligibleAt: at }] });
+  });
+
+  it('separates airing confidence, imported/future/unknown timing, and actual held coverage', () => {
+    const inventory = snapshot([
+      episode(101, 1, 1, '2020-01-01', { hasFile: true }),
+      episode(102, 1, 2, '2020-01-02', { finaleType: 'season' }),
+      episode(201, 2, 1, '2026-09-01', { hasFile: true }),
+      episode(202, 2, 2, '2026-10-08', { airDateUtc: '2026-10-08T23:00:00Z' }),
+      episode(203, 2, 3, null),
+    ], { status: 'continuing' });
+    const first = unit(1, [{ id: 102, number: 2, title: 'Finale' }]);
+    const second = unit(2, [{ id: 202, number: 2, title: 'Future' }, { id: 203, number: 3, title: 'Unknown' }]);
+    const rows = [reconciled(first, 'ready', { eligibleUnit: null, activeCoverage: [{ workKey: first.key, episodeIds: [102], basis: 'explicit-episodes' }] }),
+      reconciled(second, 'waiting-release', { eligibleUnit: null, blockedReason: 'waiting-release' })];
+    const context = buildPlanningContext({ snapshot: inventory, rows, queues: queues(), intents: [] });
+    expect(context.openWork.map((row) => row.heldCount)).toEqual([1, 0]);
+    const payload = JSON.parse(serializeGroupPlannerInput({ group: groupFixture(), context })) as { context: { seasonProgress: unknown[] } };
+    expect(payload.context.seasonProgress).toMatchObject([
+      { workKey: first.key, lifecycle: 'finished', counts: { imported: 1, airedMissing: 1, future: 0, timingUnknown: 0, downloadHeld: 1 } },
+      { workKey: second.key, lifecycle: 'airing', counts: { imported: 1, airedMissing: 0, future: 1, timingUnknown: 1, downloadHeld: 0 }, nextEligibilityAt: '2026-10-08T23:00:00.000Z' },
+    ]);
+    const unknown = buildPlanningContext({ snapshot: snapshot([episode(101, 1, 1, '2020-01-01')]), rows: [reconciled(first, 'ready')], queues: queues(), intents: [] });
+    const unknownPayload = JSON.parse(serializeGroupPlannerInput({ group: groupFixture(), context: unknown })) as { context: { seasonProgress: Array<{ lifecycle: string }> } };
+    expect(unknownPayload.context.seasonProgress[0]!.lifecycle).toBe('unknown');
+    inventory.sonarr.known = false;
+    const unavailable = buildPlanningContext({ snapshot: inventory, rows, queues: queues(), intents: [] });
+    expect(unavailable.seasonProgress).toMatchObject([{ lifecycle: 'unknown', counts: null, episodes: [] }, { lifecycle: 'unknown', counts: null, episodes: [] }]);
+  });
+
   it('groups by Arr service identity, includes only ready/cooldown eligible residual targets, and keeps waiting context', () => {
     const episodes = [
       episode(101, 1, 1, '2020-01-01'),

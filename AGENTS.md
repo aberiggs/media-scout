@@ -4,7 +4,7 @@
 
 - Read the linked GitHub issue and relevant operator docs before changing behavior. GitHub issues are the backlog; `docs/future-features.md` is exploratory, not approved scope.
 - Investigation/proposal requests do not authorize app fixes. Separate source-confirmed behavior from hypotheses requiring runtime evidence.
-- Use `openspec/` for scoped feature proposals and approved implementation tasks, linked to their GitHub issue. Do not copy the whole backlog into active changes. Proposal creation is planning-only; wait for an apply request before implementation.
+- Use `openspec/` for scoped feature proposals and approved implementation tasks, linked to their GitHub issue. Do not copy the whole backlog into active changes. Proposal-only requests stop for approval. Explicit implementation approval carries through preparation of missing artifacts into apply without requiring another message; pause for material new scope or product decisions.
 - Keep small bug fixes lightweight: reproduce with a focused regression test, fix the root cause, then run the applicable broader checks.
 - Preserve unrelated changes and stage explicit paths. Before making any commit, check the current branch and switch to a dedicated topic branch if it is `main`; never commit directly to `main` or push directly to `main`.
 - For approved implementation/setup work, automatically commit and push each coherent, reviewed, verified relevant checkpoint to its topic branch. Open or update a pull request targeting `main`; all changes enter `main` through PRs. Do not automatically merge PRs, publish images, deploy, or create worktrees. An explicit request not to commit/push overrides checkpoint automation; investigation/proposal-only requests still do not authorize app implementation.

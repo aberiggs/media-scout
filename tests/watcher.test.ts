@@ -229,7 +229,7 @@ describe('Watcher.getWorkUnits — filters', () => {
         episode({ id: 103, episodeNumber: 9, airDate: null, title: 'Unaired' }),
         episode({ id: 104, episodeNumber: 10, airDate: '2026-09-30', title: 'Future' }),
         episode({ id: 105, episodeNumber: 11, monitored: false, title: 'Unmonitored' }),
-        episode({ id: 106, episodeNumber: 12, airDate: NOW.toISOString(), title: 'Boundary' }),
+        episode({ id: 106, episodeNumber: 12, airDate: '2026-09-28', airDateUtc: NOW.toISOString(), title: 'Boundary' }),
       ]);
     mockEmptyMovies();
 
@@ -240,6 +240,22 @@ describe('Watcher.getWorkUnits — filters', () => {
       { episodeId: 101, episodeNumber: 7, absoluteEpisodeNumber: 7, title: 'Valid' },
       { episodeId: 106, episodeNumber: 12, absoluteEpisodeNumber: null, title: 'Boundary' },
     ]);
+  });
+
+  it('uses precise UTC airtime before the calendar date and conservative date-only timing', async () => {
+    const observedAt = new Date('2026-10-15T00:01:00Z');
+    nock(SONARR).get('/api/v3/series').reply(200, [seriesFixture]);
+    nock(SONARR).get('/api/v3/episode').query({ seriesId: 1 }).reply(200, [
+      episode({ id: 201, airDate: '2026-10-15', airDateUtc: '2026-10-15T23:00:00Z' }),
+      episode({ id: 202, airDate: '2026-10-14', airDateUtc: '2026-10-14T23:00:00Z' }),
+      episode({ id: 203, airDate: '2026-10-14' }),
+      episode({ id: 206, airDate: '2026-10-15' }),
+      episode({ id: 204, airDate: 'not-a-date' }),
+      episode({ id: 205, airDate: null }),
+    ]);
+    mockEmptyMovies();
+    const units = await makeWatcher({ now: observedAt }).getWorkUnits();
+    expect(units.flatMap((unit) => unit.season?.missing.map((item) => item.episodeId) ?? [])).toEqual([202, 203]);
   });
 
   it('skips unmonitored series without fetching their episodes, while a monitored series still emits', async () => {

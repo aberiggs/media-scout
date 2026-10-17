@@ -147,6 +147,18 @@ describe('sonarr episode schema', () => {
     expect(episodes[2]!.airDate).toBeNull();
     expect(episodes[2]!.hasFile).toBe(false);
   });
+
+  it('retains optional precise airtime and lifecycle metadata while accepting older shapes', () => {
+    const [base] = episodeListSchema.parse(fixture('sonarr-episodes.json'));
+    const source = fixture('sonarr-episodes.json') as Record<string, unknown>[];
+    const [extended] = episodeListSchema.parse([{ ...source[0], airDateUtc: '2026-10-15T23:00:00Z', finaleType: 'season' }]);
+    expect(base!.airDateUtc).toBeUndefined();
+    expect(extended!.airDateUtc).toBe('2026-10-15T23:00:00Z');
+    expect(extended!.finaleType).toBe('season');
+    const [series] = seriesListSchema.parse([{ ...seriesFixture, status: 'ended', seasons: [{ seasonNumber: 1, monitored: true, statistics: { episodeFileCount: 1, totalEpisodeCount: 2, nextAiring: '2026-10-22T23:00:00Z', previousAiring: '2026-10-15T23:00:00Z' } }] }]);
+    expect(series!.status).toBe('ended');
+    expect(series!.seasons[0]!.statistics).toMatchObject({ previousAiring: '2026-10-15T23:00:00Z', nextAiring: '2026-10-22T23:00:00Z' });
+  });
 });
 
 describe('radarr movie schema', () => {

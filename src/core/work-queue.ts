@@ -1,6 +1,6 @@
 import type { RadarrQueueRecord } from '../types/radarr';
 import type { SonarrQueueRecord } from '../types/sonarr';
-import type { GrabIntent, IntentCoverage, IntentStatus, QueueRead, WorkItem } from './work-queue-types';
+import type { EpisodeProgress, GrabIntent, IntentCoverage, IntentStatus, QueueRead, WorkItem } from './work-queue-types';
 import type { AssociationDecision } from './group-types';
 import type { LibrarySnapshot, WorkUnit } from './watcher';
 import { eligibleWorkUnits } from './watcher';
@@ -43,6 +43,8 @@ export interface ReconcileWorkInput {
   legacyDecisionAt?: ReadonlyMap<string, string>;
   manualReviewKeys?: ReadonlySet<string>;
   associationDecisions?: AssociationDecision[];
+  episodeProgress?: EpisodeProgress[];
+  ignoreEpisodeCooldown?: boolean;
 }
 
 interface QueueAssociation {
@@ -821,7 +823,8 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
     }
     const unsupportedAssocHold = ambiguousQueue || activeQueue.some((row) => row.status === 'uncertain');
     if (unsupportedAssocHold) {
-      blockedReason = blockedReason ?? 'queue-ambiguous';
+      // An ordinary review must not hide a concurrent safety hold in persisted policy state.
+      if (blockedReason === null || blockedReason === 'manual-review') blockedReason = 'queue-ambiguous';
       manualReviewReason = manualReviewReason ?? 'queue-review';
     }
     else if (heldQueueCoverage.length > 0) blockedReason = blockedReason ?? 'queue-active';
@@ -836,6 +839,26 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
       residual = remaining.length ? copyUnit(eligibleUnit, remaining) : null;
     } else if (eligibleUnit && allCoverage.some((coverage) => coverage.workKey === key && coverage.episodeIds === null)) residual = null;
     if (blockedReason === 'queue-unknown' || blockedReason === 'queue-ambiguous' || blockedReason === 'queue-review' || blockedReason === 'content-identity-changed' || blockedReason === 'manual-review') residual = null;
+    if (residual?.kind === 'tv' && !input.ignoreEpisodeCooldown && ['ready', 'cooldown'].includes(scheduling.status)) {
+      const progress = (input.episodeProgress ?? []).filter((episode) => episode.workKey === key &&
+        episode.serviceId === current.serviceId && episode.externalId === current.externalId);
+      // Before the first episode-level attempt, retain conservative legacy season scheduling.
+      if (progress.some((episode) => episode.lastSearchAt !== null || episode.nextSearchAt !== null)) {
+        const clocks = new Map(progress.map((episode) => [episode.episodeId, episode]));
+        const due = residual.season!.missing.filter((episode) => {
+          const deadline = clocks.get(episode.episodeId)?.nextSearchAt;
+          return deadline == null || Date.parse(deadline) <= Date.parse(input.now);
+        });
+        if (due.length) {
+          residual = copyUnit(residual, due);
+          scheduling = { ...scheduling, status: 'ready', nextSearchAt: null };
+        } else {
+          const deadlines = residual.season!.missing.map((episode) => clocks.get(episode.episodeId)!.nextSearchAt!).sort();
+          scheduling = { ...scheduling, status: 'cooldown', nextSearchAt: deadlines[0]! };
+          residual = null;
+        }
+      }
+    }
     if (localIntents.length > 0 && residual?.kind === 'tv' && (residual.season?.missing.length ?? 0) === 0) residual = null;
     if (!residual && !blockedReason && current.kind === 'tv' && eligibleUnit === null) {
       scheduling = { ...scheduling, status: 'waiting-release' };

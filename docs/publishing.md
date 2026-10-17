@@ -72,3 +72,7 @@ The image uses the persistent SQLite database under `./data`. Before upgrading o
 To roll the application image back, set `MEDIA_AGENT_IMAGE` to the prior full-commit tag or digest and explicitly pull/recreate with `docker-compose.ghcr.yml`. Image rollback does not roll back SQLite. Newer code may have changed or migrated the schema; an older image may not be compatible with a newer database. Before restoring a database backup, stop all writers and confirm the backup's schema is compatible with the selected image. Do not assume migrations have a downgrade path, and do not clear the database to force work to retry.
 
 No automated deployment or database restore is configured by this project. Keep a known-good compatible backup before each change and validate the selected image/database pair under the operator's own rollout procedure.
+
+## Episode-progress upgrade and rollback
+
+Stop all application writers before upgrading and make a consistent SQLite backup. Never run old and new writer versions concurrently: older binaries do not honor per-episode retry state. There is no destructive down migration. To roll back, stop writers and restore the pre-upgrade backup with its matching binary; observations made after upgrade will be discarded and must be reconciled deliberately.

@@ -12,6 +12,8 @@ export const seasonSchema = z.object({
     .object({
       episodeFileCount: z.number().int().nullable().catch(null),
       totalEpisodeCount: z.number().int().nullable().catch(null),
+      nextAiring: z.string().nullable().optional().catch(null),
+      previousAiring: z.string().nullable().optional().catch(null),
     })
     .nullable()
     .catch(null),
@@ -29,6 +31,7 @@ export const seriesSchema = z.object({
   titleSlug: z.string(),
   seriesType: seriesTypeSchema,
   monitored: z.boolean(),
+  status: z.enum(['continuing', 'ended']).nullable().optional().catch(null),
   seasons: z.array(seasonSchema).catch([]),
   alternateTitles: z.array(alternateTitleSchema).catch([]),
 });
@@ -48,6 +51,8 @@ export const episodeSchema = z.object({
   absoluteEpisodeNumber: z.number().int().nullable().catch(null),
   title: z.string().catch(''),
   airDate: z.string().nullable().catch(null),
+  airDateUtc: z.string().nullable().optional().catch(null),
+  finaleType: z.string().nullable().optional().catch(null),
   monitored: z.boolean(),
   hasFile: z.boolean(),
 });

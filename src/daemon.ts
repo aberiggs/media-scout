@@ -96,6 +96,15 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
     const now = new Date();
     return operations.work({ ...page, ...(typeof status === 'string' ? { status } : {}), ...(typeof scope === 'string' ? { scope } : {}), ...(q ? { q } : {}) }, settings.safety.allowOperatorActions, now);
   });
+  app.get('/api/operations/episodes', async (request, reply) => {
+    const query = request.query as Record<string, unknown>;
+    const page = parsePage(query);
+    if (!page || typeof query.workKey !== 'string' || !query.workKey.trim() || query.workKey.length > 160) return reply.code(400).send({ error: 'invalid query parameters', code: 'invalid-query' });
+    const work = stack.state.getWorkItem(query.workKey);
+    if (!work) return reply.code(404).send({ error: 'work item not found', code: 'work-not-found' });
+    if (work.unit.kind !== 'tv') return reply.code(404).send({ error: 'TV work item not found', code: 'work-not-found' });
+    return operations.episodes(query.workKey, page.limit, page.offset, new Date());
+  });
   app.get('/api/operations/reviews', async (request, reply) => {
     const query = request.query as Record<string, unknown>;
     const page = parsePage(query);

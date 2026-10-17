@@ -20,6 +20,13 @@ export interface WorkItem {
   resetPendingAt?: string | null;
 }
 
+export interface EpisodeProgress {
+  workKey: string; serviceId: number; externalId: number; episodeId: number; seasonNumber: number;
+  episodeNumber: number; absoluteEpisodeNumber: number | null; title: string; monitored: boolean; hasFile: boolean;
+  airDate: string | null; airDateUtc: string | null; finaleType?: string | null; lastObservedAt: string;
+  lastSearchAt: string | null; nextSearchAt: string | null; lastOutcome: string | null;
+}
+
 export interface IntentCoverage {
   workKey: string;
   episodeIds: number[] | null;

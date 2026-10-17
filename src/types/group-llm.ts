@@ -4,6 +4,10 @@ const groupPlannedQuerySchema = z.object({
   query: z.string().min(1).max(300),
   categories: z.array(z.number().int()).min(1).max(4),
   targetIndices: z.array(z.number().int().nonnegative()).min(1),
+  episodeTargets: z.array(z.object({
+    targetIndex: z.number().int().nonnegative(),
+    episodeIndices: z.array(z.number().int().nonnegative()).min(1),
+  }).strict()).min(1).optional(),
 }).strict();
 
 export const groupPlanEnvelopeSchema = z.object({
@@ -34,6 +38,27 @@ export const groupPlanJsonSchema = {
   },
   required: ['queries'],
   additionalProperties: false,
+} as const;
+
+/** Strict providers require every declared property: keep episode attribution stage-specific. */
+export const groupEpisodePlanJsonSchema = {
+  ...groupPlanJsonSchema,
+  properties: { queries: {
+    ...groupPlanJsonSchema.properties.queries,
+    items: {
+      ...groupPlanJsonSchema.properties.queries.items,
+      properties: {
+        ...groupPlanJsonSchema.properties.queries.items.properties,
+        episodeTargets: { type: 'array', minItems: 1, items: {
+          type: 'object', properties: {
+            targetIndex: { type: 'integer', minimum: 0 },
+            episodeIndices: { type: 'array', items: { type: 'integer', minimum: 0 }, minItems: 1 },
+          }, required: ['targetIndex', 'episodeIndices'], additionalProperties: false,
+        } },
+      },
+      required: ['query', 'categories', 'targetIndices', 'episodeTargets'],
+    },
+  } },
 } as const;
 
 export const groupSelectionSchema = z.object({

@@ -1,5 +1,14 @@
 # Progress
 
+## PR #19 review and main conflict resolution (2026-10-16)
+
+- Reviewed issue #11, operator safety/recovery docs, and PR #19 against `origin/main` at `2838ffb3d20285c4abbb73fa5c1785f8efc8cd1f`. Preserved unrelated untracked `docs/sprocket-feedback.md`.
+- Merged main without rewriting topic history. The only conflict was the runner's State import; retained `ActivityScope`, which the episode search diagnostics require. The resolved application tree is identical to pre-merge `788d428`: main's legacy-review fixes were already present on this topic branch.
+- Fresh verification: `npm run typecheck` passed; `npm test` passed (48 files, 785 tests); `npm --prefix web run typecheck` passed; `npm --prefix web test` passed (42 tests); `npm run build` passed; `git diff --check` and `git diff --cached --check` passed. `openspec validate support-ongoing-episode-acquisition --strict` passed (artifact validation only).
+- `docker buildx build --platform linux/amd64 --load -f docker/Dockerfile -t media-scout:pr19-review-local .` passed using cached layers, image `sha256:f3ef60e2f8a134ea6f679d0e7737ea936aa6238307df2178692b0798cd4d9f16`. `docker run --rm --network none --platform linux/amd64 --entrypoint node media-scout:pr19-review-local --input-type=module -e 'import Database from "better-sqlite3"; const db = new Database(":memory:"); if (db.prepare("SELECT 1 AS value").get().value !== 1) process.exit(1); db.close(); console.log("amd64 SQLite smoke passed");'` passed.
+- Remaining verification blocker: `docker buildx inspect` still lists only amd64/x86 variants/386, not ARM64; `gh pr checks 19` reports no checks. Task 5.3 stays unchecked (16/17 complete). No ARM64 pass, production integration, or new rendered-browser review is claimed.
+- Publication restriction: controlling session instructions prohibit push despite project checkpoint guidance. This resolution is local only; PR #19 on GitHub remains conflicted until the topic merge commit is published. No PR merge, deployment, or image publication.
+
 ## Recovered session: UI, acceptance and final verification
 
 - Task 4.2: Queue summaries distinguish caught-up, known inventory imported and finished-airing evidence. Queue and TV review details expand a read-only inventory in 25-episode pages with timing basis, independent retries, scoped safety reasons and explicitly historical file facts for stale/unknown observations. Old responses without the additive summary remain supported; existing action gates are unchanged. Operator interpretation is documented in `docs/operations-dashboard.md`.

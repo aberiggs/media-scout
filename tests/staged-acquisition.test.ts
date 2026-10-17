@@ -21,13 +21,14 @@ const at = '2026-10-15T23:00:00.000Z';
 const single = (number: number): Release => ({ ...releaseFixture, guid: `synthetic-${number}`, infoHash: null, title: `Synthetic.Show.S02E${String(number).padStart(2, '0')}.1080p` });
 const pack: Release = { ...releaseFixture, guid: 'synthetic-pack', infoHash: null, title: 'Synthetic.Show.S02.Complete.1080p' };
 
-function harness(count: number, options: { pack?: Release[]; rejectPack?: boolean; manualPack?: boolean; manualSeason?: number; emptyEpisodes?: boolean; live?: boolean; packQueries?: number; episodeResults?: Release[]; badPlan?: boolean } = {}) {
+function harness(count: number, options: { pack?: Release[]; rejectPack?: boolean; manualPack?: boolean; manualSeason?: number; emptyEpisodes?: boolean; live?: boolean; packQueries?: number; episodeResults?: Release[]; badPlan?: boolean; primaryReason?: string; fallbackReason?: string; beforePickerResponse?: (state: State, selection: Record<string, unknown>) => void; invalidPicker?: boolean } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'staged-acquisition-')); directories.push(directory);
   const path = join(directory, 'isolated.db');
   let state = State.open(path); opened.push(state);
   let externalId = 123;
   let unknownQueue = false;
   let unknownLibrary = false;
+  let now = at;
   let episodes: Episode[] = Array.from({ length: count }, (_, index) => ({ id: 101 + index, seriesId: 1, seasonNumber: 2,
     episodeNumber: index + 1, absoluteEpisodeNumber: null, title: `Episode ${index + 1}`, airDate: '2026-10-01', airDateUtc: '2026-10-01T23:00:00Z', monitored: true, hasFile: false }));
   const stages: Array<{ stage: string | null; numbers: number[] }> = [];
@@ -53,13 +54,16 @@ function harness(count: number, options: { pack?: Release[]; rejectPack?: boolea
     const manual = options.manualPack && stage === 'pack-batch';
     const skip = options.rejectPack && stage === 'pack-batch';
     const limit = data.selectionLimit ?? 3;
-    return args.schema.parse({ selection: { verdict: manual ? 'manual' : skip ? 'skip' : 'grab',
+    const response = { selection: { verdict: manual ? 'manual' : skip ? 'skip' : 'grab',
       releaseIndices: manual || skip ? [] : data.candidates.slice(0, limit).map((_: unknown, index: number) => index),
       manualTargetIndices: manual ? data.dueTargetIndices : stage === 'pack-batch'
         ? data.targets.flatMap((target: { seasonNumber: number }, index: number) => target.seasonNumber === options.manualSeason ? [index] : []) : [],
-      deferredTargetIndices: [], reason: 'Synthetic stage choice' } });
+      deferredTargetIndices: [], reason: stage === 'episodes' ? options.fallbackReason ?? 'Synthetic fallback choice' : options.primaryReason ?? 'Synthetic primary choice' } };
+    if (options.invalidPicker) response.selection.releaseIndices = [999];
+    options.beforePickerResponse?.(state, response.selection);
+    return args.schema.parse(response);
   } };
-  const runner = () => new Runner({ state, logger: pino({ enabled: false }), now: () => new Date(at),
+  const runner = () => new Runner({ state, logger: pino({ enabled: false }), now: () => new Date(now),
     watcher: { getSnapshot: async () => ({ observedAt: at, sonarr: unknownLibrary ? { known: false, series: [] } : { known: true, series: [{ known: true, series: { id: 1, tvdbId: externalId, title: 'Synthetic Show', titleSlug: 'synthetic', monitored: true, seriesType: 'standard', seasons: [], alternateTitles: [] }, episodes }] }, radarr: { known: true, movies: [] } }) },
     sonarr: { getQueue: async () => { if (unknownQueue) throw new Error('synthetic incomplete queue'); return []; } }, radarr: { getQueue: async () => [] },
     planner: new Planner({ llm }), picker: new Picker({ llm }),
@@ -71,7 +75,7 @@ function harness(count: number, options: { pack?: Release[]; rejectPack?: boolea
   } as unknown as RunnerDeps);
   return { get state() { return state; }, get runner() { return runner(); }, stages, queries, grabs, get episodes() { return episodes; }, setEpisodes(value: Episode[]) { episodes = value; },
     setExternalId(value: number) { externalId = value; }, setUnknownQueue() { unknownQueue = true; },
-    setUnknownLibrary() { unknownLibrary = true; },
+    setUnknownLibrary() { unknownLibrary = true; }, advanceTo(value: string) { now = value; },
     restart() { state.close(); opened.splice(opened.indexOf(state), 1); state = State.open(path); opened.push(state); },
     failQuery(fn: typeof queryFailure) { queryFailure = fn; }, onSearch(fn: () => void) { onSearch = fn; } };
 }
@@ -176,6 +180,77 @@ describe('bounded staged TV acquisition', () => {
     expect(run.queries).toEqual(['pack-0', 'episode-2', 'episode-3']);
     expect(run.grabs).toEqual([]);
     expect(run.state.listGrabIntents()).toEqual([]);
+  });
+
+  it.each([
+    ['rate limit', new ApiError(429, 'https://synthetic.invalid', '', 900), '2026-10-15T23:15:00.000Z'],
+    ['ordinary error', new Error('synthetic search failure'), '2026-10-15T23:05:00.000Z'],
+  ] as const)('preserves primary sibling manual review when fallback hits a %s', async (_name, error, retryAt) => {
+    const run = harness(3, { pack: [single(1)], manualSeason: 3, live: true, primaryReason: 'primary sibling identity concern', fallbackReason: 'fallback concern' });
+    run.setEpisodes(run.episodes.map((episode) => episode.id === 103 ? { ...episode, seasonNumber: 3 } : episode));
+    run.failQuery((query) => query === 'episode-2' ? error : null);
+
+    const first = await run.runner.cycle();
+
+    expect(first.manualFlagged).toBe(1);
+    expect(run.queries).toEqual(['pack-0', 'episode-2']);
+    expect(run.state.listManualReview()).toMatchObject([{ workKey: 'sonarr:1:s3', reason: 'picker-manual', details: 'primary sibling identity concern' }]);
+    expect(run.state.getWorkItem('sonarr:1:s3')).toMatchObject({ status: 'manual', nextSearchAt: null });
+    expect(run.state.getWorkItem('sonarr:1:s2')).toMatchObject({ status: 'backoff', nextSearchAt: retryAt });
+    expect(run.grabs).toEqual([]);
+    expect(run.state.listGrabIntents()).toEqual([]);
+    expect(run.state.listEpisodeProgress('sonarr:1:s2').every((episode) => episode.lastSearchAt === null)).toBe(true);
+
+    run.restart();
+    run.advanceTo(retryAt);
+    run.failQuery(null);
+    const next = await run.runner.cycle();
+    expect(next.manualFlagged).toBe(0);
+    expect(run.queries).not.toContain('episode-3');
+    expect(run.stages.slice(2).flatMap((stage) => stage.numbers)).not.toContain(3);
+    expect(run.state.listManualReview()).toMatchObject([{ workKey: 'sonarr:1:s3', reason: 'picker-manual' }]);
+  });
+
+  it('keeps the primary manual reason when successful fallback selects a sibling single', async () => {
+    const run = harness(3, { pack: [single(1)], manualSeason: 3, live: true, primaryReason: 'primary sibling identity concern', fallbackReason: 'fallback selection rationale' });
+    run.setEpisodes(run.episodes.map((episode) => episode.id === 103 ? { ...episode, seasonNumber: 3 } : episode));
+
+    await run.runner.cycle();
+
+    expect(run.grabs).toEqual([single(1).title, single(2).title]);
+    expect(run.state.listManualReview()).toMatchObject([{ workKey: 'sonarr:1:s3', reason: 'picker-manual', details: 'primary sibling identity concern' }]);
+  });
+
+  it('does not persist a primary manual decision after its claim is replaced during picker response', async () => {
+    const run = harness(3, { pack: [single(1)], manualSeason: 3, live: true, beforePickerResponse: (state) => {
+      const successorAt = new Date(Date.parse(at) + 16 * 60_000);
+      run.advanceTo(successorAt.toISOString());
+      const successor = state.claimUnit('sonarr:1:s3', successorAt);
+      expect(successor).not.toBeNull();
+    } });
+    run.setEpisodes(run.episodes.map((episode) => episode.id === 103 ? { ...episode, seasonNumber: 3 } : episode));
+
+    const first = await run.runner.cycle();
+
+    expect(first.manualFlagged).toBe(0);
+    expect(run.state.listManualReview()).toEqual([]);
+    expect(run.state.getWorkItem('sonarr:1:s3')?.status).not.toBe('manual');
+    expect(run.state.lastDecisionAt('sonarr:1:s3')).toBeNull();
+    expect(run.state.claimUnit('sonarr:1:s3', new Date(Date.parse(at) + 16 * 60_000))).toBeNull();
+    expect(run.state.listGrabIntents()).toEqual([]);
+    expect(run.grabs).toEqual([]);
+  });
+
+  it('rejects an invalid picker selection without persisting its manual target decision', async () => {
+    const run = harness(3, { pack: [single(1)], manualSeason: 3, live: true, invalidPicker: true });
+    run.setEpisodes(run.episodes.map((episode) => episode.id === 103 ? { ...episode, seasonNumber: 3 } : episode));
+    const summary = await run.runner.cycle();
+    expect(summary.manualFlagged).toBe(0);
+    expect(run.state.listManualReview()).toEqual([]);
+    expect(run.state.getWorkItem('sonarr:1:s3')?.status).not.toBe('manual');
+    expect(run.state.lastDecisionAt('sonarr:1:s3')).toBeNull();
+    expect(run.state.listGrabIntents()).toEqual([]);
+    expect(run.grabs).toEqual([]);
   });
 
   it('rejects invented episode attribution before paying for an episode query', async () => {

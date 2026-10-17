@@ -58,6 +58,10 @@ function replay() {
       return [{ query: `Synthetic Show targets ${ids.join(',')}`, categories: [5000], targetIndices: group.dueTargetIndices,
         ...(stage === 'episodes' ? { episodeTargets: group.dueTargetIndices.map((targetIndex) => ({ targetIndex, episodeIndices: group.targets[targetIndex]!.season!.missing.map((_, index) => index) })) } : {}),
       }];
+    }, plan: async (unit: WorkGroup['targets'][number]) => {
+      const ids = unit.season?.missing.map((target) => target.episodeId) ?? [];
+      plannedTargets.push(ids);
+      return [{ query: `Synthetic Show targets ${ids.join(',')}`, categories: [5000] }];
     } },
     picker: { pickGroup: async () => { if (pickerError) throw pickerError; return { verdict: 'skip', releaseIndices: [], manualTargetIndices: [], deferredTargetIndices: [], reason: 'test evaluation complete' }; } },
     prowlarr: {
@@ -428,6 +432,63 @@ describe('issue #11 persisted weekly episode lifecycle', () => {
       run.at('2026-10-23T04:00:00.000Z');
       await run.poll();
       expect(run.plannedTargets).toEqual([[101], [102], [101]]);
+      expect(run.state.listGrabIntents()).toEqual([]);
+    } finally { run.close(); }
+  });
+
+  it('persists manual dry-run episode cooldowns so the next automatic poll does not immediately repeat its search', async () => {
+    const run = replay();
+    try {
+      run.setEmptyResults(true);
+      run.at('2026-10-15T23:00:00.000Z');
+      await run.poll();
+      expect(run.state.listEpisodeProgress('sonarr:1:s2')).toMatchObject([
+        { episodeId: 101, lastSearchAt: '2026-10-15T23:00:00.000Z', nextSearchAt: '2026-10-16T05:00:00.000Z' },
+        { episodeId: 102, lastSearchAt: null, nextSearchAt: null },
+      ]);
+
+      run.setEmptyResults(false);
+      run.at('2026-10-16T06:00:00.000Z');
+      expect(await run.manualPick()).toMatchObject({ outcome: 'dry-run', coveredEpisodeNumbers: [1] });
+      expect(run.state.listEpisodeProgress('sonarr:1:s2')).toMatchObject([
+        { episodeId: 101, lastSearchAt: '2026-10-16T06:00:00.000Z', nextSearchAt: '2026-10-16T12:00:00.000Z', lastOutcome: 'dry-run' },
+        { episodeId: 102, lastSearchAt: null, nextSearchAt: null },
+      ]);
+      const searchesAfterManualPick = [...run.searches];
+
+      run.restart();
+      await run.poll();
+      expect(run.searches).toEqual(searchesAfterManualPick);
+      expect(run.plannedTargets).toEqual([[101], [101]]);
+      expect(run.state.listEpisodeProgress('sonarr:1:s2')).toMatchObject([
+        { episodeId: 101, lastSearchAt: '2026-10-16T06:00:00.000Z', nextSearchAt: '2026-10-16T12:00:00.000Z', lastOutcome: 'dry-run' },
+        { episodeId: 102, lastSearchAt: null, nextSearchAt: null },
+      ]);
+      expect(run.state.listGrabIntents()).toEqual([]);
+    } finally { run.close(); }
+  });
+
+  it('does not reset an independently cooled download-held sibling during a manual pick', async () => {
+    const run = replay();
+    try {
+      run.setEpisodes(run.episodes.map((episode) => episode.id === 102 ? { ...episode, airDateUtc: '2026-10-15T23:00:00Z' } : episode));
+      run.at('2026-10-15T23:00:00.000Z');
+      await run.poll();
+      const token = run.state.claimUnit('sonarr:1:s2', new Date('2026-10-15T23:30:00.000Z'))!;
+      run.state.recordEpisodeAttempt({ key: 'sonarr:1:s2', token, episodeIds: [102],
+        now: '2026-10-15T23:30:00.000Z', nextSearchAt: '2026-10-16T05:30:00.000Z', outcome: 'release-unavailable' });
+      run.state.releaseClaim('sonarr:1:s2', token);
+      run.setQueue([{ downloadId: 'synthetic-episode-2', seriesId: 1, episodeId: 102, seasonNumber: 2, status: 'downloading' }]);
+      run.at('2026-10-16T06:00:00.000Z');
+      expect(await run.manualPick()).toMatchObject({ outcome: 'dry-run', coveredEpisodeNumbers: [1] });
+      run.restart();
+      await run.poll();
+      expect(run.plannedTargets).toEqual([[101, 102], [101]]);
+      expect(run.state.listEpisodeProgress('sonarr:1:s2')).toMatchObject([
+        { episodeId: 101, lastSearchAt: '2026-10-16T06:00:00.000Z', nextSearchAt: '2026-10-16T12:00:00.000Z', lastOutcome: 'dry-run' },
+        { episodeId: 102, lastSearchAt: '2026-10-15T23:30:00.000Z', nextSearchAt: '2026-10-16T05:30:00.000Z', lastOutcome: 'release-unavailable' },
+      ]);
+      expect(run.state.listWorkQueueObservations().find((row) => row.workKey === 'sonarr:1:s2')?.coverage).toMatchObject([{ episodeIds: [102] }]);
       expect(run.state.listGrabIntents()).toEqual([]);
     } finally { run.close(); }
   });

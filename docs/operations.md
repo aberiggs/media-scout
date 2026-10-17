@@ -45,6 +45,8 @@ MCP `ma_review_action` with `resolve` resolves an open review; it is not the das
 
 `ma_pick`'s `releaseIndex` selects from a candidate list built fresh on every call (planner queries → Prowlarr search → guardrail filtering → seeders sort → cap). The list is not stable across calls and nothing is reserved. A dry-run call does not pin an index for later. Check the returned `releaseTitle` to see what was selected; outcomes include `grabbed`, `dry-run`, `missing-download-client`, and `reverify-failed`. An index from `ma_search` raw results does not transfer.
 
+Successful manual-pick searches update episode attempt clocks for their actual eligible search scope, including dry runs. Their final retry/cooldown is persisted with the season outcome so the next automatic poll does not immediately repeat the same search. Future, imported, and download-held siblings outside that scope retain their clocks. Picker identity-manual decisions are persisted under the live claim before a later fallback stage; a fallback error or different selection rationale cannot erase or relabel that hold.
+
 For the separate opt-in administrative recovery lane, see [operator recovery](operator-recovery.md). `allowOperatorActions` defaults to `false` in the UI, and host approval is required for every MCP call if enabled. The lane does not search, grab, invoke an LLM, or call the normal runner.
 
 ## HTTP and MCP interfaces

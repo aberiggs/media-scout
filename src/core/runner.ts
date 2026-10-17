@@ -421,16 +421,10 @@ export class Runner {
         return 'processed';
       }
       selectedForDeferral = selection.deferredTargetIndices;
-      let newPickerReviews = 0;
-      for (const targetIndex of selection.manualTargetIndices) {
-        const workKey = currentGroup.targets[targetIndex]!.key;
-        if (this.flagReviewOnce(workKey, 'picker-manual', selection.reason)) newPickerReviews += 1;
-      }
       if (selection.verdict === 'manual' || selection.verdict === 'skip') {
         await this.finishGroupDecision(currentGroup, startedKeys, claims.ownerToken, selection, selection.verdict === 'manual' ? 'picker-manual' : 'picker-skip', new Set(), new Map(), summary, [], false, pendingKeys);
         startedKeys = [];
-        if (selection.verdict === 'manual') summary.manualFlagged += newPickerReviews;
-        else summary.skipped += currentGroup.dueTargetIndices.length;
+        if (selection.verdict !== 'manual') summary.skipped += currentGroup.dueTargetIndices.length;
         return 'processed';
       }
       if (this.deps.config.dryRun) {
@@ -616,8 +610,23 @@ export class Runner {
         for (const capture of candidate.capture) for (const id of capture.episodeIds ?? []) chosenIds.add(id);
       }
       const manual = choice.verdict === 'manual' && !choice.manualTargetIndices.length ? scope.dueTargetIndices : choice.manualTargetIndices;
-      for (const index of manual) { const target = scope.targets[index]; if (!target) throw new Error('Invalid staged manual target'); manualKeys.add(target.key); }
       for (const index of choice.deferredTargetIndices) { const target = scope.targets[index]; if (!target) throw new Error('Invalid staged deferred target'); deferredKeys.add(target.key); }
+      for (const index of manual) {
+        const target = scope.targets[index];
+        if (!target) throw new Error('Invalid staged manual target');
+        const work = this.deps.state.getWorkItem(target.key);
+        if (!work) throw new Error('Missing staged manual work');
+        // Identity holds are durable decisions, not provisional release choices. Persist
+        // under the live lease before another stage can fail or replace its rationale.
+        const result = this.deps.state.finishSearchWithReview({ key: target.key, token,
+          nextSearchAt: null, failCount: work.failCount, outcome: 'picker-manual',
+          now: this.now().toISOString(), expectedStatus: 'searching',
+          decision: { workKey: target.key, verdict: 'manual', grabbed: false },
+          review: { reason: 'picker-manual', details: choice.reason.slice(0, 200) } });
+        if (!result.finished) throw new Error('Could not persist staged manual hold');
+        if (result.reviewCreated) summary.manualFlagged += 1;
+        manualKeys.add(target.key);
+      }
     };
     const count = due.targets.reduce((total, unit) => total + (unit.season?.missing.length ?? 0), 0);
     if (!tv) await run(due);
@@ -1022,7 +1031,12 @@ export class Runner {
       const unit = freshRow.eligibleUnit;
       const queries = await this.deps.planner.plan(unit);
       const releases: Release[] = [];
-       for (const planned of queries) releases.push(...await this.recordedSearch(planned.query, planned.categories, allowlist, [unit], 'manual'));
+      for (const planned of queries) {
+        releases.push(...await this.recordedSearch(planned.query, planned.categories, allowlist, [unit], 'manual'));
+        if (unit.kind === 'tv') this.deps.state.recordEpisodeAttempt({ key: unit.key, token,
+          episodeIds: unit.season!.missing.map((episode) => episode.episodeId), now: this.now().toISOString(),
+          nextSearchAt: this.dateAfter(this.deps.config.minRetryHours * 60), outcome: 'searched' });
+      }
       const candidates = this.admitCandidates(freshRow.work.unit, unit, this.buildCandidates(freshRow.work.unit, releases, this.emptySummary()), freshRow.activeCoverage);
       const judged = this.orderCandidates(candidates, unit.key);
       const candidate = judged[releaseIndex];
@@ -1372,14 +1386,16 @@ export class Runner {
   }
 
   private finishCooldown(work: WorkItem, token: string, outcome: string, decision?: { workKey: string; releaseTitle?: string; infoHash?: string; verdict: string; grabbed: boolean }, noDecision = false): void {
-    this.deps.state.finishSearch({ key: work.workKey, token, status: 'cooldown', nextSearchAt: this.dateAfter(this.deps.config.minRetryHours * 60), failCount: 0, outcome, now: this.now().toISOString(), decision: noDecision ? undefined : decision });
+    this.deps.state.finishSearch({ key: work.workKey, token, status: 'cooldown', nextSearchAt: this.dateAfter(this.deps.config.minRetryHours * 60), failCount: 0, outcome, now: this.now().toISOString(), decision: noDecision ? undefined : decision,
+      episodeIds: work.unit.season?.missing.map((episode) => episode.episodeId) });
   }
 
   private async finishBackoff(work: WorkItem, token: string, error: unknown, retryAfter?: number): Promise<void> {
     if (error instanceof DefinitiveGrabError || error instanceof AmbiguousGrabError) return;
     const failCount = work.failCount + 1;
     const retry = retryAfter ?? (error instanceof ApiError ? error.retryAfter : undefined);
-    this.deps.state.finishSearch({ key: work.workKey, token, status: 'backoff', nextSearchAt: this.failureRetryAt(failCount, retry), failCount, outcome: safeErrorCode(error), now: this.now().toISOString() });
+    this.deps.state.finishSearch({ key: work.workKey, token, status: 'backoff', nextSearchAt: this.failureRetryAt(failCount, retry), failCount, outcome: safeErrorCode(error), now: this.now().toISOString(),
+      episodeIds: work.unit.season?.missing.map((episode) => episode.episodeId) });
   }
 
   private async backoffClaimed(key: string, token: string, reason: string, error?: unknown): Promise<void> {

@@ -241,7 +241,7 @@ describe('operational dashboard API', () => {
     const { app, state } = await makeApp();
     const response = await app.inject({ method: 'POST', url: '/api/operations/work/action', payload: { workKey: 'sonarr:4:s1', action: 'reset' } });
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual({ ok: true, message: 'Reset recorded; rediscovery will begin after a later known library observation.' });
+    expect(response.json()).toMatchObject({ ok: true, message: expect.stringContaining('downloads and duplicate-download protection are unchanged') });
     expect(state.getWorkItem('sonarr:4:s1')).toMatchObject({ status: 'ready', lastSearchAt: null, resetPendingAt: expect.any(String) });
     expect(await (await app.inject({ method: 'GET', url: '/api/operations/work' })).json()).toMatchObject({ items: [], total: 0, counts: { ready: 0 } });
     const unknownOwner = state.claimUnits({ keys: ['sonarr:4:s1', 'group:sonarr:4'], now: new Date() })!;
@@ -255,6 +255,16 @@ describe('operational dashboard API', () => {
     state.applyWorkQueueObservation({ key: observed.workKey, token: knownOwner.ownerToken, observedAt: afterReset, known: true, coverage: [] });
     state.releaseClaims({ keys: knownOwner.keys, ownerToken: knownOwner.ownerToken });
     expect((await (await app.inject({ method: 'GET', url: '/api/operations/work' })).json()).total).toBe(1);
+  });
+
+  it('resets an old queue review through the same guarded action without deleting its history', async () => {
+    const { app, state } = await makeApp();
+    state.flagManualReview('sonarr:4:s1', 'queue-review', undefined, new Date());
+    const reset = await app.inject({ method: 'POST', url: '/api/operations/work/action', payload: { workKey: 'sonarr:4:s1', action: 'reset' } });
+    expect(reset.statusCode).toBe(200);
+    expect(state.listManualReview()).toEqual([]);
+    expect(state.listManualReview(true)).toHaveLength(2);
+    expect(state.getWorkItem('sonarr:4:s1')?.resetPendingAt).toBeTruthy();
   });
 
   it('rejects work actions while the local cycle gate is active', async () => {

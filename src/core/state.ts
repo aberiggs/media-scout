@@ -764,9 +764,10 @@ export class State {
       const reason = this.workActionBlockReason(input.workKey, input.action, input.now, input.ownerToken);
       if (reason) throw new Error(`Work action is not eligible: ${reason}`);
       const result = this.db.prepare(`UPDATE work_items SET status='ready',next_search_at=NULL,fail_count=0,last_outcome=NULL,
+        blocked_reason=CASE WHEN ?='reset' THEN NULL ELSE blocked_reason END,
         last_search_at=CASE WHEN ?='reset' THEN NULL ELSE last_search_at END,
         reset_pending_at=CASE WHEN ?='reset' THEN ? ELSE reset_pending_at END WHERE work_key=?`)
-        .run(input.action, input.action, input.action === 'reset' ? input.now : null, input.workKey);
+        .run(input.action, input.action, input.action, input.action === 'reset' ? input.now : null, input.workKey);
       if (result.changes !== 1) throw new Error('Work action raced with another update');
       if (work.unit.kind === 'tv') {
         this.db.prepare(`UPDATE episode_progress SET next_search_at=NULL,last_outcome=NULL,
@@ -774,8 +775,13 @@ export class State {
           WHERE work_key=? AND service_id=? AND external_id=?`)
           .run(input.action, input.workKey, work.unit.serviceId, work.unit.externalId);
       }
-      this.db.prepare('UPDATE manual_review SET resolved_at=? WHERE work_key=? AND resolved_at IS NULL AND reason IN (?,?,?,?,?,?)')
-        .run(input.now, input.workKey, ...ORDINARY_REVIEW_REASONS);
+      if (input.action === 'reset') {
+        this.db.prepare('UPDATE manual_review SET resolved_at=? WHERE work_key=? AND resolved_at IS NULL AND subject_kind IS NULL AND subject_key IS NULL')
+          .run(input.now, input.workKey);
+      } else {
+        this.db.prepare('UPDATE manual_review SET resolved_at=? WHERE work_key=? AND resolved_at IS NULL AND reason IN (?,?,?,?,?,?) AND subject_kind IS NULL AND subject_key IS NULL')
+          .run(input.now, input.workKey, ...ORDINARY_REVIEW_REASONS);
+      }
       this.db.prepare('INSERT INTO work_action_audit(work_key,action,occurred_at) VALUES(?,?,?)').run(input.workKey, input.action, input.now);
     })();
   }
@@ -832,7 +838,7 @@ export class State {
     if (!work) return 'work-not-found';
     const relatedKey = (key: string): boolean => key === workKey || (work.unit.kind === 'tv' && key.startsWith(`sonarr:${work.unit.serviceId}:s`));
     if (work.lastOutcome === 'rate-limited' && work.nextSearchAt !== null && Date.parse(work.nextSearchAt) > Date.parse(now)) return 'rate-limited';
-    if (work.blockedReason !== null && work.blockedReason !== 'manual-review') return 'work-held';
+    if (action !== 'reset' && work.blockedReason !== null && work.blockedReason !== 'manual-review') return 'work-held';
     if (!work.queueObservationKnown || work.lastQueueObservedAt === null) return 'queue-observation-unknown';
     const nowMs = Date.parse(now);
     const libraryAt = Date.parse(work.lastObservedAt);
@@ -841,7 +847,7 @@ export class State {
     if (nowMs - queueAt > WORK_OBSERVATION_STALE_AFTER_MS || nowMs - libraryAt > WORK_OBSERVATION_STALE_AFTER_MS) return 'queue-observation-stale';
     const allOpenReviews = this.db.prepare('SELECT work_key,reason FROM manual_review WHERE resolved_at IS NULL').all() as Array<{ work_key: string; reason: string }>;
     const reviews = allOpenReviews.filter(({ work_key: key }) => key === workKey);
-    if (allOpenReviews.some(({ work_key: key, reason }) => relatedKey(key) && !(ORDINARY_REVIEW_REASONS as readonly string[]).includes(reason))) return 'review-not-eligible';
+    if (action !== 'reset' && allOpenReviews.some(({ work_key: key, reason }) => relatedKey(key) && !(ORDINARY_REVIEW_REASONS as readonly string[]).includes(reason))) return 'review-not-eligible';
     const ordinaryReview = work.status === 'manual' && reviews.length > 0;
     const eligibleStatus = action === 'retry'
       ? ['cooldown', 'backoff'].includes(work.status) || ordinaryReview
@@ -855,6 +861,10 @@ export class State {
     const cutoff = new Date(Date.parse(now) - CLAIM_TTL_MS).toISOString();
     const leases = this.db.prepare('SELECT work_key,owner FROM unit_claims WHERE claimed_at>=?').all(cutoff) as Array<{ work_key: string; owner: string }>;
     if (leases.some((lease) => (relatedKeys.has(lease.work_key) || lease.work_key === groupKey) && lease.owner !== ownerToken)) return 'work-claimed';
+
+    // Reset changes local scheduling/reviews only. Download evidence below is
+    // deliberately retained and re-applied on the next known library observation.
+    if (action === 'reset') return work.resetPendingAt ? 'reset-pending' : null;
 
     const openIntents = this.db.prepare("SELECT * FROM grab_intents WHERE released_at IS NULL AND status IN ('submitting','awaiting-queue','active','import-blocked','uncertain')").all() as Record<string, unknown>[];
     for (const row of openIntents) {

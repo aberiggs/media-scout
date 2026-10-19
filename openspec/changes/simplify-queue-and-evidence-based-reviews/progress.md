@@ -74,3 +74,11 @@ Continue with queue-review evidence, independent held coverage and Reset item.
 - RED regressions reproduced imported exact-episode uncertain queue rows holding future siblings, and broad unknown queue rows generating unreleased-only reviews. Fixed by using positive imported facts and retaining transient safety holds without premature durable tasks.
 - Focused `npm test -- tests/queue-review-state.test.ts tests/queue-review-lifecycle.test.ts tests/runner.test.ts tests/work-queue.test.ts`: 137 passed. `npm run typecheck`: passed. Full `npm test`: 51 files, 817 passed. `git diff --check`: passed.
 - Architectural reviewer found no blocking code findings. All checks offline; no production changes. The old review-resolution/coverage shortcut and reset are deliberately addressed next, not claimed fixed by this checkpoint.
+
+## Checkpoint 3 — safe local reset
+
+- Reset now clears scheduling/attempt clocks and unlinked reviews as history while preserving all linked reviews, intents, queue coverage, decisions, associations and dedupe protection. Freshness, provider limits, opt-in, origin/cycle checks and owned same-series leases remain enforced.
+- Removed the inference that resolving a review discharges vanished coverage; pending reset prevents pre-reset library reads from making paid work eligible.
+- RED: tests reproduced blocked reset for an old queue review/reservation, coverage disappearing after review resolution, and pre-reset read remaining actionable. GREEN after implementation. Updated two old tests that intentionally expected review-only dismissal to release coverage/terminal resets to be forbidden.
+- Focused suites exercised state/API gates, preserved linked evidence and next-poll reconstruction. Final `npm run typecheck`: passed. Full `npm test`: 51 files, 821 passed. `git diff --check`: passed.
+- Independent architectural review found no blocking findings. Confirmation UI remains task 3.2; backend action and safety invariants complete. No live calls or production mutation.

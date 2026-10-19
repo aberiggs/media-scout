@@ -35,6 +35,7 @@ function setup(change: { unknown?: boolean; identity?: number; observedAt?: stri
     evidence: change.scope === 'unknown' ? { ...evidence, scope: 'unknown', episodeIds: null } : evidence,
     intentId, now: before });
   state.applyWorkReconciliation({ key: work.workKey, token: owner, work: { ...work, status: 'manual', blockedReason: 'queue-review' }, intentUpdates: [] });
+  state.applyWorkQueueObservation({ key: work.workKey, token: owner, observedAt: before, known: true, coverage: [] });
   state.releaseClaim(work.workKey, owner);
   const episode = { id: 101, seriesId: 4, seasonNumber: 1, episodeNumber: 1, absoluteEpisodeNumber: null, title: 'Aired',
     airDate: '2020-01-01', monitored: true, hasFile: change.imported !== false };
@@ -50,6 +51,33 @@ function setup(change: { unknown?: boolean; identity?: number; observedAt?: stri
 }
 
 describe('captured queue review lifecycle', () => {
+  it('rebuilds a reset legacy item from the next known poll without searching future episodes', async () => {
+    const { state, runner } = setup({ legacy: true });
+    const at = '2026-10-18T11:30:00.000Z';
+    const lease = state.claimUnits({ keys: ['sonarr:4:s1', 'group:sonarr:4'], now: new Date(at) })!;
+    state.applyWorkAction({ workKey: 'sonarr:4:s1', action: 'reset', ownerToken: lease.ownerToken, claimKeys: lease.keys, now: at });
+    state.releaseClaims({ keys: lease.keys, ownerToken: lease.ownerToken });
+    expect(state.listManualReview()).toEqual([]);
+    expect(state.listManualReview(true)[0]?.resolvedAt).toBe(at);
+    await runner.cycle();
+    expect(state.getWorkItem('sonarr:4:s1')).toMatchObject({ status: 'waiting-release' });
+    expect(state.getWorkItem('sonarr:4:s1')?.resetPendingAt).toBeFalsy();
+    expect(state.listSearchActivity(now)).toEqual([]);
+  });
+
+  it('reset preserves a linked review and every reservation while clearing only unlinked clutter', () => {
+    const { state } = setup({ linked: true, imported: false });
+    state.flagManualReview('sonarr:4:s1', 'no-suitable-release', undefined, new Date(before));
+    state.recordRelease(1, 'synthetic-dedupe', 'sonarr:4:s1', new Date(before));
+    const intents = state.listGrabIntents();
+    const at = '2026-10-18T11:30:00.000Z';
+    const lease = state.claimUnits({ keys: ['sonarr:4:s1', 'group:sonarr:4'], now: new Date(at) })!;
+    state.applyWorkAction({ workKey: 'sonarr:4:s1', action: 'reset', ownerToken: lease.ownerToken, claimKeys: lease.keys, now: at });
+    expect(state.listManualReview()).toMatchObject([{ reason: 'queue-review', subjectKind: 'intent', resolvedAt: null }]);
+    expect(state.listGrabIntents()).toEqual(intents);
+    expect(state.hasRelease(1, 'synthetic-dedupe')).toBe(true);
+  });
+
   it('retires an imported captured episode without holding future siblings or searching them', async () => {
     const { state, runner } = setup();
     await runner.cycle();

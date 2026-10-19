@@ -102,7 +102,7 @@ describe('operational work actions', () => {
     right.close();
   });
 
-  it('ordinary Retry clears backoff but preserves lastSearchAt; unsafe reviews block both actions', () => {
+  it('ordinary Retry preserves lastSearchAt; Reset clears unlinked safety reviews without deleting history', () => {
     const state = State.open(':memory:');
     seed(state);
     const keys = ['sonarr:4:s1', 'group:sonarr:4'];
@@ -114,7 +114,12 @@ describe('operational work actions', () => {
 
     const current = state.getWorkItem('sonarr:4:s1')!;
     state.flagManualReview(current.workKey, 'queue-review', 'must remain untouched', new Date(LATER));
-    expect(state.getWorkActionEligibility(current.workKey, LATER).reset).toMatchObject({ allowed: false, reason: 'review-not-eligible' });
+    expect(state.getWorkActionEligibility(current.workKey, LATER).reset).toEqual({ allowed: true });
+    const reset = state.claimUnits({ keys, now: new Date(LATER) })!;
+    state.applyWorkAction({ workKey: current.workKey, action: 'reset', ownerToken: reset.ownerToken, claimKeys: reset.keys, now: LATER });
+    expect(state.listManualReview()).toEqual([]);
+    expect(state.listManualReview(true).every((review) => review.resolvedAt !== null)).toBe(true);
+    expect(state.hasRelease(7, 'guid-stays')).toBe(true);
     state.close();
   });
 
@@ -146,10 +151,13 @@ describe('operational work actions', () => {
     if (!reservation.ok) throw new Error('expected sibling reservation');
     reservationState.markGrabUncertain({ intentId: reservation.intentId, ownerToken: reservationLease.ownerToken, now: LATER });
     reservationState.releaseClaims({ keys: reservationLease.keys, ownerToken: reservationLease.ownerToken });
-    expect(reservationState.getWorkActionEligibility('sonarr:4:s1', LATER).reset).toMatchObject({ allowed: false, reason: 'reservation-open' });
+    expect(reservationState.getWorkActionEligibility('sonarr:4:s1', LATER).retry).toMatchObject({ allowed: false, reason: 'reservation-open' });
+    expect(reservationState.getWorkActionEligibility('sonarr:4:s1', LATER).reset).toEqual({ allowed: true });
     const rejectedLease = reservationState.claimUnits({ keys: ['sonarr:4:s1', 'group:sonarr:4'], now: new Date(LATER) })!;
-    expect(() => reservationState.applyWorkAction({ workKey: 'sonarr:4:s1', action: 'reset', ownerToken: rejectedLease.ownerToken, claimKeys: rejectedLease.keys, now: LATER })).toThrow(/reservation-open/);
-    expect(reservationState.getWorkItem('sonarr:4:s1')).toMatchObject({ status: 'backoff', lastSearchAt: NOW, failCount: 3 });
+    const beforeIntents = reservationState.listGrabIntents();
+    reservationState.applyWorkAction({ workKey: 'sonarr:4:s1', action: 'reset', ownerToken: rejectedLease.ownerToken, claimKeys: rejectedLease.keys, now: LATER });
+    expect(reservationState.getWorkItem('sonarr:4:s1')).toMatchObject({ status: 'ready', lastSearchAt: null, failCount: 0, resetPendingAt: LATER });
+    expect(reservationState.listGrabIntents()).toEqual(beforeIntents);
     expect(reservationState.listGrabIntents()[0]?.releasedAt).toBeUndefined();
     reservationState.releaseClaims({ keys: rejectedLease.keys, ownerToken: rejectedLease.ownerToken });
     reservationState.close();
@@ -162,7 +170,11 @@ describe('operational work actions', () => {
     queueState.applyWorkQueueObservation({ key: queueSibling.workKey, token: queueLease, observedAt: NOW, known: true, coverage: [{ workKey: queueSibling.workKey, episodeIds: [201], basis: 'explicit-episodes' }] });
     queueState.applyWorkQueueObservation({ key: queueSibling.workKey, token: queueLease, observedAt: LATER, known: false, coverage: [] });
     queueState.releaseClaim(queueSibling.workKey, queueLease);
-    expect(queueState.getWorkActionEligibility('sonarr:4:s1', LATER).reset).toMatchObject({ allowed: false, reason: 'queue-coverage-held' });
+    expect(queueState.getWorkActionEligibility('sonarr:4:s1', LATER).retry).toMatchObject({ allowed: false, reason: 'queue-coverage-held' });
+    const beforeQueue = queueState.listWorkQueueObservations();
+    const resetQueue = queueState.claimUnits({ keys: ['sonarr:4:s1', 'group:sonarr:4'], now: new Date(LATER) })!;
+    queueState.applyWorkAction({ workKey: 'sonarr:4:s1', action: 'reset', ownerToken: resetQueue.ownerToken, claimKeys: resetQueue.keys, now: LATER });
+    expect(queueState.listWorkQueueObservations()).toEqual(beforeQueue);
     queueState.close();
 
     const leaseState = State.open(':memory:');

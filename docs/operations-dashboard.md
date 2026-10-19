@@ -18,10 +18,10 @@ New activity entries include `scope`: stage (`pack-batch`, `episodes`, `movie`, 
 
 ## Retry and Reset
 
-Actions are offered only when the work is safe to change. Live worker/group claims, open reservations, persisted queue coverage, unsafe review reasons, unknown or stale observations, and an active rate-limit deadline keep actions unavailable. TV actions also require the same-series group lease.
+Actions require fresh known observations, no competing live worker/group claim and no active rate-limit deadline. TV actions also require the same-series group lease. Retry additionally requires ordinary scheduling/review state with no open reservation, retained coverage or safety review. Reset can clear unlinked review clutter while retaining those independent download protections.
 
 - **Retry** clears ordinary cooldown/backoff scheduling and eligible ordinary reviews while preserving the last search time. It makes work eligible for a later processing pass; it does not start a cycle or promise when the scheduler will process it.
-- **Reset tracking** also clears the last search time and records a pending reset. The work item is hidden from Queue until a later known library observation; that observation allows normal reconciliation to rediscover eligible missing media. Reset does not search, grab, or clear queue coverage, reservations, receipts, dedupe markers, decisions, associations, or audit history.
+- **Reset item** clears current retry/attempt scheduling and unlinked reviews (kept as resolved history), then records a pending reset. The work item is hidden from Queue until a later known library observation; a read begun before reset cannot authorize paid work. Reset does not search, grab, cancel downloads, or clear linked reviews, queue coverage, reservations, receipts, dedupe markers, decisions, associations or audit history. Actual download problems can correctly remain or reappear after rediscovery.
 
 For TV, Retry also clears the current content identity's episode retry deadlines and scheduling outcomes while preserving episode attempt times. Reset clears those attempt times as well. Both retain observed episode facts and historical records; neither can make a future, unmonitored, imported, or safety-held episode searchable. Historical rows belonging to a different content identity are not reset. Explicit manual picks can bypass ordinary scheduling, but still require known aired missing targets and all download-safety checks.
 

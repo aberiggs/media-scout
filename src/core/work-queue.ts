@@ -768,9 +768,7 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
     }));
     const previousQueueCoverage = priorCoverageForCurrentWork(input.previousQueueCoverage ?? new Map(), existing, current);
     const reviewWasResolved = old?.blockedReason === 'queue-review' && input.manualReviewKeys !== undefined && !input.manualReviewKeys.has(key);
-    const vanishedCoverage = reviewWasResolved
-      ? []
-      : queueFresh && input.queues[arr].kind === 'known' && !ambiguousQueue
+    const vanishedCoverage = queueFresh && input.queues[arr].kind === 'known' && !ambiguousQueue
         ? subtractCoverage(previousQueueCoverage, observedQueueCoverage, capturedCoverage)
         : !queueFresh || ambiguousQueue ? previousQueueCoverage : [];
     const queueDisappeared = queueFresh && input.queues[arr].kind === 'known' && !ambiguousQueue && vanishedCoverage.length > 0;
@@ -903,6 +901,7 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
       scheduling = { ...scheduling, status: 'waiting-release' };
       blockedReason = 'waiting-release';
     }
+    if (old?.resetPendingAt && Date.parse(input.snapshot.observedAt) <= Date.parse(old.resetPendingAt)) residual = null;
     const work: WorkItem = {
       workKey: key, contentIdentity, missingFingerprint: fingerprint, unit: current, ...scheduling,
       lastObservedAt: input.snapshot.observedAt,

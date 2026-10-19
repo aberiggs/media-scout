@@ -359,7 +359,7 @@ describe('reconcileWork', () => {
     expect(result.items.find((item) => item.work.workKey === 'radarr:8')).toMatchObject({ work: { status: 'waiting-release' }, eligibleUnit: null, blockedReason: 'waiting-release' });
   });
 
-  it('turns a disappeared external queue reservation into a review hold until review resolution', () => {
+  it('retains disappeared queue protection even if its review is resolved', () => {
     const queue = knownTvQueue([{ downloadId: 'gone', seriesId: 4, episodeId: 101, seasonNumber: 1, status: 'downloading' } as SonarrQueueRecord]);
     const withQueue = reconcile({ tvQueue: queue });
     const oldWork = withQueue.items.find((item) => item.work.workKey === 'sonarr:4:s1')!.work;
@@ -368,7 +368,14 @@ describe('reconcileWork', () => {
     const reviewHold = reconcileWork({ snapshot: snapshot(), queues: { sonarr: knownTvQueue(), radarr: knownMovieQueue() }, existingWorkItems: [oldWork], intents: [], previousQueueCoverage: new Map([[oldWork.workKey, oldCoverage]]), now: NOW, minRetryHours: 6, queueGraceMin: 30 });
     expect(reviewHold.items[0]).toMatchObject({ work: { status: 'manual', blockedReason: 'queue-review' }, manualReviewReason: 'queue-review', eligibleUnit: null });
     const resolved = reconcileWork({ snapshot: snapshot(), queues: { sonarr: knownTvQueue(), radarr: knownMovieQueue() }, existingWorkItems: [reviewHold.items[0]!.work], intents: [], previousQueueCoverage: new Map([[oldWork.workKey, oldCoverage]]), manualReviewKeys: new Set(), now: NOW, minRetryHours: 6, queueGraceMin: 30 });
-    expect(resolved.items[0]).toMatchObject({ work: { status: 'ready', blockedReason: null }, eligibleUnit: expect.any(Object) });
+    expect(resolved.items[0]).toMatchObject({ work: { status: 'manual', blockedReason: 'queue-review' }, eligibleUnit: null, queueCoverage: oldCoverage });
+  });
+
+  it('does not authorize paid work from a library read begun before reset', () => {
+    const prior = { ...reconcile().items[0]!.work, resetPendingAt: LATER, status: 'ready' as const };
+    const row = reconcile({ workItems: [prior] }).items[0]!;
+    expect(row.work.resetPendingAt).toBe(LATER);
+    expect(row.eligibleUnit).toBeNull();
   });
 
   it('positively fulfills a captured episode only after the library reports hasFile', () => {

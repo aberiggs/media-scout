@@ -142,7 +142,7 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
     if (!lease) return reply.code(409).send({ error: 'work is currently in flight or held', code: 'work-claimed' });
     try {
       stack.state.applyWorkAction({ workKey: work.workKey, action, ownerToken: lease.ownerToken, claimKeys: lease.keys, now: new Date().toISOString() });
-      return { ok: true, message: action === 'retry' ? 'Retry is eligible for a later processing pass.' : 'Reset recorded; rediscovery will begin after a later known library observation.' };
+      return { ok: true, message: action === 'retry' ? 'Retry scheduled for a later eligible pass.' : 'Item reset. Tracking will rebuild on the next successful library check; downloads and duplicate-download protection are unchanged.' };
     } catch {
       return reply.code(409).send({ error: 'work is not eligible for this action', code: 'action-not-eligible' });
     } finally {

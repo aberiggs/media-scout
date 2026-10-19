@@ -1654,7 +1654,7 @@ describe('Runner.cycle', () => {
     expect(state.getWorkQueueStatus().items[0]?.coveredEpisodeIds).toEqual([101]);
   });
 
-  it('holds a disappeared tracked queue item for review and resumes only after its review row is resolved', async () => {
+  it('keeps disappeared download protection after the review alone is resolved', async () => {
     const llm = new FakeLLM();
     llm.planner.set('sonarr:1:s1', [{ query: 'Show', categories: [5000] }]);
     const series = tvSeries(1, 'Show', 11, 'standard');
@@ -1680,8 +1680,9 @@ describe('Runner.cycle', () => {
     mockDiscovery({ series: [series], episodes: { 1: inventory }, sonarrQueue: { records: remainingQueue } });
     mockSearch([]);
     const resolved = await stack.runner.cycle();
-    expect(resolved.searched).toBe(1);
-    expect(llm.callsFor('planner:')).toHaveLength(1);
+    expect(resolved.searched).toBe(0);
+    expect(llm.callsFor('planner:')).toHaveLength(0);
+    expect(stack.state.getWorkQueueStatus().items[0]?.coveredEpisodeIds).toEqual([101, 102]);
   });
 
   it('holds an unknown POST acknowledgment durably without recording markers or retrying on an empty queue', async () => {

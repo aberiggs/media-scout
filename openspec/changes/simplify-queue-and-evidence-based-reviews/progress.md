@@ -65,3 +65,12 @@ Continue with queue-review evidence, independent held coverage and Reset item.
 - Architectural review caught availability changes bypassing retained provider backoff. Added RED available → throttled → unavailable → available regression, then retained future provider backoff status/deadline. Reviewer follow-up found no blockers.
 - Final `npm run typecheck`: passed. `npm test`: 49 files, 803 tests passed. `git diff --check`: passed. `openspec validate simplify-queue-and-evidence-based-reviews --strict`: passed.
 - Application tests are offline, no live/prod mutation. Frontend/container checks are not claimed by this backend checkpoint; complete integration and remote CI remain later tasks.
+
+## Checkpoint 2 — queue-review lifecycle
+
+- Added nullable versioned private evidence, migration/reinstantiation coverage, owned incident creation, cause/scope/intent dedupe and resolved-history recurrence. Invalid evidence is tolerated as unknown, never used for cleanup.
+- Added positive-import cleanup with fresh/non-regressing source and exact provider/episode identity; legacy and unknown-scope reviews remain untouched. Linked intent reviews wait for actual intent fulfillment.
+- Parent completed the worker's missing negative and future-sibling lifecycle tests, removed guessed fallback intent linkage, and tightened canonical scope/time validation.
+- RED regressions reproduced imported exact-episode uncertain queue rows holding future siblings, and broad unknown queue rows generating unreleased-only reviews. Fixed by using positive imported facts and retaining transient safety holds without premature durable tasks.
+- Focused `npm test -- tests/queue-review-state.test.ts tests/queue-review-lifecycle.test.ts tests/runner.test.ts tests/work-queue.test.ts`: 137 passed. `npm run typecheck`: passed. Full `npm test`: 51 files, 817 passed. `git diff --check`: passed.
+- Architectural reviewer found no blocking code findings. All checks offline; no production changes. The old review-resolution/coverage shortcut and reset are deliberately addressed next, not claimed fixed by this checkpoint.

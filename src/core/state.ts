@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { GrabIntent, IntentCoverage, IntentStatus, WorkItem, WorkQueueStatus, WorkStatus, ClaimSet } from './work-queue-types';
+import type { GrabIntent, IntentCoverage, IntentStatus, WorkItem, WorkQueueStatus, WorkStatus, ClaimSet, QueueReviewEvidence } from './work-queue-types';
 import type { AssociationCacheEntry, AssociationDecision, AssociationRequest, ParsedReleaseCoverage } from './group-types';
 import { episodeListSchema, type Episode } from '../types/sonarr';
 import type { EpisodeProgress } from './work-queue-types';
@@ -30,6 +30,8 @@ export interface ManualReviewRow {
   targetEvidence?: UnparseableTargetEvidence | null;
   targetEvidenceKind?: 'captured' | 'legacy' | 'legacy-ineligible';
   targetEvidenceInvalid?: boolean;
+  queueEvidence?: QueueReviewEvidence | null;
+  queueEvidenceInvalid?: boolean;
 }
 
 export interface UnparseableTargetEvidence {
@@ -129,7 +131,8 @@ CREATE TABLE IF NOT EXISTS manual_review (
   resolved_at TEXT,
   subject_kind TEXT,
   subject_key TEXT,
-  target_evidence_json TEXT CHECK (target_evidence_json IS NULL OR json_valid(target_evidence_json))
+  target_evidence_json TEXT CHECK (target_evidence_json IS NULL OR json_valid(target_evidence_json)),
+  queue_evidence_json TEXT CHECK (queue_evidence_json IS NULL OR json_valid(queue_evidence_json))
 );
 CREATE TABLE IF NOT EXISTS unit_claims (
   work_key   TEXT PRIMARY KEY,
@@ -289,6 +292,17 @@ function decodeReviewEvidence(json: string): UnparseableTargetEvidence {
   return validateReviewEvidence(value);
 }
 
+function validateQueueReviewEvidence(value: unknown): asserts value is QueueReviewEvidence {
+  if (!isRecord(value) || Object.keys(value).some((key) => !['version','cause','contentIdentity','arr','serviceId','externalId','episodeIds','scope','observedAt'].includes(key)) ||
+    value.version !== 1 || !['queue-disappeared','intent-unresolved','queue-ambiguous'].includes(String(value.cause)) ||
+    typeof value.contentIdentity !== 'string' || !value.contentIdentity || (value.arr !== 'sonarr' && value.arr !== 'radarr') ||
+    !Number.isSafeInteger(value.serviceId) || Number(value.serviceId) < 0 || !Number.isSafeInteger(value.externalId) || Number(value.externalId) < 0 ||
+    !['targets','unknown'].includes(String(value.scope)) || (value.scope === 'unknown' && value.episodeIds !== null) ||
+    (value.episodeIds !== null && (!validPositiveIds(value.episodeIds) || value.arr !== 'sonarr')) ||
+    (value.episodeIds === null && value.arr !== 'radarr' && value.scope === 'targets')) throw new Error('Invalid queue review evidence');
+  validIso(value.observedAt, 'queue review observedAt');
+}
+
 export function reviewEvidenceMatchesWorkKey(workKey: string, evidence: UnparseableTargetEvidence): boolean {
   const tv = /^(sonarr):(0|[1-9]\d*):s(0|[1-9]\d*)$/.exec(workKey);
   if (tv) return evidence.arr === 'sonarr' && evidence.episodeIds !== null && Number.isSafeInteger(Number(tv[2])) && Number(tv[2]) === evidence.serviceId && Number.isSafeInteger(Number(tv[3]));
@@ -300,6 +314,12 @@ function decodeManualReviewRow(row: Record<string, unknown>): ManualReviewRow {
   let targetEvidence: UnparseableTargetEvidence | undefined;
   let targetEvidenceInvalid = false;
   let targetEvidenceKind: ManualReviewRow['targetEvidenceKind'];
+  let queueEvidence: QueueReviewEvidence | undefined;
+  let queueEvidenceInvalid = false;
+  if (row.queue_evidence_json !== null && row.queue_evidence_json !== undefined) {
+    try { queueEvidence = JSON.parse(String(row.queue_evidence_json)) as QueueReviewEvidence; validateQueueReviewEvidence(queueEvidence); }
+    catch { queueEvidence = undefined; queueEvidenceInvalid = true; }
+  }
   if (row.target_evidence_json !== null && row.target_evidence_json !== undefined) {
     try {
       const raw: unknown = JSON.parse(String(row.target_evidence_json));
@@ -315,6 +335,7 @@ function decodeManualReviewRow(row: Record<string, unknown>): ManualReviewRow {
     ...((row.subject_kind ?? null) === null ? {} : { subjectKind: String(row.subject_kind) as 'intent' | 'queue' }),
     ...((row.subject_key ?? null) === null ? {} : { subjectKey: String(row.subject_key) }),
     ...(targetEvidence ? { targetEvidence } : {}), ...(targetEvidenceKind ? { targetEvidenceKind } : {}), ...(targetEvidenceInvalid ? { targetEvidenceInvalid: true } : {}),
+    ...(queueEvidence ? { queueEvidence } : {}), ...(queueEvidenceInvalid ? { queueEvidenceInvalid: true } : {}),
   };
 }
 
@@ -498,6 +519,38 @@ export class State {
       .run(workKey, reason, details ?? null, at.toISOString());
   }
 
+  flagQueueReview(input: { workKey: string; ownerToken: string; evidence: QueueReviewEvidence; intentId?: string; now: string }): boolean {
+    validIso(input.now, 'now');
+    validateQueueReviewEvidence(input.evidence);
+    const evidence = input.evidence;
+    return this.db.transaction(() => {
+      this.assertClaim(input.workKey, input.ownerToken, input.now);
+      const work = this.getWorkItem(input.workKey);
+      if (!work || work.contentIdentity !== evidence.contentIdentity || work.unit.arr !== evidence.arr || work.unit.serviceId !== evidence.serviceId || work.unit.externalId !== evidence.externalId) throw new Error('Queue review evidence does not match current work identity');
+      const expectedKey = work.unit.kind === 'tv' ? `sonarr:${evidence.serviceId}:s${work.unit.season?.seasonNumber}` : `radarr:${evidence.serviceId}`;
+      if (work.workKey !== expectedKey || work.unit.key !== expectedKey || Date.parse(evidence.observedAt) > Date.parse(input.now)) throw new Error('Invalid queue review scope or observation time');
+      const intentId = input.intentId ?? null;
+      if (intentId) {
+        const row = this.db.prepare('SELECT * FROM grab_intents WHERE id=?').get(intentId) as Record<string, unknown> | undefined;
+        if (!row) throw new Error('Cannot link queue review to unknown intent');
+        const intent = this.decodeIntent(row);
+        if (intent.releasedAt || intent.status === 'failed' || intent.status === 'fulfilled' || !intent.coverage.some((capture) => capture.workKey === input.workKey)) throw new Error('Intent is not an unresolved capture of this work');
+      }
+      const json = JSON.stringify({ ...evidence, episodeIds: evidence.episodeIds === null ? null : [...evidence.episodeIds].sort((a, b) => a - b) });
+      const duplicate = this.db.prepare(`SELECT 1 FROM manual_review WHERE work_key=? AND reason='queue-review' AND resolved_at IS NULL AND
+        queue_evidence_json IS NOT NULL AND json_valid(queue_evidence_json) AND json_extract(queue_evidence_json,'$.cause')=? AND json_extract(queue_evidence_json,'$.contentIdentity')=? AND
+        json_extract(queue_evidence_json,'$.arr')=? AND json_extract(queue_evidence_json,'$.serviceId')=? AND json_extract(queue_evidence_json,'$.externalId')=? AND
+        json_extract(queue_evidence_json,'$.scope')=? AND COALESCE(json_extract(queue_evidence_json,'$.episodeIds'),'null')=COALESCE(json_extract(?,'$.episodeIds'),'null')
+        AND subject_key IS ?`).get(
+        input.workKey,evidence.cause,evidence.contentIdentity,evidence.arr,evidence.serviceId,evidence.externalId,evidence.scope,json,intentId);
+      if (duplicate) return false;
+      // Evidence-less legacy queue reviews remain untouched; they are not silently upgraded.
+      this.db.prepare('INSERT INTO manual_review(work_key,reason,details,created_at,subject_kind,subject_key,queue_evidence_json) VALUES (?,?,?,?,?,?,?)')
+        .run(input.workKey, 'queue-review', null, input.now, intentId ? 'intent' : null, intentId, json);
+      return true;
+    })();
+  }
+
   flagUnparseableReview(input: { workKey: string; details: string; evidence: UnparseableTargetEvidence; at: Date }): boolean {
     const evidence = validateReviewEvidence(input.evidence);
     if (!reviewEvidenceMatchesWorkKey(input.workKey, evidence)) throw new Error('Review evidence does not match work key');
@@ -565,6 +618,24 @@ export class State {
       return result.changes === 1;
     })();
   }
+
+  resolveQueueReview(input: { id: number; workKey: string; token: string; now: string; contentIdentity: string }): boolean {
+    validIso(input.now, 'now');
+    return this.db.transaction(() => {
+      this.assertClaim(input.workKey, input.token, input.now);
+      const review = this.getManualReview(input.id);
+      const work = this.getWorkItem(input.workKey);
+      if (!review || review.reason !== 'queue-review' || review.resolvedAt || review.workKey !== input.workKey || review.queueEvidenceInvalid ||
+        !review.queueEvidence || review.queueEvidence.scope !== 'targets' || review.queueEvidence.contentIdentity !== input.contentIdentity || !work || work.contentIdentity !== input.contentIdentity) return false;
+      if (review.subjectKind === 'intent' && review.subjectKey) {
+        const intent = this.getIntent(review.subjectKey);
+        if (!intent || intent.status !== 'fulfilled' || intent.releasedAt) return false;
+      }
+      return this.db.prepare("UPDATE manual_review SET resolved_at=? WHERE id=? AND work_key=? AND reason='queue-review' AND resolved_at IS NULL")
+        .run(input.now, input.id, input.workKey).changes === 1;
+    })();
+  }
+
 
   /** Deletes obsolete legacy title noise only; never removes linked reviews or safety state. */
   deleteIneligibleUnparseableReview(input: { id: number; workKey: string; token: string; now: string }): boolean {
@@ -1712,6 +1783,7 @@ export class State {
   private ensureReviewEvidenceColumn(): void {
     const columns = new Set((this.db.prepare('PRAGMA table_info(manual_review)').all() as Array<{ name: string }>).map(({ name }) => name));
     if (!columns.has('target_evidence_json')) this.db.exec('ALTER TABLE manual_review ADD COLUMN target_evidence_json TEXT');
+    if (!columns.has('queue_evidence_json')) this.db.exec('ALTER TABLE manual_review ADD COLUMN queue_evidence_json TEXT');
   }
 
   /**

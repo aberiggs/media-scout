@@ -39,6 +39,23 @@ function reconcile(input: {
 }
 
 describe('reconcileWork', () => {
+  it('keeps broad unknown queue safety without opening reviews for unreleased-only work', () => {
+    const result = reconcile({ inventory: snapshot([ep(102, false)], [movie({ isAvailable: false })]),
+      tvQueue: knownTvQueue([{ id: 7, status: 'downloading' } as SonarrQueueRecord]),
+      movieQueue: knownMovieQueue([{ id: 8, status: 'downloading' } as RadarrQueueRecord]) });
+    for (const row of result.items) {
+      expect(row).toMatchObject({ eligibleUnit: null, manualReviewReason: null, blockedReason: 'queue-ambiguous' });
+      expect(row.queueReviewEvidence).toBeUndefined();
+    }
+  });
+
+  it('does not hold future siblings for an uncertain queue row whose exact episode is positively imported', () => {
+    const row = reconcile({ inventory: snapshot([ep(101, true, true), ep(102, false)]),
+      tvQueue: knownTvQueue([{ id: 7, seriesId: 4, episodeId: 101, seasonNumber: 1, status: 'unknown' } as SonarrQueueRecord]) }).items[0]!;
+    expect(row).toMatchObject({ work: { status: 'waiting-release' }, blockedReason: 'waiting-release', manualReviewReason: null, eligibleUnit: null });
+    expect(row.queueReviewEvidence).toBeUndefined();
+  });
+
   it('preserves provider backoff across unavailable then available movie metadata', () => {
     const initial = reconcile({ inventory: snapshot([], [movie()]) }).items.find((row) => row.work.unit.kind === 'movie')!.work;
     const deadline = '2026-09-29T06:00:00.000Z';
@@ -505,6 +522,7 @@ describe('reconcileWork', () => {
     const remainingQueue = knownTvQueue([{ downloadId: 'two-episode-job', seriesId: 4, episodeId: 102, seasonNumber: 1, status: 'downloading' } as SonarrQueueRecord]);
     const next = reconcileWork({ snapshot: snapshot(), queues: { sonarr: remainingQueue, radarr: knownMovieQueue() }, existingWorkItems: [firstRow.work], intents: [], previousQueueCoverage: new Map([[firstRow.work.workKey, firstRow.queueCoverage]]), now: LATER, minRetryHours: 6, queueGraceMin: 30 });
     expect(next.items[0]).toMatchObject({ manualReviewReason: 'queue-review', work: { blockedReason: 'queue-review' } });
+    expect(next.items[0]?.queueReviewEvidence).toMatchObject({ cause: 'queue-disappeared', episodeIds: [101], scope: 'targets' });
     expect(next.items[0]?.activeCoverage).toEqual([{ workKey: 'sonarr:4:s1', episodeIds: [101, 102], basis: 'explicit-episodes' }]);
     const stillHeld = reconcileWork({ snapshot: snapshot(), queues: { sonarr: remainingQueue, radarr: knownMovieQueue() }, existingWorkItems: [next.items[0]!.work], intents: [], previousQueueCoverage: new Map([[firstRow.work.workKey, next.items[0]!.queueCoverage]]), manualReviewKeys: new Set([firstRow.work.workKey]), now: '2026-09-29T00:10:00.000Z', minRetryHours: 6, queueGraceMin: 30 });
     expect(stillHeld.items[0]).toMatchObject({ work: { status: 'manual', blockedReason: 'queue-review' }, activeCoverage: [{ episodeIds: [101, 102] }] });

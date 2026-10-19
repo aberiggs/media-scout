@@ -1,6 +1,6 @@
 import type { RadarrQueueRecord } from '../types/radarr';
 import type { SonarrQueueRecord } from '../types/sonarr';
-import type { EpisodeProgress, GrabIntent, IntentCoverage, IntentStatus, QueueRead, WorkItem } from './work-queue-types';
+import type { EpisodeProgress, GrabIntent, IntentCoverage, IntentStatus, QueueRead, WorkItem, QueueReviewEvidence } from './work-queue-types';
 import type { AssociationDecision } from './group-types';
 import type { LibrarySnapshot, WorkUnit } from './watcher';
 import { eligibleWorkUnits } from './watcher';
@@ -26,6 +26,8 @@ export interface ReconciledWork {
   blockedReason: string | null;
   intentUpdates: IntentUpdate[];
   manualReviewReason: string | null;
+  queueReviewEvidence?: QueueReviewEvidence;
+  queueReviewIntentId?: string;
 }
 
 export interface ReconcileWorkInput {
@@ -715,6 +717,8 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
     const targetChange = old ? sameTargets(old, current) : { added: false, removed: false };
     let blockedReason: string | null = null;
     let manualReviewReason: string | null = null;
+    let queueReviewEvidence: QueueReviewEvidence | undefined;
+    let queueReviewIntentId: string | undefined;
     if (old && old.contentIdentity !== contentIdentity) {
       blockedReason = 'content-identity-changed';
       for (const intent of input.intents) if (isOpenIntent(intent) && intent.coverage.some((coverage) => coverage.workKey === key) && intent.status !== 'failed' && intent.status !== 'fulfilled' && intent.confirmedAt === null) intentUpdates.push({ id: intent.id, status: 'uncertain' });
@@ -725,7 +729,17 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
     if (eligibleUnit && (scheduling.status === 'waiting-release' || scheduling.status === 'fulfilled' || scheduling.status === 'inactive')) scheduling = { ...scheduling, status: 'ready', nextSearchAt: null };
     const queueFresh = queueReadFresh(input.snapshot, arr, input.queues[arr], old, input.now);
     if (!queueFresh) blockedReason = blockedReason ?? 'queue-unknown';
-    const scopedQueue = queueFresh ? associations.filter((row) => appliesToWork(row, current!)) : [];
+    const scopedQueue = queueFresh ? associations.filter((row) => {
+      if (!appliesToWork(row, current!)) return false;
+      // A directly identified imported episode is no longer a missing-target hold.
+      // Missing IDs, conflicted scope and fuzzy/unknown coverage are not import proof.
+      if (current.kind === 'tv' && row.authoritative && !row.scopeConflict && row.coverage?.episodeIds?.length) {
+        const library = input.snapshot.sonarr.series.find((entry) => entry.series.id === current.serviceId);
+        if (input.snapshot.sonarr.known && library?.known && library.series.tvdbId === current.externalId &&
+          row.coverage.episodeIds.every((id) => library.episodes?.some((episode) => episode.id === id && episode.seriesId === current.serviceId && episode.hasFile))) return false;
+      }
+      return true;
+    }) : [];
     const activeQueue = scopedQueue.filter((row) => row.status !== 'failed');
     let ambiguousQueue = scopedQueue.some((row) => row.coverage === null);
     const nowMs = Date.parse(input.now);
@@ -764,12 +778,23 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
       blockedReason = 'queue-review';
       manualReviewReason = 'queue-review';
       scheduling = { ...scheduling, status: 'manual', nextSearchAt: null };
+      const targets = mergeCoverage(vanishedCoverage);
+      const episodeIds = current.kind === 'movie' ? null : [...new Set(targets.filter((coverage) => coverage.workKey === key).flatMap((coverage) => coverage.episodeIds ?? []))].sort((a, b) => a - b);
+      queueReviewEvidence = { version: 1, cause: 'queue-disappeared', contentIdentity, arr: current.arr, serviceId: current.serviceId, externalId: current.externalId,
+        episodeIds, scope: current.kind === 'movie' || (episodeIds !== null && episodeIds.length > 0) ? 'targets' : 'unknown', observedAt: input.snapshot.observedAt };
     }
     for (const { intent } of localIntents) {
       if (intentQueueLinks.get(intent.id)?.review) {
         blockedReason = 'queue-review';
         manualReviewReason = 'queue-review';
         scheduling = { ...scheduling, status: 'manual', nextSearchAt: null };
+        const target = intent.coverage.find((coverage) => coverage.workKey === key);
+        const ids = target?.episodeIds ?? null;
+        if (!queueReviewEvidence) {
+          queueReviewEvidence = { version: 1, cause: 'intent-unresolved', contentIdentity, arr: current.arr, serviceId: current.serviceId, externalId: current.externalId,
+            episodeIds: ids, scope: target && (ids !== null || current.kind === 'movie') ? 'targets' : 'unknown', observedAt: input.snapshot.observedAt };
+          if (target) queueReviewIntentId = intent.id;
+        }
       }
     }
     const queueFailureRefs = priorFailureRefsForCurrent(input.previousQueueFailureRefs ?? new Map(), existing, current);
@@ -829,8 +854,17 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
     const unsupportedAssocHold = ambiguousQueue || activeQueue.some((row) => row.status === 'uncertain');
     if (unsupportedAssocHold) {
       // An ordinary review must not hide a concurrent safety hold in persisted policy state.
-      if (blockedReason === null || blockedReason === 'manual-review') blockedReason = 'queue-ambiguous';
-      manualReviewReason = manualReviewReason ?? 'queue-review';
+      if (blockedReason === null || blockedReason === 'manual-review' || blockedReason === 'waiting-release') blockedReason = 'queue-ambiguous';
+      const uncertain = activeQueue.filter((row) => row.coverage === null || row.status === 'uncertain');
+      const exact = uncertain.length > 0 && uncertain.every((row) => row.authoritative && !row.scopeConflict && row.coverage !== null);
+      // Broad unidentified jobs still block resubmission, but future-only work
+      // needs no durable human task until there is eligible or captured work at risk.
+      if (eligibleUnit || localIntents.length || heldQueueCoverage.length) {
+        manualReviewReason = manualReviewReason ?? 'queue-review';
+        queueReviewEvidence ??= { version: 1, cause: 'queue-ambiguous', contentIdentity, arr: current.arr, serviceId: current.serviceId, externalId: current.externalId,
+          episodeIds: exact && current.kind === 'tv' ? [...new Set(uncertain.flatMap((row) => row.coverage?.episodeIds ?? []))].sort((a, b) => a - b) : null,
+          scope: exact ? 'targets' : 'unknown', observedAt: input.snapshot.observedAt };
+      }
     }
     else if (heldQueueCoverage.length > 0) blockedReason = blockedReason ?? 'queue-active';
     else if (localIntents.length > 0) blockedReason = blockedReason ?? 'active-intent';
@@ -877,7 +911,8 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
       blockedReason,
       resetPendingAt: old?.resetPendingAt && Date.parse(input.snapshot.observedAt) <= Date.parse(old.resetPendingAt) ? old.resetPendingAt : null,
     };
-    result.push({ work, eligibleUnit: residual, queueCoverage: heldQueueCoverage, queueFailureRefs: [...queueFailureRefs], activeCoverage: allCoverage, blockedReason, intentUpdates: [], manualReviewReason });
+    result.push({ work, eligibleUnit: residual, queueCoverage: heldQueueCoverage, queueFailureRefs: [...queueFailureRefs], activeCoverage: allCoverage, blockedReason, intentUpdates: [], manualReviewReason,
+      ...(queueReviewEvidence ? { queueReviewEvidence } : {}), ...(queueReviewIntentId ? { queueReviewIntentId } : {}) });
   }
 
   // A queue-wide unknown read still produces blocked rows for known work retained through source errors.

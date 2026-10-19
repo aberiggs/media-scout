@@ -6,7 +6,7 @@
 
 ## 2. Queue review lifecycle and reset
 
-- [ ] 2.1 Capture versioned queue-review cause/scope evidence with additive migration, dedupe and positive-import cleanup; add regressions for imported targets with future siblings and unknown/stale/identity-change/legacy cases. Verify focused runner, work-queue and review-state tests plus migration/reopen coverage; document lifecycle rules.
+- [x] 2.1 Capture versioned queue-review cause/scope evidence with additive migration, dedupe and positive-import cleanup; add regressions for imported targets with future siblings and unknown/stale/identity-change/legacy cases. Verify focused runner, work-queue and review-state tests plus migration/reopen coverage; document lifecycle rules.
 - [ ] 2.2 Implement confirmed Reset item using current work action route, clear unlinked reviews/scheduling but preserve linked reviews, coverage, reservations, dedupe and audit. Remove review-visibility-based coverage discharge and guard reset pending until later known reads. Verify state/API/reconciliation regressions for reset, claims, provider limits, cross-origin/cycle/opt-out gates and rediscovery; update recovery docs.
 
 ## 3. Operations projections and UI

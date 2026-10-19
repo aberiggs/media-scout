@@ -35,6 +35,18 @@ export interface IntentCoverage {
 
 export type IntentStatus = 'submitting' | 'awaiting-queue' | 'active' | 'fulfilled' | 'import-blocked' | 'uncertain' | 'failed';
 
+export interface QueueReviewEvidence {
+  version: 1;
+  cause: 'queue-disappeared' | 'intent-unresolved' | 'queue-ambiguous';
+  contentIdentity: string;
+  arr: 'sonarr' | 'radarr';
+  serviceId: number;
+  externalId: number;
+  episodeIds: number[] | null;
+  scope: 'targets' | 'unknown';
+  observedAt: string;
+}
+
 /** One owner token atomically owns every listed work or coordination lease key. */
 export interface ClaimSet {
   ownerToken: string;

@@ -1066,6 +1066,7 @@ export class Runner {
     const snapshot = await this.deps.watcher.getSnapshot();
     const queues = await this.readQueues();
     this.resolveImportedUnparseableReviews(snapshot);
+    this.resolveImportedQueueReviews(snapshot);
     const initialWork = this.deps.state.listWorkItems();
     const initialIntents = this.openGrabIntents();
     const initialObservations = this.deps.state.listWorkQueueObservations();
@@ -1134,11 +1135,15 @@ export class Runner {
            rows.push({ ...row, work: this.deps.state.getWorkItem(key)!, eligibleUnit: null, blockedReason: null, manualReviewReason: null });
            continue;
          }
-         if (row.manualReviewReason && !(deferAssociationReview && row.blockedReason === 'queue-ambiguous')) {
-           const reviewNow = this.now().toISOString();
-           const linkedUncertain = queueRead.kind === 'known' && intents.find((intent) => intent.status === 'uncertain' && !intent.releasedAt && intent.confirmedAt === null && Date.parse(intent.queueDeadlineAt) <= Date.parse(reviewNow) && intent.coverage.some((capture) => capture.workKey === key));
-           if (linkedUncertain) this.flagLinkedReviewOnce(key, row.manualReviewReason, linkedUncertain.id);
-           else this.flagReviewOnce(key, row.manualReviewReason);
+          if (row.manualReviewReason && !(deferAssociationReview && row.blockedReason === 'queue-ambiguous')) {
+            const reviewNow = this.now().toISOString();
+            const linkedUncertain = queueRead.kind === 'known' && intents.find((intent) => intent.status === 'uncertain' && !intent.releasedAt && intent.confirmedAt === null && Date.parse(intent.queueDeadlineAt) <= Date.parse(reviewNow) && intent.coverage.some((capture) => capture.workKey === key));
+            if (row.queueReviewEvidence) this.deps.state.flagQueueReview({ workKey: key, ownerToken: token, evidence: row.queueReviewEvidence,
+              ...(row.queueReviewIntentId ? { intentId: row.queueReviewIntentId } : {}), now: reviewNow });
+            else if (row.manualReviewReason !== 'queue-review') {
+              if (linkedUncertain) this.flagLinkedReviewOnce(key, row.manualReviewReason, linkedUncertain.id);
+              else this.flagReviewOnce(key, row.manualReviewReason);
+            }
          }
         rows.push(row);
       } finally {
@@ -1290,6 +1295,34 @@ export class Runner {
       } finally {
         this.deps.state.releaseClaim(review.workKey, token);
       }
+    }
+  }
+
+  /** Retire only captured queue scopes proven imported by a fresh, matching library read. */
+  private resolveImportedQueueReviews(snapshot: LibrarySnapshot): void {
+    const observedAt = parseReviewObservationTime(snapshot.observedAt);
+    const now = this.now();
+    if (observedAt === null || observedAt > now.getTime() || now.getTime() - observedAt > WORK_OBSERVATION_STALE_AFTER_MS) return;
+    for (const review of this.deps.state.listManualReview()) {
+      if (review.reason !== 'queue-review' || !review.queueEvidence || review.queueEvidenceInvalid || review.queueEvidence.scope !== 'targets') continue;
+      const evidence = review.queueEvidence;
+      const token = this.deps.state.claimUnit(review.workKey, now);
+      if (!token) continue;
+      try {
+        const work = this.deps.state.getWorkItem(review.workKey);
+        const evidenceAt = parseReviewObservationTime(evidence.observedAt);
+        const workAt = work ? parseReviewObservationTime(work.lastObservedAt) : null;
+        if (!work || work.contentIdentity !== evidence.contentIdentity || work.unit.arr !== evidence.arr || work.unit.serviceId !== evidence.serviceId ||
+          work.unit.externalId !== evidence.externalId || evidenceAt === null || observedAt < evidenceAt || workAt === null || observedAt < workAt) continue;
+        if (evidence.arr === 'sonarr') {
+          const series = snapshot.sonarr.series.find((item) => item.series.id === evidence.serviceId && item.known && item.series.tvdbId === evidence.externalId && item.episodes);
+          if (!snapshot.sonarr.known || !series || !evidence.episodeIds?.length || !evidence.episodeIds.every((id) => series.episodes!.some((episode) => episode.id === id && episode.seriesId === evidence.serviceId && episode.hasFile))) continue;
+        } else {
+          const movie = snapshot.radarr.movies.find((item) => item.id === evidence.serviceId && item.tmdbId === evidence.externalId && item.hasFile);
+          if (!snapshot.radarr.known || !movie) continue;
+        }
+        this.deps.state.resolveQueueReview({ id: review.id, workKey: review.workKey, token, now: now.toISOString(), contentIdentity: evidence.contentIdentity });
+      } finally { this.deps.state.releaseClaim(review.workKey, token); }
     }
   }
 

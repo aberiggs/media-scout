@@ -87,3 +87,25 @@ Episode progress is stored additively beside the existing season work, intent, a
 Known observations retain all episodes of a tracked season, including imported and future episodes. Episode availability deadlines determine the next searchable subset; the season work row remains the coordination and aggregate scheduling entry. Download reservations and queue coverage remain authoritative safety evidence rather than a second episode reservation ledger. Unknown/partial reads do not erase prior observations or prove imports, and an uncertain or vanished download can still conservatively hold the season. An operational retry changes only the successfully searched episodes from that attempt; it does not clear a sibling's availability deadline.
 
 On a fresh, identity-matched known poll, an old unlinked TV or movie `no-suitable-release` review can be converted to ordinary availability handling only when no conflicting review, configuration, claim, reservation, or queue uncertainty applies. The review remains as resolved history; eligible content receives a finite retry deadline without fabricating a historical search or an import, while unavailable movies wait for Radarr metadata without an availability retry deadline. Linked, unknown/stale, identity-changed, active/ambiguous-download, and other blocking review cases remain held. An existing later ordinary retry deadline is not shortened by conversion. This policy does not require operator-action opt-in and does not release reservations.
+
+## Queue review evidence and cleanup
+
+Queue-related reviews retain a private, versioned cause and affected scope. The
+evidence contains Arr identity and episode IDs (or movie scope), not queue
+references, request URLs, or raw service messages. Repeated reads of the same
+unresolved cause and scope do not create new review incidents; resolved history
+does not suppress a later occurrence. Existing evidence-less reviews remain
+unknown and are not assigned targets retroactively.
+
+Captured-target reviews are retired only after a fresh, non-regressing known
+library observation confirms every captured file under the same service and
+external identity. Unknown or broad ambiguous scopes, stale reads, missing
+targets, and changed identities remain open. Linked intent reviews additionally
+require that their actual intent is fulfilled; clearing a review never releases
+an independent download reservation.
+
+An unidentified queue row still blocks potentially overlapping work, but does not
+create a durable review for unreleased-only items with no captured work at risk.
+Directly identified episodes positively observed with files no longer hold their
+future siblings because of a lingering uncertain queue row. Missing IDs and
+unknown inventory do not establish that completion.

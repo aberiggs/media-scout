@@ -4,7 +4,7 @@ Issue: https://github.com/aberiggs/media-scout/issues/20
 
 ## State
 
-Investigation and draft proposal only. No implementation tasks completed or yet finalized. Material product decisions in `proposal.md` block design/spec/task completion and implementation. The unrelated ongoing-episode change and untracked user feedback document are untouched.
+Implementation approved after the user confirmed metadata-gated release waiting and a simple Reset item action that preserves downloads and duplicate-download protection. Planning artifacts now reflect that approval; task completion is tracked in tasks.md. The unrelated ongoing-episode change and untracked user feedback document are untouched.
 
 ## Evidence gathered
 
@@ -46,6 +46,22 @@ Investigation and draft proposal only. No implementation tasks completed or yet 
 
 Architectural reviewer inspected the actual two-document checkpoint. Corrected an initial exploration error about resolved-history dedupe by independently reading `listManualReview(includeResolved = false)`. Also removed language implying that evidence-poor reviews were proven obsolete. No sensitive-information exposure identified in the planning documents.
 
+## Approved implementation
+
+- User clarified unreleased movies must wait for Radarr metadata rather than paid retries. Existing `isAvailable` is the gate; released-but-not-found is distinct.
+- User approved Reset item clearing local tracking/reviews for next-poll reconstruction while retaining downloads and duplicate-download protections. This supersedes the proposed elaborate legacy-retirement ceremony; reservation release remains separately guarded.
+- Completed proposal, design, two capability specs and task checklist. Implementation continues through offline verification and PR publication; no production cleanup or deployment is authorized.
+- Consulted official Radarr availability documentation through Context7: `isAvailable` reflects configured minimum availability, including release-date handling. No private data sent.
+
 ## Next action
 
-Present the draft planning PR and obtain decisions on automatic movie availability retries and the guarded legacy-recovery option. Then complete the remaining planning artifacts; implementation requires the user's approval. No production cleanup or deployment is authorized by this proposal.
+Continue with queue-review evidence, independent held coverage and Reset item.
+
+## Checkpoint 1 — availability
+
+- Worker added a failing released-movie no-results regression, then ordinary cooldown. Parent completed legacy movie conversion and metadata transition coverage; existing TV conversion generalized without clearing concurrent reviews, intents or coverage.
+- RED: legacy movie conversions returned false; unavailable movie retained an old availability retry deadline. GREEN after implementation.
+- Focused command: `npm test -- tests/movie-availability.test.ts tests/watcher.test.ts tests/review-policy.test.ts tests/runner.test.ts tests/work-queue.test.ts tests/episode-progress-state.test.ts`: 181 passed before the final provider regression.
+- Architectural review caught availability changes bypassing retained provider backoff. Added RED available → throttled → unavailable → available regression, then retained future provider backoff status/deadline. Reviewer follow-up found no blockers.
+- Final `npm run typecheck`: passed. `npm test`: 49 files, 803 tests passed. `git diff --check`: passed. `openspec validate simplify-queue-and-evidence-based-reviews --strict`: passed.
+- Application tests are offline, no live/prod mutation. Frontend/container checks are not claimed by this backend checkpoint; complete integration and remote CI remain later tasks.

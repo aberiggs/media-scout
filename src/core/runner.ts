@@ -870,6 +870,13 @@ export class Runner {
             decision: { workKey: key, verdict: 'skip', grabbed: false } });
           continue;
         }
+        if (target?.kind === 'movie') {
+          const nextSearchAt = this.dateAfter(this.deps.config.minRetryHours * 60);
+          this.deps.state.finishSearch({ key, token, status: 'cooldown', nextSearchAt, failCount: 0,
+            outcome: 'release-unavailable', now: this.now().toISOString(), expectedStatus: 'searching',
+            decision: { workKey: key, verdict: 'skip', grabbed: false } });
+          continue;
+        }
         const result = this.deps.state.finishSearchWithReview({
           key,
           token,
@@ -1122,7 +1129,7 @@ export class Runner {
            episodeObservations: this.episodeObservations(row.work, snapshot) });
            this.deps.state.applyWorkQueueObservation({ key, token, observedAt: queueRead.observedAt, known: row.work.queueObservationKnown && queueRead.kind === 'known', coverage: row.queueCoverage, failedQueueRefs: row.queueFailureRefs });
          if (persisted?.contentIdentity === row.work.contentIdentity && row.blockedReason === 'manual-review' && row.manualReviewReason === null &&
-           this.deps.state.convertLegacyTvAvailability({ key, token, contentIdentity: row.work.contentIdentity,
+           this.deps.state.convertLegacyAvailability({ key, token, contentIdentity: row.work.contentIdentity,
              now: this.now().toISOString(), retryAt: this.dateAfter(this.deps.config.minRetryHours * 60) })) {
            rows.push({ ...row, work: this.deps.state.getWorkItem(key)!, eligibleUnit: null, blockedReason: null, manualReviewReason: null });
            continue;

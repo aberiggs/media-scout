@@ -857,6 +857,62 @@ describe('Runner.cycle', () => {
     expect(state.hasHash('MOVIEHASH0000000000000000000000000000')).toBe(true);
   });
 
+  it('released movie with no admitted releases persists an ordinary cooldown', async () => {
+    const movie = { ...movieFixture, isAvailable: true };
+    mockDiscovery({ series: [], movies: [movie] });
+    mockSearch([]);
+    const llm = new FakeLLM();
+    llm.planner.set('radarr:3', [{ query: 'Example movie', categories: [2000] }]);
+    const { runner, state } = buildStack(llm, { now: new Date('2026-10-18T00:00:00.000Z') });
+
+    await runner.cycle();
+
+    expect(state.getWorkItem('radarr:3')).toMatchObject({ status: 'cooldown', lastOutcome: 'release-unavailable', nextSearchAt: '2026-10-18T06:00:00.000Z' });
+    expect(state.listManualReview()).toEqual([]);
+  });
+
+  it('waits on movie metadata without carrying an availability retry deadline', async () => {
+    mockDiscovery({ series: [], movies: [{ ...movieFixture, isAvailable: false }] });
+    const llm = new FakeLLM();
+    const { runner, state } = buildStack(llm, { now: NOW });
+    const workKey = 'radarr:3';
+    const unit: WorkItem['unit'] = { key: workKey, kind: 'movie', arr: 'radarr', serviceId: 3,
+      externalId: movieFixture.tmdbId as number, title: 'Movie', year: 2026, altTitles: [] };
+    const token = state.claimUnit(workKey, NOW)!;
+    state.applyWorkReconciliation({ key: workKey, token, intentUpdates: [], work: {
+      workKey, unit, contentIdentity: `radarr:3:${unit.externalId}:movie`, missingFingerprint: 'old', status: 'cooldown',
+      lastSearchAt: NOW.toISOString(), nextSearchAt: '2026-09-30T00:00:00.000Z', failCount: 0,
+      lastOutcome: 'release-unavailable', lastObservedAt: NOW.toISOString(), lastQueueObservedAt: NOW.toISOString(),
+      queueObservationKnown: true, blockedReason: null,
+    } });
+    state.releaseClaim(workKey, token);
+    await runner.cycle();
+    expect(state.getWorkItem(workKey)).toMatchObject({ status: 'waiting-release', nextSearchAt: null });
+    expect(state.listSearchActivity(NOW.toISOString())).toEqual([]);
+    expect(state.listManualReview()).toEqual([]);
+    expect(llm.calls).toEqual([]);
+  });
+
+  it('searches only after Radarr availability changes and keeps cooldown across runner recreation', async () => {
+    const llm = new FakeLLM();
+    llm.planner.set('radarr:3', [{ query: 'Example movie', categories: [2000] }]);
+    mockDiscovery({ movies: [{ ...movieFixture, isAvailable: false }] });
+    const first = buildStack(llm);
+    await first.runner.cycle();
+    expect(first.state.getWorkItem('radarr:3')).toMatchObject({ status: 'waiting-release', nextSearchAt: null });
+    expect(first.state.listSearchActivity(NOW.toISOString())).toEqual([]);
+    nock.cleanAll();
+    mockDiscovery({ movies: [{ ...movieFixture, isAvailable: true }] });
+    mockSearch([]);
+    await buildStack(llm, { state: first.state }).runner.cycle();
+    expect(first.state.getWorkItem('radarr:3')).toMatchObject({ status: 'cooldown', nextSearchAt: '2026-09-29T06:00:00.000Z' });
+    nock.cleanAll();
+    mockDiscovery({ movies: [{ ...movieFixture, isAvailable: true }] });
+    await buildStack(llm, { state: first.state, now: new Date('2026-09-29T01:00:00.000Z') }).runner.cycle();
+    expect(first.state.listSearchActivity(NOW.toISOString())).toHaveLength(1);
+    expect(first.state.listManualReview()).toEqual([]);
+  });
+
   it('missing download client entry: grab-path pick flags manual review, grab never called', async () => {
     const llm = new FakeLLM();
     llm.planner.set('sonarr:1:s1', [{ query: 'Frieren', categories: [5070] }]);

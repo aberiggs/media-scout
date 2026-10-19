@@ -621,20 +621,36 @@ export class State {
     };
   }
 
-  /** Convert only an ordinary legacy TV availability hold; never infer historical search targets or release evidence. */
-  convertLegacyTvAvailability(input: { key: string; token: string; contentIdentity: string; now: string; retryAt: string }): boolean {
+  /** Convert only ordinary availability holds; never infer historical search targets or release evidence. */
+  convertLegacyAvailability(input: { key: string; token: string; contentIdentity: string; now: string; retryAt: string }): boolean {
     validIso(input.now, 'now');
     validIso(input.retryAt, 'retryAt');
     if (input.retryAt < input.now) throw new Error('Legacy availability retry precedes conversion');
     return this.db.transaction(() => {
       this.assertClaim(input.key, input.token, input.now);
       const work = this.getWorkItem(input.key);
-      if (!work || work.unit.kind !== 'tv' || work.status !== 'manual' || work.contentIdentity !== input.contentIdentity ||
-        this.workActionBlockReason(input.key, 'retry', input.now, input.token) !== null) return false;
+      if (!work || !['manual', 'waiting-release'].includes(work.status) || work.contentIdentity !== input.contentIdentity) return false;
+      const block = this.workActionBlockReason(input.key, 'retry', input.now, input.token);
+      if (block !== null && !(work.unit.kind === 'movie' && work.status === 'waiting-release' && block === 'work-not-retryable')) return false;
       const reviews = this.listManualReview().filter((review) => review.workKey === input.key);
       if (reviews.some((review) => review.subjectKind || review.subjectKey || !['no-suitable-release', 'unparseable-title'].includes(review.reason))) return false;
       const ordinary = reviews.filter((review) => review.reason === 'no-suitable-release');
       if (!ordinary.length) return false;
+      if (work.unit.kind === 'movie') {
+        // Availability is captured by trusted reconciliation, not guessed from title/year.
+        let fingerprint: unknown;
+        try { fingerprint = JSON.parse(work.missingFingerprint); } catch { return false; }
+        if (!Array.isArray(fingerprint) || fingerprint[0] !== work.contentIdentity || !Array.isArray(fingerprint[1]) ||
+          fingerprint[1].length !== 1 || !Array.isArray(fingerprint[1][0]) || fingerprint[1][0][0] !== work.unit.serviceId ||
+          typeof fingerprint[1][0][1] !== 'boolean') return false;
+        const available = fingerprint[1][0][1];
+        const deadline = available ? [input.retryAt, work.nextSearchAt].filter((at): at is string => at !== null).sort().at(-1)! : null;
+        this.db.prepare('UPDATE work_items SET status=?,next_search_at=?,fail_count=0,last_outcome=?,blocked_reason=? WHERE work_key=?')
+          .run(available ? 'cooldown' : 'waiting-release', deadline, 'legacy-availability', available ? null : 'waiting-release', input.key);
+        const resolve = this.db.prepare('UPDATE manual_review SET resolved_at=? WHERE id=? AND resolved_at IS NULL');
+        for (const review of ordinary) resolve.run(input.now, review.id);
+        return true;
+      }
       const inventory = new Map(work.unit.season!.missing.map((episode) => [episode.episodeId, episode]));
       const eligible = this.listEpisodeProgress(input.key).filter((episode) => {
         const target = inventory.get(episode.episodeId);
@@ -759,7 +775,6 @@ export class State {
     const eligibleStatus = action === 'retry'
       ? ['cooldown', 'backoff'].includes(work.status) || ordinaryReview
       : ['ready', 'cooldown', 'backoff'].includes(work.status) || ordinaryReview;
-    if (!eligibleStatus) return action === 'retry' ? 'work-not-retryable' : 'work-not-resettable';
 
     const works = this.listWorkItems();
     const related = (candidate: WorkItem): boolean => relatedKey(candidate.workKey) ||
@@ -782,7 +797,7 @@ export class State {
       validateCoverage(coverage, true);
       if ((coverage as IntentCoverage[]).some((capture) => relatedKey(capture.workKey))) return 'queue-coverage-held';
     }
-    return null;
+    return eligibleStatus ? null : action === 'retry' ? 'work-not-retryable' : 'work-not-resettable';
   }
 
   /** Mints a short-lived, single-use proof handle after the trusted operator service completed its reads. */

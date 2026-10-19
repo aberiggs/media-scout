@@ -39,6 +39,15 @@ function reconcile(input: {
 }
 
 describe('reconcileWork', () => {
+  it('preserves provider backoff across unavailable then available movie metadata', () => {
+    const initial = reconcile({ inventory: snapshot([], [movie()]) }).items.find((row) => row.work.unit.kind === 'movie')!.work;
+    const deadline = '2026-09-29T06:00:00.000Z';
+    const throttled: WorkItem = { ...initial, status: 'backoff', lastOutcome: 'rate-limited', nextSearchAt: deadline };
+    const unavailable = reconcile({ inventory: snapshot([], [movie({ isAvailable: false })]), workItems: [throttled] }).items.find((row) => row.work.unit.kind === 'movie')!.work;
+    const availableAgain = reconcile({ inventory: snapshot([], [movie()]), workItems: [unavailable] }).items.find((row) => row.work.unit.kind === 'movie')!.work;
+    expect(availableAgain).toMatchObject({ status: 'backoff', lastOutcome: 'rate-limited', nextSearchAt: deadline });
+  });
+
   it('consumes a reset marker only after a known library observation began after reset and re-enables rediscovery', () => {
     const resetAt = '2026-09-29T00:05:00.000Z';
     const prior = { ...reconcile().items.find((item) => item.work.workKey === 'sonarr:4:s1')!.work,

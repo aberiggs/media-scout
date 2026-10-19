@@ -818,7 +818,12 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
       manualReviewReason = 'queue-review';
     }
     if (current.kind === 'movie' && !currentIsAvailable(input.snapshot, current)) {
-      scheduling = { ...scheduling, status: 'waiting-release' };
+      // Ordinary availability cooldowns do not schedule searches before release.
+      // Provider backoff remains independently authoritative.
+      const providerBackoff = scheduling.lastOutcome === 'rate-limited' && scheduling.nextSearchAt !== null &&
+        Date.parse(scheduling.nextSearchAt) > Date.parse(input.now);
+      scheduling = { ...scheduling, status: providerBackoff ? 'backoff' : 'waiting-release',
+        nextSearchAt: providerBackoff ? scheduling.nextSearchAt : null };
       blockedReason = blockedReason ?? 'waiting-release';
     }
     const unsupportedAssocHold = ambiguousQueue || activeQueue.some((row) => row.status === 'uncertain');

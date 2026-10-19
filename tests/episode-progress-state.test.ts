@@ -149,10 +149,10 @@ describe('episode progress state', () => {
     state.flagManualReview(work.workKey, 'no-suitable-release', undefined, new Date(now));
     const input = { key: work.workKey, token, contentIdentity: work.contentIdentity, now, retryAt: '2026-01-01T06:00:00.000Z' };
     const before = state.listEpisodeProgress();
-    expect(() => state.convertLegacyTvAvailability({ ...input, token: 'foreign' })).toThrow();
-    expect(state.convertLegacyTvAvailability({ ...input, contentIdentity: 'different' })).toBe(false);
+    expect(() => state.convertLegacyAvailability({ ...input, token: 'foreign' })).toThrow();
+    expect(state.convertLegacyAvailability({ ...input, contentIdentity: 'different' })).toBe(false);
     expect(state.listEpisodeProgress()).toEqual(before);
-    expect(state.convertLegacyTvAvailability(input)).toBe(true);
+    expect(state.convertLegacyAvailability(input)).toBe(true);
     expect(state.listEpisodeProgress()[0]).toMatchObject({ lastSearchAt: now, nextSearchAt: '2026-01-03T00:00:00.000Z', hasFile: false });
     expect(state.listManualReview(true)).toMatchObject([{ reason: 'no-suitable-release', resolvedAt: now }]);
   });
@@ -166,7 +166,7 @@ describe('episode progress state', () => {
     const later = '2026-01-03T00:00:00.000Z';
     const owner = state.claimUnit(work.workKey, new Date(later))!;
     const before = state.listEpisodeProgress();
-    expect(state.convertLegacyTvAvailability({ key: work.workKey, token: owner, contentIdentity: work.contentIdentity, now: later, retryAt: '2026-01-03T06:00:00.000Z' })).toBe(false);
+    expect(state.convertLegacyAvailability({ key: work.workKey, token: owner, contentIdentity: work.contentIdentity, now: later, retryAt: '2026-01-03T06:00:00.000Z' })).toBe(false);
     expect(state.listEpisodeProgress()).toEqual(before);
     expect(state.listManualReview()).toHaveLength(1);
   });
@@ -183,7 +183,7 @@ describe('episode progress state', () => {
     state.applyWorkQueueObservation({ key: work.workKey, token, observedAt: now, known: true, coverage: [] });
     const rows = () => ['grab_intents', 'manual_review', 'seen_releases', 'seen_hashes', 'queue_associations', 'operator_audit', 'episode_progress'].map((table) => db.prepare(`SELECT * FROM ${table}`).all());
     const before = rows();
-    expect(state.convertLegacyTvAvailability({ key: work.workKey, token, contentIdentity: work.contentIdentity, now, retryAt: '2026-01-01T06:00:00.000Z' })).toBe(false);
+    expect(state.convertLegacyAvailability({ key: work.workKey, token, contentIdentity: work.contentIdentity, now, retryAt: '2026-01-01T06:00:00.000Z' })).toBe(false);
     expect(rows()).toEqual(before);
   });
 

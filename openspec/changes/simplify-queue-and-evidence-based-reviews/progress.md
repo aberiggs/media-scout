@@ -82,3 +82,10 @@ Continue with queue-review evidence, independent held coverage and Reset item.
 - RED: tests reproduced blocked reset for an old queue review/reservation, coverage disappearing after review resolution, and pre-reset read remaining actionable. GREEN after implementation. Updated two old tests that intentionally expected review-only dismissal to release coverage/terminal resets to be forbidden.
 - Focused suites exercised state/API gates, preserved linked evidence and next-poll reconstruction. Final `npm run typecheck`: passed. Full `npm test`: 51 files, 821 passed. `git diff --check`: passed.
 - Independent architectural review found no blocking findings. Confirmation UI remains task 3.2; backend action and safety invariants complete. No live calls or production mutation.
+
+## Checkpoint 4 — grouped operations projections
+
+- Added strict opt-in grouped review API with server-side grouping before filter/page, retained underlying causes/IDs and raw row compatibility. Badge counts unique work items; Reset eligibility no longer inherits a reason-specific Retry restriction.
+- Added cause-specific safe summaries, association-as-assessment and separate attention/availability facts. Parent replaced worker's status-based availability inference with identity-matched captured Radarr metadata and known episode summaries, and corrected overgeneric configuration/identity wording.
+- RED: a manual-held unavailable movie projected availability unknown instead of metadata waiting. GREEN after fix; tests cover full causes across pagination/filtering, opt-out, raw compatibility and evidence redaction.
+- `npm run typecheck`: passed. Focused API/recovery/replay tests: 39 passed. Full `npm test`: 51 files, 823 passed. `git diff --check`: passed. Read-only review found no blockers; corrected its minor documentation finding.

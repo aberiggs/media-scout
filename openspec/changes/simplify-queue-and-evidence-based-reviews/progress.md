@@ -4,7 +4,7 @@ Issue: https://github.com/aberiggs/media-scout/issues/20
 
 ## State
 
-Original implementation: **7/7 tasks**. Two approved PR-review follow-up tasks are tracked below and in tasks.md. The user-approved metadata-gated waiting and simple Reset item preserve downloads and duplicate-download protection. The unrelated ongoing-episode change and untracked user feedback document are untouched. No production mutation or deployment.
+Approved implementation and PR-review follow-up complete: **9/9 tasks**. The user-approved metadata-gated waiting and simple Reset item preserve downloads and duplicate-download protection. The unrelated ongoing-episode change and untracked user feedback document are untouched. No production mutation or deployment.
 
 ## Evidence gathered
 
@@ -126,4 +126,6 @@ Review PR #21. It is ready for review and not merged; deployment/production clea
 - Initial focused tests: `npm test -- tests/operations-state.test.ts tests/operations-api.test.ts tests/queue-review-lifecycle.test.ts tests/work-queue.test.ts` — 67 passed. Parent fixture expansion initially missed two required episode fields; backend typecheck caught them and the synthetic fixture was corrected. Full final verification follows before publication.
 - Independent public-boundary review of operations grouping/actions/privacy, HTTP/MCP and UI found no blocking findings. Independent core follow-up review confirmed the previous finding addressed and found no remaining definite blockers in the scoped runtime diff.
 - Final local checks: `npm run typecheck` passed; `npm test` passed **51 files / 832 tests**; `npm --prefix web run typecheck` passed; `npm --prefix web test` passed **44 tests**; `npm run build`, `git diff --check` and `openspec validate simplify-queue-and-evidence-based-reviews --strict` passed. All checks offline/synthetic. No frontend implementation changed, so prior rendered evidence is unchanged, not claimed as a new browser run.
-- Follow-up status: **8/9 tasks complete**; final publication/CI remains pending. No merge, deployment, production mutation or image publication performed.
+- Runtime fix checkpoint `55bb6b98b084b1abde347800ac126147c3ad67e4` committed and normally pushed to the existing PR head branch. Updated PR #21's description and comment with the fix and new check totals. `gh pr edit` hit the deprecated Projects classic GraphQL field; the equivalent REST PR update succeeded.
+- `gh pr checks 21 --watch --interval 15` completed successfully after resuming its initial two-minute timeout. CI run [39360528600](https://github.com/aberiggs/media-scout/actions/runs/39360528600) passed. `gh run view 39360528600 --json headSha,conclusion,jobs` confirmed the runtime fix SHA, checks and both linux/amd64 and linux/arm64 container builds succeeded, including **Smoke-test SQLite native addon** on both architectures. `publish-dev` was skipped.
+- Follow-up status: **9/9 tasks complete**. Core and public-boundary reviewers found no remaining blocking findings. PR #21 is open and mergeable; no merge, deployment, production mutation or image publication performed. This final tracking-only checkpoint changes no runtime code; its own PR checks will be observed after publication.

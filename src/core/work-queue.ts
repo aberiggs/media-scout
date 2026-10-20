@@ -332,14 +332,49 @@ function projectCoverage(coverage: IntentCoverage, current: WorkUnit, existing: 
   return ids.length ? { workKey: current.key, episodeIds: ids, basis: coverage.basis } : null;
 }
 
-function priorCoverageForCurrentWork(previous: ReadonlyMap<string, IntentCoverage[]>, existing: ReadonlyMap<string, WorkItem>, current: WorkUnit): IntentCoverage[] {
+function priorCoverageForCurrentWork(previous: ReadonlyMap<string, IntentCoverage[]>, existing: ReadonlyMap<string, WorkItem>, current: WorkUnit, snapshot: LibrarySnapshot, now: string): IntentCoverage[] {
   return mergeCoverage([...previous.entries()].flatMap(([key, coverages]) => {
     if (key !== current.key && !sameWorkFamily(existing.get(key), current)) return [];
     return coverages.flatMap((coverage) => {
       const projected = projectCoverage(coverage, current, existing);
+      if (key === current.key && current.kind === 'tv' && coverage.episodeIds !== null) {
+        const library = snapshot.sonarr.series.find((entry) => entry.series.id === current.serviceId);
+        const ids = new Set(projected?.episodeIds ?? []);
+        for (const id of coverage.episodeIds) {
+          const episode = libraryReadCurrent(snapshot, existing.get(key), now) && library?.known && library.series.tvdbId === current.externalId
+            ? library.episodes?.find((entry) => entry.id === id && entry.seriesId === current.serviceId) : undefined;
+          // Removal/unmonitoring is not import proof. Missing captured IDs keep
+          // their old hold; monitored targets moved to another season project there.
+          if (!episode?.hasFile && (!episode || episode.seasonNumber === current.season?.seasonNumber || !episode.monitored)) ids.add(id);
+        }
+        return ids.size ? [{ ...coverage, workKey: current.key, episodeIds: [...ids].sort((a, b) => a - b) }] : [];
+      }
       return projected ? [projected] : [];
     });
   }));
+}
+
+/** A terminal work status cannot discharge an independently captured download. */
+function unimportedQueueCoverage(coverage: IntentCoverage[], work: WorkItem | undefined, snapshot: LibrarySnapshot, now: string): IntentCoverage[] {
+  if (!work || !libraryReadCurrent(snapshot, work, now)) return coverage;
+  return coverage.flatMap((capture) => {
+    if (capture.workKey !== work.workKey) return [capture];
+    if (work.unit.kind === 'movie' && capture.episodeIds === null) {
+      const movie = snapshot.radarr.known && snapshot.radarr.movies.find((entry) => entry.id === work.unit.serviceId && entry.tmdbId === work.unit.externalId);
+      return movie && movie.hasFile ? [] : [capture];
+    }
+    if (work.unit.kind !== 'tv' || capture.episodeIds === null || !snapshot.sonarr.known) return [capture];
+    const series = snapshot.sonarr.series.find((entry) => entry.series.id === work.unit.serviceId && entry.series.tvdbId === work.unit.externalId && entry.known);
+    const ids = capture.episodeIds.filter((id) => !series?.episodes?.some((episode) => episode.id === id && episode.seriesId === work.unit.serviceId && episode.hasFile));
+    return ids.length ? [{ ...capture, episodeIds: ids }] : [];
+  });
+}
+
+function libraryReadCurrent(snapshot: LibrarySnapshot, work: WorkItem | undefined, now: string): boolean {
+  const observed = Date.parse(snapshot.observedAt);
+  const current = Date.parse(now);
+  const previous = work ? Date.parse(work.lastObservedAt) : observed;
+  return [observed, current, previous].every(Number.isFinite) && observed >= previous && observed <= current && current - observed <= 24 * 60 * 60_000;
 }
 
 function priorFailureRefsForCurrent(previous: ReadonlyMap<string, string[]>, existing: ReadonlyMap<string, WorkItem>, current: WorkUnit): Set<string> {
@@ -651,6 +686,7 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
   for (const key of allKeys) {
     const old = existing.get(key);
     const savedQueueFailureRefs = input.previousQueueFailureRefs?.get(key) ?? [];
+    const savedQueueCoverage = unimportedQueueCoverage(input.previousQueueCoverage?.get(key) ?? [], old, input.snapshot, input.now);
     const unit = currentUnits.get(key);
     const arr = old?.unit.arr ?? unit?.arr ?? (key.startsWith('radarr:') ? 'radarr' : 'sonarr');
     const source = arr === 'sonarr' ? input.snapshot.sonarr : input.snapshot.radarr;
@@ -672,13 +708,13 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
           ? currentOld.every((episode) => episode?.hasFile === true)
           : currentOriginalSeason.length > 0 && currentOriginalSeason.every((episode) => episode.hasFile === true);
         if (positivelyComplete) {
-          result.push({ work: withQueueFreshness(terminalItem(old, 'fulfilled', input.snapshot.observedAt), input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: [], queueFailureRefs: savedQueueFailureRefs, activeCoverage: [], blockedReason: null, intentUpdates: [], manualReviewReason: null });
+          result.push({ work: withQueueFreshness(terminalItem(old, 'fulfilled', input.snapshot.observedAt), input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: savedQueueCoverage, queueFailureRefs: savedQueueFailureRefs, activeCoverage: savedQueueCoverage, blockedReason: null, intentUpdates: [], manualReviewReason: null });
           continue;
         }
       }
       if (arr === 'sonarr' && seriesObservation?.series.monitored === false) {
         const item = terminalItem(old, 'inactive', input.snapshot.observedAt);
-        result.push({ work: withQueueFreshness(item, input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: [], queueFailureRefs: savedQueueFailureRefs, activeCoverage: [], blockedReason: null, intentUpdates: [], manualReviewReason: null });
+        result.push({ work: withQueueFreshness(item, input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: savedQueueCoverage, queueFailureRefs: savedQueueFailureRefs, activeCoverage: savedQueueCoverage, blockedReason: null, intentUpdates: [], manualReviewReason: null });
         continue;
       }
       if (arr === 'sonarr' && seriesObservation && seriesObservation.known && seriesObservation.episodes) {
@@ -686,25 +722,25 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
         const oldEpisodes = old.unit.season?.missing ?? [];
         const currentOld = oldEpisodes.map((prior) => observations.find((episode) => episode.id === prior.episodeId));
         if (currentOld.every((episode) => episode === undefined || episode.monitored === false)) {
-          result.push({ work: withQueueFreshness(terminalItem(old, 'inactive', input.snapshot.observedAt), input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: [], queueFailureRefs: savedQueueFailureRefs, activeCoverage: [], blockedReason: null, intentUpdates: [], manualReviewReason: null });
+          result.push({ work: withQueueFreshness(terminalItem(old, 'inactive', input.snapshot.observedAt), input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: savedQueueCoverage, queueFailureRefs: savedQueueFailureRefs, activeCoverage: savedQueueCoverage, blockedReason: null, intentUpdates: [], manualReviewReason: null });
           continue;
         }
       }
       if (arr === 'radarr') {
         const movie = input.snapshot.radarr.movies.find((entry) => entry.id === old.unit.serviceId);
         if (movie?.hasFile) {
-          result.push({ work: withQueueFreshness(terminalItem(old, 'fulfilled', input.snapshot.observedAt), input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: [], queueFailureRefs: savedQueueFailureRefs, activeCoverage: [], blockedReason: null, intentUpdates: [], manualReviewReason: null });
+          result.push({ work: withQueueFreshness(terminalItem(old, 'fulfilled', input.snapshot.observedAt), input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: savedQueueCoverage, queueFailureRefs: savedQueueFailureRefs, activeCoverage: savedQueueCoverage, blockedReason: null, intentUpdates: [], manualReviewReason: null });
           continue;
         }
         if (!movie || !movie.monitored) {
-          result.push({ work: withQueueFreshness(terminalItem(old, 'inactive', input.snapshot.observedAt), input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: [], queueFailureRefs: savedQueueFailureRefs, activeCoverage: [], blockedReason: null, intentUpdates: [], manualReviewReason: null });
+          result.push({ work: withQueueFreshness(terminalItem(old, 'inactive', input.snapshot.observedAt), input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: savedQueueCoverage, queueFailureRefs: savedQueueFailureRefs, activeCoverage: savedQueueCoverage, blockedReason: null, intentUpdates: [], manualReviewReason: null });
           continue;
         }
       }
       if (old) {
         // A season with no current missing targets is terminal after a complete positive library observation.
         const item = terminalItem(old, 'inactive', input.snapshot.observedAt);
-        result.push({ work: withQueueFreshness(item, input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: [], queueFailureRefs: savedQueueFailureRefs, activeCoverage: [], blockedReason: null, intentUpdates: [], manualReviewReason: null });
+        result.push({ work: withQueueFreshness(item, input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: savedQueueCoverage, queueFailureRefs: savedQueueFailureRefs, activeCoverage: savedQueueCoverage, blockedReason: null, intentUpdates: [], manualReviewReason: null });
       }
       continue;
     }
@@ -735,7 +771,7 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
       // Missing IDs, conflicted scope and fuzzy/unknown coverage are not import proof.
       if (current.kind === 'tv' && row.authoritative && !row.scopeConflict && row.coverage?.episodeIds?.length) {
         const library = input.snapshot.sonarr.series.find((entry) => entry.series.id === current.serviceId);
-        if (input.snapshot.sonarr.known && library?.known && library.series.tvdbId === current.externalId &&
+        if (libraryReadCurrent(input.snapshot, old, input.now) && input.snapshot.sonarr.known && library?.known && library.series.tvdbId === current.externalId &&
           row.coverage.episodeIds.every((id) => library.episodes?.some((episode) => episode.id === id && episode.seriesId === current.serviceId && episode.hasFile))) return false;
       }
       return true;
@@ -766,7 +802,7 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
       const projected = projectCoverage(coverage, current!, existing);
       return projected ? [projected] : [];
     }));
-    const previousQueueCoverage = priorCoverageForCurrentWork(input.previousQueueCoverage ?? new Map(), existing, current);
+    const previousQueueCoverage = priorCoverageForCurrentWork(input.previousQueueCoverage ?? new Map(), existing, current, input.snapshot, input.now);
     const reviewWasResolved = old?.blockedReason === 'queue-review' && input.manualReviewKeys !== undefined && !input.manualReviewKeys.has(key);
     const vanishedCoverage = queueFresh && input.queues[arr].kind === 'known' && !ambiguousQueue
         ? subtractCoverage(previousQueueCoverage, observedQueueCoverage, capturedCoverage)

@@ -46,6 +46,10 @@ describe('queue review evidence', () => {
     expect(() => state.flagQueueReview({ workKey: item.workKey, ownerToken, evidence: { ...evidence, externalId: 99 }, now: NOW })).toThrow();
     expect(() => state.flagQueueReview({ workKey: item.workKey, ownerToken, evidence: { ...evidence, observedAt: '2027-01-01T00:00:00.000Z' }, now: NOW })).toThrow();
     expect(() => state.resolveQueueReview({ id: state.listManualReview()[0]!.id, workKey: item.workKey, token: 'foreign', now: NOW, contentIdentity: item.contentIdentity })).toThrow();
+    const persisted = db.serialize();
     db.close();
+    const reopened = new Database(persisted);
+    expect(new State(reopened).listManualReview()[0]?.queueEvidence).toEqual(evidence);
+    reopened.close();
   });
 });

@@ -16,7 +16,7 @@
 
 ## 4. Integration and publication
 
-- [ ] 4.1 Run `npm run typecheck`, `npm test`, `npm --prefix web run typecheck`, `npm --prefix web test`, `npm run build`, `git diff --check` and strict OpenSpec validation; review the full diff independently, fix regressions and record actual results in progress.md. Verify synthetic offline evidence only; no live evaluation, production mutation or deployment.
+- [x] 4.1 Run `npm run typecheck`, `npm test`, `npm --prefix web run typecheck`, `npm --prefix web test`, `npm run build`, `git diff --check` and strict OpenSpec validation; review the full diff independently, fix regressions and record actual results in progress.md. Verify synthetic offline evidence only; no live evaluation, production mutation or deployment.
 - [ ] 4.2 Publish verified checkpoints and update PR #21 with behavior/check evidence; inspect remote CI including amd64/arm64 container/native-SQLite smoke results and record exact pending/failing blockers rather than claiming unrun checks passed.
 
 ## Workflow follow-up

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { reconcileWork, candidateOverlapsQueue } from '../src/core/work-queue';
 import type { LibrarySnapshot } from '../src/core/watcher';
-import type { GrabIntent, WorkItem, QueueRead } from '../src/core/work-queue-types';
+import type { GrabIntent, IntentCoverage, WorkItem, QueueRead } from '../src/core/work-queue-types';
 import type { Episode, Series, SonarrQueueRecord } from '../src/types/sonarr';
 import type { Movie, RadarrQueueRecord } from '../src/types/radarr';
 import type { AssociationDecision } from '../src/core/group-types';
@@ -376,6 +376,42 @@ describe('reconcileWork', () => {
     const row = reconcile({ workItems: [prior] }).items[0]!;
     expect(row.work.resetPendingAt).toBe(LATER);
     expect(row.eligibleUnit).toBeNull();
+  });
+
+  it.each([true, false])('retains captured external coverage when a target disappears from metadata (sibling remains: %s)', (siblingRemains) => {
+    const prior = reconcile().items[0]!.work;
+    const coverage = [{ workKey: prior.workKey, episodeIds: [101], basis: 'explicit-episodes' as const }];
+    const result = reconcileWork({ snapshot: snapshot(siblingRemains ? [ep(102, true)] : []),
+      queues: { sonarr: knownTvQueue(), radarr: knownMovieQueue() }, existingWorkItems: [prior], intents: [],
+      previousQueueCoverage: new Map([[prior.workKey, coverage]]), manualReviewKeys: new Set(), now: NOW, minRetryHours: 6, queueGraceMin: 30 });
+    expect(result.items[0]?.queueCoverage).toEqual(coverage);
+    expect(result.items[0]?.eligibleUnit).toBeNull();
+  });
+
+  it('keeps missing captured coverage through sibling fulfillment and later target restoration', () => {
+    const prior = reconcile().items[0]!.work;
+    const coverage = [{ workKey: prior.workKey, episodeIds: [101], basis: 'explicit-episodes' as const }];
+    const observe = (inventory: LibrarySnapshot, work: WorkItem, held: IntentCoverage[] = coverage) => reconcileWork({
+      snapshot: inventory, queues: { sonarr: knownTvQueue(), radarr: knownMovieQueue() }, existingWorkItems: [work], intents: [],
+      previousQueueCoverage: new Map([[prior.workKey, held]]), manualReviewKeys: new Set(), now: NOW, minRetryHours: 6, queueGraceMin: 30,
+    }).items[0]!;
+    const missing = observe(snapshot([ep(102, true)]), prior);
+    const siblingImported = observe(snapshot([ep(102, true, true)]), missing.work, missing.queueCoverage);
+    expect(siblingImported.queueCoverage).toEqual(coverage);
+    const restored = observe(snapshot([ep(101, true), ep(102, true, true)]), siblingImported.work, siblingImported.queueCoverage);
+    expect(restored.eligibleUnit).toBeNull();
+    expect(restored.queueCoverage).toEqual(coverage);
+    const imported = observe(snapshot([ep(101, true, true), ep(102, true, true)]), restored.work, restored.queueCoverage);
+    expect(imported.queueCoverage).toEqual([]);
+  });
+
+  it.each(['2026-09-28T00:00:00.000Z', '2026-09-30T00:00:00.000Z'])('does not discharge terminal coverage using a regressing or future library read %s', (observedAt) => {
+    const prior = { ...reconcile().items[0]!.work, status: 'fulfilled' as const };
+    const coverage = [{ workKey: prior.workKey, episodeIds: [101], basis: 'explicit-episodes' as const }];
+    const inventory = { ...snapshot([ep(101, true, true), ep(102, true, true)]), observedAt };
+    const row = reconcileWork({ snapshot: inventory, queues: { sonarr: knownTvQueue(), radarr: knownMovieQueue() },
+      existingWorkItems: [prior], intents: [], previousQueueCoverage: new Map([[prior.workKey, coverage]]), now: NOW, minRetryHours: 6, queueGraceMin: 30 }).items[0]!;
+    expect(row.queueCoverage).toEqual(coverage);
   });
 
   it('positively fulfills a captured episode only after the library reports hasFile', () => {

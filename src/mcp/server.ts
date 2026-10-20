@@ -75,7 +75,12 @@ export function createMcpServer(stack: Stack): McpServer {
   server.registerTool(
     'ma_review_list',
     { description: 'Manual-review queue rows (ambiguous/unparseable picks awaiting a human).', inputSchema: z.object({ includeResolved: z.boolean().default(false) }) },
-    async ({ includeResolved }) => jsonResult({ rows: state.listManualReview(includeResolved) }),
+    async ({ includeResolved }) => jsonResult({ rows: state.listManualReview(includeResolved).map((review) => {
+      const publicReview = { ...review };
+      delete publicReview.queueEvidence;
+      delete publicReview.queueEvidenceInvalid;
+      return publicReview;
+    }) }),
   );
 
   server.registerTool(

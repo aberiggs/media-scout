@@ -109,3 +109,10 @@ create a durable review for unreleased-only items with no captured work at risk.
 Directly identified episodes positively observed with files no longer hold their
 future siblings because of a lingering uncertain queue row. Missing IDs and
 unknown inventory do not establish that completion.
+
+Reset or source metadata removal/unmonitoring also does not discharge retained
+external queue coverage. Missing captured episode IDs keep their protection until
+positive file evidence accounts for them; inactive work retains that private
+ledger. New causal evidence is kept out of both public operations projections and
+the MCP review list. The final manual-pick queue recheck records the same causal
+review evidence as automatic reconciliation.

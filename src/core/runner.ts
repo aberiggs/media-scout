@@ -1383,7 +1383,9 @@ export class Runner {
       this.deps.state.applyWorkReconciliation({ key: unit.key, token, work: latest.work, intentUpdates: related });
       this.deps.state.applyWorkQueueObservation({ key: unit.key, token, observedAt: freshQueue.observedAt, known: latest.work.queueObservationKnown && freshQueue.kind === 'known', coverage: latest.queueCoverage, failedQueueRefs: latest.queueFailureRefs });
     }
-    if (latest?.manualReviewReason) this.flagReviewOnce(unit.key, latest.manualReviewReason);
+    if (latest?.queueReviewEvidence) this.deps.state.flagQueueReview({ workKey: unit.key, ownerToken: token,
+      evidence: latest.queueReviewEvidence, ...(latest.queueReviewIntentId ? { intentId: latest.queueReviewIntentId } : {}), now: this.now().toISOString() });
+    else if (latest?.manualReviewReason && latest.manualReviewReason !== 'queue-review') this.flagReviewOnce(unit.key, latest.manualReviewReason);
     if (!latest || latest.work.status !== 'searching' || ['queue-unknown', 'queue-review', 'queue-ambiguous', 'content-identity-changed'].includes(latest.blockedReason ?? '') || candidateOverlapsQueue(originalCoverage, latest.activeCoverage)) {
       if (latest?.work.status === 'searching') await this.finishBackoff(work, token, new Error('queue-overlap-or-unknown'));
       summary.skipped++;

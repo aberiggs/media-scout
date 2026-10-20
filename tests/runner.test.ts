@@ -2216,6 +2216,22 @@ describe('Runner.cycle', () => {
 });
 
 describe('Runner.manualPick', () => {
+  it('retains causal review evidence when the final manual-pick queue check becomes uncertain', async () => {
+    const llm = new FakeLLM();
+    llm.planner.set('sonarr:1:s1', [{ query: 'Show S01', categories: [5000] }]);
+    mockDiscovery({ series: [tvSeries(1, 'Show', 11, 'standard')], sonarrQueueSequence: [[], [
+      { id: 7, seriesId: 1, episodeId: 101, seasonNumber: 1, status: 'unknown' },
+    ]] });
+    mockSearch([release({ title: 'Show S01E01 1080p' })]);
+    const { runner, state } = buildStack(llm);
+    const result = await runner.manualPick('sonarr:1:s1', 0);
+    expect(result.outcome).toBe('reverify-failed');
+    expect(state.listManualReview()[0]).toMatchObject({ reason: 'queue-review', queueEvidence: {
+      version: 1, cause: 'queue-ambiguous', scope: 'targets', episodeIds: [101],
+    } });
+    expect(state.listGrabIntents()).toEqual([]);
+  });
+
   it('legacy single-item reverify persists a known-but-stale queue read as unknown and retains earlier holds', async () => {
     const llm = new FakeLLM();
     llm.planner.set('sonarr:1:s1', [{ query: 'Show S01', categories: [5000] }]);

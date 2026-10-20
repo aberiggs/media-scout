@@ -495,6 +495,24 @@ describe('mcp server tools', () => {
     expect(resolvedRow.resolvedAt).not.toBeNull();
   });
 
+  it('keeps new private causal queue evidence out of the MCP review list', async () => {
+    await connect(new FakeLLM());
+    const work: WorkItem = { workKey: 'radarr:8', contentIdentity: 'radarr:8:88:movie', missingFingerprint: 'known',
+      unit: { key: 'radarr:8', kind: 'movie', arr: 'radarr', serviceId: 8, externalId: 88, title: 'Synthetic movie', year: 2026, altTitles: [] },
+      status: 'manual', blockedReason: 'queue-review', lastSearchAt: null, nextSearchAt: null, failCount: 0, lastOutcome: null,
+      lastObservedAt: NOW.toISOString(), lastQueueObservedAt: NOW.toISOString(), queueObservationKnown: true };
+    const owner = stack.state.claimUnit(work.workKey, NOW)!;
+    stack.state.applyWorkReconciliation({ key: work.workKey, token: owner, work, intentUpdates: [] });
+    stack.state.flagQueueReview({ workKey: work.workKey, ownerToken: owner, now: NOW.toISOString(), evidence: {
+      version: 1, cause: 'queue-disappeared', contentIdentity: work.contentIdentity, arr: 'radarr', serviceId: 8, externalId: 88,
+      episodeIds: null, scope: 'targets', observedAt: NOW.toISOString(),
+    } });
+    const listed = await callJson('ma_review_list');
+    expect(listed.rows).toMatchObject([{ workKey: work.workKey, reason: 'queue-review' }]);
+    expect(JSON.stringify(listed)).not.toMatch(/queueEvidence|contentIdentity|externalId|episodeIds/);
+    expect(stack.state.listManualReview()[0]?.queueEvidence).toBeDefined();
+  });
+
   it('ma_review_action rejects an unknown action value via the input schema', async () => {
     await connect(new FakeLLM());
     // Input-validation failures come back as isError results (SDK converts invalid params to a tool error).

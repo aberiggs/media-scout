@@ -6,7 +6,8 @@ import {
 
 const PAGE_SIZE = 50
 const EPISODE_PAGE_SIZE = 25
-const WORK_STATUSES = ['ready', 'waiting-release', 'searching', 'cooldown', 'backoff', 'manual', 'fulfilled', 'inactive'] as const
+const WORK_STATUSES = ['ready', 'waiting-release', 'searching', 'cooldown', 'backoff', 'manual'] as const
+const RESET_COPY = 'Clear local scheduling and old reviews, then rebuild tracking on the next successful library check. Downloads, linked reviews, history and duplicate-download protection stay unchanged.'
 
 type WorkAction = { allowed: boolean; reason?: string }
 type WorkActions = { retry: WorkAction; reset: WorkAction }
@@ -19,13 +20,14 @@ type WorkRow = {
   observedAt: string | null; observationState: 'known' | 'unknown' | 'stale'
   queueObservationKnown?: boolean; queueObservedAt?: string | null
   coverage: { observed: number; reserved: number }; actions: WorkActions
-  episodeProgress?: EpisodeSummary
+  episodeProgress?: EpisodeSummary; attentionRequired?: boolean; availability?: 'waiting-release' | 'available' | 'unknown'
 }
 type ReviewActionSet = WorkActions & { associate: WorkAction; release: WorkAction }
 type OperationsScope = 'active' | 'all'
 type ReviewRow = {
   id: number; workKey: string; title: string; reason: string; summary: string; createdAt: string
   resolvedAt: string | null; mediaType: 'movie' | 'tv' | 'unknown'; season?: number; actions: ReviewActionSet
+  reviews?: ReviewRow[]; workStatus?: string; availability?: 'waiting-release' | 'available' | 'unknown'
 }
 type ActivityRow = {
   id: number; source: 'cycle' | 'manual'; startedAt: string; finishedAt: string | null; query: string
@@ -180,10 +182,6 @@ function lastPageOffset(total: number): number {
   return total <= 0 ? 0 : Math.floor((total - 1) / PAGE_SIZE) * PAGE_SIZE
 }
 
-function isTerminalStatus(status: string): boolean {
-  return status === 'fulfilled' || status === 'inactive'
-}
-
 function reviewMediaLabel(row: Pick<ReviewRow, 'mediaType' | 'season'>): string {
   if (row.mediaType === 'movie') return 'Movie'
   if (row.mediaType === 'tv') return row.season === undefined ? 'TV' : `TV · Season ${row.season}`
@@ -201,7 +199,7 @@ function formatDate(value: string | null | undefined, markClockAhead = false): s
 function statusLabel(value: string): string {
   const labels: Record<string, string> = {
     'waiting-release': 'Waiting for release', cooldown: 'Cooling down', backoff: 'Retry delayed', searching: 'Searching',
-    ready: 'Ready', manual: 'Manual review', fulfilled: 'Complete', inactive: 'Inactive',
+    ready: 'Ready', manual: 'Needs review', fulfilled: 'Complete', inactive: 'Inactive',
   }
   const fallback = value.replace(/-/gu, ' ')
   return labels[value] ?? fallback.charAt(0).toLocaleUpperCase() + fallback.slice(1)
@@ -214,9 +212,9 @@ function holdReasonLabel(value: string): string {
     'queue-ambiguous': 'Queue coverage needs review',
     'active-intent': 'A download reservation is still active',
     'waiting-release': 'Waiting for the movie to become available or the requested episodes to air.',
-    'manual-review': 'This season is held for manual review; episode-level eligibility does not clear the work-wide hold.',
+    'manual-review': 'An unresolved review is holding this item.',
     'content-identity-changed': 'Library details changed; review is needed',
-    'queue-review': 'This season is held for queue review; episode-level eligibility does not clear the work-wide hold.',
+    'queue-review': 'A download needs attention before Scout can continue.',
     'library-unknown': 'Library status is unknown',
     blocked: 'Held for safety',
     'uncertain-download': 'This episode is held because its download coverage is uncertain.',
@@ -233,10 +231,10 @@ function holdReasonLabel(value: string): string {
 function actionReasonLabel(value: string | undefined): string {
   const labels: Record<string, string> = {
     'work-not-found': 'This work item is no longer available.',
-    'work-held': 'This item is held for a separate safety reason.',
+    'work-held': 'A download or library check is still holding this item.',
     'queue-observation-unknown': 'Actions need a known library and queue observation.',
     'queue-observation-stale': 'Actions need a current observation. Scout marks observations stale after 24 hours.',
-    'review-not-eligible': 'The open review does not allow this action.',
+    'review-not-eligible': 'Resolve the download or library issue before retrying.',
     'work-not-retryable': 'Retry is not available for this status.',
     'work-not-resettable': 'Reset is not available for this status.',
     'work-claimed': 'Another Scout task is working on this item.',
@@ -244,7 +242,8 @@ function actionReasonLabel(value: string | undefined): string {
     'queue-coverage-unknown': 'Queue coverage could not be verified.',
     'queue-coverage-held': 'Queue coverage is still holding this item.',
     'rate-limited': 'Wait until the provider retry window ends.',
-    'operator-actions-disabled': 'Enable operator actions in Settings before using Retry or Reset tracking.',
+    'operator-actions-disabled': 'Enable operator actions in Settings to change tracking.',
+    'reset-pending': 'Tracking will rebuild on the next successful library check.',
   }
   return value ? labels[value] ?? 'This action is currently unavailable.' : 'This action is currently unavailable.'
 }
@@ -306,7 +305,7 @@ export function OperationsPage({ page }: { page: OperationsPageName }) {
 }
 
 function QueuePage() {
-  const [scope, setScope] = useState<OperationsScope>('active')
+  const scope: OperationsScope = 'active'
   const [status, setStatus] = useState('all')
   const [query, setQuery] = useState('')
   const [offset, setOffset] = useState(0)
@@ -318,16 +317,12 @@ function QueuePage() {
   const remote = useRemoteData<WorkResponse>(url)
   const counts = remote.data?.counts ?? {}
   const controlData = remote.data ?? remote.previousData
-  const controlCounts = controlData?.counts ?? {}
-  const statusOptions = Object.keys(controlCounts).length ? Object.keys(controlCounts) : [...WORK_STATUSES]
-  const countScope = remote.data?.countScope ?? remote.data?.scope ?? scope
   const freshnessHours = (remote.data ?? remote.previousData)?.freshness.staleAfterHours ?? 24
   const correctionOffset = remote.data ? lastPageOffset(remote.data.total) : 0
   const pageNeedsCorrection = Boolean(remote.data && offset > correctionOffset)
   useEffect(() => {
     if (remote.data && offset > lastPageOffset(remote.data.total)) setOffset(lastPageOffset(remote.data.total))
   }, [remote.data?.total, offset])
-  const resetConfirmCopy = 'Clear Scout’s current retry and review state. Missing content may reappear on the next poll. Download reservations and history are retained.'
 
   const performAction = async () => {
     if (!confirm || actionBusy) return
@@ -344,70 +339,59 @@ function QueuePage() {
   }
 
   const submitSearch = (event: React.FormEvent) => { event.preventDefault(); setOffset(0); setQuery(searchText.trim()) }
-  const changeScope = (nextScope: OperationsScope) => {
-    setScope(nextScope)
-    if (nextScope === 'active' && isTerminalStatus(status)) setStatus('all')
-    setOffset(0)
-  }
-  const changeStatus = (nextStatus: string) => {
-    setStatus(nextStatus)
-    if (isTerminalStatus(nextStatus)) setScope('all')
-    setOffset(0)
-  }
   const title = 'Queue'
   return <>
     <PageHeading eyebrow="SCOUT WORK" title={title} intro="A clear view of what Media Scout is watching, waiting on, and holding." icon={<Activity size={15} />} />
-    <div className="ops-page">
+    <div className="ops-page" aria-hidden={confirm ? true : undefined}>
       <div className="ops-page-toolbar"><div className="ops-scope-note"><ShieldCheck size={16} /><span>Scout work queue <strong>· not live download-client jobs</strong></span></div><button className="button button-secondary" type="button" onClick={() => void remote.refresh()} disabled={remote.refreshing}><RefreshCw className={remote.refreshing ? 'spin' : ''} size={15} /> Refresh view</button></div>
-      <p className="ops-freshness-note" id="queue-freshness-note"><Clock3 size={14} /><span>Freshness uses Scout’s saved library and queue observations. A known observation older than {freshnessHours} hours is stale. Refresh view reloads saved status; it does not start a poll. Automatic monitoring is configured in <a href="#settings" aria-label="Monitoring settings">Settings</a>.</span></p>
+      <p className="ops-freshness-note" id="queue-freshness-note"><Clock3 size={14} /><span>Refresh reloads saved status, not a live library check. <a href="#settings" aria-label="Monitoring settings">Monitoring settings</a></span></p>
       {remote.error && <ErrorBanner message={remote.error} onRetry={() => void remote.refresh()} refreshing={remote.refreshing} />}
       {actionNotice && <div className={`notice notice-${actionNotice.kind}`} role={actionNotice.kind === 'error' ? 'alert' : 'status'}><span>{actionNotice.text}</span></div>}
       {remote.data && <>
         <div className="ops-summary-grid" aria-label="Queue counts">
           <SummaryCard label="Work items" value={Object.values(counts).reduce((sum, count) => sum + count, 0)} tone="neutral" />
           <SummaryCard label="Open reviews" value={remote.data.openReviewCount} tone={remote.data.openReviewCount ? 'amber' : 'neutral'} href="#reviews" />
-          <SummaryCard label="Ready status" value={counts.ready ?? 0} tone="mint" hint="Scheduling state, not a promise that a search will run." />
           <SummaryCard label="Waiting" value={(counts.cooldown ?? 0) + (counts.backoff ?? 0) + (counts['waiting-release'] ?? 0)} tone="amber" />
         </div>
-        <ScopeCountsNote scope={countScope} />
       </>}
       {controlData && !remote.data && remote.loading && <p className="ops-filter-refresh-note" role="status">Updating this filter. Previous rows are hidden until matching results arrive; status counts are from the last loaded view.</p>}
       <div className="ops-list-card">
-        <div className="ops-list-head"><div><h2>Tracked media</h2><p>Search timing and holds come from Scout’s latest observation.</p></div>{remote.data && <span className="ops-generated">View updated {formatDate(remote.data.generatedAt, true)}</span>}</div>
-        <div className="ops-controls"><div className="ops-filter-tabs" role="group" aria-label="Work scope"><button type="button" aria-pressed={scope === 'active'} className={scope === 'active' ? 'selected' : ''} title="Hide completed and inactive work" onClick={() => changeScope('active')}>Active work</button><button type="button" aria-pressed={scope === 'all'} className={scope === 'all' ? 'selected' : ''} title="Include completed and inactive work" onClick={() => changeScope('all')}>All work</button></div>
+        <div className="ops-list-head"><div><h2>Tracked media</h2><p>Waiting work stays here; completed history does not.</p></div>{remote.data && <span className="ops-generated">View updated {formatDate(remote.data.generatedAt, true)}</span>}</div>
+        <div className="ops-controls">
           <form className="ops-search" onSubmit={submitSearch} role="search"><Search size={16} /><input aria-label="Search queue" value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="Find a movie or series" /><button className="text-button" type="submit">Search</button></form>
-          <label className="sr-only" htmlFor="queue-status">Filter by status</label><select id="queue-status" value={status} onChange={(event) => changeStatus(event.target.value)}><option value="all">All statuses</option>{statusOptions.filter((key) => scope === 'all' || !isTerminalStatus(key)).map((key) => <option key={key} value={key}>{statusLabel(key)} · {controlCounts[key] ?? 0}</option>)}</select>
+          <label className="sr-only" htmlFor="queue-status">Filter by status</label><select id="queue-status" value={status} onChange={(event) => { setStatus(event.target.value); setOffset(0) }}><option value="all">All statuses</option>{WORK_STATUSES.map((key) => <option key={key} value={key}>{statusLabel(key)}</option>)}</select>
         </div>
         {remote.refreshing && <div className="ops-refreshing" role="status"><LoaderCircle className="spin" size={14} /> Updating this view…</div>}
         {pageNeedsCorrection && <div className="ops-correction-note" role="status">The list changed. Returning to the last available page…</div>}
-        {remote.loading && !remote.data ? <LoadingPanel label="Loading Scout’s work queue…" /> : remote.error && !remote.data && remote.previousData ? <EmptyPanel title="This queue view couldn’t load" detail="Previous rows are hidden because they don’t match the current filters. Try again or adjust the filters." /> : remote.data && !pageNeedsCorrection ? (remote.data.items.length === 0 ? <EmptyPanel title={query || status !== 'all' ? 'No matching work' : 'Nothing in the queue yet'} detail={query || status !== 'all' ? 'Try another search or status filter.' : 'When missing media is found, Scout’s work will appear here.'} /> : <div className="ops-work-list">{remote.data.items.map((row) => <WorkCard key={row.workKey} row={row} onAction={(action) => setConfirm({ row, action })} />)}</div>) : null}
+        {remote.loading && !remote.data ? <LoadingPanel label="Loading Scout’s work queue…" /> : remote.error && !remote.data && remote.previousData ? <EmptyPanel title="This queue view couldn’t load" detail="Previous rows are hidden because they don’t match the current filters. Try again or adjust the filters." /> : remote.data && !pageNeedsCorrection ? (remote.data.items.length === 0 ? <EmptyPanel title={query || status !== 'all' ? 'No matching work' : 'Nothing in the queue yet'} detail={query || status !== 'all' ? 'Try another search or status filter.' : 'When missing media is found, Scout’s work will appear here.'} /> : <div className="ops-work-list">{remote.data.items.filter((row) => !['fulfilled', 'inactive'].includes(row.status)).map((row) => <WorkCard key={row.workKey} row={row} onAction={(action) => setConfirm({ row, action })} freshnessHours={freshnessHours} />)}</div>) : null}
         {remote.data && !pageNeedsCorrection && (remote.data.total > PAGE_SIZE || offset > 0) && <Pagination offset={offset} total={remote.data.total} onChange={setOffset} />}
       </div>
       {!remote.data && remote.error && !remote.previousData && <EmptyPanel title="Queue is unavailable" detail="The last view is not available yet. Check the service connection and try again." />}
     </div>
-    {confirm && <Dialog title={confirm.action === 'reset' ? 'Reset tracking?' : 'Make this work due?'} description={confirm.row.title} onClose={() => !actionBusy && setConfirm(null)} closeDisabled={actionBusy}>
-      <div className="ops-dialog-body"><div className={confirm.action === 'reset' ? 'ops-warning-box' : 'ops-info-box'}>{confirm.action === 'reset' ? <><ShieldAlert size={18} /><p>{resetConfirmCopy}</p></> : <><Clock3 size={18} /><p>Mark this item due for the next eligible pass. This does not start a search now.</p></>}</div>
+    {confirm && <Dialog title={confirm.action === 'reset' ? 'Reset item?' : 'Schedule retry?'} description={confirm.row.title} onClose={() => !actionBusy && setConfirm(null)} closeDisabled={actionBusy}>
+      <div className="ops-dialog-body"><div className={confirm.action === 'reset' ? 'ops-warning-box' : 'ops-info-box'}>{confirm.action === 'reset' ? <><ShieldAlert size={18} /><p>{RESET_COPY}</p></> : <><Clock3 size={18} /><p>Schedule a retry for a later eligible pass. This does not start a search now.</p></>}</div>
         {actionNotice?.kind === 'error' && <div className="ops-inline-error" role="alert">{actionNotice.text}</div>}
-        <div className="ops-dialog-actions"><button className="button button-secondary" type="button" onClick={() => setConfirm(null)} disabled={actionBusy}>Cancel</button><button className={`button ${confirm.action === 'reset' ? 'button-danger' : 'button-primary'}`} type="button" onClick={() => void performAction()} disabled={actionBusy}>{actionBusy ? <LoaderCircle className="spin" size={16} /> : confirm.action === 'reset' ? <RotateCcw size={16} /> : <Clock3 size={16} />}{actionBusy ? 'Working…' : confirm.action === 'reset' ? 'Reset tracking' : 'Mark due'}</button></div>
+        <div className="ops-dialog-actions"><button className="button button-secondary" type="button" onClick={() => setConfirm(null)} disabled={actionBusy}>Cancel</button><button className={`button ${confirm.action === 'reset' ? 'button-danger' : 'button-primary'}`} type="button" onClick={() => void performAction()} disabled={actionBusy}>{actionBusy ? <LoaderCircle className="spin" size={16} /> : confirm.action === 'reset' ? <RotateCcw size={16} /> : <Clock3 size={16} />}{actionBusy ? 'Working…' : confirm.action === 'reset' ? 'Reset item' : 'Schedule retry'}</button></div>
       </div>
     </Dialog>}
   </>
 }
 
-function WorkCard({ row, onAction }: { row: WorkRow; onAction: (action: 'retry' | 'reset') => void }) {
+function WorkCard({ row, onAction, freshnessHours }: { row: WorkRow; onAction: (action: 'retry' | 'reset') => void; freshnessHours: number }) {
   const terminal = row.status === 'fulfilled' || row.status === 'inactive'
   const idSuffix = useId()
   const holdCopy = row.holdReason && !((row.status === 'waiting-release' && row.holdReason === 'waiting-release') || (row.status === 'manual' && row.holdReason === 'manual-review') || (row.holdReason === 'queue-unknown' && row.queueObservationKnown === false))
     ? holdReasonLabel(row.holdReason) : null
   const holdId = holdCopy ? `work-hold-${idSuffix}` : undefined
   const observationId = `work-observation-${idSuffix}`
+  const needsReview = row.attentionRequired || row.status === 'manual'
   return <article className="ops-work-row">
     <div className="ops-media-icon">{row.mediaType === 'movie' ? <Film size={18} /> : <Tv size={18} />}</div>
-    <div className="ops-work-main"><div className="ops-work-title"><h3>{row.title}</h3><StatusPill value={row.status} /></div><div className="ops-work-meta"><span>{row.mediaType === 'movie' ? 'Movie' : `TV${row.season === undefined ? '' : ` · Season ${row.season}`}`}</span><span>{row.missingCount} missing</span><span>Coverage: {row.coverage.observed} observed · {row.coverage.reserved} reserved</span></div>
+    <div className="ops-work-main"><div className="ops-work-title"><h3>{row.title}</h3><StatusPill value={needsReview ? 'manual' : row.status} /></div><div className="ops-work-meta"><span>{row.mediaType === 'movie' ? 'Movie' : `TV${row.season === undefined ? '' : ` · Season ${row.season}`}`}</span>{needsReview && row.availability === 'waiting-release' && <span>Waiting for release</span>}</div>
       <WorkSchedule row={row} terminal={terminal} />
       {row.mediaType === 'tv' && row.episodeProgress && <SeasonProgress row={row} />}
-      <ObservationSummary row={row} id={observationId} />
       {holdCopy && <p className="ops-hold-reason" id={holdId}><ShieldAlert size={14} />{holdCopy}</p>}
+      <details className="ops-item-details"><summary>Details</summary><div className="ops-item-diagnostics"><p>{row.missingCount} missing · Coverage: {row.coverage.observed} observed · {row.coverage.reserved} reserved</p><ObservationSummary row={row} id={observationId} /><p>Observations older than {freshnessHours} hours need a successful library check.</p>{row.lastSearchAt && <p>Last search · {formatDate(row.lastSearchAt, true)}</p>}</div></details>
     </div>
     <ActionControls actions={row.actions} onAction={onAction} observationState={row.observationState} observationId={observationId} holdCopy={holdCopy} holdId={holdId} terminalStatus={row.status === 'fulfilled' ? 'fulfilled' : row.status === 'inactive' ? 'inactive' : undefined} />
   </article>
@@ -421,10 +405,8 @@ function SeasonProgress({ row }: { row: WorkRow }) {
   const label = summary.knowledge !== 'known' || !counts ? 'Episode inventory unavailable' : summary.completion === 'caught-up' ? 'Caught up · awaiting airtime' : summary.completion === 'imported' ? `Known inventory imported · ${counts.total} episodes` : `${counts.imported} of ${counts.total} imported · ${counts.airedMissing} aired missing`
   const detail = expanded ? <EpisodeInventory workKey={row.workKey} offset={offset} onOffset={setOffset} revision={row} /> : null
   return <section className="ops-season-progress" aria-label={`Season ${row.season ?? ''} episode progress`}>
-    <div className="ops-season-summary"><strong>{label}</strong>{counts && <span>{counts.future} future · {counts.timingUnknown} timing unknown · {counts.ready} ready · {counts.waitingRelease} waiting for release · {counts.held} held · {counts.downloading} downloading</span>}</div>
-    {summary.nextEligibilityAt && <p>Next airtime · {formatDate(summary.nextEligibilityAt)}</p>}
-    {summary.nextRetryAt && <p>Next retry · {formatDate(summary.nextRetryAt)}</p>}
-    {summary.lifecycle === 'finished' && <p>Season finished airing</p>}{summary.lifecycle === 'unknown' && <p>Airing status unknown</p>}
+    <div className="ops-season-summary"><strong>{label}</strong></div>
+    {expanded && <>{counts && <p>{counts.future} future · {counts.timingUnknown} timing unknown · {counts.ready} ready · {counts.waitingRelease} waiting for release · {counts.held} held · {counts.downloading} downloading</p>}{summary.lifecycle === 'finished' && <p>Season finished airing</p>}{summary.lifecycle === 'unknown' && <p>Airing status unknown</p>}</>}
     <button className="text-button ops-episode-toggle" type="button" aria-expanded={expanded} onClick={() => { setExpanded(!expanded); setOffset(0) }}>{expanded ? 'Hide episode details' : 'Episode details'}</button>
     {detail}
   </section>
@@ -452,8 +434,10 @@ function ReviewEpisodeDetails({ workKey }: { workKey: string }) {
 
 function WorkSchedule({ row, terminal }: { row: WorkRow; terminal: boolean }) {
   const entries = [
-    ...(!terminal && row.nextSearchAt ? [`Next eligible pass · ${formatDate(row.nextSearchAt)}`] : []),
-    ...(row.lastSearchAt ? [`Last search · ${formatDate(row.lastSearchAt, true)}`] : []),
+    ...(!terminal && row.nextSearchAt ? [`Next retry · ${formatDate(row.nextSearchAt)}`] : []),
+    ...(!row.nextSearchAt && row.episodeProgress?.nextRetryAt ? [`Next retry · ${formatDate(row.episodeProgress.nextRetryAt)}`] : []),
+    ...(row.episodeProgress?.nextEligibilityAt ? [`Next airtime · ${formatDate(row.episodeProgress.nextEligibilityAt)}`] : []),
+    ...(row.observedAt ? [`Last checked · ${formatDate(row.observedAt, true)}`] : []),
   ]
   return entries.length ? <div className="ops-work-schedule">{entries.map((entry) => <span key={entry}>{entry}</span>)}</div> : null
 }
@@ -474,38 +458,28 @@ function ObservationSummary({ row, id }: { row: WorkRow; id: string }) {
   } else {
     sources = [`Library · ${libraryTime ?? 'time unavailable'}`]
   }
-  const labels = { known: 'Current observations', stale: 'Stale observations', unknown: 'Observation status unknown' }
+  const labels = { known: 'Saved checks', stale: 'Stale observations', unknown: 'Observation status unknown' }
   return <div className="ops-observation-summary" id={id}>
     <span className={`ops-observation-status obs-${row.observationState}`}><span className="tiny-dot" />{labels[row.observationState]}</span>
     <div className="ops-observation-sources">{sources.map((source, index) => <span key={`${index}-${source}`}>{source}</span>)}</div>
   </div>
 }
 
-function ActionControls({ actions, onAction, observationState, observationId, holdCopy, holdId, terminalStatus }: {
+function ActionControls({ actions, onAction, terminalStatus }: {
   actions: WorkActions; onAction: (action: 'retry' | 'reset') => void
   observationState?: WorkRow['observationState']; observationId?: string; holdCopy?: string | null; holdId?: string
   terminalStatus?: 'fulfilled' | 'inactive'
 }) {
-  const id = useId()
   if (terminalStatus) return null
-  const blocked = [actions.retry, actions.reset].filter((action) => !action.allowed)
-  const blockedReasons = [...new Set(blocked.map(({ reason }) => reason).filter((reason): reason is string => Boolean(reason)))]
-  const freshnessBlocked = observationState === 'stale' && blockedReasons.every((reason) => reason === 'queue-observation-stale')
-    || observationState === 'unknown' && blockedReasons.length > 0 && blockedReasons.every((reason) => reason === 'queue-observation-unknown')
-  const holdBlocked = Boolean(holdCopy && blockedReasons.length > 0 && blockedReasons.every((reason) => reason === 'work-held'))
-  const reasonId = `work-action-reason-${id}`
-  let message = ''
-  if (!freshnessBlocked && !holdBlocked && blockedReasons.length) {
-    if (blockedReasons.includes('work-not-retryable') && blockedReasons.includes('work-not-resettable')) message = 'Retry and reset are not available for this status.'
-    else message = [...new Set(blockedReasons.map(actionReasonLabel))].join(' ')
-  }
-  const descriptionId = message ? reasonId : freshnessBlocked ? 'queue-freshness-note' : holdBlocked ? holdId : observationId
+  const noActions = !actions.retry.allowed && !actions.reset.allowed
+  const reason = actions.reset.reason ?? actions.retry.reason
+  const message = noActions && reason ? actionReasonLabel(reason) : null
   return <div className="ops-work-actions">
     <div className="ops-row-actions" role="group" aria-label="Work actions">
-      <button className="button button-secondary" type="button" disabled={!actions.retry.allowed} onClick={() => onAction('retry')} aria-describedby={!actions.retry.allowed && descriptionId ? descriptionId : undefined}><Clock3 size={14} />Retry</button>
-      <button className="button button-secondary" type="button" disabled={!actions.reset.allowed} onClick={() => onAction('reset')} aria-describedby={!actions.reset.allowed && descriptionId ? descriptionId : undefined}><RotateCcw size={14} />Reset tracking</button>
+      {actions.retry.allowed && <button className="button button-secondary" type="button" onClick={() => onAction('retry')}><Clock3 size={14} />Retry later</button>}
+      {actions.reset.allowed && <button className="button button-secondary" type="button" onClick={() => onAction('reset')}><RotateCcw size={14} />Reset item</button>}
     </div>
-    {message && <p className="ops-action-reason" id={reasonId}>{message}</p>}
+    {message && <p className="ops-action-reason">{message}</p>}
   </div>
 }
 
@@ -523,10 +497,6 @@ function PageHeading({ eyebrow, title, intro, icon }: { eyebrow: string; title: 
   return <div className="page-heading ops-page-heading"><div><div className="eyebrow"><span className="eyebrow-mark" />{eyebrow}</div><h1>{title}<span className="heading-period">.</span></h1><p className="page-intro">{intro}</p></div><div className="heading-stamp">{icon}<span>LOCAL CONTROL</span></div></div>
 }
 
-function ScopeCountsNote({ scope }: { scope: OperationsScope }) {
-  return <p className="ops-count-context">Summary counts cover <strong>{scope === 'active' ? 'active work' : 'all work, including completed and inactive items'}</strong>. Search and status filters only narrow the list.</p>
-}
-
 function ReviewsPage() {
   const [resolved, setResolved] = useState(false)
   const [offset, setOffset] = useState(0)
@@ -535,7 +505,8 @@ function ReviewsPage() {
   const [selected, setSelected] = useState<ReviewRow | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
-  const url = `/api/operations/reviews?resolved=${resolved}&q=${encodeURIComponent(query)}&limit=${PAGE_SIZE}&offset=${offset}`
+  const [workConfirm, setWorkConfirm] = useState<{ row: ReviewRow; action: 'retry' | 'reset' } | null>(null)
+  const url = `/api/operations/reviews?grouped=true&resolved=${resolved}&q=${encodeURIComponent(query)}&limit=${PAGE_SIZE}&offset=${offset}`
   const remote = useRemoteData<ReviewResponse>(url)
   const correctionOffset = remote.data ? lastPageOffset(remote.data.total) : 0
   const pageNeedsCorrection = Boolean(remote.data && offset > correctionOffset)
@@ -544,9 +515,10 @@ function ReviewsPage() {
   }, [remote.data?.total, offset])
   const search = (event: React.FormEvent) => { event.preventDefault(); setOffset(0); setQuery(searchText.trim()) }
   return <>
-    <PageHeading eyebrow="NEEDS A HUMAN" title="Manual review" intro="Review held work and choose only the actions Scout says are available." icon={<ShieldAlert size={15} />} />
-    <div className="ops-page">
-      <div className="ops-page-toolbar"><div className="ops-scope-note"><ShieldAlert size={16} /><span>Review does not mean complete. No generic dismiss action is available.</span></div><button className="button button-secondary" type="button" onClick={() => void remote.refresh()} disabled={remote.refreshing}><RefreshCw className={remote.refreshing ? 'spin' : ''} size={15} /> Refresh view</button></div>
+    <PageHeading eyebrow="NEEDS ATTENTION" title="Reviews" intro="One place for media that needs a decision, with every reason kept together." icon={<ShieldAlert size={15} />} />
+    <div className="ops-page" aria-hidden={selected || workConfirm ? true : undefined}>
+      <div className="ops-page-toolbar"><div className="ops-scope-note"><ShieldAlert size={16} /><span>Reset an old review to rebuild tracking. Existing downloads stay protected.</span></div><button className="button button-secondary" type="button" onClick={() => void remote.refresh()} disabled={remote.refreshing}><RefreshCw className={remote.refreshing ? 'spin' : ''} size={15} /> Refresh view</button></div>
+      <p className="ops-freshness-note">Refresh reloads saved status, not a live library check.</p>
       {remote.error && <ErrorBanner message={remote.error} onRetry={() => void remote.refresh()} refreshing={remote.refreshing} />}
       {notice && <div className="notice notice-success" role="status">{notice}</div>}
       <div className="ops-list-card">
@@ -555,15 +527,16 @@ function ReviewsPage() {
           <form className="ops-search" role="search" onSubmit={search}><Search size={16} /><input aria-label="Search reviews" value={searchText} onChange={(event) => setSearchText(event.target.value)} placeholder="Find a movie or review reason" /><button className="text-button" type="submit">Search</button></form></div>
         {remote.refreshing && <div className="ops-refreshing" role="status"><LoaderCircle className="spin" size={14} /> Updating this view…</div>}
         {pageNeedsCorrection && <div className="ops-correction-note" role="status">The review list changed. Returning to the last available page…</div>}
-        {remote.loading && !remote.data ? <LoadingPanel label="Loading reviews…" /> : remote.data && !pageNeedsCorrection && remote.data.items.length === 0 ? <EmptyPanel title={query ? 'No matching reviews' : resolved ? 'No resolved reviews yet' : 'No open reviews'} detail={query ? 'Try another search.' : resolved ? 'Resolved reviews will remain available here.' : 'If Scout needs a decision, the review will appear here.'} /> : remote.data && !pageNeedsCorrection && <div className="ops-review-list">{remote.data.items.map((row) => <article className="ops-review-row" key={row.id}>
-          <div className="ops-review-marker"><ShieldAlert size={17} /></div><div className="ops-review-content"><div className="ops-work-title"><h3>{row.title}</h3><span className={`ops-status ${row.resolvedAt ? 'status-quiet' : 'status-amber'}`}>{row.resolvedAt ? 'Resolved' : 'Open'}</span></div><p>{row.summary}</p><div className="ops-work-meta"><span>{reviewMediaLabel(row)}</span><span>Created {formatDate(row.createdAt, true)}</span>{row.resolvedAt && <span>Resolved {formatDate(row.resolvedAt, true)}</span>}</div></div>
-          <button className="button button-secondary" type="button" onClick={() => { setSelected(row); setActionError(null) }}>{resolved ? 'View details' : 'Review details'} <ArrowRight size={15} /></button>
+        {remote.loading && !remote.data ? <LoadingPanel label="Loading reviews…" /> : remote.data && !pageNeedsCorrection && remote.data.items.length === 0 ? <EmptyPanel title={query ? 'No matching reviews' : resolved ? 'No resolved reviews yet' : 'No open reviews'} detail={query ? 'Try another search.' : resolved ? 'Resolved reviews will remain available here.' : 'If Scout needs a decision, the review will appear here.'} /> : remote.data && !pageNeedsCorrection && <div className="ops-review-list">{remote.data.items.map((row) => <article className="ops-review-row" key={row.workKey}>
+          <div className="ops-review-marker">{row.mediaType === 'movie' ? <Film size={17} /> : <Tv size={17} />}</div><div className="ops-review-content"><div className="ops-work-title"><h3>{row.title}</h3><span className={`ops-status ${row.resolvedAt ? 'status-quiet' : 'status-amber'}`}>{row.resolvedAt ? 'Resolved' : 'Needs review'}</span></div><div className="ops-work-meta"><span>{reviewMediaLabel(row)}</span>{row.availability === 'waiting-release' && <span>Waiting for release</span>}{row.resolvedAt && <span>Resolved {formatDate(row.resolvedAt, true)}</span>}</div><ul className="ops-review-causes">{(row.reviews ?? [row]).map((cause) => <li key={cause.id}>{cause.summary}</li>)}</ul></div>
+          <div className="ops-review-card-actions">{!resolved && <ActionControls actions={row.actions} onAction={(action) => setWorkConfirm({ row, action })} />}<button className="text-button" type="button" onClick={() => { setSelected(row); setActionError(null) }}>{resolved ? 'View details' : 'Review details'} <ArrowRight size={15} /></button></div>
         </article>)}</div>}
         {remote.data && !pageNeedsCorrection && (remote.data.total > PAGE_SIZE || offset > 0) && <Pagination offset={offset} total={remote.data.total} onChange={setOffset} />}
       </div>
       {remote.loading && !remote.data && null}{!remote.data && remote.error && <EmptyPanel title="Reviews are unavailable" detail="Check the service connection and try again." />}
     </div>
     {selected && <ReviewDialog row={selected} onClose={() => setSelected(null)} onSuccess={(text) => { setSelected(null); setNotice(text); void remote.refresh() }} actionError={actionError} setActionError={setActionError} />}
+    {workConfirm && <ReviewWorkActionDialog row={workConfirm.row} action={workConfirm.action} onClose={() => setWorkConfirm(null)} onSuccess={(text) => { setWorkConfirm(null); setNotice(text); void remote.refresh() }} />}
   </>
 }
 
@@ -573,6 +546,7 @@ function ReviewDialog({ row, onClose, onSuccess, actionError, setActionError }: 
 }) {
   const [prepared, setPrepared] = useState<PreparedAction | null>(null)
   const [action, setAction] = useState<'associate' | 'release' | null>(null)
+  const [recoveryReview, setRecoveryReview] = useState<ReviewRow>(row)
   const [chosenMediaIndex, setChosenMediaIndex] = useState<number | null>(null)
   const [chosenTargetIndices, setChosenTargetIndices] = useState<number[]>([])
   const [challenge, setChallenge] = useState('')
@@ -601,10 +575,11 @@ function ReviewDialog({ row, onClose, onSuccess, actionError, setActionError }: 
   const expired = prepared ? !Number.isFinite(expiry) || expiry <= now : false
   const canCommit = Boolean(prepared && action && !expired && challenge === prepared.challenge && note.trim().length >= 3 && note.trim().length <= 500 && (!prepared.requiresClientInspection || inspectionConfirmed) && (action !== 'associate' || (chosenMediaIndex !== null && chosenTargetIndices.length > 0)))
 
-  const prepare = async (nextAction: 'associate' | 'release') => {
+  const prepare = async (nextAction: 'associate' | 'release', source: ReviewRow = recoveryReview) => {
+    setRecoveryReview(source)
     setAction(nextAction); setPrepared(null); setActionError(null); setChallenge(''); setNote(''); setInspectionConfirmed(false); setChosenMediaIndex(null); setChosenTargetIndices([]); setBusy(true)
     try {
-      const response = await fetch(`/api/operations/reviews/${row.id}/prepare`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: nextAction }) })
+      const response = await fetch(`/api/operations/reviews/${source.id}/prepare`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: nextAction }) })
       const result = await readJson<PreparedAction>(response)
       setPrepared(result)
     } catch (error) { setActionError(messageFrom(error)) }
@@ -617,7 +592,7 @@ function ReviewDialog({ row, onClose, onSuccess, actionError, setActionError }: 
     if (!canCommit) return
     setBusy(true); setActionError(null)
     try {
-      const response = await fetch(`/api/operations/reviews/${row.id}/commit`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, token: prepared.token, challenge, note: note.trim(), ...(action === 'associate' ? { workKey: row.workKey, mediaIndex: chosenMediaIndex, targetIndices: chosenTargetIndices } : {}), ...(prepared.requiresClientInspection ? { clientInspectionConfirmed: inspectionConfirmed } : {}) }) })
+      const response = await fetch(`/api/operations/reviews/${recoveryReview.id}/commit`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, token: prepared.token, challenge, note: note.trim(), ...(action === 'associate' ? { workKey: row.workKey, mediaIndex: chosenMediaIndex, targetIndices: chosenTargetIndices } : {}), ...(prepared.requiresClientInspection ? { clientInspectionConfirmed: inspectionConfirmed } : {}) }) })
       const result = await readJson<{ ok: true; message: string }>(response)
       onSuccess(result.message)
     } catch (error) { setActionError(messageFrom(error)) }
@@ -626,18 +601,18 @@ function ReviewDialog({ row, onClose, onSuccess, actionError, setActionError }: 
 
   return <div className="ops-dialog-backdrop">
     <div className="ops-dialog ops-review-dialog" role="dialog" aria-modal="true" aria-labelledby="review-dialog-title" ref={dialog}>
-      <div className="ops-dialog-head"><div><div className="eyebrow"><span className="eyebrow-mark" />REVIEW #{row.id}</div><h2 id="review-dialog-title">{row.title}</h2><p>{row.summary}</p></div><button className="icon-button" type="button" aria-label="Close review details" onClick={closeReview} disabled={busy || workActionConfirm !== null}><X size={18} /></button></div>
+      <div className="ops-dialog-head"><div><h2 id="review-dialog-title">{row.title}</h2><p>{reviewMediaLabel(row)}{row.availability === 'waiting-release' ? ' · Waiting for release' : ''}</p></div><button className="icon-button" type="button" aria-label="Close review details" onClick={closeReview} disabled={busy || workActionConfirm !== null}><X size={18} /></button></div>
       <div className="ops-dialog-body ops-review-body">
-        <div className="ops-review-facts"><span><strong>Media</strong>{reviewMediaLabel(row)}</span><span><strong>Created</strong>{formatDate(row.createdAt, true)}</span>{row.resolvedAt && <span><strong>Resolved</strong>{formatDate(row.resolvedAt, true)}</span>}</div>
+        <ul className="ops-review-causes">{(row.reviews ?? [row]).map((cause) => <li key={cause.id}>{cause.summary}</li>)}</ul>
+        <div className="ops-review-facts"><span><strong>Created</strong>{formatDate(row.createdAt, true)}</span>{row.resolvedAt && <span><strong>Resolved</strong>{formatDate(row.resolvedAt, true)}</span>}</div>
         {row.mediaType === 'tv' && <ReviewEpisodeDetails workKey={row.workKey} />}
         {actionError && <div className="ops-inline-error" role="alert">{actionError}</div>}
         {!prepared && <>
-          <div className="ops-scope-note"><ShieldCheck size={17} /><span>Actions depend on fresh evidence. Scout supplies which operations are currently available.</span></div>
-          {!row.resolvedAt && <div className="ops-review-work-actions"><div><strong>Manage this work item</strong><span>Retry schedules its next eligible pass. Reset clears only the current retry/review session.</span></div><ActionControls actions={row.actions} onAction={setWorkActionConfirm} /></div>}
-          {!row.resolvedAt && <div className="ops-recovery-actions">
-            <RecoveryButton label="Associate queue" action={row.actions.associate} onClick={() => void prepare('associate')} busy={busy} />
-            <RecoveryButton label="Release reservation" action={row.actions.release} onClick={() => void prepare('release')} busy={busy} />
-          </div>}
+          {!row.resolvedAt && <div className="ops-review-work-actions"><div><strong>Recheck this item</strong><span>Retry schedules a later pass. Reset rebuilds local tracking; existing downloads stay protected.</span></div><ActionControls actions={row.actions} onAction={setWorkActionConfirm} /></div>}
+          {!row.resolvedAt && (row.reviews ?? [row]).some((cause) => cause.actions.associate.allowed || cause.actions.release.allowed) && <details className="ops-advanced-recovery"><summary>Advanced recovery</summary><p>Check a download match or release an eligible hold using fresh evidence. These tools do not start or cancel downloads.</p>{(row.reviews ?? [row]).filter((cause) => cause.actions.associate.allowed || cause.actions.release.allowed).map((cause) => <div className="ops-recovery-cause" key={cause.id}><p>{cause.summary}</p><div className="ops-recovery-actions">
+            <RecoveryButton label="Check download match" action={cause.actions.associate} onClick={() => void prepare('associate', cause)} busy={busy} />
+            <RecoveryButton label="Release download hold" action={cause.actions.release} onClick={() => void prepare('release', cause)} busy={busy} />
+          </div></div>)}</details>}
         </>}
           {prepared && action && <>
           <div className="ops-prepared-summary"><span className="ops-step-number">PREPARED · {action === 'associate' ? 'ASSOCIATE QUEUE' : 'RELEASE RESERVATION'}</span><p>{prepared.summary}</p><span className={`ops-expiry ${expired ? 'is-expired' : ''}`}><Clock3 size={14} />{expired ? 'Preview expired · prepare again' : `Expires ${formatDate(prepared.expiresAt)}`}</span></div>
@@ -674,7 +649,6 @@ function ReviewWorkActionDialog({ row, action, onClose, onSuccess }: {
 }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const resetCopy = 'Clear Scout’s current retry and review state. Missing content may reappear on the next poll. Download reservations and history are retained.'
   const submit = async () => {
     if (busy) return
     setBusy(true); setError(null)
@@ -685,16 +659,17 @@ function ReviewWorkActionDialog({ row, action, onClose, onSuccess }: {
     } catch (cause) { setError(messageFrom(cause)) }
     finally { setBusy(false) }
   }
-  return <Dialog title={action === 'retry' ? 'Make this work due?' : 'Reset tracking?'} description={row.title} onClose={() => !busy && onClose()} className="ops-confirm-dialog" closeDisabled={busy}>
-    <div className="ops-dialog-body"><div className={action === 'reset' ? 'ops-warning-box' : 'ops-info-box'}>{action === 'reset' ? <><ShieldAlert size={18} /><p>{resetCopy}</p></> : <><Clock3 size={18} /><p>Mark this item due for the next eligible pass. This does not start a search now.</p></>}</div>
+  return <Dialog title={action === 'retry' ? 'Schedule retry?' : 'Reset item?'} description={row.title} onClose={() => !busy && onClose()} className="ops-confirm-dialog" closeDisabled={busy}>
+    <div className="ops-dialog-body"><div className={action === 'reset' ? 'ops-warning-box' : 'ops-info-box'}>{action === 'reset' ? <><ShieldAlert size={18} /><p>{RESET_COPY}</p></> : <><Clock3 size={18} /><p>Schedule a retry for a later eligible pass. This does not start a search now.</p></>}</div>
       {error && <div className="ops-inline-error" role="alert">{error}</div>}
-      <div className="ops-dialog-actions"><button className="button button-secondary" type="button" onClick={onClose} disabled={busy}>Cancel</button><button className={`button ${action === 'reset' ? 'button-danger' : 'button-primary'}`} type="button" onClick={() => void submit()} disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : action === 'reset' ? <RotateCcw size={16} /> : <Clock3 size={16} />}{busy ? 'Working…' : action === 'reset' ? 'Reset tracking' : 'Mark due'}</button></div>
+      <div className="ops-dialog-actions"><button className="button button-secondary" type="button" onClick={onClose} disabled={busy}>Cancel</button><button className={`button ${action === 'reset' ? 'button-danger' : 'button-primary'}`} type="button" onClick={() => void submit()} disabled={busy}>{busy ? <LoaderCircle className="spin" size={16} /> : action === 'reset' ? <RotateCcw size={16} /> : <Clock3 size={16} />}{busy ? 'Working…' : action === 'reset' ? 'Reset item' : 'Schedule retry'}</button></div>
     </div>
   </Dialog>
 }
 
 function RecoveryButton({ label, action, onClick, busy }: { label: string; action: WorkAction; onClick: () => void; busy: boolean }) {
-  return <span className="ops-recovery-wrap"><button className="button button-secondary" type="button" onClick={onClick} disabled={!action.allowed || busy} title={!action.allowed ? action.reason : undefined}><ShieldCheck size={15} />{label}</button>{!action.allowed && action.reason && <small>{action.reason}</small>}</span>
+  if (!action.allowed) return null
+  return <button className="button button-secondary" type="button" onClick={onClick} disabled={busy}><ShieldCheck size={15} />{label}</button>
 }
 
 function ActivityPage() {

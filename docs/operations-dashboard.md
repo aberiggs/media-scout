@@ -1,8 +1,10 @@
 # Operations dashboard
 
-The dashboard's **Queue** shows Media Scout's tracked work items, scheduling, observations, and held coverage. It is not a view of live download-client jobs. By default, fulfilled and inactive history is excluded before filtering and pagination; choose a terminal status or `scope=all` to inspect it. `counts` describe the returned scope, `scope` reports the requested scope, and `countScope` reports the effective scope (a terminal-status filter includes history). Pending-reset items remain hidden until a later known library observation.
+The dashboard's **Queue** shows outstanding tracked media, including waiting-for-release work, not live download-client jobs. It always requests active scope; completed/inactive history and the old All work switch are absent. Rows prioritize title/type, status, next retry/airtime and last checked. **Details** contains coverage, search and freshness diagnostics; episode details remain read-only. Pending-reset items stay hidden until a later known library observation. The low-level work API retains terminal filters and `scope=all` for history compatibility; `counts`, `scope` and `countScope` describe that requested/effective API scope.
 
 Observation freshness uses one response-time snapshot and a 24-hour threshold. A missing or unknown queue timestamp/completeness is reported as unknown; an older library or queue observation is stale. Actions remain unavailable for either state. Reviews identify media type and TV season without exposing raw work-unit data, so separate season reviews can be distinguished.
+
+`GET /api/operations/reviews` preserves the raw per-cause row response by default. `grouped=true` opts into one item per work key; filtering matches a cause/title first but returns every cause in that matching group, then pagination applies to groups and `total` counts groups. Each grouped item keeps representative review fields for compatibility and adds `reviews` with every underlying row and ID, plus saved `workStatus` and `availability` (`waiting-release`, `available`, or `unknown`). Availability uses fresh identity-matched Radarr eligibility captured during reconciliation or known episode metadata, never work status or a title alone. Work `openReviewCount` counts distinct open work keys; raw review history remains available in ungrouped mode. Reset eligibility uses current work-state safety checks, while Retry remains restricted to ordinary review reasons. Eligible association is a fresh-evidence assessment (`requiresAssessment: true`), not assurance that a commit will be available. Queue summaries use allowlisted saved causes; legacy reviews without one say so explicitly.
 
 TV work rows may include additive `episodeProgress` with observation knowledge, lifecycle confidence, completion (`caught-up` is distinct from all-files-imported), counts, and earliest eligibility/retry timestamps. Counts are `null` when episode observations are absent, identity-mismatched, stale, omit a previously tracked target, or are not from the work row's current library poll; work status alone never establishes completion. Lifecycle `finished` requires positive finale evidence and known elapsed timing; the absence of future episodes does not establish that a season ended. Timing counters and safety holds can overlap (for example, a future episode under a broad queue hold), but observed/reserved download coverage is a unique episode union and is never counted twice.
 
@@ -12,16 +14,28 @@ Queue season rows show imported inventory separately from airing lifecycle: “C
 
 Refreshing Queue, Reviews, or Search history reads the local SQLite projection; it does not trigger a cycle or search.
 
+**Reviews** requests grouped results and shows one card per movie or season with
+all underlying causes. A release-waiting fact remains visible alongside an
+independent review, never mislabeled as a season for movies. **Retry later** and
+**Reset item** appear only when available; reset uses a short confirmation before
+changing local tracking. If neither action is available, one concise prerequisite
+replaces a row of disabled buttons. Rare tools live under **Advanced recovery**:
+**Check download match** assesses fresh evidence rather than promising a match,
+and **Release download hold** appears only for an eligible linked reservation.
+Their original preview, expiration, explicit choices and approval/inspection
+safeguards remain enforced. Recovery acts on the selected underlying review ID,
+not every cause in its group.
+
 **Search history** records bounded search activity for seven days, up to 2,000 entries. Query terms can reveal what you are looking for; this is an operational view, not raw server logs.
 
 New activity entries include `scope`: stage (`pack-batch`, `episodes`, `movie`, or `manual`), whether it was fallback, and season/episode-number attribution. Scope summaries retain at most 20 work references and the first 100 episode numbers per reference, with each reference's full episode count. Older rows without scope remain readable. `scope.event: capacity-deferred` is explicitly **not a search**: no query was executed and no attempt clock was advanced for those deferred episodes. Its query label says `No query: capacity deferred`, its result count is unknown, and `deferredEpisodeCount` identifies outstanding work. Failed stage searches keep their attributed scope and safe error code; raw release or queue payloads are never added to diagnostics.
 
 ## Retry and Reset
 
-Actions are offered only when the work is safe to change. Live worker/group claims, open reservations, persisted queue coverage, unsafe review reasons, unknown or stale observations, and an active rate-limit deadline keep actions unavailable. TV actions also require the same-series group lease.
+Actions require fresh known observations, no competing live worker/group claim and no active rate-limit deadline. TV actions also require the same-series group lease. Retry additionally requires ordinary scheduling/review state with no open reservation, retained coverage or safety review. Reset can clear unlinked review clutter while retaining those independent download protections.
 
 - **Retry** clears ordinary cooldown/backoff scheduling and eligible ordinary reviews while preserving the last search time. It makes work eligible for a later processing pass; it does not start a cycle or promise when the scheduler will process it.
-- **Reset tracking** also clears the last search time and records a pending reset. The work item is hidden from Queue until a later known library observation; that observation allows normal reconciliation to rediscover eligible missing media. Reset does not search, grab, or clear queue coverage, reservations, receipts, dedupe markers, decisions, associations, or audit history.
+- **Reset item** clears current retry/attempt scheduling and unlinked reviews (kept as resolved history), then records a pending reset. The work item is hidden from Queue until a later known library observation; a read begun before reset cannot authorize paid work. Reset does not search, grab, cancel downloads, or clear linked reviews, queue coverage, reservations, receipts, dedupe markers, decisions, associations or audit history. Actual download problems can correctly remain or reappear after rediscovery.
 
 For TV, Retry also clears the current content identity's episode retry deadlines and scheduling outcomes while preserving episode attempt times. Reset clears those attempt times as well. Both retain observed episode facts and historical records; neither can make a future, unmonitored, imported, or safety-held episode searchable. Historical rows belonging to a different content identity are not reset. Explicit manual picks can bypass ordinary scheduling, but still require known aired missing targets and all download-safety checks.
 

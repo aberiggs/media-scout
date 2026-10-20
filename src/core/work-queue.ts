@@ -1,6 +1,6 @@
 import type { RadarrQueueRecord } from '../types/radarr';
 import type { SonarrQueueRecord } from '../types/sonarr';
-import type { EpisodeProgress, GrabIntent, IntentCoverage, IntentStatus, QueueRead, WorkItem } from './work-queue-types';
+import type { EpisodeProgress, GrabIntent, IntentCoverage, IntentStatus, QueueRead, WorkItem, QueueReviewEvidence } from './work-queue-types';
 import type { AssociationDecision } from './group-types';
 import type { LibrarySnapshot, WorkUnit } from './watcher';
 import { eligibleWorkUnits } from './watcher';
@@ -26,6 +26,8 @@ export interface ReconciledWork {
   blockedReason: string | null;
   intentUpdates: IntentUpdate[];
   manualReviewReason: string | null;
+  queueReviewEvidence?: QueueReviewEvidence;
+  queueReviewIntentId?: string;
 }
 
 export interface ReconcileWorkInput {
@@ -330,14 +332,49 @@ function projectCoverage(coverage: IntentCoverage, current: WorkUnit, existing: 
   return ids.length ? { workKey: current.key, episodeIds: ids, basis: coverage.basis } : null;
 }
 
-function priorCoverageForCurrentWork(previous: ReadonlyMap<string, IntentCoverage[]>, existing: ReadonlyMap<string, WorkItem>, current: WorkUnit): IntentCoverage[] {
+function priorCoverageForCurrentWork(previous: ReadonlyMap<string, IntentCoverage[]>, existing: ReadonlyMap<string, WorkItem>, current: WorkUnit, snapshot: LibrarySnapshot, now: string): IntentCoverage[] {
   return mergeCoverage([...previous.entries()].flatMap(([key, coverages]) => {
     if (key !== current.key && !sameWorkFamily(existing.get(key), current)) return [];
     return coverages.flatMap((coverage) => {
       const projected = projectCoverage(coverage, current, existing);
+      if (key === current.key && current.kind === 'tv' && coverage.episodeIds !== null) {
+        const library = snapshot.sonarr.series.find((entry) => entry.series.id === current.serviceId);
+        const ids = new Set(projected?.episodeIds ?? []);
+        for (const id of coverage.episodeIds) {
+          const episode = libraryReadCurrent(snapshot, existing.get(key), now) && library?.known && library.series.tvdbId === current.externalId
+            ? library.episodes?.find((entry) => entry.id === id && entry.seriesId === current.serviceId) : undefined;
+          // Removal/unmonitoring is not import proof. Missing captured IDs keep
+          // their old hold; monitored targets moved to another season project there.
+          if (!episode?.hasFile && (!episode || episode.seasonNumber === current.season?.seasonNumber || !episode.monitored)) ids.add(id);
+        }
+        return ids.size ? [{ ...coverage, workKey: current.key, episodeIds: [...ids].sort((a, b) => a - b) }] : [];
+      }
       return projected ? [projected] : [];
     });
   }));
+}
+
+/** A terminal work status cannot discharge an independently captured download. */
+function unimportedQueueCoverage(coverage: IntentCoverage[], work: WorkItem | undefined, snapshot: LibrarySnapshot, now: string): IntentCoverage[] {
+  if (!work || !libraryReadCurrent(snapshot, work, now)) return coverage;
+  return coverage.flatMap((capture) => {
+    if (capture.workKey !== work.workKey) return [capture];
+    if (work.unit.kind === 'movie' && capture.episodeIds === null) {
+      const movie = snapshot.radarr.known && snapshot.radarr.movies.find((entry) => entry.id === work.unit.serviceId && entry.tmdbId === work.unit.externalId);
+      return movie && movie.hasFile ? [] : [capture];
+    }
+    if (work.unit.kind !== 'tv' || capture.episodeIds === null || !snapshot.sonarr.known) return [capture];
+    const series = snapshot.sonarr.series.find((entry) => entry.series.id === work.unit.serviceId && entry.series.tvdbId === work.unit.externalId && entry.known);
+    const ids = capture.episodeIds.filter((id) => !series?.episodes?.some((episode) => episode.id === id && episode.seriesId === work.unit.serviceId && episode.hasFile));
+    return ids.length ? [{ ...capture, episodeIds: ids }] : [];
+  });
+}
+
+function libraryReadCurrent(snapshot: LibrarySnapshot, work: WorkItem | undefined, now: string): boolean {
+  const observed = Date.parse(snapshot.observedAt);
+  const current = Date.parse(now);
+  const previous = work ? Date.parse(work.lastObservedAt) : observed;
+  return [observed, current, previous].every(Number.isFinite) && observed >= previous && observed <= current && current - observed <= 24 * 60 * 60_000;
 }
 
 function priorFailureRefsForCurrent(previous: ReadonlyMap<string, string[]>, existing: ReadonlyMap<string, WorkItem>, current: WorkUnit): Set<string> {
@@ -649,6 +686,7 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
   for (const key of allKeys) {
     const old = existing.get(key);
     const savedQueueFailureRefs = input.previousQueueFailureRefs?.get(key) ?? [];
+    const savedQueueCoverage = unimportedQueueCoverage(input.previousQueueCoverage?.get(key) ?? [], old, input.snapshot, input.now);
     const unit = currentUnits.get(key);
     const arr = old?.unit.arr ?? unit?.arr ?? (key.startsWith('radarr:') ? 'radarr' : 'sonarr');
     const source = arr === 'sonarr' ? input.snapshot.sonarr : input.snapshot.radarr;
@@ -670,13 +708,13 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
           ? currentOld.every((episode) => episode?.hasFile === true)
           : currentOriginalSeason.length > 0 && currentOriginalSeason.every((episode) => episode.hasFile === true);
         if (positivelyComplete) {
-          result.push({ work: withQueueFreshness(terminalItem(old, 'fulfilled', input.snapshot.observedAt), input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: [], queueFailureRefs: savedQueueFailureRefs, activeCoverage: [], blockedReason: null, intentUpdates: [], manualReviewReason: null });
+          result.push({ work: withQueueFreshness(terminalItem(old, 'fulfilled', input.snapshot.observedAt), input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: savedQueueCoverage, queueFailureRefs: savedQueueFailureRefs, activeCoverage: savedQueueCoverage, blockedReason: null, intentUpdates: [], manualReviewReason: null });
           continue;
         }
       }
       if (arr === 'sonarr' && seriesObservation?.series.monitored === false) {
         const item = terminalItem(old, 'inactive', input.snapshot.observedAt);
-        result.push({ work: withQueueFreshness(item, input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: [], queueFailureRefs: savedQueueFailureRefs, activeCoverage: [], blockedReason: null, intentUpdates: [], manualReviewReason: null });
+        result.push({ work: withQueueFreshness(item, input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: savedQueueCoverage, queueFailureRefs: savedQueueFailureRefs, activeCoverage: savedQueueCoverage, blockedReason: null, intentUpdates: [], manualReviewReason: null });
         continue;
       }
       if (arr === 'sonarr' && seriesObservation && seriesObservation.known && seriesObservation.episodes) {
@@ -684,25 +722,25 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
         const oldEpisodes = old.unit.season?.missing ?? [];
         const currentOld = oldEpisodes.map((prior) => observations.find((episode) => episode.id === prior.episodeId));
         if (currentOld.every((episode) => episode === undefined || episode.monitored === false)) {
-          result.push({ work: withQueueFreshness(terminalItem(old, 'inactive', input.snapshot.observedAt), input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: [], queueFailureRefs: savedQueueFailureRefs, activeCoverage: [], blockedReason: null, intentUpdates: [], manualReviewReason: null });
+          result.push({ work: withQueueFreshness(terminalItem(old, 'inactive', input.snapshot.observedAt), input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: savedQueueCoverage, queueFailureRefs: savedQueueFailureRefs, activeCoverage: savedQueueCoverage, blockedReason: null, intentUpdates: [], manualReviewReason: null });
           continue;
         }
       }
       if (arr === 'radarr') {
         const movie = input.snapshot.radarr.movies.find((entry) => entry.id === old.unit.serviceId);
         if (movie?.hasFile) {
-          result.push({ work: withQueueFreshness(terminalItem(old, 'fulfilled', input.snapshot.observedAt), input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: [], queueFailureRefs: savedQueueFailureRefs, activeCoverage: [], blockedReason: null, intentUpdates: [], manualReviewReason: null });
+          result.push({ work: withQueueFreshness(terminalItem(old, 'fulfilled', input.snapshot.observedAt), input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: savedQueueCoverage, queueFailureRefs: savedQueueFailureRefs, activeCoverage: savedQueueCoverage, blockedReason: null, intentUpdates: [], manualReviewReason: null });
           continue;
         }
         if (!movie || !movie.monitored) {
-          result.push({ work: withQueueFreshness(terminalItem(old, 'inactive', input.snapshot.observedAt), input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: [], queueFailureRefs: savedQueueFailureRefs, activeCoverage: [], blockedReason: null, intentUpdates: [], manualReviewReason: null });
+          result.push({ work: withQueueFreshness(terminalItem(old, 'inactive', input.snapshot.observedAt), input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: savedQueueCoverage, queueFailureRefs: savedQueueFailureRefs, activeCoverage: savedQueueCoverage, blockedReason: null, intentUpdates: [], manualReviewReason: null });
           continue;
         }
       }
       if (old) {
         // A season with no current missing targets is terminal after a complete positive library observation.
         const item = terminalItem(old, 'inactive', input.snapshot.observedAt);
-        result.push({ work: withQueueFreshness(item, input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: [], queueFailureRefs: savedQueueFailureRefs, activeCoverage: [], blockedReason: null, intentUpdates: [], manualReviewReason: null });
+        result.push({ work: withQueueFreshness(item, input.snapshot, arr, input.queues[arr], input.now, old), eligibleUnit: null, queueCoverage: savedQueueCoverage, queueFailureRefs: savedQueueFailureRefs, activeCoverage: savedQueueCoverage, blockedReason: null, intentUpdates: [], manualReviewReason: null });
       }
       continue;
     }
@@ -715,6 +753,8 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
     const targetChange = old ? sameTargets(old, current) : { added: false, removed: false };
     let blockedReason: string | null = null;
     let manualReviewReason: string | null = null;
+    let queueReviewEvidence: QueueReviewEvidence | undefined;
+    let queueReviewIntentId: string | undefined;
     if (old && old.contentIdentity !== contentIdentity) {
       blockedReason = 'content-identity-changed';
       for (const intent of input.intents) if (isOpenIntent(intent) && intent.coverage.some((coverage) => coverage.workKey === key) && intent.status !== 'failed' && intent.status !== 'fulfilled' && intent.confirmedAt === null) intentUpdates.push({ id: intent.id, status: 'uncertain' });
@@ -725,7 +765,17 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
     if (eligibleUnit && (scheduling.status === 'waiting-release' || scheduling.status === 'fulfilled' || scheduling.status === 'inactive')) scheduling = { ...scheduling, status: 'ready', nextSearchAt: null };
     const queueFresh = queueReadFresh(input.snapshot, arr, input.queues[arr], old, input.now);
     if (!queueFresh) blockedReason = blockedReason ?? 'queue-unknown';
-    const scopedQueue = queueFresh ? associations.filter((row) => appliesToWork(row, current!)) : [];
+    const scopedQueue = queueFresh ? associations.filter((row) => {
+      if (!appliesToWork(row, current!)) return false;
+      // A directly identified imported episode is no longer a missing-target hold.
+      // Missing IDs, conflicted scope and fuzzy/unknown coverage are not import proof.
+      if (current.kind === 'tv' && row.authoritative && !row.scopeConflict && row.coverage?.episodeIds?.length) {
+        const library = input.snapshot.sonarr.series.find((entry) => entry.series.id === current.serviceId);
+        if (libraryReadCurrent(input.snapshot, old, input.now) && input.snapshot.sonarr.known && library?.known && library.series.tvdbId === current.externalId &&
+          row.coverage.episodeIds.every((id) => library.episodes?.some((episode) => episode.id === id && episode.seriesId === current.serviceId && episode.hasFile))) return false;
+      }
+      return true;
+    }) : [];
     const activeQueue = scopedQueue.filter((row) => row.status !== 'failed');
     let ambiguousQueue = scopedQueue.some((row) => row.coverage === null);
     const nowMs = Date.parse(input.now);
@@ -752,11 +802,9 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
       const projected = projectCoverage(coverage, current!, existing);
       return projected ? [projected] : [];
     }));
-    const previousQueueCoverage = priorCoverageForCurrentWork(input.previousQueueCoverage ?? new Map(), existing, current);
+    const previousQueueCoverage = priorCoverageForCurrentWork(input.previousQueueCoverage ?? new Map(), existing, current, input.snapshot, input.now);
     const reviewWasResolved = old?.blockedReason === 'queue-review' && input.manualReviewKeys !== undefined && !input.manualReviewKeys.has(key);
-    const vanishedCoverage = reviewWasResolved
-      ? []
-      : queueFresh && input.queues[arr].kind === 'known' && !ambiguousQueue
+    const vanishedCoverage = queueFresh && input.queues[arr].kind === 'known' && !ambiguousQueue
         ? subtractCoverage(previousQueueCoverage, observedQueueCoverage, capturedCoverage)
         : !queueFresh || ambiguousQueue ? previousQueueCoverage : [];
     const queueDisappeared = queueFresh && input.queues[arr].kind === 'known' && !ambiguousQueue && vanishedCoverage.length > 0;
@@ -764,12 +812,23 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
       blockedReason = 'queue-review';
       manualReviewReason = 'queue-review';
       scheduling = { ...scheduling, status: 'manual', nextSearchAt: null };
+      const targets = mergeCoverage(vanishedCoverage);
+      const episodeIds = current.kind === 'movie' ? null : [...new Set(targets.filter((coverage) => coverage.workKey === key).flatMap((coverage) => coverage.episodeIds ?? []))].sort((a, b) => a - b);
+      queueReviewEvidence = { version: 1, cause: 'queue-disappeared', contentIdentity, arr: current.arr, serviceId: current.serviceId, externalId: current.externalId,
+        episodeIds, scope: current.kind === 'movie' || (episodeIds !== null && episodeIds.length > 0) ? 'targets' : 'unknown', observedAt: input.snapshot.observedAt };
     }
     for (const { intent } of localIntents) {
       if (intentQueueLinks.get(intent.id)?.review) {
         blockedReason = 'queue-review';
         manualReviewReason = 'queue-review';
         scheduling = { ...scheduling, status: 'manual', nextSearchAt: null };
+        const target = intent.coverage.find((coverage) => coverage.workKey === key);
+        const ids = target?.episodeIds ?? null;
+        if (!queueReviewEvidence) {
+          queueReviewEvidence = { version: 1, cause: 'intent-unresolved', contentIdentity, arr: current.arr, serviceId: current.serviceId, externalId: current.externalId,
+            episodeIds: ids, scope: target && (ids !== null || current.kind === 'movie') ? 'targets' : 'unknown', observedAt: input.snapshot.observedAt };
+          if (target) queueReviewIntentId = intent.id;
+        }
       }
     }
     const queueFailureRefs = priorFailureRefsForCurrent(input.previousQueueFailureRefs ?? new Map(), existing, current);
@@ -818,14 +877,28 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
       manualReviewReason = 'queue-review';
     }
     if (current.kind === 'movie' && !currentIsAvailable(input.snapshot, current)) {
-      scheduling = { ...scheduling, status: 'waiting-release' };
+      // Ordinary availability cooldowns do not schedule searches before release.
+      // Provider backoff remains independently authoritative.
+      const providerBackoff = scheduling.lastOutcome === 'rate-limited' && scheduling.nextSearchAt !== null &&
+        Date.parse(scheduling.nextSearchAt) > Date.parse(input.now);
+      scheduling = { ...scheduling, status: providerBackoff ? 'backoff' : 'waiting-release',
+        nextSearchAt: providerBackoff ? scheduling.nextSearchAt : null };
       blockedReason = blockedReason ?? 'waiting-release';
     }
     const unsupportedAssocHold = ambiguousQueue || activeQueue.some((row) => row.status === 'uncertain');
     if (unsupportedAssocHold) {
       // An ordinary review must not hide a concurrent safety hold in persisted policy state.
-      if (blockedReason === null || blockedReason === 'manual-review') blockedReason = 'queue-ambiguous';
-      manualReviewReason = manualReviewReason ?? 'queue-review';
+      if (blockedReason === null || blockedReason === 'manual-review' || blockedReason === 'waiting-release') blockedReason = 'queue-ambiguous';
+      const uncertain = activeQueue.filter((row) => row.coverage === null || row.status === 'uncertain');
+      const exact = uncertain.length > 0 && uncertain.every((row) => row.authoritative && !row.scopeConflict && row.coverage !== null);
+      // Broad unidentified jobs still block resubmission, but future-only work
+      // needs no durable human task until there is eligible or captured work at risk.
+      if (eligibleUnit || localIntents.length || heldQueueCoverage.length) {
+        manualReviewReason = manualReviewReason ?? 'queue-review';
+        queueReviewEvidence ??= { version: 1, cause: 'queue-ambiguous', contentIdentity, arr: current.arr, serviceId: current.serviceId, externalId: current.externalId,
+          episodeIds: exact && current.kind === 'tv' ? [...new Set(uncertain.flatMap((row) => row.coverage?.episodeIds ?? []))].sort((a, b) => a - b) : null,
+          scope: exact ? 'targets' : 'unknown', observedAt: input.snapshot.observedAt };
+      }
     }
     else if (heldQueueCoverage.length > 0) blockedReason = blockedReason ?? 'queue-active';
     else if (localIntents.length > 0) blockedReason = blockedReason ?? 'active-intent';
@@ -864,6 +937,7 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
       scheduling = { ...scheduling, status: 'waiting-release' };
       blockedReason = 'waiting-release';
     }
+    if (old?.resetPendingAt && Date.parse(input.snapshot.observedAt) <= Date.parse(old.resetPendingAt)) residual = null;
     const work: WorkItem = {
       workKey: key, contentIdentity, missingFingerprint: fingerprint, unit: current, ...scheduling,
       lastObservedAt: input.snapshot.observedAt,
@@ -872,7 +946,8 @@ export function reconcileWork(input: ReconcileWorkInput): { items: ReconciledWor
       blockedReason,
       resetPendingAt: old?.resetPendingAt && Date.parse(input.snapshot.observedAt) <= Date.parse(old.resetPendingAt) ? old.resetPendingAt : null,
     };
-    result.push({ work, eligibleUnit: residual, queueCoverage: heldQueueCoverage, queueFailureRefs: [...queueFailureRefs], activeCoverage: allCoverage, blockedReason, intentUpdates: [], manualReviewReason });
+    result.push({ work, eligibleUnit: residual, queueCoverage: heldQueueCoverage, queueFailureRefs: [...queueFailureRefs], activeCoverage: allCoverage, blockedReason, intentUpdates: [], manualReviewReason,
+      ...(queueReviewEvidence ? { queueReviewEvidence } : {}), ...(queueReviewIntentId ? { queueReviewIntentId } : {}) });
   }
 
   // A queue-wide unknown read still produces blocked rows for known work retained through source errors.

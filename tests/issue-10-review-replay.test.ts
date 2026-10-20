@@ -183,19 +183,19 @@ describe('issue 10 completed legacy review cleanup', () => {
     state.releaseClaim(workKey, token);
   });
 
-  it('keeps fulfilled history and all 21 open reviews while blocking work mutations', async () => {
+  it('keeps fulfilled history and all 21 open reviews while blocking retry but allowing local reset', async () => {
     const { app, state, workKey } = await fixture();
     const work = await app.inject({ method: 'GET', url: '/api/operations/work' });
     const history = await app.inject({ method: 'GET', url: '/api/operations/work?scope=all' });
     const reviews = await app.inject({ method: 'GET', url: '/api/operations/reviews?resolved=false' });
-    expect(work.json()).toMatchObject({ total: 0, counts: { fulfilled: 0 }, openReviewCount: 21 });
+    expect(work.json()).toMatchObject({ total: 0, counts: { fulfilled: 0 }, openReviewCount: 1 });
     expect(history.json()).toMatchObject({ total: 1, counts: { fulfilled: 1 }, items: [{ workKey, status: 'fulfilled', missingCount: 0 }] });
     expect(reviews.json()).toMatchObject({ total: 21, items: Array.from({ length: 21 }, () => ({ actions: {
-      retry: { allowed: false, reason: 'work-not-retryable' }, reset: { allowed: false, reason: 'work-not-resettable' },
+      retry: { allowed: false, reason: 'work-not-retryable' }, reset: { allowed: true },
       associate: { allowed: false, reason: 'action-not-eligible' }, release: { allowed: false, reason: 'action-not-eligible' },
     } })) });
-    expect(new OperationsDashboard(state, () => now).work({ limit: 50, offset: 0 }, true, now).openReviewCount).toBe(21);
-    expect(state.getWorkActionEligibility(workKey, now.toISOString())).toMatchObject({ retry: { allowed: false, reason: 'work-not-retryable' }, reset: { allowed: false, reason: 'work-not-resettable' } });
+    expect(new OperationsDashboard(state, () => now).work({ limit: 50, offset: 0 }, true, now).openReviewCount).toBe(1);
+    expect(state.getWorkActionEligibility(workKey, now.toISOString())).toMatchObject({ retry: { allowed: false, reason: 'work-not-retryable' }, reset: { allowed: true } });
     expect((await app.inject({ method: 'POST', url: '/api/operations/work/action', payload: { workKey, action: 'retry' } })).json()).toMatchObject({ code: 'action-not-eligible' });
     expect(state.getWorkItem(workKey)?.status).toBe('fulfilled');
     expect(state.listManualReview()).toHaveLength(21);

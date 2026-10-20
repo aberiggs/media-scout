@@ -20,12 +20,12 @@ Keep dry-run enabled while checking configuration and reviewing logs. Dry runs m
 - TV guardrails require explicit episode coverage or a single matching-season-only pack claim. Inferred pack coverage is labeled inferred, not proof of torrent contents. Known wrong seasons and malformed/conflicting scopes are rejected.
 - The picker sees at most 100 candidates. Media preferences are optional soft ranking guidance, not a filter, identity rule, or override of guardrails. For example, `Prefer 1080p over 4K.` can be entered in the UI. Saved settings apply to subsequent operations without container recreation.
 - Successful real grabs are deduplicated by `(indexerId, guid)` and infoHash when available. Hashless releases have weaker cross-indexer detection. Dry runs and failed grabs do not create successful-grab markers.
-- Unparseable/ambiguous candidates, searches with no admitted candidates, and repeated ordinary operational failures can enter manual review. Unknown, paused, active, import-blocked, uncertain, or ambiguous queue evidence remains held rather than being automatically resubmitted.
+- Unparseable/ambiguous candidates and repeated ordinary operational failures can enter manual review. An ordinary search with no admitted release schedules a retry only for already-eligible content; unreleased movies and future episodes wait for source metadata. Unknown, paused, active, import-blocked, uncertain, or ambiguous queue evidence remains held rather than being automatically resubmitted.
 
 ## Cadence and failure behavior
 
 - The UI interval defaults to 5 minutes and has a maximum of 35,791 minutes (the largest whole-minute interval within Node's timer limit). It is reconciliation cadence, not a promise to call the planner every interval. Saves apply to new operations; an in-progress cycle finishes with its original settings snapshot.
-- A picker `skip` or dry-run decision is cooled down by the UI retry window (default 6 hours). For TV, a successful search with no candidate admitted by guardrails records `release-unavailable` for the attempted episodes and retries automatically after that same configured window. A newly aired sibling does not inherit or reset that episode's availability deadline. Movie empty searches still create a `no-suitable-release` manual hold. Rate limits, operational backoff, identity/configuration reviews, and uncertain downloads remain separate holds; a TV availability retry does not override them.
+- A picker `skip` or dry-run decision is cooled down by the UI retry window (default 6 hours). For TV, a successful search with no candidate admitted by guardrails records `release-unavailable` for the attempted episodes and retries automatically after that same configured window. A newly aired sibling does not inherit or reset that episode's availability deadline. An available movie with no admitted candidate uses the same finite work-item retry cadence; unavailable movies wait for Radarr metadata without a retry deadline or paid search. Rate limits, operational backoff, identity/configuration reviews, and uncertain downloads remain separate holds; availability does not override them.
 - UI failure-backoff defaults are 5/60 minutes and cap exponential failure delay; a longer upstream `Retry-After` takes precedence. The third consecutive ordinary operational failure enters manual review; rate limits stay on backoff and do not escalate solely due to quota.
 - Diagnostics include safe stage, error code/type, HTTP status, and retry seconds, not exception messages, response bodies, or authenticated URLs.
 
@@ -41,7 +41,7 @@ A confirmed intent can link to one unique, fresh, healthy physical job whose dir
 
 During known library reconciliation, positive `hasFile` evidence for every previously tracked TV target or for a tracked movie takes precedence over the item's becoming unmonitored, including on later polls after the item first becomes terminal. The original TV target IDs remain private reconciliation evidence; terminal status and safe projections, not an empty target list, express completion. For a legacy terminal TV row whose saved target list is already empty, completion is recovered only from a nonempty, known inventory for that exact season where every listed episode has a file. Library removal, a missing target ID, an empty season inventory, zero remaining eligible targets, or an unknown read alone is not completion evidence. A complete target set is fulfilled on the normal poll; incomplete unmonitored work becomes inactive and unknown observations remain held.
 
-MCP `ma_review_action` with `resolve` resolves an open review; it is not the dashboard's Retry action. The HTTP operations dashboard provides guarded Retry/Reset for eligible ordinary scheduling/review reasons when **Safety → Allow operator actions** is enabled. Retry makes work eligible for a later processing pass; neither action starts an immediate cycle, search, or grab. Queue reservations, coverage, receipts, dedupe markers, decisions, and association history are retained. For an explicit human release choice, `ma_pick` is a fresh, guarded manual pick. A matching-season-only pack may proceed with explicitly labeled inferred coverage; it is not proof that the torrent contains every missing episode.
+MCP `ma_review_action` with `resolve` resolves an open review; it is not the dashboard's Retry action and does not discharge vanished queue coverage. The HTTP operations dashboard provides guarded Retry for ordinary scheduling/review reasons and Reset item for rebuilding local tracking when **Safety → Allow operator actions** is enabled. Reset resolves unlinked reviews as history and clears current scheduling, but retains linked reviews and all queue reservations, coverage, receipts, dedupe markers, decisions and association history. It waits for a later known library observation before work becomes visible/actionable again. Neither action starts an immediate cycle, search, or grab. Fresh saved observations, provider throttling and owner-checked claims remain enforced. For an explicit human release choice, `ma_pick` is a fresh, guarded manual pick. A matching-season-only pack may proceed with explicitly labeled inferred coverage; it is not proof that the torrent contains every missing episode.
 
 `ma_pick`'s `releaseIndex` selects from a candidate list built fresh on every call (planner queries → Prowlarr search → guardrail filtering → seeders sort → cap). The list is not stable across calls and nothing is reserved. A dry-run call does not pin an index for later. Check the returned `releaseTitle` to see what was selected; outcomes include `grabbed`, `dry-run`, `missing-download-client`, and `reverify-failed`. An index from `ma_search` raw results does not transfer.
 
@@ -86,4 +86,33 @@ Episode progress is stored additively beside the existing season work, intent, a
 
 Known observations retain all episodes of a tracked season, including imported and future episodes. Episode availability deadlines determine the next searchable subset; the season work row remains the coordination and aggregate scheduling entry. Download reservations and queue coverage remain authoritative safety evidence rather than a second episode reservation ledger. Unknown/partial reads do not erase prior observations or prove imports, and an uncertain or vanished download can still conservatively hold the season. An operational retry changes only the successfully searched episodes from that attempt; it does not clear a sibling's availability deadline.
 
-On a fresh, identity-matched known poll, an old unlinked TV `no-suitable-release` review can be converted to an ordinary availability retry only when no conflicting review, configuration, claim, reservation, or queue uncertainty applies. The review remains as resolved history; current eligible episodes receive a finite retry deadline without fabricating a historical search or an import. Linked, unknown/stale, identity-changed, active/ambiguous-download, and other blocking review cases remain held. An existing later deadline is not shortened by conversion. This policy does not require operator-action opt-in and does not release reservations.
+On a fresh, identity-matched known poll, an old unlinked TV or movie `no-suitable-release` review can be converted to ordinary availability handling only when no conflicting review, configuration, claim, reservation, or queue uncertainty applies. The review remains as resolved history; eligible content receives a finite retry deadline without fabricating a historical search or an import, while unavailable movies wait for Radarr metadata without an availability retry deadline. Linked, unknown/stale, identity-changed, active/ambiguous-download, and other blocking review cases remain held. An existing later ordinary retry deadline is not shortened by conversion. This policy does not require operator-action opt-in and does not release reservations.
+
+## Queue review evidence and cleanup
+
+Queue-related reviews retain a private, versioned cause and affected scope. The
+evidence contains Arr identity and episode IDs (or movie scope), not queue
+references, request URLs, or raw service messages. Repeated reads of the same
+unresolved cause and scope do not create new review incidents; resolved history
+does not suppress a later occurrence. Existing evidence-less reviews remain
+unknown and are not assigned targets retroactively.
+
+Captured-target reviews are retired only after a fresh, non-regressing known
+library observation confirms every captured file under the same service and
+external identity. Unknown or broad ambiguous scopes, stale reads, missing
+targets, and changed identities remain open. Linked intent reviews additionally
+require that their actual intent is fulfilled; clearing a review never releases
+an independent download reservation.
+
+An unidentified queue row still blocks potentially overlapping work, but does not
+create a durable review for unreleased-only items with no captured work at risk.
+Directly identified episodes positively observed with files no longer hold their
+future siblings because of a lingering uncertain queue row. Missing IDs and
+unknown inventory do not establish that completion.
+
+Reset or source metadata removal/unmonitoring also does not discharge retained
+external queue coverage. Missing captured episode IDs keep their protection until
+positive file evidence accounts for them; inactive work retains that private
+ledger. New causal evidence is kept out of both public operations projections and
+the MCP review list. The final manual-pick queue recheck records the same causal
+review evidence as automatic reconciliation.

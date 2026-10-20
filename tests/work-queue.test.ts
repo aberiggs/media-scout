@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { reconcileWork, candidateOverlapsQueue } from '../src/core/work-queue';
 import type { LibrarySnapshot } from '../src/core/watcher';
-import type { GrabIntent, WorkItem, QueueRead } from '../src/core/work-queue-types';
+import type { GrabIntent, IntentCoverage, WorkItem, QueueRead } from '../src/core/work-queue-types';
 import type { Episode, Series, SonarrQueueRecord } from '../src/types/sonarr';
 import type { Movie, RadarrQueueRecord } from '../src/types/radarr';
 import type { AssociationDecision } from '../src/core/group-types';
@@ -39,6 +39,32 @@ function reconcile(input: {
 }
 
 describe('reconcileWork', () => {
+  it('keeps broad unknown queue safety without opening reviews for unreleased-only work', () => {
+    const result = reconcile({ inventory: snapshot([ep(102, false)], [movie({ isAvailable: false })]),
+      tvQueue: knownTvQueue([{ id: 7, status: 'downloading' } as SonarrQueueRecord]),
+      movieQueue: knownMovieQueue([{ id: 8, status: 'downloading' } as RadarrQueueRecord]) });
+    for (const row of result.items) {
+      expect(row).toMatchObject({ eligibleUnit: null, manualReviewReason: null, blockedReason: 'queue-ambiguous' });
+      expect(row.queueReviewEvidence).toBeUndefined();
+    }
+  });
+
+  it('does not hold future siblings for an uncertain queue row whose exact episode is positively imported', () => {
+    const row = reconcile({ inventory: snapshot([ep(101, true, true), ep(102, false)]),
+      tvQueue: knownTvQueue([{ id: 7, seriesId: 4, episodeId: 101, seasonNumber: 1, status: 'unknown' } as SonarrQueueRecord]) }).items[0]!;
+    expect(row).toMatchObject({ work: { status: 'waiting-release' }, blockedReason: 'waiting-release', manualReviewReason: null, eligibleUnit: null });
+    expect(row.queueReviewEvidence).toBeUndefined();
+  });
+
+  it('preserves provider backoff across unavailable then available movie metadata', () => {
+    const initial = reconcile({ inventory: snapshot([], [movie()]) }).items.find((row) => row.work.unit.kind === 'movie')!.work;
+    const deadline = '2026-09-29T06:00:00.000Z';
+    const throttled: WorkItem = { ...initial, status: 'backoff', lastOutcome: 'rate-limited', nextSearchAt: deadline };
+    const unavailable = reconcile({ inventory: snapshot([], [movie({ isAvailable: false })]), workItems: [throttled] }).items.find((row) => row.work.unit.kind === 'movie')!.work;
+    const availableAgain = reconcile({ inventory: snapshot([], [movie()]), workItems: [unavailable] }).items.find((row) => row.work.unit.kind === 'movie')!.work;
+    expect(availableAgain).toMatchObject({ status: 'backoff', lastOutcome: 'rate-limited', nextSearchAt: deadline });
+  });
+
   it('consumes a reset marker only after a known library observation began after reset and re-enables rediscovery', () => {
     const resetAt = '2026-09-29T00:05:00.000Z';
     const prior = { ...reconcile().items.find((item) => item.work.workKey === 'sonarr:4:s1')!.work,
@@ -333,7 +359,7 @@ describe('reconcileWork', () => {
     expect(result.items.find((item) => item.work.workKey === 'radarr:8')).toMatchObject({ work: { status: 'waiting-release' }, eligibleUnit: null, blockedReason: 'waiting-release' });
   });
 
-  it('turns a disappeared external queue reservation into a review hold until review resolution', () => {
+  it('retains disappeared queue protection even if its review is resolved', () => {
     const queue = knownTvQueue([{ downloadId: 'gone', seriesId: 4, episodeId: 101, seasonNumber: 1, status: 'downloading' } as SonarrQueueRecord]);
     const withQueue = reconcile({ tvQueue: queue });
     const oldWork = withQueue.items.find((item) => item.work.workKey === 'sonarr:4:s1')!.work;
@@ -342,7 +368,50 @@ describe('reconcileWork', () => {
     const reviewHold = reconcileWork({ snapshot: snapshot(), queues: { sonarr: knownTvQueue(), radarr: knownMovieQueue() }, existingWorkItems: [oldWork], intents: [], previousQueueCoverage: new Map([[oldWork.workKey, oldCoverage]]), now: NOW, minRetryHours: 6, queueGraceMin: 30 });
     expect(reviewHold.items[0]).toMatchObject({ work: { status: 'manual', blockedReason: 'queue-review' }, manualReviewReason: 'queue-review', eligibleUnit: null });
     const resolved = reconcileWork({ snapshot: snapshot(), queues: { sonarr: knownTvQueue(), radarr: knownMovieQueue() }, existingWorkItems: [reviewHold.items[0]!.work], intents: [], previousQueueCoverage: new Map([[oldWork.workKey, oldCoverage]]), manualReviewKeys: new Set(), now: NOW, minRetryHours: 6, queueGraceMin: 30 });
-    expect(resolved.items[0]).toMatchObject({ work: { status: 'ready', blockedReason: null }, eligibleUnit: expect.any(Object) });
+    expect(resolved.items[0]).toMatchObject({ work: { status: 'manual', blockedReason: 'queue-review' }, eligibleUnit: null, queueCoverage: oldCoverage });
+  });
+
+  it('does not authorize paid work from a library read begun before reset', () => {
+    const prior = { ...reconcile().items[0]!.work, resetPendingAt: LATER, status: 'ready' as const };
+    const row = reconcile({ workItems: [prior] }).items[0]!;
+    expect(row.work.resetPendingAt).toBe(LATER);
+    expect(row.eligibleUnit).toBeNull();
+  });
+
+  it.each([true, false])('retains captured external coverage when a target disappears from metadata (sibling remains: %s)', (siblingRemains) => {
+    const prior = reconcile().items[0]!.work;
+    const coverage = [{ workKey: prior.workKey, episodeIds: [101], basis: 'explicit-episodes' as const }];
+    const result = reconcileWork({ snapshot: snapshot(siblingRemains ? [ep(102, true)] : []),
+      queues: { sonarr: knownTvQueue(), radarr: knownMovieQueue() }, existingWorkItems: [prior], intents: [],
+      previousQueueCoverage: new Map([[prior.workKey, coverage]]), manualReviewKeys: new Set(), now: NOW, minRetryHours: 6, queueGraceMin: 30 });
+    expect(result.items[0]?.queueCoverage).toEqual(coverage);
+    expect(result.items[0]?.eligibleUnit).toBeNull();
+  });
+
+  it('keeps missing captured coverage through sibling fulfillment and later target restoration', () => {
+    const prior = reconcile().items[0]!.work;
+    const coverage = [{ workKey: prior.workKey, episodeIds: [101], basis: 'explicit-episodes' as const }];
+    const observe = (inventory: LibrarySnapshot, work: WorkItem, held: IntentCoverage[] = coverage) => reconcileWork({
+      snapshot: inventory, queues: { sonarr: knownTvQueue(), radarr: knownMovieQueue() }, existingWorkItems: [work], intents: [],
+      previousQueueCoverage: new Map([[prior.workKey, held]]), manualReviewKeys: new Set(), now: NOW, minRetryHours: 6, queueGraceMin: 30,
+    }).items[0]!;
+    const missing = observe(snapshot([ep(102, true)]), prior);
+    const siblingImported = observe(snapshot([ep(102, true, true)]), missing.work, missing.queueCoverage);
+    expect(siblingImported.queueCoverage).toEqual(coverage);
+    const restored = observe(snapshot([ep(101, true), ep(102, true, true)]), siblingImported.work, siblingImported.queueCoverage);
+    expect(restored.eligibleUnit).toBeNull();
+    expect(restored.queueCoverage).toEqual(coverage);
+    const imported = observe(snapshot([ep(101, true, true), ep(102, true, true)]), restored.work, restored.queueCoverage);
+    expect(imported.queueCoverage).toEqual([]);
+  });
+
+  it.each(['2026-09-28T00:00:00.000Z', '2026-09-30T00:00:00.000Z'])('does not discharge terminal coverage using a regressing or future library read %s', (observedAt) => {
+    const prior = { ...reconcile().items[0]!.work, status: 'fulfilled' as const };
+    const coverage = [{ workKey: prior.workKey, episodeIds: [101], basis: 'explicit-episodes' as const }];
+    const inventory = { ...snapshot([ep(101, true, true), ep(102, true, true)]), observedAt };
+    const row = reconcileWork({ snapshot: inventory, queues: { sonarr: knownTvQueue(), radarr: knownMovieQueue() },
+      existingWorkItems: [prior], intents: [], previousQueueCoverage: new Map([[prior.workKey, coverage]]), now: NOW, minRetryHours: 6, queueGraceMin: 30 }).items[0]!;
+    expect(row.queueCoverage).toEqual(coverage);
   });
 
   it('positively fulfills a captured episode only after the library reports hasFile', () => {
@@ -496,6 +565,7 @@ describe('reconcileWork', () => {
     const remainingQueue = knownTvQueue([{ downloadId: 'two-episode-job', seriesId: 4, episodeId: 102, seasonNumber: 1, status: 'downloading' } as SonarrQueueRecord]);
     const next = reconcileWork({ snapshot: snapshot(), queues: { sonarr: remainingQueue, radarr: knownMovieQueue() }, existingWorkItems: [firstRow.work], intents: [], previousQueueCoverage: new Map([[firstRow.work.workKey, firstRow.queueCoverage]]), now: LATER, minRetryHours: 6, queueGraceMin: 30 });
     expect(next.items[0]).toMatchObject({ manualReviewReason: 'queue-review', work: { blockedReason: 'queue-review' } });
+    expect(next.items[0]?.queueReviewEvidence).toMatchObject({ cause: 'queue-disappeared', episodeIds: [101], scope: 'targets' });
     expect(next.items[0]?.activeCoverage).toEqual([{ workKey: 'sonarr:4:s1', episodeIds: [101, 102], basis: 'explicit-episodes' }]);
     const stillHeld = reconcileWork({ snapshot: snapshot(), queues: { sonarr: remainingQueue, radarr: knownMovieQueue() }, existingWorkItems: [next.items[0]!.work], intents: [], previousQueueCoverage: new Map([[firstRow.work.workKey, next.items[0]!.queueCoverage]]), manualReviewKeys: new Set([firstRow.work.workKey]), now: '2026-09-29T00:10:00.000Z', minRetryHours: 6, queueGraceMin: 30 });
     expect(stillHeld.items[0]).toMatchObject({ work: { status: 'manual', blockedReason: 'queue-review' }, activeCoverage: [{ episodeIds: [101, 102] }] });

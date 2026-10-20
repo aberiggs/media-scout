@@ -4,6 +4,16 @@ This is an isolated administrative lane for a human to repair an existing queue 
 
 ## Enablement and approval boundary
 
+**Reset item** is the simpler tracking action, not a reservation release. With
+operator actions enabled, one confirmation clears current scheduling and unlinked
+reviews, retains resolved history/audit and waits for a later known library poll
+to rebuild tracking. Existing reservations, linked reviews, queue coverage,
+receipts, associations and duplicate-download protection are unchanged. Live
+claims, stale/unknown saved observations and active provider throttling still
+prevent reset. A continuing download problem can correctly reappear after reset.
+No download-client inspection challenge is required because reset releases no
+download protection and does not cancel or start downloads.
+
 In the UI, open **Safety** and explicitly enable **Allow operator actions** (off by default) before using this lane. This is an opt-in, not authentication or proof of human identity; it is persisted in the SQLite settings database and therefore survives container/image replacement. Check the setting in the UI before an upgrade or operator test rather than relying on an environment variable. `ALLOW_OPERATOR_ACTIONS` is the underlying runtime guard name, not a supported environment-variable setup instruction. The MCP `ma_review_action` tool contains both preview and mutating variants and is marked destructive as a whole; an MCP host must require human approval for every call, including commits. Tool metadata and a caller-supplied challenge string cannot prove a human typed that string. If the host cannot enforce per-call approval, use the interactive TTY CLI (`node_modules/.bin/tsx src/operator-cli.ts`); it refuses non-TTY use and has no `--yes`/noninteractive path.
 
 The CLI and MCP both require the same fresh observation, one-use token, exact action challenge, note, and state checks. Tokens are random 256-bit values, only SHA-256 digests are persisted, and token evidence expires after 120 seconds. Successful commits consume the token and write an audit record atomically with the mutation. Failed, stale, mismatched, or replayed commits do not mutate or consume it.

@@ -111,10 +111,12 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
     if (!page) return reply.code(400).send({ error: 'invalid query parameters', code: 'invalid-query' });
     const resolved = query.resolved === undefined ? false : query.resolved === 'true' ? true : query.resolved === 'false' ? false : null;
     if (resolved === null) return reply.code(400).send({ error: 'invalid resolved filter', code: 'invalid-query' });
+    const grouped = query.grouped === undefined ? false : query.grouped === 'true' ? true : query.grouped === 'false' ? false : null;
+    if (grouped === null) return reply.code(400).send({ error: 'invalid grouped filter', code: 'invalid-query' });
     const q = parseSearch(query.q);
     if (q === null) return reply.code(400).send({ error: 'invalid search filter', code: 'invalid-query' });
     const settings = stack.state.getSettings();
-    return operations.reviews({ ...page, resolved, ...(q ? { q } : {}) }, settings.safety.allowOperatorActions, new Date());
+    return operations.reviews({ ...page, resolved, grouped, ...(q ? { q } : {}) }, settings.safety.allowOperatorActions, new Date());
   });
   app.get('/api/operations/activity', async (request, reply) => {
     const query = request.query as Record<string, unknown>;
@@ -142,7 +144,7 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
     if (!lease) return reply.code(409).send({ error: 'work is currently in flight or held', code: 'work-claimed' });
     try {
       stack.state.applyWorkAction({ workKey: work.workKey, action, ownerToken: lease.ownerToken, claimKeys: lease.keys, now: new Date().toISOString() });
-      return { ok: true, message: action === 'retry' ? 'Retry is eligible for a later processing pass.' : 'Reset recorded; rediscovery will begin after a later known library observation.' };
+      return { ok: true, message: action === 'retry' ? 'Retry scheduled for a later eligible pass.' : 'Item reset. Tracking will rebuild on the next successful library check; downloads and duplicate-download protection are unchanged.' };
     } catch {
       return reply.code(409).send({ error: 'work is not eligible for this action', code: 'action-not-eligible' });
     } finally {
@@ -179,7 +181,7 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
         requiresClientInspection: body.action === 'release',
       };
     } catch {
-      return reply.code(409).send({ error: 'review action could not be prepared from current evidence', code: 'prepare-unavailable' });
+      return reply.code(409).send({ error: 'Current download evidence is unavailable. Refresh the review and prepare again after the next successful queue check.', code: 'prepare-unavailable' });
     }
   });
   app.post('/api/operations/reviews/:id/commit', async (request, reply) => {

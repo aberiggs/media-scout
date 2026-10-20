@@ -857,6 +857,62 @@ describe('Runner.cycle', () => {
     expect(state.hasHash('MOVIEHASH0000000000000000000000000000')).toBe(true);
   });
 
+  it('released movie with no admitted releases persists an ordinary cooldown', async () => {
+    const movie = { ...movieFixture, isAvailable: true };
+    mockDiscovery({ series: [], movies: [movie] });
+    mockSearch([]);
+    const llm = new FakeLLM();
+    llm.planner.set('radarr:3', [{ query: 'Example movie', categories: [2000] }]);
+    const { runner, state } = buildStack(llm, { now: new Date('2026-10-18T00:00:00.000Z') });
+
+    await runner.cycle();
+
+    expect(state.getWorkItem('radarr:3')).toMatchObject({ status: 'cooldown', lastOutcome: 'release-unavailable', nextSearchAt: '2026-10-18T06:00:00.000Z' });
+    expect(state.listManualReview()).toEqual([]);
+  });
+
+  it('waits on movie metadata without carrying an availability retry deadline', async () => {
+    mockDiscovery({ series: [], movies: [{ ...movieFixture, isAvailable: false }] });
+    const llm = new FakeLLM();
+    const { runner, state } = buildStack(llm, { now: NOW });
+    const workKey = 'radarr:3';
+    const unit: WorkItem['unit'] = { key: workKey, kind: 'movie', arr: 'radarr', serviceId: 3,
+      externalId: movieFixture.tmdbId as number, title: 'Movie', year: 2026, altTitles: [] };
+    const token = state.claimUnit(workKey, NOW)!;
+    state.applyWorkReconciliation({ key: workKey, token, intentUpdates: [], work: {
+      workKey, unit, contentIdentity: `radarr:3:${unit.externalId}:movie`, missingFingerprint: 'old', status: 'cooldown',
+      lastSearchAt: NOW.toISOString(), nextSearchAt: '2026-09-30T00:00:00.000Z', failCount: 0,
+      lastOutcome: 'release-unavailable', lastObservedAt: NOW.toISOString(), lastQueueObservedAt: NOW.toISOString(),
+      queueObservationKnown: true, blockedReason: null,
+    } });
+    state.releaseClaim(workKey, token);
+    await runner.cycle();
+    expect(state.getWorkItem(workKey)).toMatchObject({ status: 'waiting-release', nextSearchAt: null });
+    expect(state.listSearchActivity(NOW.toISOString())).toEqual([]);
+    expect(state.listManualReview()).toEqual([]);
+    expect(llm.calls).toEqual([]);
+  });
+
+  it('searches only after Radarr availability changes and keeps cooldown across runner recreation', async () => {
+    const llm = new FakeLLM();
+    llm.planner.set('radarr:3', [{ query: 'Example movie', categories: [2000] }]);
+    mockDiscovery({ movies: [{ ...movieFixture, isAvailable: false }] });
+    const first = buildStack(llm);
+    await first.runner.cycle();
+    expect(first.state.getWorkItem('radarr:3')).toMatchObject({ status: 'waiting-release', nextSearchAt: null });
+    expect(first.state.listSearchActivity(NOW.toISOString())).toEqual([]);
+    nock.cleanAll();
+    mockDiscovery({ movies: [{ ...movieFixture, isAvailable: true }] });
+    mockSearch([]);
+    await buildStack(llm, { state: first.state }).runner.cycle();
+    expect(first.state.getWorkItem('radarr:3')).toMatchObject({ status: 'cooldown', nextSearchAt: '2026-09-29T06:00:00.000Z' });
+    nock.cleanAll();
+    mockDiscovery({ movies: [{ ...movieFixture, isAvailable: true }] });
+    await buildStack(llm, { state: first.state, now: new Date('2026-09-29T01:00:00.000Z') }).runner.cycle();
+    expect(first.state.listSearchActivity(NOW.toISOString())).toHaveLength(1);
+    expect(first.state.listManualReview()).toEqual([]);
+  });
+
   it('missing download client entry: grab-path pick flags manual review, grab never called', async () => {
     const llm = new FakeLLM();
     llm.planner.set('sonarr:1:s1', [{ query: 'Frieren', categories: [5070] }]);
@@ -1598,7 +1654,7 @@ describe('Runner.cycle', () => {
     expect(state.getWorkQueueStatus().items[0]?.coveredEpisodeIds).toEqual([101]);
   });
 
-  it('holds a disappeared tracked queue item for review and resumes only after its review row is resolved', async () => {
+  it('keeps disappeared download protection after the review alone is resolved', async () => {
     const llm = new FakeLLM();
     llm.planner.set('sonarr:1:s1', [{ query: 'Show', categories: [5000] }]);
     const series = tvSeries(1, 'Show', 11, 'standard');
@@ -1624,8 +1680,9 @@ describe('Runner.cycle', () => {
     mockDiscovery({ series: [series], episodes: { 1: inventory }, sonarrQueue: { records: remainingQueue } });
     mockSearch([]);
     const resolved = await stack.runner.cycle();
-    expect(resolved.searched).toBe(1);
-    expect(llm.callsFor('planner:')).toHaveLength(1);
+    expect(resolved.searched).toBe(0);
+    expect(llm.callsFor('planner:')).toHaveLength(0);
+    expect(stack.state.getWorkQueueStatus().items[0]?.coveredEpisodeIds).toEqual([101, 102]);
   });
 
   it('holds an unknown POST acknowledgment durably without recording markers or retrying on an empty queue', async () => {
@@ -2159,6 +2216,22 @@ describe('Runner.cycle', () => {
 });
 
 describe('Runner.manualPick', () => {
+  it('retains causal review evidence when the final manual-pick queue check becomes uncertain', async () => {
+    const llm = new FakeLLM();
+    llm.planner.set('sonarr:1:s1', [{ query: 'Show S01', categories: [5000] }]);
+    mockDiscovery({ series: [tvSeries(1, 'Show', 11, 'standard')], sonarrQueueSequence: [[], [
+      { id: 7, seriesId: 1, episodeId: 101, seasonNumber: 1, status: 'unknown' },
+    ]] });
+    mockSearch([release({ title: 'Show S01E01 1080p' })]);
+    const { runner, state } = buildStack(llm);
+    const result = await runner.manualPick('sonarr:1:s1', 0);
+    expect(result.outcome).toBe('reverify-failed');
+    expect(state.listManualReview()[0]).toMatchObject({ reason: 'queue-review', queueEvidence: {
+      version: 1, cause: 'queue-ambiguous', scope: 'targets', episodeIds: [101],
+    } });
+    expect(state.listGrabIntents()).toEqual([]);
+  });
+
   it('legacy single-item reverify persists a known-but-stale queue read as unknown and retains earlier holds', async () => {
     const llm = new FakeLLM();
     llm.planner.set('sonarr:1:s1', [{ query: 'Show S01', categories: [5000] }]);

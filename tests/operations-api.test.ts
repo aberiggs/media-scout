@@ -75,22 +75,22 @@ describe('operational dashboard API', () => {
     const offPage = dashboard.reviews({ resolved: false, limit: 1, offset: 0 }, true, now);
     expect(offPage.total).toBe(2);
     expect(offPage.items).toMatchObject([{ reason: 'queue-review' }]);
-    expect(eligibility).not.toHaveBeenCalled();
+    expect(eligibility).toHaveBeenCalledTimes(1);
 
     const disabled = dashboard.reviews({ resolved: false, limit: 10, offset: 0 }, false, now);
     expect(disabled.items).toHaveLength(2);
     expect(disabled.items.every((row) => row.actions.retry.reason === 'operator-actions-disabled')).toBe(true);
-    expect(eligibility).not.toHaveBeenCalled();
+    expect(eligibility).toHaveBeenCalledTimes(1);
 
     const resolved = dashboard.reviews({ resolved: true, limit: 10, offset: 0 }, true, now);
     expect(resolved.items).toHaveLength(1);
     expect(resolved.items[0]?.actions.retry).toEqual({ allowed: false, reason: 'review-resolved' });
-    expect(eligibility).not.toHaveBeenCalled();
+    expect(eligibility).toHaveBeenCalledTimes(1);
 
     const ordinary = dashboard.reviews({ resolved: false, q: 'Show', limit: 1, offset: 1 }, true, now);
     expect(ordinary.items).toHaveLength(1);
     expect(ordinary.items[0]?.actions.retry).toMatchObject({ allowed: false, reason: 'review-not-eligible' });
-    expect(eligibility).toHaveBeenCalledTimes(1);
+    expect(eligibility).toHaveBeenCalledTimes(2);
   });
 
   it('accepts the frontend default All-filter URLs for work and activity', async () => {
@@ -106,6 +106,56 @@ describe('operational dashboard API', () => {
     expect(activity.json()).toHaveProperty('generatedAt');
     expect((await app.inject({ method: 'GET', url: '/api/operations/work?status=not-a-status&q=&limit=50&offset=0' })).statusCode).toBe(400);
     expect((await app.inject({ method: 'GET', url: '/api/operations/activity?q=&outcome=not-an-outcome&limit=50&offset=0' })).statusCode).toBe(400);
+  });
+
+  it('opts into work-grouped reviews before filtering and pagination while retaining raw rows by default', async () => {
+    const { app, state } = await makeApp();
+    state.flagManualReview('sonarr:4:s1', 'queue-review', undefined, new Date());
+    state.flagManualReview('sonarr:4:s1', 'picker-manual', undefined, new Date());
+    const raw = await app.inject({ method: 'GET', url: '/api/operations/reviews?limit=1' });
+    expect(raw.json().total).toBe(3);
+    const grouped = await app.inject({ method: 'GET', url: '/api/operations/reviews?grouped=true&q=queue-review&limit=1&offset=0' });
+    expect(grouped.statusCode).toBe(200);
+    expect(grouped.json().total).toBe(1);
+    expect(grouped.json().items[0].workKey).toBe('sonarr:4:s1');
+    expect(grouped.json().items[0].reviews).toHaveLength(3);
+    expect(grouped.json().items[0].reviews.map((review: { id: number }) => review.id).sort()).toEqual([1, 2, 3]);
+    expect((await app.inject({ method: 'GET', url: '/api/operations/reviews?grouped=no' })).statusCode).toBe(400);
+  });
+
+  it('keeps movie availability separate from safety attention and groups all causes across page boundaries', async () => {
+    const { app, state } = await makeApp();
+    const at = new Date().toISOString();
+    const work: WorkItem = { workKey: 'radarr:8', contentIdentity: 'radarr:8:88:movie',
+      missingFingerprint: '["radarr:8:88:movie",[[8,false]]]',
+      unit: { key: 'radarr:8', kind: 'movie', arr: 'radarr', serviceId: 8, externalId: 88, title: 'Unreleased movie', year: 2027, altTitles: [] },
+      status: 'manual', blockedReason: 'queue-review', lastSearchAt: null, nextSearchAt: null, lastOutcome: null, failCount: 0,
+      lastObservedAt: at, lastQueueObservedAt: at, queueObservationKnown: true };
+    const token = state.claimUnit(work.workKey, new Date(at))!;
+    state.applyWorkReconciliation({ key: work.workKey, token, work, intentUpdates: [] });
+    state.applyWorkQueueObservation({ key: work.workKey, token, observedAt: at, known: true, coverage: [] });
+    state.flagQueueReview({ workKey: work.workKey, ownerToken: token, now: at, evidence: {
+      version: 1, cause: 'queue-disappeared', contentIdentity: work.contentIdentity, arr: 'radarr', serviceId: 8, externalId: 88,
+      scope: 'targets', episodeIds: null, observedAt: at } });
+    state.flagManualReview(work.workKey, 'missing-download-client', 'https://private.invalid/never-project', new Date(at));
+    state.releaseClaim(work.workKey, token);
+    const projected = await app.inject({ method: 'GET', url: '/api/operations/work?q=Unreleased' });
+    expect(projected.json().items[0]).toMatchObject({ attentionRequired: true, availability: 'waiting-release' });
+    const first = await app.inject({ method: 'GET', url: '/api/operations/reviews?grouped=true&limit=1&offset=0' });
+    const second = await app.inject({ method: 'GET', url: '/api/operations/reviews?grouped=true&limit=1&offset=1' });
+    expect(first.json().total).toBe(2);
+    expect(second.json().total).toBe(2);
+    const movie = [...first.json().items, ...second.json().items].find((row: { workKey: string }) => row.workKey === work.workKey);
+    expect(movie).toMatchObject({ mediaType: 'movie', availability: 'waiting-release', actions: { reset: { allowed: true }, retry: { allowed: false } } });
+    expect(movie.reviews).toHaveLength(2);
+    expect(movie.reviews.find((row: { reason: string }) => row.reason === 'queue-review').actions.associate.allowed).toBe(false);
+    expect(movie.reviews.find((row: { reason: string }) => row.reason === 'missing-download-client').summary).not.toContain('older');
+    expect(JSON.stringify(movie)).not.toMatch(/queueEvidence|contentIdentity|episodeIds|private\.invalid|season is/);
+    const filtered = await app.inject({ method: 'GET', url: '/api/operations/reviews?grouped=true&q=queue-review' });
+    expect(filtered.json().items[0].reviews).toHaveLength(2);
+    const dashboard = new OperationsDashboard(state);
+    const optedOut = dashboard.reviews({ grouped: true, resolved: false, limit: 50, offset: 0 }, false);
+    expect(optedOut.items.every((row) => Object.values(row.actions).every((action) => !action.allowed))).toBe(true);
   });
 
   it('filters terminal history before pagination and reports the effective count scope', async () => {
@@ -241,7 +291,7 @@ describe('operational dashboard API', () => {
     const { app, state } = await makeApp();
     const response = await app.inject({ method: 'POST', url: '/api/operations/work/action', payload: { workKey: 'sonarr:4:s1', action: 'reset' } });
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual({ ok: true, message: 'Reset recorded; rediscovery will begin after a later known library observation.' });
+    expect(response.json()).toMatchObject({ ok: true, message: expect.stringContaining('downloads and duplicate-download protection are unchanged') });
     expect(state.getWorkItem('sonarr:4:s1')).toMatchObject({ status: 'ready', lastSearchAt: null, resetPendingAt: expect.any(String) });
     expect(await (await app.inject({ method: 'GET', url: '/api/operations/work' })).json()).toMatchObject({ items: [], total: 0, counts: { ready: 0 } });
     const unknownOwner = state.claimUnits({ keys: ['sonarr:4:s1', 'group:sonarr:4'], now: new Date() })!;
@@ -255,6 +305,16 @@ describe('operational dashboard API', () => {
     state.applyWorkQueueObservation({ key: observed.workKey, token: knownOwner.ownerToken, observedAt: afterReset, known: true, coverage: [] });
     state.releaseClaims({ keys: knownOwner.keys, ownerToken: knownOwner.ownerToken });
     expect((await (await app.inject({ method: 'GET', url: '/api/operations/work' })).json()).total).toBe(1);
+  });
+
+  it('resets an old queue review through the same guarded action without deleting its history', async () => {
+    const { app, state } = await makeApp();
+    state.flagManualReview('sonarr:4:s1', 'queue-review', undefined, new Date());
+    const reset = await app.inject({ method: 'POST', url: '/api/operations/work/action', payload: { workKey: 'sonarr:4:s1', action: 'reset' } });
+    expect(reset.statusCode).toBe(200);
+    expect(state.listManualReview()).toEqual([]);
+    expect(state.listManualReview(true)).toHaveLength(2);
+    expect(state.getWorkItem('sonarr:4:s1')?.resetPendingAt).toBeTruthy();
   });
 
   it('rejects work actions while the local cycle gate is active', async () => {

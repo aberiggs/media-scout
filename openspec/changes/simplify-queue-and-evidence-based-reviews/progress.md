@@ -4,7 +4,7 @@ Issue: https://github.com/aberiggs/media-scout/issues/20
 
 ## State
 
-Approved implementation complete: **7/7 tasks**, with local tests, rendered checks and remote runtime CI evidence below. The user-approved metadata-gated waiting and simple Reset item preserve downloads and duplicate-download protection. The unrelated ongoing-episode change and untracked user feedback document are untouched. No production mutation or deployment.
+Original implementation: **7/7 tasks**. Two approved PR-review follow-up tasks are tracked below and in tasks.md. The user-approved metadata-gated waiting and simple Reset item preserve downloads and duplicate-download protection. The unrelated ongoing-episode change and untracked user feedback document are untouched. No production mutation or deployment.
 
 ## Evidence gathered
 
@@ -116,3 +116,14 @@ Review PR #21. It is ready for review and not merged; deployment/production clea
 - Independently read CI jobs/steps via `gh run view ... --json headSha,conclusion,jobs`: checks passed; linux/amd64 and linux/arm64 container builds passed; **Smoke-test SQLite native addon succeeded on both architectures**. `publish-dev` skipped as expected for a PR; no image publication.
 - This final tracking-only checkpoint records completion without changing runtime code. Its own head checks will be observed after publication; the concrete container evidence above is tied explicitly to the tested runtime SHA, not falsely attributed to a later documentation SHA.
 - Residual limitation: evidence-poor historic reviews cannot be proven obsolete automatically. Reset item safely rebuilds local tracking; actual unresolved download protections remain and may correctly reappear. No live model/indexer or production behavior test is claimed.
+
+## PR review follow-up — legacy terminal Reset
+
+- Review reproduced a real invariant violation in an isolated in-memory database: Reset accepted a legacy terminal TV row with an empty saved target inventory, wrote `ready`, then all work reads threw `Only terminal work may have an empty missing inventory`.
+- Preserve that row's valid terminal status while clearing scheduling/unlinked reviews and recording reset-pending. No inventory is invented and no download protection is released; real reconciliation rebuilds it from a later known poll.
+- Worker first reproduced RED for both fulfilled/inactive rows; parent expanded coverage to real reconciliation and dashboard projections instead of directly fabricating the reconstructed row. Parent mutation check independently reproduced both failures when restoring unconditional `ready`.
+- Regressions cover readable get/list/dashboard after reset, review history resolution, pending action gates, unknown and pre-reset reads, positive terminal reconstruction, and reappearing aired missing targets becoming actionable only on a later known poll.
+- Initial focused tests: `npm test -- tests/operations-state.test.ts tests/operations-api.test.ts tests/queue-review-lifecycle.test.ts tests/work-queue.test.ts` — 67 passed. Parent fixture expansion initially missed two required episode fields; backend typecheck caught them and the synthetic fixture was corrected. Full final verification follows before publication.
+- Independent public-boundary review of operations grouping/actions/privacy, HTTP/MCP and UI found no blocking findings. Independent core follow-up review confirmed the previous finding addressed and found no remaining definite blockers in the scoped runtime diff.
+- Final local checks: `npm run typecheck` passed; `npm test` passed **51 files / 832 tests**; `npm --prefix web run typecheck` passed; `npm --prefix web test` passed **44 tests**; `npm run build`, `git diff --check` and `openspec validate simplify-queue-and-evidence-based-reviews --strict` passed. All checks offline/synthetic. No frontend implementation changed, so prior rendered evidence is unchanged, not claimed as a new browser run.
+- Follow-up status: **8/9 tasks complete**; final publication/CI remains pending. No merge, deployment, production mutation or image publication performed.

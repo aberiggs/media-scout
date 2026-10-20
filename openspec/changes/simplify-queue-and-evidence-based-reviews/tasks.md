@@ -21,4 +21,7 @@
 
 ## Workflow follow-up
 
+- [x] 5.1 Fix PR review finding: preserve readable legacy empty-inventory terminal TV work during Reset; verify real reconciliation, dashboard reads and later rediscovery with offline regressions.
+- [ ] 5.2 Continue independent PR review, address confirmed findings, rerun applicable checks, publish to PR #21 and inspect final-head CI/container results.
+
 - Archive only when requested after review; do not merge PR or deploy automatically.

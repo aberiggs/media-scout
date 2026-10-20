@@ -763,11 +763,14 @@ export class State {
       if (work.unit.kind === 'tv' && !keys.includes(`group:sonarr:${work.unit.serviceId}`)) throw new Error('TV work action requires the same-series group claim');
       const reason = this.workActionBlockReason(input.workKey, input.action, input.now, input.ownerToken);
       if (reason) throw new Error(`Work action is not eligible: ${reason}`);
-      const result = this.db.prepare(`UPDATE work_items SET status='ready',next_search_at=NULL,fail_count=0,last_outcome=NULL,
+      // Legacy terminal TV rows may have no saved targets. Keep them valid
+      // until reconciliation can rebuild inventory from a later library read.
+      const status = work.unit.kind === 'tv' && work.unit.season!.missing.length === 0 ? work.status : 'ready';
+      const result = this.db.prepare(`UPDATE work_items SET status=?,next_search_at=NULL,fail_count=0,last_outcome=NULL,
         blocked_reason=CASE WHEN ?='reset' THEN NULL ELSE blocked_reason END,
         last_search_at=CASE WHEN ?='reset' THEN NULL ELSE last_search_at END,
         reset_pending_at=CASE WHEN ?='reset' THEN ? ELSE reset_pending_at END WHERE work_key=?`)
-        .run(input.action, input.action, input.action, input.action === 'reset' ? input.now : null, input.workKey);
+        .run(status, input.action, input.action, input.action, input.now, input.workKey);
       if (result.changes !== 1) throw new Error('Work action raced with another update');
       if (work.unit.kind === 'tv') {
         this.db.prepare(`UPDATE episode_progress SET next_search_at=NULL,last_outcome=NULL,

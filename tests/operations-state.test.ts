@@ -5,6 +5,9 @@ import { join } from 'node:path';
 import { State, type ActivityScope } from '../src/core/state';
 import Database from 'better-sqlite3';
 import type { WorkItem } from '../src/core/work-queue-types';
+import { reconcileWork } from '../src/core/work-queue';
+import { OperationsDashboard } from '../src/core/operations';
+import type { LibrarySnapshot } from '../src/core/watcher';
 
 const NOW = '2026-10-01T00:00:00.000Z';
 const LATER = '2026-10-01T00:10:00.000Z';
@@ -40,6 +43,54 @@ function seed(state: State): void {
 }
 
 describe('operational work actions', () => {
+  it.each(['fulfilled', 'inactive'] as const)('keeps empty-inventory legacy %s work readable after reset until a known poll', (status) => {
+    const state = State.open(':memory:');
+    seed(state);
+    const current = state.getWorkItem('sonarr:4:s1')!;
+    const owner = state.claimUnit(current.workKey, new Date(NOW))!;
+    const terminal = { ...current, status, unit: { ...current.unit, season: { seasonNumber: 1, missing: [] } } } as WorkItem;
+    state.applyWorkReconciliation({ key: terminal.workKey, token: owner, work: terminal, intentUpdates: [] });
+    state.releaseClaim(terminal.workKey, owner);
+    state.flagManualReview(terminal.workKey, 'queue-review', 'legacy unlinked review', new Date(LATER));
+    const lease = state.claimUnits({ keys: [terminal.workKey, 'group:sonarr:4'], now: new Date(LATER) })!;
+    state.applyWorkAction({ workKey: terminal.workKey, action: 'reset', ownerToken: lease.ownerToken, claimKeys: lease.keys, now: LATER });
+    state.releaseClaims({ keys: lease.keys, ownerToken: lease.ownerToken });
+
+    expect(state.getWorkItem(terminal.workKey)).toMatchObject({ status, nextSearchAt: null, failCount: 0, resetPendingAt: LATER });
+    expect(state.listWorkItems()).toContainEqual(expect.objectContaining({ status, resetPendingAt: LATER }));
+    expect(state.listManualReview(false)).toEqual([]);
+    expect(state.getWorkActionEligibility(terminal.workKey, LATER).retry).toMatchObject({ allowed: false, reason: 'work-not-retryable' });
+    expect(state.getWorkActionEligibility(terminal.workKey, LATER).reset).toMatchObject({ allowed: false, reason: 'reset-pending' });
+    expect(new OperationsDashboard(state).work({ limit: 50, offset: 0 }, true, new Date(LATER)).items).toEqual([]);
+    const laterPoll = '2026-10-01T00:11:00.000Z';
+    const inventory: LibrarySnapshot = { observedAt: laterPoll, sonarr: { known: true, series: [{
+      series: { id: 4, tvdbId: 44, title: 'Show', titleSlug: 'show', seriesType: 'standard', monitored: true, seasons: [], alternateTitles: [] },
+      known: true, episodes: [{ id: 101, seriesId: 4, seasonNumber: 1, episodeNumber: 1, absoluteEpisodeNumber: null,
+        title: 'Episode', airDate: '2020-01-01', monitored: true, hasFile: true }],
+    }] }, radarr: { known: true, movies: [] } };
+    const reconcile = (snapshot: LibrarySnapshot) => reconcileWork({ snapshot, now: laterPoll, minRetryHours: 6, queueGraceMin: 30,
+      queues: { sonarr: { kind: 'known', records: [], observedAt: laterPoll }, radarr: { kind: 'known', records: [], observedAt: laterPoll } },
+      existingWorkItems: state.listWorkItems(), intents: [] }).items[0]!;
+    const pending = reconcile({ ...inventory, sonarr: { known: false, series: [] } });
+    expect(pending.work.resetPendingAt).toBe(LATER);
+    expect(pending.eligibleUnit).toBeNull();
+    const complete = reconcile(inventory);
+    expect(complete.work).toMatchObject({ status: 'fulfilled', resetPendingAt: null });
+    // A pre-reset observation with newly missing targets cannot authorize a search.
+    inventory.sonarr.series[0]!.episodes![0] = { ...inventory.sonarr.series[0]!.episodes![0]!, hasFile: false, airDate: '2020-01-01' };
+    const beforeReset = reconcile({ ...inventory, observedAt: NOW });
+    expect(beforeReset.eligibleUnit).toBeNull();
+    expect(beforeReset.work.resetPendingAt).toBe(LATER);
+    const restored = reconcile(inventory);
+    expect(restored.work).toMatchObject({ status: 'ready', resetPendingAt: null });
+    expect(restored.eligibleUnit?.season?.missing).toMatchObject([{ episodeId: 101 }]);
+    const poll = state.claimUnit(terminal.workKey, new Date(laterPoll))!;
+    state.applyWorkReconciliation({ key: terminal.workKey, token: poll, work: restored.work, intentUpdates: [] });
+    state.releaseClaim(terminal.workKey, poll);
+    expect(new OperationsDashboard(state).work({ limit: 50, offset: 0 }, true, new Date(laterPoll)).items).toMatchObject([{ status: 'ready' }]);
+    state.close();
+  });
+
   it('upgrades legacy activity rows idempotently and retains safe stage attribution through reopen', () => {
     const db = new Database(':memory:');
     db.exec(`CREATE TABLE search_activity(id INTEGER PRIMARY KEY AUTOINCREMENT,source TEXT NOT NULL,started_at TEXT NOT NULL,finished_at TEXT,query TEXT NOT NULL,media_json TEXT NOT NULL,result_count INTEGER,outcome TEXT NOT NULL,error_code TEXT);

@@ -4,7 +4,7 @@ Issue: https://github.com/aberiggs/media-scout/issues/20
 
 ## State
 
-Implementation approved after the user confirmed metadata-gated release waiting and a simple Reset item action that preserves downloads and duplicate-download protection. Planning artifacts now reflect that approval; task completion is tracked in tasks.md. The unrelated ongoing-episode change and untracked user feedback document are untouched.
+Approved implementation complete: **7/7 tasks**, with local tests, rendered checks and remote runtime CI evidence below. The user-approved metadata-gated waiting and simple Reset item preserve downloads and duplicate-download protection. The unrelated ongoing-episode change and untracked user feedback document are untouched. No production mutation or deployment.
 
 ## Evidence gathered
 
@@ -31,7 +31,7 @@ Implementation approved after the user confirmed metadata-gated release waiting 
 - Designer recommended retaining existing visual styling, reducing row hierarchy, active-only Queue, grouped Reviews and Advanced recovery; no implementation or visual verification performed.
 - Architectural reviewer rejected blanket future-only dismissal and automatic cleanup based only on surviving coverage. Recommended structured causal evidence and a separately approved guarded legacy-review retirement path. These constraints are incorporated in the proposal.
 
-## Checks
+## Initial planning checkpoint checks (historical)
 
 - `git diff` before branching: no tracked changes; user file `docs/sprocket-feedback.md` remains untracked and excluded.
 - `openspec list --json` / `openspec context --json`: existing intended repo root confirmed; no initialization.
@@ -55,7 +55,7 @@ Architectural reviewer inspected the actual two-document checkpoint. Corrected a
 
 ## Next action
 
-Continue with queue-review evidence, independent held coverage and Reset item.
+Review PR #21. It is ready for review and not merged; deployment/production cleanup remain outside this task.
 
 ## Checkpoint 1 — availability
 
@@ -107,3 +107,12 @@ Continue with queue-review evidence, independent held coverage and Reset item.
 - Final `npm run typecheck`: passed. Full `npm test`: **51 files, 830 passed**. `npm --prefix web run typecheck`: passed. `npm --prefix web test`: **44 passed**. `npm run build`: passed. `git diff --check`: passed. `openspec validate simplify-queue-and-evidence-based-reviews --strict`: passed.
 - Rendered synthetic checks and screenshot review remain valid for the unchanged frontend. All verification offline/synthetic; no daemon, live evaluation, production edits, deployment or PR merge.
 - Final publication/remote CI is the only remaining checklist task. Prior checkpoint CI already passed checks and both architecture container builds/native SQLite smoke; final head must be read separately, not inferred from that prior run.
+
+## Publication and remote verification
+
+- All coherent implementation checkpoints committed and normally pushed to `plan/queue-review-experience`; unrelated feedback remains untracked/excluded.
+- Updated issue #20 to the approved scope and PR #21 to the implemented behavior/check evidence. PR is **open, ready for review, targeting main, mergeable**; no merge or deployment performed.
+- Runtime checkpoint `aa2dc38f7b0c7e01574e2be07ce0915e4ad658fa`: `gh pr checks 21 --watch --interval 15` completed successfully. CI run [39357568447](https://github.com/aberiggs/media-scout/actions/runs/39357568447) concluded **success**.
+- Independently read CI jobs/steps via `gh run view ... --json headSha,conclusion,jobs`: checks passed; linux/amd64 and linux/arm64 container builds passed; **Smoke-test SQLite native addon succeeded on both architectures**. `publish-dev` skipped as expected for a PR; no image publication.
+- This final tracking-only checkpoint records completion without changing runtime code. Its own head checks will be observed after publication; the concrete container evidence above is tied explicitly to the tested runtime SHA, not falsely attributed to a later documentation SHA.
+- Residual limitation: evidence-poor historic reviews cannot be proven obsolete automatically. Reset item safely rebuilds local tracking; actual unresolved download protections remain and may correctly reappear. No live model/indexer or production behavior test is claimed.

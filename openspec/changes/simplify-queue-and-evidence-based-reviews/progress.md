@@ -89,3 +89,11 @@ Continue with queue-review evidence, independent held coverage and Reset item.
 - Added cause-specific safe summaries, association-as-assessment and separate attention/availability facts. Parent replaced worker's status-based availability inference with identity-matched captured Radarr metadata and known episode summaries, and corrected overgeneric configuration/identity wording.
 - RED: a manual-held unavailable movie projected availability unknown instead of metadata waiting. GREEN after fix; tests cover full causes across pagination/filtering, opt-out, raw compatibility and evidence redaction.
 - `npm run typecheck`: passed. Focused API/recovery/replay tests: 39 passed. Full `npm test`: 51 files, 823 passed. `git diff --check`: passed. Read-only review found no blockers; corrected its minor documentation finding.
+
+## Checkpoint 5 — quieter operations UI
+
+- Parent completed the designer's partial/incomplete implementation: restored nonterminal status filters, finished grouped cards/confirmations, moved diagnostics and rare recovery behind disclosure, and retained all guarded recovery mechanics using the chosen underlying review ID.
+- Explicit parent RED: focused grouped UI test could not find Reset item. GREEN after implementation; resolved outdated label/visibility tests without deleting their behavioral safeguards. Added selected-underlying-review routing test; full frontend suite now 44 passed.
+- `npm --prefix web run typecheck`: passed. `npm --prefix web test`: 44 passed. `npm run build`: passed. `git diff --check`: passed.
+- Synthetic-only Playwright script `/tmp/opencode/pr21-browser.mts` passed at 1440px and 390px: active/grouped API params, grouped causes, no horizontal overflow, keyboard focus trap/restore, nested review reset cancellation, no page errors, GET-only mocked requests. No real service or production settings were loaded. Screenshots `/tmp/opencode/pr21-{queue,reviews,reset}-{1440,390}.png` inspected by parent and designer.
+- Rendered designer review found no blockers. Numeric review IDs are intentionally not visible jargon; the UI preserves them for scoped actions. Loopback Vite preview was started for these synthetic checks; no daemon or live integration calls.

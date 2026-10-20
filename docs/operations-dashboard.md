@@ -1,6 +1,6 @@
 # Operations dashboard
 
-The dashboard's **Queue** shows Media Scout's tracked work items, scheduling, observations, and held coverage. It is not a view of live download-client jobs. By default, fulfilled and inactive history is excluded before filtering and pagination; choose a terminal status or `scope=all` to inspect it. `counts` describe the returned scope, `scope` reports the requested scope, and `countScope` reports the effective scope (a terminal-status filter includes history). Pending-reset items remain hidden until a later known library observation.
+The dashboard's **Queue** shows outstanding tracked media, including waiting-for-release work, not live download-client jobs. It always requests active scope; completed/inactive history and the old All work switch are absent. Rows prioritize title/type, status, next retry/airtime and last checked. **Details** contains coverage, search and freshness diagnostics; episode details remain read-only. Pending-reset items stay hidden until a later known library observation. The low-level work API retains terminal filters and `scope=all` for history compatibility; `counts`, `scope` and `countScope` describe that requested/effective API scope.
 
 Observation freshness uses one response-time snapshot and a 24-hour threshold. A missing or unknown queue timestamp/completeness is reported as unknown; an older library or queue observation is stale. Actions remain unavailable for either state. Reviews identify media type and TV season without exposing raw work-unit data, so separate season reviews can be distinguished.
 
@@ -13,6 +13,18 @@ TV work rows may include additive `episodeProgress` with observation knowledge, 
 Queue season rows show imported inventory separately from airing lifecycle: “Caught up · awaiting airtime” means currently known aired targets are handled while future episodes remain; “Known inventory imported” does not assert that no further episodes will be added or that airing is finished. Unknown/stale episode observations are shown as unavailable rather than an empty inventory. Expand **Episode details** to read the paginated inventory, including each episode's timing basis, next eligible/retry time, and any precise episode-level hold explanation. Broad work-level holds remain distinct from exact episode holds; uncertain download coverage is described as a safety hold, not as an airtime delay. The same read-only episode inventory is available from TV review details. These controls only read saved operations data: they do not change action eligibility or trigger searches. Retry, Reset, association, and release controls remain gated by the existing API action eligibility and evidence workflow.
 
 Refreshing Queue, Reviews, or Search history reads the local SQLite projection; it does not trigger a cycle or search.
+
+**Reviews** requests grouped results and shows one card per movie or season with
+all underlying causes. A release-waiting fact remains visible alongside an
+independent review, never mislabeled as a season for movies. **Retry later** and
+**Reset item** appear only when available; reset uses a short confirmation before
+changing local tracking. If neither action is available, one concise prerequisite
+replaces a row of disabled buttons. Rare tools live under **Advanced recovery**:
+**Check download match** assesses fresh evidence rather than promising a match,
+and **Release download hold** appears only for an eligible linked reservation.
+Their original preview, expiration, explicit choices and approval/inspection
+safeguards remain enforced. Recovery acts on the selected underlying review ID,
+not every cause in its group.
 
 **Search history** records bounded search activity for seven days, up to 2,000 entries. Query terms can reveal what you are looking for; this is an operational view, not raw server logs.
 

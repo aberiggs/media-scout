@@ -12,7 +12,7 @@
 ## 3. Operations projections and UI
 
 - [x] 3.1 Add opt-in grouped review projections before paging, grouped counts, all underlying causes/IDs, media-correct status/availability and contextual action eligibility. Verify operations API tests for grouping, pagination, opt-out, private evidence redaction and unknown legacy causes; document API behavior.
-- [ ] 3.2 Redesign Queue/Reviews hierarchy: active-only scope, concise rows, expandable diagnostics, one card per review item, plain labels, confirmed Reset item and advanced guarded recovery. Add red/green UI tests and verify frontend typecheck/test/build plus rendered narrow-screen and keyboard review; update dashboard docs.
+- [x] 3.2 Redesign Queue/Reviews hierarchy: active-only scope, concise rows, expandable diagnostics, one card per review item, plain labels, confirmed Reset item and advanced guarded recovery. Add red/green UI tests and verify frontend typecheck/test/build plus rendered narrow-screen and keyboard review; update dashboard docs.
 
 ## 4. Integration and publication
 

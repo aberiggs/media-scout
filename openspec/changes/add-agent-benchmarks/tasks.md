@@ -1,6 +1,8 @@
 # Tasks
 
-Planning only; implementation and live capture/model execution are not approved by this artifact.
+Implementation approved by the user for PR #22. Paid baseline: configured model,
+US$2 total including retries/corrections. Targeted label/rubric and sanitized subset
+publication/provider disclosure approved in-session. No merge or deployment.
 
 ## 1. Dataset and isolation foundations
 

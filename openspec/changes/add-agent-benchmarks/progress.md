@@ -51,3 +51,52 @@
 **0/13 full feature tasks complete.** Keep 3.1 unchecked: this utility accepts manually verified metadata, not an automated metadata-capture CLI; the broader foundations remain unimplemented. Keep 3.2 unchecked: candidate identity/coverage/multiple-acceptable labels need human review and a frozen label revision. The coherent query-capture increment is verified, but is not the whole benchmark feature.
 
 Present the private workbook for annotation/privacy review. No model call is needed until those labels are ready; require selected endpoint/model and explicit budgets before a scored live model run. The app implementation remains outside this capture-only authorization.
+
+## Approved implementation continuation
+
+- User explicitly approved full implementation and actual benchmarking for PR #22,
+  not another capture-only completion. Reused its existing worktree/head branch;
+  left the unrelated checkout's untracked feedback file untouched.
+- Read #6/#15, all change artifacts, project instructions and operator docs.
+  Reused the existing 12-work / 38-query / 2,010-observation private capture; no
+  Prowlarr recapture, download-link fetch or production application startup.
+- Human explicitly approved **US$2 total** for the configured-model baseline,
+  including retries/corrections, conditional on enforceable conservative bounds.
+  SQLite read-only/query-only selected only AI model/base URL on zima; configured
+  model is `z-ai/glm-5.3-flash` at OpenRouter. No credentials printed or DB copied.
+- Inspected all 262 selected candidate titles. Corrected draft documentary identity,
+  explicit range coverage and seasonal-local episode mistakes. Human reviewed the
+  named documentary/Batman distractors, Blue Box mapping and multi-acceptable
+  inferred-pack rubric, and approved publishing/provider disclosure of the
+  sanitized factual subset. Uncertain bracketed claims remain unscored. Published
+  fixture contains actual candidate evidence, ordered exact-query subset mappings,
+  original counts, public source provenance and review limitations, not raw exports.
+- Added strict artifact contracts/storage and attempt telemetry, budget reservations
+  and production-class decision evaluation. Tests exposed traversal reads, invalid
+  schema/JSON accounting, failed transport accounting, duplicate settlement,
+  contradictory cost bounds and untrusted returned model strings; corrected root
+  causes. Independent review's three important findings were fixed with regressions.
+- TDD: evaluator regression initially failed 4/7 (fabricated references, group
+  overlap, actual association and retrieval subset isolation); 7/7 passed after
+  implementing distinct real decision paths. Unseen requests remain unsupported.
+- This is a foundations/evidence checkpoint, not feature completion. App run service,
+  transport controls and UI still need implementation; budget helpers alone do not
+  authorize or prove paid execution. No live model call has yet been made.
+
+### Fresh checkpoint checks
+
+- `npm run typecheck`: passed.
+- `npm test`: **853 tests / 55 files passed**.
+- `npm --prefix web run typecheck`: passed.
+- `npm --prefix web test`: **44 passed**.
+- `npm run build`: passed.
+- `python3 -B -m unittest discover -s tests -p 'benchmark*_test.py'`: **24 passed**.
+- `git diff --check`: passed.
+- `openspec validate add-agent-benchmarks --strict`: passed.
+- No container/native-addon success claimed for this new checkpoint; PR CI must
+  supply it. Full tasks remain unchecked until all their assigned criteria pass.
+- Follow-up review exposed permissive structural grounding and lost replay order.
+  Four regressions failed before correction; now title boundaries and supplied
+  numeric scope are checked, and replay assembles the ordered per-query ID union.
+  Fresh `npm run typecheck`, `npm test` (**857/55**), whitespace and strict OpenSpec
+  checks passed after those fixes. No further review relaunch used.

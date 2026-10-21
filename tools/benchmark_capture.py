@@ -299,6 +299,8 @@ def main(argv=None):
         if not a.execute:
             print(json.dumps({"plan": plan, "live": False}))
             return 0
+        if not a.indexer_ids:
+            raise SafeError("explicit_indexers_required")
         if os.path.exists(a.out):
             raise SafeError("output_exists")
         base, key = read_settings(a.settings_db)

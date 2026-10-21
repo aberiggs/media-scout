@@ -12,8 +12,8 @@ Manifest JSON uses version 1, for example:
 ```
 
 Without `--execute`, the tool validates and prints a plan without opening
-settings. Live capture requires `--execute`; optionally pass at most two
-explicit `--indexer-ids`. The tool calls only Prowlarr indexer metadata,
+settings. Live capture requires `--execute` and one or two explicitly selected
+`--indexer-ids`. The tool calls only Prowlarr indexer metadata,
 status, and search GET endpoints. It does not contact Sonarr/Radarr, submit
 downloads, or run models. Errors/backoff are unavailable, never an empty result.
 Completeness is provisional: HTTP 200 does not establish that each indexer
@@ -42,10 +42,10 @@ upstream work, and an indexer failure may not be surfaced by Prowlarr. Status is
 checked before and after every search; a newly cooling source is unavailable,
 not an empty success. Reaching a result cap is explicitly truncated.
 
-Use explicit indexer IDs after inspecting enabled/healthy status and category
+Select explicit indexer IDs after inspecting source purpose, enabled/healthy status and category
 capabilities. An omitted indexer-status entry means no recorded cooldown, not
-unavailable. Default selection is the first two enabled, non-cooling entries;
-it does not establish indexer quality, category support, or public-data status.
+unavailable. The live CLI refuses automatic selection: enabled status and category
+support do not establish indexer purpose, quality, or public-data status.
 For public-data experiments explicitly select only public sources. The manifest's
 categories must match source capabilities; notably anime can be exposed as 6000
 rather than the planner's 5070 hint. This utility does not change app categories.

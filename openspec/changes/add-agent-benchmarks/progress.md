@@ -33,7 +33,7 @@
 
 ## Increment verification
 
-- `python3 -B -m unittest discover -s tests -p 'benchmark_capture_test.py'`: initial red coverage exposed absent safety features; final **20 tests passed**. Covers manifest/plan, balanced pilot, read-only settings, safe GET/redirect boundary, wall deadline, response/row caps, sanitization, transitive identity, empty-versus-failure, pre/post cooldown, interruption, immutable private output and dry plan isolation. Added this offline command to CI; no live invocation in CI.
+- `python3 -B -m unittest discover -s tests -p 'benchmark_capture_test.py'`: initial red coverage exposed absent safety features; **21 tests passed** after the final source-selection correction. Covers manifest/plan, balanced pilot, read-only settings, safe GET/redirect boundary, wall deadline, response/row caps, sanitization, transitive identity, empty-versus-failure, pre/post cooldown, interruption, immutable private output and dry plan isolation. Live CLI now requires explicit selected sources before reading credentials; a red/green regression establishes that no implicit selection occurs. Added this offline command to CI; no live invocation in CI.
 - `python3 -m py_compile tools/benchmark_capture.py`: passed before final safety changes; final syntax/import checked by the complete Python suite.
 - Frozen repository manifest equals executed primary manifest: passed (12 works, 52 slots; 50 exact distinct requests).
 - Retained projection assertions: passed; 12 cases, only retained source pseudonyms, successful exact retrieval records, no URL/hash/GUID/key fields.

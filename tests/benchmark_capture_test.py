@@ -210,6 +210,14 @@ class CaptureTests(unittest.TestCase):
                     self.assertEqual(capture.main(['--manifest',str(p),'--settings-db','/missing','--out',str(p)+'.out']),0)
             self.assertFalse(pathlib.Path(str(p)+'.out').exists())
 
+    def test_live_cli_requires_explicit_sources_before_reading_credentials(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=pathlib.Path(d)/'manifest.json'; p.write_text(json.dumps(self.manifest(1)))
+            with patch.object(capture,'read_settings') as settings, patch('builtins.print') as diagnostic:
+                self.assertEqual(capture.main(['--manifest',str(p),'--settings-db','/missing','--out',str(p)+'.out','--execute']),2)
+                settings.assert_not_called()
+                diagnostic.assert_called_with('capture_error:explicit_indexers_required',file=capture.sys.stderr)
+
     def test_interruption_retains_prior_results_and_stops(self):
         class Fake:
             searches=0

@@ -8,7 +8,7 @@
     "dev": "vite --host 0.0.0.0",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit --pretty",
-    "test": "tsx --test src/App.test.tsx"
+    "test": "tsx --test src/App.test.tsx src/Benchmarks.test.tsx"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",

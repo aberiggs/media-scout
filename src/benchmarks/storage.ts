@@ -1,5 +1,5 @@
-import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync, unlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync, unlinkSync, openSync, closeSync, fsyncSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 import { DatasetSchema, RunSchema, type Dataset, type Run } from './contracts';
 
 function safeId(id: string): string {
@@ -28,6 +28,7 @@ export class BenchmarkStorage {
     const run = RunSchema.parse(value); const old = this.getRun(run.id);
     if (!old) throw new Error('run does not exist');
     if (old.datasetId !== run.datasetId || old.datasetRevision !== run.datasetRevision) throw new Error('run lineage is immutable');
+    if (JSON.stringify([old.config, old.datasetHash, old.sourceHash, old.priceBound, old.createdAt, old.plannedCases]) !== JSON.stringify([run.config, run.datasetHash, run.sourceHash, run.priceBound, run.createdAt, run.plannedCases])) throw new Error('run snapshot is immutable');
     if (old.status !== 'running') throw new Error('invalid run status transition');
     this.persist(join(this.runs, `${run.id}.json`), run); return run;
   }
@@ -47,6 +48,12 @@ export class BenchmarkStorage {
     const payload = `${JSON.stringify(value)}\n`;
     if (files.length + (oldSize ? 0 : 1) > this.limits.maxFiles || currentSize - oldSize + Buffer.byteLength(payload) > this.limits.maxBytes) throw new Error('benchmark artifact limit exceeded');
     const temp = `${path}.${process.pid}.${Date.now()}.tmp`;
-    try { writeFileSync(temp, payload, { mode: 0o600, flag: 'wx' }); renameSync(temp, path); } finally { try { unlinkSync(temp); } catch { /* already renamed */ } }
+    try {
+      const fd = openSync(temp, 'wx', 0o600);
+      try { writeFileSync(fd, payload); fsyncSync(fd); } finally { closeSync(fd); }
+      renameSync(temp, path);
+      const directory = openSync(dirname(path), 'r');
+      try { fsyncSync(directory); } finally { closeSync(directory); }
+    } finally { try { unlinkSync(temp); } catch { /* already renamed */ } }
   }
 }

@@ -10,6 +10,11 @@ import { missingSettings, settingsSchema, type Settings } from './settings';
 import type { CycleSummary } from './core/runner';
 import { OperationsDashboard } from './core/operations';
 import type { WorkAction } from './core/state';
+import { BenchmarkService, bundledBenchmarkDataset } from './benchmarks/service';
+import { registerBenchmarkRoutes } from './benchmarks/routes';
+import { homedir } from 'node:os';
+import { syntheticSafetyDataset } from './benchmarks/safety';
+import { serverBenchmarkProfiles } from './benchmarks/profiles';
 
 type CycleAttempt = { ok: true; summary: CycleSummary } | { ok: false; conflict: true } | { ok: false; error: unknown };
 interface CycleGate { run(): Promise<CycleAttempt>; settled(): Promise<void>; isRunning(): boolean }
@@ -49,7 +54,7 @@ function mutationAllowed(request: { headers: Record<string, string | string[] | 
   return true;
 }
 
-export async function buildApp(stack: Stack, options: { webRoot?: string } = {}): Promise<FastifyInstance> {
+export async function buildApp(stack: Stack, options: { webRoot?: string; benchmarks?: BenchmarkService } = {}): Promise<FastifyInstance> {
   // Fastify's default request serializer logs full URLs (including query strings).
   // These local settings routes carry secrets in bodies, so do not log request records.
   const app = Fastify({ loggerInstance: stack.logger.child({ component: 'daemon' }), logController: new LogController({ disableRequestLogging: true }) });
@@ -62,6 +67,7 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
   });
   app.decorate('cycleGate', gate);
   const operations = new OperationsDashboard(stack.state);
+  if (options.benchmarks) registerBenchmarkRoutes(app, options.benchmarks, mutationAllowed);
 
   app.get('/health', async () => { const settings = stack.state.getSettings(); return { status: 'ok', dryRun: settings.safety.dryRun, model: settings.ai.model }; });
   app.get('/api/settings', async () => envelope(stack.state.getSettings(), gate.isRunning()));
@@ -223,7 +229,12 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
 }
 
 export async function startDaemon(stack: Stack): Promise<void> {
-  const app = await buildApp(stack);
+  const benchmarks = new BenchmarkService({
+    root: process.env.BENCHMARK_DIR ?? resolve(homedir(), '.local/share/media-scout/benchmark-runs'),
+    datasets: [bundledBenchmarkDataset(), syntheticSafetyDataset()],
+    profiles: () => serverBenchmarkProfiles(stack.state.getSettings().ai),
+  });
+  const app = await buildApp(stack, { benchmarks });
   const logger: Logger = stack.logger.child({ component: 'daemon' });
   await app.listen({ port: stack.config.HTTP_PORT, host: stack.config.HTTP_HOST ?? '0.0.0.0' });
 

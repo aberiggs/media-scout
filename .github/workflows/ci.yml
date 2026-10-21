@@ -131,8 +131,8 @@ jobs:
       - name: Test
         run: npm test
 
-      - name: Offline benchmark capture tests
-        run: python3 -B -m unittest discover -s tests -p 'benchmark_capture_test.py'
+      - name: Offline benchmark capture and fixture tests
+        run: python3 -B -m unittest discover -s tests -p 'benchmark*_test.py'
 
   container-build-matrix:
     name: container-build / ${{ matrix.platform }}

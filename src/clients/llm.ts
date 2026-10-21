@@ -38,6 +38,10 @@ export interface LLMAttemptEvent {
   valid: boolean | null;
   failure: LLMFailureCode | null;
 }
+export interface LLMAttemptReservation {
+  serialized: string; maxOutputTokens: number | undefined;
+  logicalCallId: string; attemptId: string; startedAt: string; correction: boolean;
+}
 
 /**
  * Strips ```json ... ``` / ``` ... ``` markdown fences around LLM JSON output.
@@ -93,8 +97,10 @@ export class OpenRouterLLM implements LLMClient {
       maxOutputTokens?: number;
       maxAttempts?: number;
       onAttempt?: (event: LLMAttemptEvent) => void;
-      beforeAttempt?: (request: { serialized: string; maxOutputTokens: number | undefined }) => void;
+      beforeAttempt?: (request: LLMAttemptReservation) => void;
       providerPriceCeiling?: { prompt: string; completion: string; request: string };
+      temperature?: number;
+      seed?: number;
     },
   ) {}
 
@@ -139,13 +145,15 @@ export class OpenRouterLLM implements LLMClient {
           responseFormat: { type: 'json_schema' as const, jsonSchema: { name: args.jsonSchema?.name ?? 'llm_output', strict: true, schema: args.jsonSchema?.schema ?? withoutMetaSchema(z.toJSONSchema(args.schema)) } },
           provider: { requireParameters: true, ...(this.deps.providerPriceCeiling ? { maxPrice: this.deps.providerPriceCeiling } : {}) },
           ...(this.deps.maxOutputTokens ? { maxTokens: this.deps.maxOutputTokens } : {}),
+          ...(this.deps.temperature !== undefined ? { temperature: this.deps.temperature } : {}),
+          ...(this.deps.seed !== undefined ? { seed: this.deps.seed } : {}),
         };
         const serialized = JSON.stringify(request);
-        this.deps.beforeAttempt?.({ serialized, maxOutputTokens: this.deps.maxOutputTokens });
         const start = Date.now();
         const event: LLMAttemptEvent = { logicalCallId, attemptId: randomUUID(), attempt, correction: correcting,
           startedAt: new Date(start).toISOString(), finishedAt: '', model: null, provider: null,
           promptHash: createHash('sha256').update(serialized).digest('hex'), promptTokens: null, completionTokens: null, cost: null, valid: null, failure: null };
+        this.deps.beforeAttempt?.({ serialized, maxOutputTokens: this.deps.maxOutputTokens, logicalCallId, attemptId: event.attemptId, startedAt: event.startedAt, correction: correcting });
         let retryTransport = false;
         let transportError: unknown;
         try {
@@ -173,7 +181,8 @@ export class OpenRouterLLM implements LLMClient {
           if (controller.signal.aborted) {
             event.failure = controller.signal.reason?.name === 'TimeoutError' ? 'timeout' : 'cancel';
           } else if (!event.failure) {
-            event.failure = error instanceof OpenRouterError && [400, 404, 422].includes(error.statusCode) ? 'unsupported-strict' : 'provider-error';
+            const unsupported = error instanceof OpenRouterError && [400, 404, 422].includes(error.statusCode) && /json_schema|structured.?output|response_format/i.test(error.body.slice(0, 4000)) && /not support|unsupported|not available|no endpoints/i.test(error.body.slice(0, 4000));
+            event.failure = unsupported ? 'unsupported-strict' : 'provider-error';
           }
           retryTransport = !controller.signal.aborted && error instanceof OpenRouterError && error.statusCode >= 500 && error.statusCode < 600 && attempt + 1 < (this.deps.maxAttempts ?? Number.POSITIVE_INFINITY);
           if (!retryTransport) throw normalizeOpenRouterError(error);

@@ -35,14 +35,17 @@ ENV NODE_ENV=production
 # Same Debian base as the builder, so the compiled better-sqlite3 binary is
 # binary-compatible — no toolchain needed here.
 COPY --from=builder --chown=node:node /app/node_modules ./node_modules
-COPY --from=builder --chown=node:node /app/package.json ./package.json
+COPY --from=builder --chown=node:node /app/package.json /app/package-lock.json ./
 COPY --from=builder --chown=node:node /app/src ./src
 COPY --from=builder --chown=node:node /app/web/dist ./web/dist
+COPY --chown=node:node benchmarks/datasets ./benchmarks/datasets
 COPY LICENSE ./LICENSE
 
 # DB_PATH defaults to data/media-agent.db (relative to /app); compose
 # bind-mounts ./data here, so pre-create it and give it to the node user.
 RUN mkdir -p /app/data && chown node:node /app/data
+RUN mkdir -p /home/node/.local/share/media-scout/benchmark-runs \
+  && chown -R node:node /home/node/.local
 USER node
 
 EXPOSE 7877

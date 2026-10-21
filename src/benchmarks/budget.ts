@@ -16,7 +16,7 @@ export interface RequestBound {
   hardMaxDollar?: number;
 }
 
-/** UTF-8 bytes bound token count conservatively; framing adds one token per message. */
+/** Heuristic for non-dollar experiments only; NOT a verified full-request bound. */
 export function conservativePromptTokens(messages: readonly string[]): number {
   return messages.reduce((sum, message) => sum + Buffer.byteLength(message, 'utf8') + 1, 0);
 }

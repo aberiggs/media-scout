@@ -100,3 +100,78 @@ Present the private workbook for annotation/privacy review. No model call is nee
   numeric scope are checked, and replay assembles the ordered per-query ID union.
   Fresh `npm run typecheck`, `npm test` (**857/55**), whitespace and strict OpenSpec
   checks passed after those fixes. No further review relaunch used.
+
+## Full software implementation checkpoint (before paid baseline)
+
+- **11/13 tasks complete.** Integration CI and the actual paid baseline remain
+  unchecked. The latest explicit request and $2 approval select the configured
+  model only; reconciled task 6.2 from the earlier suggested two-model pilot to
+  that approved one-model initial baseline. Multi-model/prompt comparison remains
+  implemented; no unselected second model was silently authorized.
+- Existing metadata/query capture consumes the explicitly reviewed public-metadata
+  manifest; automatic public-catalog discovery is not required for capture and
+  does not bypass human mapping review. Task 3.1's explicit CLI/limits/tests are
+  satisfied by that capture plus the tested sanitizing fixture projection. No
+  indexer recapture was necessary. Task 3.2 now has the formerly missing reviewed,
+  publishable actual-result subset and documented uncertainty/denominators.
+- Implemented six distinct decision tracks and network-free recorded scoring,
+  synthetic edge cases, exact request replay and frozen paired experiment manifests.
+  Added independent identity/claimed-coverage metrics, optional reviewed preference
+  tiers, raw-proposal/validator distinction, unsupported/unavailable retrieval,
+  admission/cap losses and justified/avoidable abstention.
+- Isolated service/API snapshots only registered model connection data; no State,
+  Runner, Watcher, Prowlarr or Arr capability is supplied to execution. Model-only
+  transport rejects other paths/origins, query URLs and redirects. Pending attempts
+  are synchronized before send. Reservations are keyed by logical/transport IDs,
+  including late abort responses; missing accounting remains unknown.
+- Hard-dollar mode quotes structured-output capability and token-only pricing,
+  reserves the whole advertised context and bounded output, and sends provider
+  price ceilings. Conservative-bound absence rejects launch. Local loopback
+  profiles require explicit call/token mode; compute cost stays unknown, never
+  inferred zero or hosted-price equivalent. No paid local/provider fallback occurs.
+- Added model/prompt/dataset/split/track/repeat/budget selection, disclosures,
+  explicit confirmation, polling, cancellation, reload-safe history, comparison,
+  per-case evidence links and sanitized export. No production-settings PUT/cycle
+  is called. One owner process per artifact root is an operator constraint.
+- Independent service review found nonpersistent container results and malformed
+  proposal persistence failures; fixed with separate named artifact volumes,
+  safe malformed-reference evidence, synchronized atomic files and fail-closed
+  storage fault handling. Final review found strict result storage dropped valid
+  grouped attribution; red regressions reproduced both episode and pack-stage
+  failures, now fixed. A six-track service test verifies all paths persist.
+- Extracted production-v1 request builders without editing prompt text. Captured
+  requests on all five default paths before/after extraction compare byte-identical:
+  SHA-256 `051caed0a2db1d98405f2e2eec0c71b8f86ea56b9c9622fc85aa76078b7861f5`.
+  Benchmark variants are registered separately; #15 production tuning is untouched.
+- Rendered the isolated, monitoring-disabled preview on loopback port 7889 with a
+  new `/tmp/opencode/media-scout-benchmark-preview/app.db`, no production settings
+  or credentials. Reviewed desktop 1440x900 and mobile 390x844 captures under
+  `.openchamber/screenshots/issue6-benchmarks-{desktop,mobile}-*.jpg`; forms/navigation
+  fit without page overflow. Keyboard focus trap/Escape/restore covered in tests.
+  Tool-generated screenshots remain local, outside checkpoints.
+
+### Verification
+
+- Focused service/API/transport/LLM/storage/scoring/prompt/safety suites passed;
+  regression failures were observed before their corresponding corrections.
+- `npm run typecheck`: passed.
+- `npm test`: **889 tests / 62 files passed**, including cap-loss attribution,
+  unavailable replay and grounded numbering-role/sequel-variation regressions.
+- `npm --prefix web run typecheck`: passed.
+- `npm --prefix web test`: **54 passed** (including launch, retry-idempotency,
+  active reload/cancel, polling, pagination, comparison and local-cost disclosure).
+- `npm run build`: passed.
+- `python3 -B -m unittest discover -s tests -p 'benchmark*_test.py'`: **24 passed**;
+  CI now runs both capture and projection suites.
+- `git diff --check` and strict OpenSpec validation: passed.
+- Both `docker compose config --quiet` and the published-image Compose equivalent
+  with a dummy image reference passed without starting/building/pulling anything.
+  Source fingerprints include the committed dependency lockfile; it is shipped
+  in the runtime image for reproducible benchmark snapshots.
+- Previous foundations checkpoint f340239 has passing amd64/arm64 image builds and
+  SQLite addon smoke checks in Actions run 39543790261; this new software checkpoint
+  requires its own CI evidence before task 6.1 is complete.
+- **No live model calls yet.** Next: publish this verified software checkpoint,
+  run exactly one idempotent configured-model baseline with a $2 total cap using
+  selected AI connection fields piped from SQLite RO/query-only access, inspect
+  and publish sanitized per-case results, then verify the new remote CI state.

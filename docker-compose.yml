@@ -29,4 +29,8 @@ services:
       # the host dir too (`mkdir -p data`) or Docker creates it root-owned and the
       # daemon exits on the DB permission error — see README Troubleshooting.
       - ./data:/app/data
+      # Separate from SQLite; retains paid evidence/idempotency across recreation.
+      - benchmark-artifacts:/home/node/.local/share/media-scout/benchmark-runs
     restart: unless-stopped
+volumes:
+  benchmark-artifacts:

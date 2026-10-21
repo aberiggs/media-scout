@@ -42,3 +42,44 @@ it('does not emit unexpected provider-returned model strings', async () => {
   expect(events[0]!.model).toBeNull();
   expect(JSON.stringify(events)).not.toMatch(/Bearer|sk-proj/);
 });
+it('sends benchmark-only generation controls without changing ordinary client defaults', async () => {
+  const scope = nock(base).post('/chat/completions', b => b.temperature === 0 && b.seed === 42).reply(200, body('{"ok":true}'));
+  const llm = new OpenRouterLLM({ client: new OpenRouter({ apiKey: 'canary', serverURL: base }), model: 'test', temperature: 0, seed: 42 });
+  await llm.json({ system: 's', user: 'u', schema: z.object({ ok: z.boolean() }), label: 'test' });
+  expect(scope.isDone()).toBe(true);
+});
+it('accounts 5xx retries as transport attempts, not JSON corrections', async () => {
+  const events: LLMAttemptEvent[] = [];
+  nock(base).post('/chat/completions').reply(503, { error: { message: 'unavailable' } }, { 'retry-after-ms': '1' });
+  nock(base).post('/chat/completions').reply(200, body('{"ok":true}'));
+  const llm = new OpenRouterLLM({ client: new OpenRouter({ apiKey: 'canary', serverURL: base }), model: 'test', maxAttempts: 2, onAttempt: e => events.push(e) });
+  await llm.json({ system: 's', user: 'u', schema: z.object({ ok: z.boolean() }), label: 'test' });
+  expect(events.map(e => [e.failure, e.correction])).toEqual([['provider-error', false], [null, false]]);
+  expect(events[0]!.logicalCallId).toBe(events[1]!.logicalCallId);
+});
+it('records refusals and aborts new attempts during retry backoff', async () => {
+  const events: LLMAttemptEvent[] = [];
+  nock(base).post('/chat/completions').reply(200, { ...body(''), choices: [{ index: 0, message: { role: 'assistant', content: '', refusal: 'no' }, finish_reason: 'stop' }] });
+  const client = new OpenRouter({ apiKey: 'canary', serverURL: base });
+  await expect(new OpenRouterLLM({ client, model: 'test', onAttempt: e => events.push(e) }).json({ system: 's', user: 'u', schema: z.object({ ok: z.boolean() }), label: 'test' })).rejects.toThrow(/refusal/);
+  expect(events[0]!.failure).toBe('refusal');
+  const controller = new AbortController();
+  nock(base).post('/chat/completions').reply(503, { error: { message: 'unavailable' } });
+  await expect(new OpenRouterLLM({ client, model: 'test', signal: controller.signal, onAttempt: e => { events.push(e); controller.abort(); } }).json({ system: 's', user: 'u', schema: z.object({ ok: z.boolean() }), label: 'test' })).rejects.toThrow();
+  expect(events).toHaveLength(2);
+});
+it.each([['context length exceeded', 'provider-error'], ['json_schema is not supported by this provider', 'unsupported-strict']])('classifies output-capability failure without publishing provider messages: %s', async (message, failure) => {
+  const events: LLMAttemptEvent[] = [];
+  nock(base).post('/chat/completions').reply(400, { error: { message } });
+  const llm = new OpenRouterLLM({ client: new OpenRouter({ apiKey: 'canary', serverURL: base }), model: 'test', onAttempt: e => events.push(e) });
+  await expect(llm.json({ system: 's', user: 'u', schema: z.object({ ok: z.boolean() }), label: 'test' })).rejects.toThrow();
+  expect(events[0]!.failure).toBe(failure);
+  expect(JSON.stringify(events)).not.toContain(message);
+});
+it('binds durable reservations to attempt identities before transport starts', async () => {
+  const reservations: unknown[] = [], events: LLMAttemptEvent[] = [];
+  nock(base).post('/chat/completions').reply(200, body('{"ok":true}'));
+  const llm = new OpenRouterLLM({ client: new OpenRouter({ apiKey: 'canary', serverURL: base }), model: 'test', beforeAttempt: r => reservations.push(r), onAttempt: e => events.push(e) });
+  await llm.json({ system: 's', user: 'u', schema: z.object({ ok: z.boolean() }), label: 'test' });
+  expect(reservations[0]).toMatchObject({ attemptId: events[0]!.attemptId, logicalCallId: events[0]!.logicalCallId });
+});

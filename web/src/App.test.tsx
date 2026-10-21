@@ -266,7 +266,7 @@ describe('operations dashboard', () => {
     assert.ok(screen.getByText('Details'))
     assert.ok(operationRequests.some(({ input }) => new URL(String(input), 'http://localhost').searchParams.get('scope') === 'active'))
     const navigation = screen.getByRole('navigation', { name: 'Workspace' })
-    for (const label of ['Queue', 'Reviews', 'Search history', 'Settings']) assert.ok(within(navigation).getByRole('link', { name: label }))
+    for (const label of ['Queue', 'Reviews', 'Search history', 'Benchmarks', 'Settings']) assert.ok(within(navigation).getByRole('link', { name: label }))
     assert.equal(screen.getByRole('link', { name: 'Queue' }).getAttribute('aria-current'), 'page')
   })
 

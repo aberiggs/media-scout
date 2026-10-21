@@ -28,6 +28,7 @@ describe('benchmark artifact storage', () => {
   });
   it('rejects malformed and secret-bearing artifacts before persistence', () => {
     expect(DatasetSchema.safeParse({ ...fixture, surprise: 'x' }).success).toBe(false);
+    for (const title of ['Bearer sk-proj-AbCdEfGhIjKlMnOp', 'ftp://private.invalid/release']) expect(DatasetSchema.safeParse({ ...fixture, cases: [{ ...firstCase, input: { ...firstCase.input, title } }] }).success).toBe(false);
     expect(DatasetSchema.safeParse({ ...fixture, cases: [{ ...firstCase, input: { ...firstCase.input, title: 'release https://private.invalid/?api_key=canary' } }] }).success).toBe(false);
     expect(DatasetSchema.safeParse({ ...fixture, cases: [{ ...firstCase, candidates: [{ ...firstCase.candidates[0]!, size: Number.POSITIVE_INFINITY }] }] }).success).toBe(false);
     expect(DatasetSchema.safeParse({ ...fixture, cases: [{ ...firstCase, label: { ...firstCase.label, acceptableCandidateIds: ['not-local'] } }] }).success).toBe(false);
@@ -78,6 +79,14 @@ describe('benchmark artifact storage', () => {
       expect(() => store.saveRun({ ...run, datasetRevision: 2 })).toThrow(/lineage/i);
       store.saveRun({ ...run, status: 'completed' });
       expect(() => store.saveRun(run)).toThrow(/transition/i);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('fails before writing when the byte ceiling is exhausted', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'benchmark-bytes-'));
+    try {
+      const store = new BenchmarkStorage(dir, { maxFiles: 100, maxBytes: 100 });
+      expect(() => store.saveDataset(fixture)).toThrow(/limit/);
+      expect(store.listDatasets()).toEqual([]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

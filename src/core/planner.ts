@@ -99,13 +99,7 @@ export class Planner {
 
   /** 1–3 Prowlarr queries for the unit. LLM errors propagate (runner catches per-unit). */
   async plan(unit: WorkUnit): Promise<PlannedQuery[]> {
-    const result = await this.deps.llm.json({
-      system: SYSTEM_PROMPT,
-      user: describeUnit(unit),
-      schema: plannedQueriesSchema,
-      jsonSchema: { name: 'planner_queries', schema: plannerJsonSchema },
-      label: `planner:${unit.key}`,
-    });
+    const result = await this.deps.llm.json(buildSinglePlannerRequest(unit));
     // Normalize the bare-array shape to the internal envelope (see schema comment).
     return Array.isArray(result) ? result : result.queries;
   }
@@ -113,7 +107,20 @@ export class Planner {
   /** Plans broad grouped queries, retaining only supplied target indices as query intent. */
   async planGroup(args: { group: WorkGroup; context: PlanningContext; stage?: AcquisitionStage }): Promise<GroupPlannedQuery[]> {
     validateGroupTargets(args.group);
-    const result = await this.deps.llm.json({
+    const result = await this.deps.llm.json(buildGroupPlannerRequest(args));
+
+    validateGroupPlan(args, result.queries);
+    return result.queries;
+  }
+}
+
+/** production-v1 builders: default request bytes remain unchanged. */
+export function buildSinglePlannerRequest(unit: WorkUnit) {
+  return { system: SYSTEM_PROMPT, user: describeUnit(unit), schema: plannedQueriesSchema,
+    jsonSchema: { name: 'planner_queries', schema: plannerJsonSchema }, label: `planner:${unit.key}` };
+}
+export function buildGroupPlannerRequest(args: { group: WorkGroup; context: PlanningContext; stage?: AcquisitionStage }) {
+  return {
       system: GROUP_SYSTEM_PROMPT,
       user: serializeGroupPlannerInput(args),
       schema: groupPlanEnvelopeSchema,
@@ -121,11 +128,7 @@ export class Planner {
         ? { name: 'group_episode_queries', schema: groupEpisodePlanJsonSchema }
         : { name: 'group_planner_queries', schema: groupPlanJsonSchema },
       label: `planner:group:${args.group.key}`,
-    });
-
-    validateGroupPlan(args, result.queries);
-    return result.queries;
-  }
+  };
 }
 
 /** The runner also validates injected planner implementations before attributing paid work. */

@@ -180,18 +180,7 @@ export class QueueAssociator {
 
   async associate(request: AssociationRequest): Promise<AssociationDecision[]> {
     assertRequestLookup(request);
-    const response = await this.deps.llm.json({
-      system: ASSOCIATION_SYSTEM_PROMPT,
-      user: JSON.stringify({
-        promptVersion: request.promptVersion,
-        queue: request.queue,
-        media: request.media,
-        targets: request.targets,
-      }),
-      schema: associationResponseSchema,
-      label: 'queue association',
-      jsonSchema: { name: 'association_response', schema: associationResponseJsonSchema },
-    });
+    const response = await this.deps.llm.json(buildAssociationPrompt(request));
     const parsed = associationResponseSchema.parse(response);
     const seenQueue = new Set<number>();
     const result: AssociationDecision[] = [];
@@ -257,6 +246,13 @@ const ASSOCIATION_SYSTEM_PROMPT = [
   'This is content association only: do not infer queue activity, successful submission, import success, or permission to mutate anything.',
   'Return exactly one decision for every queue row. Unrelated and uncertain decisions must have empty mediaIndices and targetIndices.',
 ].join(' ');
+
+/** production-v1: private lookup tables never enter the rendered request. */
+export function buildAssociationPrompt(request: Pick<AssociationRequest, 'promptVersion' | 'queue' | 'media' | 'targets'>) {
+  return { system: ASSOCIATION_SYSTEM_PROMPT,
+    user: JSON.stringify({ promptVersion: request.promptVersion, queue: request.queue, media: request.media, targets: request.targets }),
+    schema: associationResponseSchema, label: 'queue association', jsonSchema: { name: 'association_response', schema: associationResponseJsonSchema } };
+}
 
 function makeMediaEntries(arr: 'sonarr' | 'radarr', snapshot: LibrarySnapshot): MediaEntry[] {
   if (arr === 'sonarr') return snapshot.sonarr.series.map(({ series }): MediaEntry => ({

@@ -12,6 +12,7 @@ import {
   EyeOff,
   Film,
   History,
+  FlaskConical,
   KeyRound,
   LoaderCircle,
   LockKeyhole,
@@ -25,6 +26,7 @@ import {
 } from 'lucide-react'
 import { mergeSettings, type Settings, type SettingsEnvelope, type SettingsStatus } from './types'
 import { OperationsPage } from './Operations'
+import { Benchmarks } from './Benchmarks'
 
 const MAX_INTERVAL_MINUTES = 35_791
 
@@ -44,11 +46,11 @@ class SettingsRequestError extends Error {
 }
 
 type Notice = { kind: 'error' | 'success' | 'info'; text: string; details?: string[] } | null
-type Page = 'queue' | 'reviews' | 'activity' | 'settings'
+type Page = 'queue' | 'reviews' | 'activity' | 'benchmarks' | 'settings'
 
 function currentPage(): Page {
   const page = window.location.hash.slice(1)
-  return page === 'reviews' || page === 'activity' || page === 'settings' ? page : 'queue'
+  return page === 'reviews' || page === 'activity' || page === 'benchmarks' || page === 'settings' ? page : 'queue'
 }
 
 const issueFieldLabels: Record<string, string> = {
@@ -260,7 +262,7 @@ function App() {
   }
 
   const saveLabel = saving ? 'Saving…' : isDirty ? 'Save changes' : 'All changes saved'
-  const pageLabels: Record<Page, string> = { queue: 'Queue', reviews: 'Manual review', activity: 'Search history', settings: 'Settings' }
+  const pageLabels: Record<Page, string> = { queue: 'Queue', reviews: 'Manual review', activity: 'Search history', benchmarks: 'Benchmarks', settings: 'Settings' }
   const missingSettings = status?.missing ?? []
   const prowlarrConfigured = Boolean(settings?.integrations.prowlarr.url && settings.integrations.prowlarr.apiKey && settings.integrations.prowlarr.tvClient && settings.integrations.prowlarr.movieClient)
 
@@ -277,6 +279,7 @@ function App() {
           <a className={`nav-item ${page === 'queue' ? 'active' : ''}`} href="#queue" aria-current={page === 'queue' ? 'page' : undefined}><Activity size={17} /> Queue {page === 'queue' && <span className="nav-dot" />}</a>
           <a className={`nav-item ${page === 'reviews' ? 'active' : ''}`} href="#reviews" aria-current={page === 'reviews' ? 'page' : undefined}><ShieldCheck size={17} /> Reviews {page === 'reviews' && <span className="nav-dot" />}</a>
           <a className={`nav-item ${page === 'activity' ? 'active' : ''}`} href="#activity" aria-current={page === 'activity' ? 'page' : undefined}><History size={17} /> Search history {page === 'activity' && <span className="nav-dot" />}</a>
+          <a className={`nav-item ${page === 'benchmarks' ? 'active' : ''}`} href="#benchmarks" aria-current={page === 'benchmarks' ? 'page' : undefined}><FlaskConical size={17} /> Benchmarks {page === 'benchmarks' && <span className="nav-dot" />}</a>
           <a className={`nav-item ${page === 'settings' ? 'active' : ''}`} href="#settings" aria-current={page === 'settings' ? 'page' : undefined}><Settings2 size={17} /> Settings {page === 'settings' && <span className="nav-dot" />}</a>
         </nav>
 
@@ -449,7 +452,7 @@ function App() {
               </fieldset>
             </form>
           )}
-          </> : <OperationsPage page={page} />}
+          </> : page === 'benchmarks' ? <Benchmarks /> : <OperationsPage page={page} />}
           <footer className="page-footer"><span>MEDIA SCOUT</span><span className="footer-divider" /><span>MADE FOR YOUR HOME LAB</span></footer>
         </main>
       </div>

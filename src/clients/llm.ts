@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { OpenRouter } from '@openrouter/sdk';
 import { OpenRouterError } from '@openrouter/sdk/models/errors';
 import { ApiError } from '../http';
+import { createHash, randomUUID } from 'node:crypto';
 
 const JSON_DEADLINE_MS = 60_000;
 const RETRY_INITIAL_INTERVAL_MS = 500;
@@ -18,6 +19,28 @@ export interface LLMClient {
     /** Explicit provider-compatible JSON Schema for refinements/nullable wire fields. */
     jsonSchema?: { name: string; schema: Record<string, unknown> };
   }): Promise<T>;
+}
+
+export type LLMFailureCode = 'refusal' | 'invalid-json' | 'schema-error' | 'unsupported-strict' | 'provider-error' | 'timeout' | 'cancel';
+export interface LLMAttemptEvent {
+  logicalCallId: string;
+  attemptId: string;
+  attempt: number;
+  correction: boolean;
+  startedAt: string;
+  finishedAt: string;
+  model: string | null;
+  provider: string | null;
+  promptHash: string;
+  promptTokens: number | null;
+  completionTokens: number | null;
+  cost: number | null;
+  valid: boolean | null;
+  failure: LLMFailureCode | null;
+}
+export interface LLMAttemptReservation {
+  serialized: string; maxOutputTokens: number | undefined;
+  logicalCallId: string; attemptId: string; startedAt: string; correction: boolean;
 }
 
 /**
@@ -70,6 +93,14 @@ export class OpenRouterLLM implements LLMClient {
       model: string;
       /** Test seam; production calls use the fixed one-minute JSON deadline. */
       timeoutMs?: number;
+      signal?: AbortSignal;
+      maxOutputTokens?: number;
+      maxAttempts?: number;
+      onAttempt?: (event: LLMAttemptEvent) => void;
+      beforeAttempt?: (request: LLMAttemptReservation) => void;
+      providerPriceCeiling?: { prompt: string; completion: string; request: string };
+      temperature?: number;
+      seed?: number;
     },
   ) {}
 
@@ -79,8 +110,13 @@ export class OpenRouterLLM implements LLMClient {
     schema: z.ZodType<T>;
     label: string;
     jsonSchema?: { name: string; schema: Record<string, unknown> };
+    signal?: AbortSignal;
   }): Promise<T> {
     const controller = new AbortController();
+    const externalSignal = args.signal ?? this.deps.signal;
+    const abort = () => controller.abort(externalSignal?.reason);
+    externalSignal?.addEventListener('abort', abort, { once: true });
+    if (externalSignal?.aborted) abort();
     const timeoutMs = this.deps.timeoutMs ?? JSON_DEADLINE_MS;
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<never>((_resolve, reject) => {
@@ -93,28 +129,71 @@ export class OpenRouterLLM implements LLMClient {
     });
 
     const operation = (async () => {
+      const logicalCallId = randomUUID();
+      let correcting = false;
+      let retryIndex = 0;
       for (let attempt = 0; ; attempt++) {
-        const content = await this.complete(
-          args.system,
-          args.user,
-          args.schema,
-          args.jsonSchema,
-          attempt > 0,
-          controller.signal,
-        );
+        if (controller.signal.aborted) throw controller.signal.reason;
+        if (attempt >= (this.deps.maxAttempts ?? Number.POSITIVE_INFINITY)) throw new Error('LLM attempt limit reached');
+        const request = {
+          model: this.deps.model,
+          messages: [
+            { role: 'system' as const, content: args.system },
+            { role: 'user' as const, content: args.user },
+            ...(correcting ? [{ role: 'user' as const, content: 'Correction: Return only a JSON value that conforms to the requested JSON Schema. Do not include prose, markdown, or explanations.' }] : []),
+          ],
+          responseFormat: { type: 'json_schema' as const, jsonSchema: { name: args.jsonSchema?.name ?? 'llm_output', strict: true, schema: args.jsonSchema?.schema ?? withoutMetaSchema(z.toJSONSchema(args.schema)) } },
+          provider: { requireParameters: true, ...(this.deps.providerPriceCeiling ? { maxPrice: this.deps.providerPriceCeiling } : {}) },
+          ...(this.deps.maxOutputTokens ? { maxTokens: this.deps.maxOutputTokens } : {}),
+          ...(this.deps.temperature !== undefined ? { temperature: this.deps.temperature } : {}),
+          ...(this.deps.seed !== undefined ? { seed: this.deps.seed } : {}),
+        };
+        const serialized = JSON.stringify(request);
+        const start = Date.now();
+        const event: LLMAttemptEvent = { logicalCallId, attemptId: randomUUID(), attempt, correction: correcting,
+          startedAt: new Date(start).toISOString(), finishedAt: '', model: null, provider: null,
+          promptHash: createHash('sha256').update(serialized).digest('hex'), promptTokens: null, completionTokens: null, cost: null, valid: null, failure: null };
+        this.deps.beforeAttempt?.({ serialized, maxOutputTokens: this.deps.maxOutputTokens, logicalCallId, attemptId: event.attemptId, startedAt: event.startedAt, correction: correcting });
+        let retryTransport = false;
+        let transportError: unknown;
         try {
-          const parsed = JSON.parse(stripFences(content)) as unknown;
-          return args.schema.parse(parsed);
-        } catch (e) {
-          if (e instanceof z.ZodError) {
-            throw e; // zod failure at the LLM boundary (I8): no retry.
+          const completion = await this.deps.client.chat.send({ chatRequest: request }, { signal: controller.signal, retries: { strategy: 'none' } });
+          if (completion instanceof ReadableStream) { event.failure = 'provider-error'; throw new Error('LLM returned a stream; non-streaming completion required'); }
+          // Never persist arbitrary provider-returned strings as model identity.
+          event.model = completion.model === this.deps.model ? completion.model : null;
+          event.promptTokens = finiteUsage(completion.usage?.promptTokens);
+          event.completionTokens = finiteUsage(completion.usage?.completionTokens);
+          event.cost = finiteUsage(completion.usage?.cost);
+          const message = completion.choices[0]?.message;
+          if (typeof message?.refusal === 'string' && message.refusal.trim()) { event.failure = 'refusal'; throw new Error('LLM completion included a refusal'); }
+          if (typeof message?.content !== 'string') { event.failure = 'provider-error'; throw new Error('LLM completion had no string message content'); }
+          let parsed: unknown;
+          try { parsed = JSON.parse(stripFences(message.content)); }
+          catch {
+            event.failure = 'invalid-json'; event.valid = false;
+            if (correcting) throw new Error(`LLM ${args.label}: unparseable JSON after retry`);
+            correcting = true;
+            continue;
           }
-          const last = e instanceof Error ? e : undefined;
-          if (attempt === 1) {
-            throw new Error(
-              `LLM ${args.label}: unparseable JSON after retry: ${last?.message ?? String(e)}`,
-            );
+          try { const result = args.schema.parse(parsed); event.valid = true; return result; }
+          catch (error) { event.failure = 'schema-error'; event.valid = false; throw error; }
+        } catch (error) {
+          if (controller.signal.aborted) {
+            event.failure = controller.signal.reason?.name === 'TimeoutError' ? 'timeout' : 'cancel';
+          } else if (!event.failure) {
+            const unsupported = error instanceof OpenRouterError && [400, 404, 422].includes(error.statusCode) && /json_schema|structured.?output|response_format/i.test(error.body.slice(0, 4000)) && /not support|unsupported|not available|no endpoints/i.test(error.body.slice(0, 4000));
+            event.failure = unsupported ? 'unsupported-strict' : 'provider-error';
           }
+          retryTransport = !controller.signal.aborted && error instanceof OpenRouterError && error.statusCode >= 500 && error.statusCode < 600 && attempt + 1 < (this.deps.maxAttempts ?? Number.POSITIVE_INFINITY);
+          if (!retryTransport) throw normalizeOpenRouterError(error);
+          transportError = error;
+        } finally {
+          event.finishedAt = new Date().toISOString();
+          this.deps.onAttempt?.(event);
+        }
+        if (retryTransport) {
+          const interval = Math.min(retryAfterMs(transportError as OpenRouterError) ?? RETRY_INITIAL_INTERVAL_MS * Math.pow(retryIndex++, RETRY_EXPONENT) + Math.random() * 1000, RETRY_MAX_INTERVAL_MS);
+          await waitForRetry(interval, controller.signal);
         }
       }
     })();
@@ -122,92 +201,14 @@ export class OpenRouterLLM implements LLMClient {
       return await Promise.race([operation, deadline]);
     } finally {
       if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+      externalSignal?.removeEventListener('abort', abort);
     }
   }
 
-  private async complete(
-    system: string,
-    user: string,
-    schema: z.ZodType<unknown>,
-    jsonSchema: { name: string; schema: Record<string, unknown> } | undefined,
-    correcting: boolean,
-    signal: AbortSignal,
-  ): Promise<string> {
-    const generatedSchema = jsonSchema?.schema ?? withoutMetaSchema(z.toJSONSchema(schema));
-    let completion: Awaited<ReturnType<OpenRouter['chat']['send']>>;
-    try {
-      completion = await this.sendWithRetry({
-        model: this.deps.model,
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: user },
-          ...(correcting
-            ? [{
-                role: 'user' as const,
-                content: 'Correction: Return only a JSON value that conforms to the requested JSON Schema. Do not include prose, markdown, or explanations.',
-              }]
-            : []),
-        ],
-        responseFormat: {
-          type: 'json_schema',
-          jsonSchema: {
-            name: jsonSchema?.name ?? 'llm_output',
-            strict: true,
-            schema: generatedSchema,
-          },
-        },
-        provider: { requireParameters: true },
-      }, signal);
-    } catch (error) {
-      throw normalizeOpenRouterError(error);
-    }
-    if (completion instanceof ReadableStream) {
-      throw new Error('LLM returned a stream; non-streaming completion required');
-    }
-    const message = completion.choices[0]?.message;
-    if (typeof message?.refusal === 'string' && message.refusal.trim() !== '') {
-      throw new Error('LLM completion included a refusal');
-    }
-    const content = message?.content;
-    if (typeof content !== 'string') {
-      throw new Error('LLM completion had no string message content');
-    }
-    return content;
-  }
+}
 
-  /** Retry recognized SDK 5xx errors with bounded, abortable backoff. */
-  private async sendWithRetry(
-    chatRequest: Parameters<OpenRouter['chat']['send']>[0]['chatRequest'],
-    signal: AbortSignal,
-  ): Promise<Awaited<ReturnType<OpenRouter['chat']['send']>>> {
-    const startedAt = Date.now();
-    let retryIndex = 0;
-    for (;;) {
-      if (signal.aborted) throw signal.reason;
-      try {
-        // The SDK's backoff sleeps cannot be aborted. Keep its configured retry
-        // behavior for recognized HTTP errors here so the JSON deadline also bounds waits.
-        return await this.deps.client.chat.send({ chatRequest }, {
-          signal,
-          retries: { strategy: 'none' },
-        });
-      } catch (error) {
-        if (signal.aborted) throw signal.reason ?? error;
-        if (!(error instanceof OpenRouterError) || error.statusCode < 500 || error.statusCode >= 600) {
-          throw error;
-        }
-        // Match the SDK's maxElapsedTime check: stop once a failed attempt returns
-        // after the configured window; the enclosing deadline is the hard bound.
-        if (Date.now() - startedAt > JSON_DEADLINE_MS) throw error;
-        const interval = Math.min(
-          retryAfterMs(error) ?? RETRY_INITIAL_INTERVAL_MS * Math.pow(retryIndex, RETRY_EXPONENT) + Math.random() * 1000,
-          RETRY_MAX_INTERVAL_MS,
-        );
-        await waitForRetry(interval, signal);
-        retryIndex++;
-      }
-    }
-  }
+function finiteUsage(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
 function retryAfterMs(error: OpenRouterError): number | undefined {

@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "cases": [
+    {"id":"blue-box","kind":"anime","title":"Blue Box","queries":[
+      {"family":"broad-title","query":"Blue Box","categories":[5000,6000]},
+      {"family":"seasonal","query":"Blue Box S02","categories":[5000,6000]},
+      {"family":"episode","query":"Blue Box S02E01","categories":[5000,6000]},
+      {"family":"alternate-episode","query":"Ao no Hako S02E01","categories":[5000,6000]},
+      {"family":"absolute","query":"Blue Box 26","categories":[5000,6000]},
+      {"family":"alternate-broad","query":"Ao no Hako","categories":[5000,6000]}]},
+    {"id":"frieren","kind":"anime","title":"Frieren: Beyond Journey's End","queries":[
+      {"family":"broad-title","query":"Frieren","categories":[5000,6000]},
+      {"family":"seasonal","query":"Frieren S02","categories":[5000,6000]},
+      {"family":"episode","query":"Frieren S02E01","categories":[5000,6000]},
+      {"family":"alternate-episode","query":"Sousou no Frieren S02E01","categories":[5000,6000]},
+      {"family":"absolute","query":"Frieren 29","categories":[5000,6000]},
+      {"family":"alternate-broad","query":"Sousou no Frieren","categories":[5000,6000]}]},
+    {"id":"apothecary-diaries","kind":"anime","title":"The Apothecary Diaries","queries":[
+      {"family":"broad-title","query":"The Apothecary Diaries","categories":[5000,6000]},
+      {"family":"seasonal","query":"The Apothecary Diaries S02","categories":[5000,6000]},
+      {"family":"episode","query":"The Apothecary Diaries S02E01","categories":[5000,6000]},
+      {"family":"alternate-episode","query":"Kusuriya no Hitorigoto S02E01","categories":[5000,6000]},
+      {"family":"absolute","query":"The Apothecary Diaries 25","categories":[5000,6000]},
+      {"family":"alternate-broad","query":"Kusuriya no Hitorigoto","categories":[5000,6000]}]},
+    {"id":"one-piece","kind":"anime","title":"One Piece","queries":[
+      {"family":"broad-title","query":"One Piece","categories":[5000,6000]},
+      {"family":"seasonal","query":"One Piece S22","categories":[5000,6000]},
+      {"family":"episode","query":"One Piece S22E01","categories":[5000,6000]},
+      {"family":"alternate-episode","query":"One Piece S22E01","categories":[5000,6000]},
+      {"family":"absolute","query":"One Piece 1086","categories":[5000,6000]},
+      {"family":"alternate-broad","query":"One Piece","categories":[5000,6000]}]},
+    {"id":"the-bear","kind":"tv","title":"The Bear","queries":[
+      {"family":"broad-title","query":"The Bear","categories":[5000]},
+      {"family":"seasonal","query":"The Bear S02","categories":[5000]},
+      {"family":"episode","query":"The Bear S02E01","categories":[5000]},
+      {"family":"season-word","query":"The Bear Season 2","categories":[5000]}]},
+    {"id":"abbott-elementary","kind":"tv","title":"Abbott Elementary","queries":[
+      {"family":"broad-title","query":"Abbott Elementary","categories":[5000]},
+      {"family":"seasonal","query":"Abbott Elementary S02","categories":[5000]},
+      {"family":"episode","query":"Abbott Elementary S02E01","categories":[5000]},
+      {"family":"season-word","query":"Abbott Elementary Season 2","categories":[5000]}]},
+    {"id":"severance","kind":"tv","title":"Severance","queries":[
+      {"family":"broad-title","query":"Severance","categories":[5000]},
+      {"family":"seasonal","query":"Severance S02","categories":[5000]},
+      {"family":"episode","query":"Severance S02E01","categories":[5000]},
+      {"family":"season-word","query":"Severance Season 2","categories":[5000]}]},
+    {"id":"the-last-of-us","kind":"tv","title":"The Last of Us","queries":[
+      {"family":"broad-title","query":"The Last of Us","categories":[5000]},
+      {"family":"seasonal","query":"The Last of Us S02","categories":[5000]},
+      {"family":"episode","query":"The Last of Us S02E01","categories":[5000]},
+      {"family":"season-word","query":"The Last of Us Season 2","categories":[5000]}]},
+    {"id":"dune-part-two","kind":"movie","title":"Dune: Part Two","queries":[
+      {"family":"broad-title","query":"Dune Part Two","categories":[2000]},
+      {"family":"title-year","query":"Dune Part Two 2024","categories":[2000]},
+      {"family":"title-year-parentheses","query":"Dune Part Two (2024)","categories":[2000]}]},
+    {"id":"everything-everywhere","kind":"movie","title":"Everything Everywhere All at Once","queries":[
+      {"family":"broad-title","query":"Everything Everywhere All at Once","categories":[2000]},
+      {"family":"title-year","query":"Everything Everywhere All at Once 2022","categories":[2000]},
+      {"family":"title-year-parentheses","query":"Everything Everywhere All at Once (2022)","categories":[2000]}]},
+    {"id":"the-batman","kind":"movie","title":"The Batman","queries":[
+      {"family":"broad-title","query":"The Batman","categories":[2000]},
+      {"family":"title-year","query":"The Batman 2022","categories":[2000]},
+      {"family":"title-year-parentheses","query":"The Batman (2022)","categories":[2000]}]},
+    {"id":"oppenheimer","kind":"movie","title":"Oppenheimer","queries":[
+      {"family":"broad-title","query":"Oppenheimer","categories":[2000]},
+      {"family":"title-year","query":"Oppenheimer 2023","categories":[2000]},
+      {"family":"title-year-parentheses","query":"Oppenheimer (2023)","categories":[2000]}]}
+  ]
+}

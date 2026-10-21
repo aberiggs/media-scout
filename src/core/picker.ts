@@ -128,17 +128,7 @@ export class Picker {
       throw new Error('picker: candidates must be non-empty (runner bug if hit)');
     }
 
-    const verdict = await this.deps.llm.json({
-      system: PICKER_SYSTEM_PROMPT,
-      user: JSON.stringify({
-        unit: unitJson(args.unit),
-        candidates: args.candidates.map(candidateJson),
-        mediaPreferences: this.deps.mediaPreferences ?? '',
-      }),
-      schema: providerVerdictSchema,
-      jsonSchema: { name: 'picker_verdict', schema: providerVerdictJsonSchema },
-      label: `picker:${args.unit.key}`,
-    });
+    const verdict = await this.deps.llm.json(buildSinglePickerRequest(args, this.deps.mediaPreferences));
 
     const normalizedVerdict = pickVerdictSchema.parse({
       verdict: verdict.verdict,
@@ -163,16 +153,25 @@ export class Picker {
     if (args.candidates.length === 0) throw new Error('group picker requires at least one candidate');
     for (const candidate of args.candidates) validateCandidateCoverage(args.group, candidate);
 
-    const envelope = await this.deps.llm.json({
-      system: GROUP_PICKER_SYSTEM_PROMPT,
-      user: serializeGroupPickerInput({ ...args, mediaPreferences: this.deps.mediaPreferences }),
-      schema: groupSelectionEnvelopeSchema,
-      jsonSchema: { name: 'group_picker_selection', schema: groupSelectionJsonSchema },
-      label: `picker:group:${args.group.key}`,
-    });
+    const envelope = await this.deps.llm.json(buildGroupPickerRequest(args, this.deps.mediaPreferences));
     validateGroupSelection(args.group, args.context, args.candidates, envelope.selection, limit);
     return envelope.selection;
   }
+}
+
+/** production-v1 builders: benchmarks register variants without editing defaults. */
+export function buildSinglePickerRequest(args: { unit: WorkUnit; candidates: Candidate[] }, mediaPreferences?: string) {
+  return { system: PICKER_SYSTEM_PROMPT, user: JSON.stringify({ unit: unitJson(args.unit), candidates: args.candidates.map(candidateJson), mediaPreferences: mediaPreferences ?? '' }),
+    schema: providerVerdictSchema, jsonSchema: { name: 'picker_verdict', schema: providerVerdictJsonSchema }, label: `picker:${args.unit.key}` };
+}
+export function buildGroupPickerRequest(args: { group: WorkGroup; context: PlanningContext; candidates: GroupCandidate[]; selectionLimit?: number }, mediaPreferences?: string) {
+  return {
+      system: GROUP_PICKER_SYSTEM_PROMPT,
+      user: serializeGroupPickerInput({ ...args, mediaPreferences }),
+      schema: groupSelectionEnvelopeSchema,
+      jsonSchema: { name: 'group_picker_selection', schema: groupSelectionJsonSchema },
+      label: `picker:group:${args.group.key}`,
+  };
 }
 
 const GROUP_PICKER_SYSTEM_PROMPT = `You judge releases for one supplied group of actual missing media targets. Return exactly {"selection":{"verdict":"grab","releaseIndices":[0],"manualTargetIndices":[],"deferredTargetIndices":[],"reason":"..."}}. The verdict must be exactly one of grab, manual, or skip. Choose a practical best plausible suitable non-overlapping set. Prefer a competitive combined multi-season pack over multiple releases when the evidence and size plausibility are comparable; separate releases are fine when they are better or needed. Ordinary quality ties, incomplete metadata, and lack of a perfect match do not by themselves require manual review. Use manual only for genuinely unresolved identity or ambiguous evidence; clearly wrong content must never be grabbed. Use skip when candidates are clearly unsuitable.

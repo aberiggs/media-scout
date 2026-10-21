@@ -15,4 +15,7 @@ services:
       - "127.0.0.1:${HTTP_PORT:-7877}:${HTTP_PORT:-7877}"
     volumes:
       - ./data:/app/data
+      - benchmark-artifacts:/home/node/.local/share/media-scout/benchmark-runs
     restart: unless-stopped
+volumes:
+  benchmark-artifacts:

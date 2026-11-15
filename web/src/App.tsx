@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useId, useMemo, useState, type FormEvent, type ReactNode } from 'react'
-import { Activity as ActivityIcon, Bot, Check, CheckCircle2, CircleAlert, Eye, EyeOff, Film, KeyRound, Radio, Search as SearchIcon, Settings2, ShieldCheck, SlidersHorizontal, Tv, Waves } from 'lucide-react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import { Activity as ActivityIcon, Bot, Check, CheckCircle2, CircleAlert, Copy, Eye, EyeOff, Film, KeyRound, Radio, Search as SearchIcon, Settings2, ShieldCheck, SlidersHorizontal, Tv, Waves } from 'lucide-react'
 import { defaults, mergeSettings, type Settings, type SettingsEnvelope } from './types'
 import { SearchPage } from './Search'
 import { ActivityPage, AutomationPage } from './Activity'
@@ -10,25 +10,35 @@ function pageFromHash(): Page { const value = location.hash.slice(1); return ['a
 export default function App() {
   const [page, setPage] = useState<Page>(pageFromHash), [openedSearch, setOpenedSearch] = useState<string>()
   const [settings, setSettings] = useState<Settings>(defaults), [status, setStatus] = useState<SettingsEnvelope['status'] | null>(null)
-  const [loading, setLoading] = useState(true), [saving, setSaving] = useState(false), [message, setMessage] = useState(''), [saved, setSaved] = useState('')
+  const [loading, setLoading] = useState(true), [saving, setSaving] = useState(false), [message, setMessage] = useState(''), [messageIsError, setMessageIsError] = useState(false), [saved, setSaved] = useState('')
   const dirty = useMemo(() => JSON.stringify(settings) !== saved, [settings, saved])
   const accept = (envelope: SettingsEnvelope) => { const next = mergeSettings(envelope.settings); setSettings(next); setStatus(envelope.status); setSaved(JSON.stringify(next)) }
   const load = useCallback(async () => {
     setLoading(true)
-    try { const response = await fetch('/api/settings'); if (!response.ok) throw new Error(); accept(await response.json()); setMessage('') }
-    catch { setMessage('Could not load settings. Check that Media Scout is running.') }
+    try { const response = await fetch('/api/settings'); if (!response.ok) throw new Error(); accept(await response.json()); setMessage(''); setMessageIsError(false) }
+    catch { setMessage('Could not load settings. Check that Media Scout is running.'); setMessageIsError(true) }
     finally { setLoading(false) }
   }, [])
   useEffect(() => { void load(); const change = () => setPage(pageFromHash()); window.addEventListener('hashchange', change); return () => window.removeEventListener('hashchange', change) }, [load])
   async function persist(next: Settings) {
     const response = await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(next) })
-    if (!response.ok) throw new Error('Settings were rejected. Review the values and try again.')
+    if (!response.ok) {
+      let payload: { issues?: Array<{ path?: Array<string | number>; message?: string }> } = {}
+      try { payload = await response.json() } catch { /* The server may return a non-JSON proxy error. */ }
+      const details = (payload.issues ?? []).map(issue => {
+        const path = issue.path?.join('.') ?? ''
+        const field = settingsFieldLabels[path] ?? path
+        const reason = issue.message ?? 'is invalid'
+        return `${field ? `${field}: ` : ''}${reason.replace('failureBackoffMinMinutes', 'Initial failure backoff (minutes)')}`
+      })
+      throw new Error(details.length ? `Settings could not be saved. ${details.join('; ')}` : `Settings could not be saved (HTTP ${response.status}). Check the values and try again.`)
+    }
     accept(await response.json())
   }
   async function save(event: FormEvent) {
-    event.preventDefault(); setSaving(true); setMessage('')
+    event.preventDefault(); setSaving(true); setMessage(''); setMessageIsError(false)
     try { await persist(settings); setMessage('Settings saved.') }
-    catch (failure) { setMessage(failure instanceof Error ? failure.message : 'Settings could not be saved.') }
+    catch (failure) { setMessage(failure instanceof Error ? failure.message : 'Settings could not be saved.'); setMessageIsError(true) }
     finally { setSaving(false) }
   }
   async function toggleAutomation() {
@@ -48,7 +58,7 @@ export default function App() {
         {page === 'automation' && <AutomationPage settings={settings} onOpenSearch={openSearch} onToggle={toggleAutomation}/>}
         {page === 'settings' && <>
           <div className="page-heading"><div><h1>Settings<span className="heading-period">.</span></h1><p className="page-intro">Connect search services. Add Arr only if you want automation.</p></div></div>
-          {message && <p className="notice" role="status">{message}</p>}
+          {message && <div className={`notice ${messageIsError ? 'notice-error' : 'notice-success'}`} role={messageIsError ? 'alert' : 'status'}>{messageIsError ? <CircleAlert size={17}/> : <CheckCircle2 size={17}/>}<span>{message}</span></div>}
           {loading ? <p role="status">Loading settings…</p> : <form id="settings-form" onSubmit={save}><div className="content-grid"><div className="settings-stack">
              <Section title="Search services" description="Connect the indexers and model Scout uses to find and compare releases." icon={<SearchIcon size={18}/>}>
               <Group title="Prowlarr" fields={[["Prowlarr URL", settings.integrations.prowlarr.url, 'url'], ["Prowlarr API key", settings.integrations.prowlarr.apiKey, 'apiKey'], ["TV download client", settings.integrations.prowlarr.tvClient, 'tvClient'], ["Movie download client", settings.integrations.prowlarr.movieClient, 'movieClient']]} update={(key, value) => setSettings(s => ({ ...s, integrations: { ...s.integrations, prowlarr: { ...s.integrations.prowlarr, [key]: value } } }))}/>
@@ -60,12 +70,12 @@ export default function App() {
                <Group title="Radarr" fields={[["Radarr URL", settings.integrations.radarr.url, 'url'], ["Radarr API key", settings.integrations.radarr.apiKey, 'apiKey']]} update={(key, value) => setSettings(s => ({ ...s, integrations: { ...s.integrations, radarr: { ...s.integrations.radarr, [key]: value } } }))}/>
              </Section>
              <Section title="Search limits" description="Set bounds for how long Scout searches and how many service calls it makes." icon={<SlidersHorizontal size={18}/>}>
-               <div className="field-grid">{(['maxDecisions', 'maxSearches', 'deadlineMinutes'] as const).map(key => <label className="field" key={key}>{key === 'maxDecisions' ? 'Model decisions' : key === 'maxSearches' ? 'Indexer searches' : 'Time limit (minutes)'}<input type="number" min="1" max={key === 'maxDecisions' ? 20 : key === 'maxSearches' ? 12 : 10} value={settings.search[key]} onChange={event => setSettings(s => ({ ...s, search: { ...s.search, [key]: Number(event.target.value) } }))}/></label>)}</div><p className="field-hint">All returned candidates remain visible to the model. These limits bound calls and time, not a top-N result list.</p>
+                <div className="field-grid">{(['maxDecisions', 'maxSearches', 'deadlineMinutes'] as const).map(key => <label className="field number-field" key={key}>{key === 'maxDecisions' ? 'Model decisions' : key === 'maxSearches' ? 'Indexer searches' : 'Time limit (minutes)'}<input type="number" min="1" max={key === 'maxDecisions' ? 20 : key === 'maxSearches' ? 12 : 10} step="1" required value={Number.isNaN(settings.search[key]) ? '' : settings.search[key]} onChange={event => setSettings(s => ({ ...s, search: { ...s.search, [key]: numericValue(event.target.value) } }))}/><span className="field-hint">1–{key === 'maxDecisions' ? 20 : key === 'maxSearches' ? 12 : 10}</span></label>)}</div><p className="field-hint">All returned candidates remain visible to the model. These limits bound calls and time, not a top-N result list.</p>
              </Section>
              <Section title="Automation and retries" description="Control scheduled Arr searches, safety mode, and retry timing." icon={<Radio size={18}/>}>
               <Toggle label="Automatic monitoring" description="Scheduled Arr searches can submit the best suitable recommendation when dry-run is off." checked={settings.monitoring.enabled} onChange={enabled => setSettings(s => ({ ...s, monitoring: { ...s.monitoring, enabled } }))}/>
               <Toggle label="Dry-run mode" description="Search and compare, but never submit a download. Live searches still use model/indexer calls." checked={settings.safety.dryRun} onChange={dryRun => setSettings(s => ({ ...s, safety: { dryRun } }))}/>
-              <div className="field-grid">{([['Check interval (minutes)', 'intervalMinutes'], ['No-match retry (hours)', 'minRetryHours'], ['Initial failure backoff (minutes)', 'failureBackoffMinMinutes'], ['Maximum failure backoff (minutes)', 'failureBackoffMaxMinutes'], ['Queue appearance grace (minutes)', 'queueGraceMinutes']] as const).map(([label, key]) => <label className="field" key={key}>{label}<input type="number" min="1" value={settings.monitoring[key]} onChange={event => setSettings(s => ({ ...s, monitoring: { ...s.monitoring, [key]: Number(event.target.value) } }))}/></label>)}</div>
+               <div className="field-grid">{([['Check interval (minutes)', 'intervalMinutes', 35791], ['No-match retry (hours)', 'minRetryHours', 8760], ['Initial failure backoff (minutes)', 'failureBackoffMinMinutes', 35791], ['Maximum failure backoff (minutes)', 'failureBackoffMaxMinutes', 35791], ['Queue appearance grace (minutes)', 'queueGraceMinutes', 1440]] as const).map(([label, key, max]) => <label className="field number-field" key={key}>{label}<input type="number" min="1" max={max} step="1" required value={Number.isNaN(settings.monitoring[key]) ? '' : settings.monitoring[key]} onChange={event => setSettings(s => ({ ...s, monitoring: { ...s.monitoring, [key]: numericValue(event.target.value) } }))}/><span className="field-hint">1–{max.toLocaleString()}</span></label>)}</div>
               <p className="field-hint">After finite appearance grace, unmatched downloads may be retried. Scout does not inspect or cancel qBittorrent jobs.</p>
              </Section>
            </div><aside className="right-rail" aria-label="Instance information">
@@ -82,9 +92,45 @@ export default function App() {
 }
 function Section({ title, description, icon, children }: { title: string; description: string; icon: ReactNode; children: ReactNode }) { return <section className="settings-card"><div className="section-heading"><div className="section-icon">{icon}</div><div className="section-title"><h2>{title}</h2><p>{description}</p></div></div><div className="section-body">{children}</div></section> }
 function Field({ label, value, onChange, multiline = false }: { label: string; value: string; onChange(value: string): void; multiline?: boolean }) {
-  const id = useId(), [revealed, setRevealed] = useState(false), secret = label.includes('API key')
-  return <div className="field"><label htmlFor={id}>{label}</label>{multiline ? <textarea id={id} rows={3} value={value} onChange={event => onChange(event.target.value)}/> : secret ? <div className="secret-control"><input id={id} value={value} type={revealed ? 'text' : 'password'} autoComplete="off" onChange={event => onChange(event.target.value)}/><button className="icon-button" type="button" onClick={() => setRevealed(!revealed)} aria-label={`${revealed ? 'Hide' : 'Reveal'} ${label}`}>{revealed ? <EyeOff size={16}/> : <Eye size={16}/>}</button></div> : <input id={id} value={value} type={label.endsWith('URL') ? 'url' : 'text'} onChange={event => onChange(event.target.value)}/>}</div>
+  const id = useId(), inputRef = useRef<HTMLInputElement>(null), [revealed, setRevealed] = useState(false), [copied, setCopied] = useState(false), [copyFailed, setCopyFailed] = useState(false), secret = label.includes('API key')
+  useEffect(() => { if (!copied) return; const timeout = window.setTimeout(() => setCopied(false), 1600); return () => window.clearTimeout(timeout) }, [copied])
+  async function copySecret() {
+    setCopyFailed(false)
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('Clipboard API unavailable')
+      await navigator.clipboard.writeText(value)
+      setCopied(true)
+    } catch {
+      const input = inputRef.current
+      let copiedWithFallback = false
+      if (input) {
+        const originalType = input.type
+        try {
+          input.type = 'text'
+          input.select()
+          copiedWithFallback = document.execCommand?.('copy') ?? false
+        } catch { /* Clipboard fallback is not available in every browser. */ }
+        finally { input.type = originalType; input.setSelectionRange(0, 0) }
+      }
+      if (copiedWithFallback) {
+        setCopied(true)
+      } else setCopyFailed(true)
+    }
+  }
+  return <div className="field"><label htmlFor={id}>{label}</label>{multiline ? <textarea id={id} rows={3} value={value} onChange={event => onChange(event.target.value)}/> : secret ? <div className="secret-control"><input ref={inputRef} id={id} value={value} type={revealed ? 'text' : 'password'} autoComplete="off" onChange={event => onChange(event.target.value)}/><div className="secret-actions"><button className="icon-button" type="button" onClick={() => setRevealed(!revealed)} aria-label={`${revealed ? 'Hide' : 'Reveal'} ${label}`}>{revealed ? <EyeOff size={16}/> : <Eye size={16}/>}</button><button className={`icon-button ${copied ? 'copied' : ''}`} type="button" disabled={!value} onClick={() => void copySecret()} aria-label={`Copy ${label}`} title={copied ? 'Copied' : 'Copy API key'}>{copied ? <Check size={16}/> : <Copy size={16}/>}</button></div>{copied && <span className="sr-only" role="status">API key copied to clipboard</span>}{copyFailed && <span className="copy-error" role="status">Clipboard is unavailable. Reveal the key and copy it manually.</span>}</div> : <input id={id} value={value} type={label.endsWith('URL') ? 'url' : 'text'} onChange={event => onChange(event.target.value)}/>}</div>
 }
+const settingsFieldLabels: Record<string, string> = {
+  'integrations.prowlarr.url': 'Prowlarr URL', 'integrations.prowlarr.apiKey': 'Prowlarr API key',
+  'integrations.prowlarr.tvClient': 'TV download client', 'integrations.prowlarr.movieClient': 'Movie download client',
+  'integrations.sonarr.url': 'Sonarr URL', 'integrations.sonarr.apiKey': 'Sonarr API key',
+  'integrations.radarr.url': 'Radarr URL', 'integrations.radarr.apiKey': 'Radarr API key',
+  'ai.apiKey': 'AI API key', 'ai.model': 'Model', 'ai.baseUrl': 'AI API base URL',
+  'ai.preferences': 'Default preferences', 'monitoring.intervalMinutes': 'Check interval (minutes)',
+  'monitoring.minRetryHours': 'No-match retry (hours)', 'monitoring.failureBackoffMinMinutes': 'Initial failure backoff (minutes)',
+  'monitoring.failureBackoffMaxMinutes': 'Maximum failure backoff (minutes)', 'monitoring.queueGraceMinutes': 'Queue appearance grace (minutes)',
+  'search.maxDecisions': 'Model decisions', 'search.maxSearches': 'Indexer searches', 'search.deadlineMinutes': 'Time limit (minutes)',
+}
+const numericValue = (value: string): number => value.trim() === '' ? Number.NaN : Number(value)
 function Group({ title, fields, update }: { title: string; fields: Array<[string, string, string]>; update(key: string, value: string): void }) { const Icon = title === 'Prowlarr' ? Waves : title === 'Sonarr' ? Tv : title === 'Radarr' ? Film : Bot; return <div className="service-block"><div className="service-heading"><span className={`service-symbol ${title.toLowerCase()}-symbol`}><Icon size={17}/></span><div><h3>{title}</h3><p>{title === 'Prowlarr' ? 'Indexer manager and download routes' : title === 'Sonarr' ? 'Optional TV library' : title === 'Radarr' ? 'Optional movie library' : 'Ranking and search decisions'}</p></div><span className={`service-badge ${fields.every(([, value]) => value.trim()) ? 'configured' : ''}`}><span/>{fields.every(([, value]) => value.trim()) ? 'Configured' : 'Needs setup'}</span></div><div className="field-grid">{fields.map(([label, value, key]) => <Field key={key} label={label} value={value} onChange={value => update(key, value)}/>)}</div></div> }
 function StatusRow({ label, done, optional = false }: { label: string; done: boolean; optional?: boolean }) { return <div className="check-row"><span className={`check-status ${done ? 'done' : ''}`}>{done ? <Check size={11}/> : <span/>}</span><span>{label}</span><span className={`check-label ${done ? 'complete' : ''}`}>{done ? 'Added' : optional ? 'Optional' : 'Needed'}</span></div> }
 function Toggle({ label, description, checked, onChange }: { label: string; description: string; checked: boolean; onChange(value: boolean): void }) { return <div className="toggle-row"><div className="toggle-copy"><strong>{label}</strong><p>{description}</p></div><button className={`switch ${checked ? 'switch-on' : ''}`} role="switch" aria-label={label} aria-checked={checked} type="button" onClick={() => onChange(!checked)}><span/></button></div> }

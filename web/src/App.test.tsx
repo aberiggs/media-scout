@@ -152,6 +152,71 @@ it('keeps Settings sections scannable and distinguishes required from optional s
   assert.ok(screen.getByRole('button', { name: 'Reveal Prowlarr API key' }))
 })
 
+it('shows server validation details as an error and preserves the rejected form values', async () => {
+  window.history.replaceState(null, '', '/#settings')
+  let submitted: Record<string, any> | undefined
+  globalThis.fetch = async (input, init) => {
+    if (String(input) === '/api/settings' && !init?.method) return Response.json(env)
+    if (String(input) === '/api/settings' && init?.method === 'PUT') {
+      submitted = JSON.parse(String(init.body))
+      return Response.json({ error: 'Invalid settings', issues: [{ path: ['monitoring', 'failureBackoffMaxMinutes'], message: 'must be at least failureBackoffMinMinutes', code: 'custom' }] }, { status: 400 })
+    }
+    return Response.json({ items: [] })
+  }
+  render(<App />)
+  const minimum = await screen.findByRole('spinbutton', { name: /Initial failure backoff \(minutes\)/ })
+  const maximum = screen.getByRole('spinbutton', { name: /Maximum failure backoff \(minutes\)/ })
+  fireEvent.change(minimum, { target: { value: '90' } })
+  fireEvent.change(maximum, { target: { value: '30' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+  const error = await screen.findByRole('alert')
+  assert.match(error.textContent ?? '', /Maximum failure backoff.*must be at least Initial failure backoff/i)
+  assert.equal((maximum as HTMLInputElement).value, '30')
+  assert.equal(submitted?.monitoring.failureBackoffMaxMinutes, 30)
+})
+
+it('keeps a cleared numeric field blank instead of silently turning it into zero', async () => {
+  window.history.replaceState(null, '', '/#settings')
+  const writes: string[] = []
+  globalThis.fetch = async (input, init) => { writes.push(`${String(input)}:${init?.method ?? 'GET'}`); return String(input) === '/api/settings' ? Response.json(env) : Response.json({ items: [] }) }
+  render(<App />)
+  const limit = await screen.findByRole('spinbutton', { name: /Indexer searches/ }) as HTMLInputElement
+  fireEvent.change(limit, { target: { value: '' } })
+  assert.equal(limit.value, '')
+  fireEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+  assert.equal(writes.includes('/api/settings:PUT'), false)
+})
+
+it('provides working reveal and copy controls for API keys', async () => {
+  window.history.replaceState(null, '', '/#settings')
+  let copied = ''
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async (value: string) => { copied = value } } })
+  const configured = structuredClone(defaults)
+  configured.integrations.prowlarr.apiKey = 'prowlarr-test-key'
+  globalThis.fetch = async input => String(input) === '/api/settings' ? Response.json({ ...env, settings: configured }) : Response.json({ items: [] })
+  render(<App />)
+  const key = await screen.findByLabelText('Prowlarr API key') as HTMLInputElement
+  assert.equal(key.type, 'password')
+  fireEvent.click(screen.getByRole('button', { name: 'Reveal Prowlarr API key' }))
+  assert.equal(key.type, 'text')
+  fireEvent.click(screen.getByRole('button', { name: 'Copy Prowlarr API key' }))
+  await waitFor(() => assert.equal(copied, 'prowlarr-test-key'))
+})
+
+it('explains when secure clipboard access is unavailable instead of silently ignoring copy', async () => {
+  window.history.replaceState(null, '', '/#settings')
+  Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async () => { throw new Error('insecure context') } } })
+  Object.defineProperty(document, 'execCommand', { configurable: true, value: () => false })
+  const configured = structuredClone(defaults)
+  configured.integrations.prowlarr.apiKey = 'prowlarr-test-key'
+  globalThis.fetch = async input => String(input) === '/api/settings' ? Response.json({ ...env, settings: configured }) : Response.json({ items: [] })
+  render(<App />)
+  await screen.findByLabelText('Prowlarr API key')
+  fireEvent.click(screen.getByRole('button', { name: 'Copy Prowlarr API key' }))
+  assert.ok(await screen.findByRole('status'))
+  assert.match(screen.getByRole('status').textContent ?? '', /clipboard.*unavailable.*copy it manually/i)
+})
+
 it('explains that expired results require a new search', async () => {
   globalThis.fetch = async input => {
     const url = String(input)

@@ -656,9 +656,21 @@ h1 { color: #f0f2ef; font-family: var(--display); font-size: clamp(1.875rem, 3vw
 .bot-symbol { background: #202a23; color: var(--mint); }
 .settings-stack .service-block + .service-block { margin-top: 17px; padding-top: 16px; border-top: 1px solid var(--line); }
 .settings-stack .service-block > .field-grid { margin-top: 12px; }
-.secret-control { display: flex; min-width: 0; }
-.secret-control input { min-width: 0; flex: 1; padding-right: 42px; }
-.secret-control .icon-button { width: 36px; height: 42px; flex: none; margin-left: -38px; }
+.secret-control { position: relative; display: flex; min-width: 0; }
+.secret-control input { min-width: 0; flex: 1; padding-right: 82px; font-family: var(--mono); letter-spacing: .35px; }
+.secret-actions { position: absolute; top: 1px; right: 3px; display: flex; height: 42px; align-items: center; }
+.secret-actions .icon-button { width: 34px; height: 36px; flex: none; }
+.secret-control .icon-button { position: static; }
+.secret-control .icon-button:disabled { cursor: not-allowed; opacity: .45; }
+.copy-error { position: absolute; top: calc(100% + 4px); right: 0; z-index: 1; max-width: min(300px,100%); padding: 6px 8px; border: 1px solid #63433d; border-radius: 4px; background: #251b19; color: #e2b4a8; font-size: var(--type-small); line-height: 1.4; }
+.number-field { gap: 6px; }
+.number-field input[type="number"] { appearance: textfield; -moz-appearance: textfield; padding: 0 12px; font-variant-numeric: tabular-nums; }
+.number-field input[type="number"]::-webkit-inner-spin-button,
+.number-field input[type="number"]::-webkit-outer-spin-button { margin: 0; -webkit-appearance: none; }
+.number-field .field-hint { margin-top: -2px; }
+.notice-success { border-color: #31523c; background: #17221a; color: #b6d9c0; }
+.notice-success > svg { color: var(--mint); }
+.notice-error { margin-top: 0; }
 .activity-layout, .automation-layout { display: grid; grid-template-columns: minmax(0,1fr) 245px; align-items: start; gap: 18px; }
 .activity-layout > .ops-page, .automation-layout > .ops-page { min-width: 0; }
 .activity-filters { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); align-items: end; gap: 12px; padding: 14px 16px; }

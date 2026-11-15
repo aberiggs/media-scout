@@ -65,6 +65,7 @@ it('filters Activity by media and inclusive local dates and offers every submiss
   }
   render(<App />)
   await screen.findByText('No matching activity')
+  assert.ok(screen.getByRole('complementary', { name: 'Activity information' }))
   fireEvent.change(screen.getByLabelText('Media'), { target: { value: 'tv' } })
   fireEvent.change(screen.getByLabelText('Created from'), { target: { value: '2026-11-01' } })
   fireEvent.change(screen.getByLabelText('Created through'), { target: { value: '2026-11-15' } })
@@ -132,11 +133,23 @@ it('keeps search available in dry-run and distinguishes a saved refresh from a l
   }
   render(<App />)
   const search = await screen.findByRole('button', { name: 'Search this item' })
+  assert.ok(screen.getByRole('complementary', { name: 'Automation guidance' }))
+  assert.ok(screen.getByText('Poll is explicit'))
   assert.equal(search.hasAttribute('disabled'), false)
   fireEvent.click(screen.getByRole('button', { name: 'Refresh saved view' }))
   assert.equal(calls.some(c => c.url.endsWith('/poll')), false)
   fireEvent.click(screen.getByRole('button', { name: 'Poll now' }))
   await waitFor(() => assert.equal(calls.filter(c => c.url.endsWith('/poll')).length, 1))
+})
+
+it('keeps Settings sections scannable and distinguishes required from optional services', async () => {
+  window.history.replaceState(null, '', '/#settings')
+  globalThis.fetch = async input => String(input) === '/api/settings' ? Response.json(env) : Response.json({ items: [] })
+  render(<App />)
+  assert.ok(await screen.findByRole('heading', { name: 'Search services' }))
+  assert.ok(screen.getByRole('complementary', { name: 'Instance information' }))
+  assert.equal(screen.getAllByText('Optional').length, 2)
+  assert.ok(screen.getByRole('button', { name: 'Reveal Prowlarr API key' }))
 })
 
 it('explains that expired results require a new search', async () => {

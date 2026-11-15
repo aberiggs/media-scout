@@ -19,6 +19,10 @@ CREATE TABLE IF NOT EXISTS grace (kind TEXT NOT NULL, identity TEXT NOT NULL, su
 CREATE TABLE IF NOT EXISTS exclusions (target TEXT NOT NULL, release TEXT NOT NULL, expires_at INTEGER NOT NULL, reason TEXT NOT NULL, PRIMARY KEY(target,release));
 CREATE TABLE IF NOT EXISTS observations (source TEXT PRIMARY KEY, observed_at INTEGER NOT NULL, complete INTEGER NOT NULL, payload_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS automation_attempts (target TEXT PRIMARY KEY, last_attempt INTEGER NOT NULL, fail_count INTEGER NOT NULL DEFAULT 0, deadline INTEGER NOT NULL DEFAULT 0, grace_until INTEGER NOT NULL DEFAULT 0, physical_key TEXT);
+CREATE INDEX IF NOT EXISTS search_events_by_search ON search_events(search_id,id);
+CREATE INDEX IF NOT EXISTS searches_by_time ON searches(created_at);
+CREATE INDEX IF NOT EXISTS candidates_by_expiry ON candidates(expires_at);
+CREATE INDEX IF NOT EXISTS submissions_by_search ON submissions(json_extract(payload_json,'$.request.searchId'),created_at);
 INSERT INTO search_meta(version) SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM search_meta);
 `;
 const json = (v: unknown): string => JSON.stringify(v);
@@ -51,16 +55,23 @@ export class SearchStore {
   close(): void { this.db.close(); }
   createSearch(r: SearchRecord): void { this.db.prepare('INSERT INTO searches(id,prompt,status,created_at,finished_at,result_json) VALUES(?,?,?,?,?,?)').run(r.searchId,r.prompt,r.status,r.createdAt,r.finishedAt ?? null,r.result === undefined ? null : json(r.result)); }
   getSearch(id: string): SearchRecord | null { const r = this.db.prepare('SELECT * FROM searches WHERE id=?').get(id) as {id:string;prompt:string;status:SearchStatus;created_at:number;finished_at:number|null;result_json:string|null}|undefined; return r ? {searchId:r.id,prompt:r.prompt,status:r.status,createdAt:r.created_at,...(r.finished_at === null ? {} : {finishedAt:r.finished_at}),...(r.result_json === null ? {} : {result:parse(r.result_json)})} : null; }
-  listSearches(limit=100): SearchRecord[] { return (this.db.prepare('SELECT id FROM searches ORDER BY created_at DESC LIMIT ?').all(Math.max(0,limit)) as Array<{id:string}>).map(r=>this.getSearch(r.id)!).filter(Boolean); }
+  listSearches(limit=100, full=true): SearchRecord[] {
+    if (full) return (this.db.prepare('SELECT id FROM searches ORDER BY created_at DESC LIMIT ?').all(Math.max(0,limit)) as Array<{id:string}>).map(r=>this.getSearch(r.id)!).filter(Boolean);
+    const rows = this.db.prepare("SELECT id,prompt,status,created_at,finished_at,json_extract(result_json,'$.counts') AS counts FROM searches ORDER BY created_at DESC LIMIT ?").all(Math.max(0,limit)) as Array<{id:string;prompt:string;status:SearchStatus;created_at:number;finished_at:number|null;counts:string|null}>;
+    return rows.map(r => ({searchId:r.id,prompt:r.prompt,status:r.status,createdAt:r.created_at,...(r.finished_at===null?{}:{finishedAt:r.finished_at}),...(r.counts?{result:{counts:parse(r.counts)}}:{})}));
+  }
   setRunning(id:string):void { this.db.prepare("UPDATE searches SET status='running' WHERE id=?").run(id); }
   interruptRunning(at=Date.now()):number { return this.db.prepare("UPDATE searches SET status='interrupted',finished_at=? WHERE status IN ('queued','running')").run(at).changes; }
+  interruptSearch(id: string, at: number): void { this.db.prepare("UPDATE searches SET status='interrupted',finished_at=? WHERE id=? AND status IN ('queued','running')").run(at,id); }
+  activeSearches(): SearchRecord[] { return (this.db.prepare("SELECT id FROM searches WHERE status IN ('queued','running')").all() as Array<{id:string}>).map(row => this.getSearch(row.id)!); }
   finishSearch(id:string,status:SearchStatus,result:unknown,at:number):void { this.db.prepare('UPDATE searches SET status=?,finished_at=?,result_json=? WHERE id=?').run(status,at,json(result),id); }
   addCandidate(c:CandidateRecord):void { this.db.prepare('INSERT INTO candidates VALUES(?,?,?,?,?)').run(c.searchId,c.candidateId,json(c.safe),json(c.privateData),c.expiresAt); }
   updateCandidate(c:CandidateRecord):void { this.db.prepare('UPDATE candidates SET safe_json=?,private_json=?,expires_at=? WHERE search_id=? AND id=?').run(json(c.safe),json(c.privateData),c.expiresAt,c.searchId,c.candidateId); }
   getCandidate(searchId:string,id:string,now=Date.now()): Omit<CandidateRecord,'searchId'|'candidateId'>|null { const r=this.db.prepare('SELECT safe_json,private_json,expires_at FROM candidates WHERE search_id=? AND id=? AND expires_at>?').get(searchId,id,now) as {safe_json:string;private_json:string;expires_at:number}|undefined; return r?{safe:parse(r.safe_json),privateData:parse(r.private_json),expiresAt:r.expires_at}:null; }
+  candidateExpiry(searchId: string, id: string): number | null { return (this.db.prepare('SELECT expires_at FROM candidates WHERE search_id=? AND id=?').get(searchId,id) as {expires_at:number}|undefined)?.expires_at ?? null; }
   listCandidates(searchId:string,now=Date.now()):Array<{candidateId:string;safe:unknown;expiresAt:number}> { return (this.db.prepare('SELECT id,safe_json,expires_at FROM candidates WHERE search_id=? AND expires_at>? ORDER BY rowid').all(searchId,now) as Array<{id:string;safe_json:string;expires_at:number}>).map(r=>({candidateId:r.id,safe:parse(r.safe_json),expiresAt:r.expires_at})); }
   appendEvent(searchId:string,event:unknown,at=Date.now()):void { this.db.prepare('INSERT INTO search_events(search_id,event_json,created_at) VALUES(?,?,?)').run(searchId,json(event),at); }
-  getEvents(searchId:string):unknown[] { return (this.db.prepare('SELECT event_json FROM search_events WHERE search_id=? ORDER BY id').all(searchId) as Array<{event_json:string}>).map(r=>parse(r.event_json)); }
+  getEvents(searchId:string):unknown[] { return (this.db.prepare('SELECT event_json,created_at FROM search_events WHERE search_id=? ORDER BY id').all(searchId) as Array<{event_json:string;created_at:number}>).map(r=>({...parse<Record<string,unknown>>(r.event_json),recordedAt:r.created_at})); }
   setSetting(key:string,value:unknown):void { this.db.prepare('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json').run(key,json(value)); }
   getSetting(key:string):unknown|null { const r=this.db.prepare('SELECT value_json FROM settings WHERE key=?').get(key) as {value_json:string}|undefined; return r?parse(r.value_json):null; }
   setDeadline(target:string,deadline:number):void { this.db.prepare('INSERT INTO target_deadlines VALUES(?,?) ON CONFLICT(target) DO UPDATE SET deadline=excluded.deadline').run(target,deadline); }
@@ -84,6 +95,7 @@ export class SearchStore {
     })();
   }
   getSubmission(key:string):SubmissionReceipt|null { const r=this.db.prepare('SELECT * FROM submissions WHERE key=?').get(key) as any; return r?{idempotencyKey:r.key,payload:parse(r.payload_json),outcome:r.outcome,createdAt:r.created_at}:null; }
+  latestSubmission(searchId: string): SubmissionReceipt | null { const row = this.db.prepare("SELECT key FROM submissions WHERE json_extract(payload_json,'$.request.searchId')=? ORDER BY created_at DESC,rowid DESC LIMIT 1").get(searchId) as {key:string}|undefined; return row ? this.getSubmission(row.key) : null; }
   updateSubmissionOutcome(key:string,outcome:string):void { this.db.prepare('UPDATE submissions SET outcome=? WHERE key=?').run(outcome,key); }
   updateSubmissionResult(key:string,outcome:string,result:unknown, claim?: { owner: string; now: number }):void { this.db.transaction(()=>{ if(claim && !this.ownsLease(`submission:${key}`,claim.owner,claim.now)) throw new Error('stale lease owner'); const prior=this.getSubmission(key); if(!prior) throw new Error('submission receipt missing'); const payload={...(prior.payload as Record<string,unknown>),result}; this.db.prepare('UPDATE submissions SET outcome=?,payload_json=? WHERE key=?').run(outcome,json(payload),key); })(); }
   reserveSubmission(input:{idempotencyKey:string;payload:unknown;owner:string;targets:string[];physicalReleases:string[];now:number;graceMs:number}):Reservation {
@@ -106,6 +118,19 @@ export class SearchStore {
     })();
   }
   pruneSearches(before:number,limit:number):number { return this.db.transaction(()=>{ const ids=(this.db.prepare('SELECT id FROM searches WHERE created_at<? ORDER BY created_at ASC LIMIT ?').all(before,Math.max(0,limit)) as Array<{id:string}>).map(r=>r.id); const del=this.db.prepare('DELETE FROM searches WHERE id=?'); const cd=this.db.prepare('DELETE FROM candidates WHERE search_id=?'); const ed=this.db.prepare('DELETE FROM search_events WHERE search_id=?'); for(const id of ids){cd.run(id);ed.run(id);del.run(id);} return ids.length; })(); }
+  maintain(now: number): void {
+    this.db.transaction(() => {
+      this.db.prepare('DELETE FROM candidates WHERE expires_at<=?').run(now);
+      const records = this.db.prepare("SELECT id,created_at FROM searches WHERE status NOT IN ('queued','running') ORDER BY created_at DESC,rowid DESC").all() as Array<{id:string;created_at:number}>;
+      const remove = records.filter((row, index) => index >= 10_000 || row.created_at < now - 30 * 86_400_000);
+      for (const row of remove) {
+        this.db.prepare('DELETE FROM candidates WHERE search_id=?').run(row.id);
+        this.db.prepare('DELETE FROM search_events WHERE search_id=?').run(row.id);
+        this.db.prepare('DELETE FROM searches WHERE id=?').run(row.id);
+        for (const prefix of ['search-source:', 'search-owner:', 'search-arr:']) this.db.prepare('DELETE FROM settings WHERE key=?').run(`${prefix}${row.id}`);
+      }
+    })();
+  }
   saveExclusion(target:string,release:string,expiresAt:number,reason:string):void { this.db.prepare('INSERT INTO exclusions VALUES(?,?,?,?) ON CONFLICT(target,release) DO UPDATE SET expires_at=excluded.expires_at,reason=excluded.reason').run(target,release,expiresAt,reason); }
   isExcluded(target:string,release:string,now:number):boolean { return !!this.db.prepare('SELECT 1 FROM exclusions WHERE target=? AND release=? AND expires_at>?').get(target,release,now); }
   getAutomationAttempt(target:string):{lastAttempt:number;failCount:number;deadline:number;graceUntil:number;physicalKey:string|null}|null { const r=this.db.prepare('SELECT * FROM automation_attempts WHERE target=?').get(target) as {last_attempt:number;fail_count:number;deadline:number;grace_until:number;physical_key:string|null}|undefined; return r?{lastAttempt:r.last_attempt,failCount:r.fail_count,deadline:r.deadline,graceUntil:r.grace_until,physicalKey:r.physical_key}:null; }

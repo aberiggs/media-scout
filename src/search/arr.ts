@@ -116,6 +116,7 @@ export class ArrObserver {
             ...(airing === undefined ? {} : { airAt: airing }), context: safeContext({ title: series.title, titles: [series.title, ...series.alternateTitles.map(t => t.title)], seasonNumber: episode.seasonNumber, episodeNumber: episode.episodeNumber, absoluteEpisodeNumber: episode.absoluteEpisodeNumber, episodeTitle: episode.title, overview: episode.overview ?? series.overview ?? undefined, originalLanguage: languageName(series.originalLanguage), seriesType: series.seriesType, profileContext: summarizeProfile(client.getQualityProfiles ? profile : series.qualityProfile), externalIds: { tvdb: series.tvdbId } }) });
         }
       }
+      if (this.sourceFingerprint('sonarr') !== fp) return unknown(at, 'source-changed');
       return { known: true, observedAt: at, targets, queue: queue.map(row => ({ ...(row.seriesId == null ? {} : { serviceId: row.seriesId }), ...(row.episodeId == null ? {} : { itemId: row.episodeId }), ...(row.seasonNumber == null ? {} : { seasonNumber: row.seasonNumber }), ...(row.status ? { status: safeText(row.status) } : {}), ...(row.trackedDownloadStatus ? { trackedStatus: safeText(row.trackedDownloadStatus) } : {}), ...(row.trackedDownloadState ? { trackedState: safeText(row.trackedDownloadState) } : {}) })), diagnostics: { unidentifiedQueueRows: queue.filter(row => row.seriesId == null).length, ...(unknownSeriesIds.length ? { unknownSeriesIds } : {}) } };
     } catch (error) { this.reportRetry('sonarr', error); return unknown(at); }
   }
@@ -135,6 +136,7 @@ export class ArrObserver {
         return { key, provider: 'radarr', sourceFingerprint: fp, serviceId: movie.id, externalId: movie.tmdbId, movieId: movie.id, monitored: movie.monitored, hasFile: movie.hasFile, available, eligible: movie.monitored && !movie.hasFile && available && !covered,
           context: safeContext({ title: movie.title, titles: [movie.title], year: movie.year, overview: movie.overview ?? undefined, originalLanguage: languageName(movie.originalLanguage), profileContext: summarizeProfile(client.getQualityProfiles ? profiles?.find(p => p.id === movie.qualityProfileId) : movie.qualityProfile), externalIds: { tmdb: movie.tmdbId } }) };
       });
+      if (this.sourceFingerprint('radarr') !== fp) return unknown(at, 'source-changed');
       return { known: true, observedAt: at, targets, queue: queue.map(row => ({ ...(row.movieId == null ? {} : { itemId: row.movieId }), ...(row.status ? { status: safeText(row.status) } : {}), ...(row.trackedDownloadStatus ? { trackedStatus: safeText(row.trackedDownloadStatus) } : {}), ...(row.trackedDownloadState ? { trackedState: safeText(row.trackedDownloadState) } : {}) })), diagnostics: { unidentifiedQueueRows: queue.filter(row => row.movieId == null).length } };
     } catch (error) { this.reportRetry('radarr', error); return unknown(at); }
   }

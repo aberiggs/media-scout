@@ -72,6 +72,7 @@ export class SearchService {
       for (const source of ['prowlarr', 'model']) if ((this.deps.store.getProviderDeadline(source) ?? 0) > now()) throw new Error('source-throttled');
       owned = this.deps.store.acquireLease('search-worker', owner, now(), 900_000);
       if (!owned) throw new Error('search-busy');
+      this.deps.store.setSetting(`search-owner:${id}`, owner);
       const initialization = async () => {
         try { return { indexers: await wait(this.deps.prowlarr.getIndexers()), states: await wait(this.deps.prowlarr.getIndexerStatuses()) }; }
         catch (error) {
@@ -101,6 +102,8 @@ export class SearchService {
           throw error;
         }
         const action = searchActionSchema.parse(next);
+        if (remaining() <= 0) throw new SearchDeadline();
+        if (!this.deps.store.ownsLease('search-worker', owner, now())) throw new SearchInterrupted();
         if (action.action === 'list_indexers') { record('indexers', { items: enabled }); continue; }
         if (action.action === 'search_releases') {
           if (searches >= limits.searches) { status = 'budget-exhausted'; message = 'Search-call budget exhausted'; break; }
@@ -115,6 +118,8 @@ export class SearchService {
             throw error;
           }
           // All rows reach the model. Repeated physical observations retain their separate evidence.
+          if (remaining() <= 0) throw new SearchDeadline();
+          if (!this.deps.store.ownsLease('search-worker', owner, now())) throw new SearchInterrupted();
           for (const release of releases) {
             const key = physicalRelease(release);
             const candidateId = refs.get(key) ?? randomUUID();

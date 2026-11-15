@@ -34,7 +34,7 @@ describe('SubmissionService', () => {
     const f = fixture();
     try {
       f.store.expireCandidatesAt('s', 20);
-      expect((await f.service.submit({ searchId: 's', optionId: 'o', idempotencyKey: 'expired' })).outcome).toBe('rejected');
+      expect((await f.service.submit({ searchId: 's', optionId: 'o', idempotencyKey: 'expired' })).outcome).toBe('expired');
       f.store.expireCandidatesAt('s', 100);
       f.prowlarr.getDownloadClients.mockResolvedValueOnce([{ id: 7, name: 'Torrent', enable: true, protocol: 'torrent', supportsCategories: true, categories: [] }]).mockResolvedValueOnce([]);
       expect((await f.service.submit({ searchId: 's', optionId: 'o', idempotencyKey: 'disabled-client' })).outcome).toBe('failed');

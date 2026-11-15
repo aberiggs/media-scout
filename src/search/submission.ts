@@ -14,7 +14,7 @@ export interface SubmissionServerContext {
   fingerprint?: () => string;
   available?: () => boolean;
 }
-export interface SubmissionResult { searchId: string; optionId: string; outcome: 'submitted' | 'rejected' | 'uncertain' | 'deferred' | 'conflict' | 'failed' | 'dry-run'; candidateIds: string[]; outcomes: Array<{ candidateId: string; outcome: string }> }
+export interface SubmissionResult { searchId: string; optionId: string; outcome: 'submitted' | 'rejected' | 'uncertain' | 'deferred' | 'conflict' | 'failed' | 'dry-run' | 'expired'; message?: string; candidateIds: string[]; outcomes: Array<{ candidateId: string; outcome: string }> }
 
 function stable(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
@@ -38,12 +38,12 @@ export class SubmissionService {
     const policy = this.deps.getPolicy();
     const policyFingerprint = stable(policy);
     if ((this.deps.store.getProviderDeadline('prowlarr') ?? 0) > now()) return { searchId: request.searchId, optionId: request.optionId, outcome: 'deferred', candidateIds: [], outcomes: [] };
-    if (policy.dryRun) return { searchId: request.searchId, optionId: request.optionId, outcome: 'dry-run', candidateIds: [], outcomes: [] };
-    if (policy.enabled === false || server.available?.() === false) return { searchId: request.searchId, optionId: request.optionId, outcome: 'failed', candidateIds: [], outcomes: [] };
+    if (policy.enabled === false || !policy.dryRun && server.available?.() === false) return { searchId: request.searchId, optionId: request.optionId, outcome: 'failed', candidateIds: [], outcomes: [] };
     const search = this.deps.store.getSearch(request.searchId);
     const options = (search?.result as any)?.options as Array<any> | undefined;
     const option = search?.status === 'matched' ? options?.find(o => o.optionId === request.optionId) : undefined;
     if (!option) return { searchId: request.searchId, optionId: request.optionId, outcome: 'rejected', candidateIds: [], outcomes: [] };
+    if ((search?.finishedAt ?? search!.createdAt) + 1_800_000 <= now() || option.releases.some((r: {candidateId:string}) => { const expiry = this.deps.store.candidateExpiry(request.searchId,r.candidateId); return expiry !== null && expiry <= now(); })) return { searchId: request.searchId, optionId: request.optionId, outcome: 'expired', message: 'Search results expired; start a new search.', candidateIds: [], outcomes: [] };
     const clients = (await this.deps.prowlarr.getDownloadClients()).filter(c => c.enable);
     let kind: string | undefined;
     try { kind = (JSON.parse(search?.prompt ?? '{}') as { context?: { kind?: string } }).context?.kind; } catch { /* malformed stored request cannot select a named client */ }
@@ -55,6 +55,7 @@ export class SubmissionService {
     const data: Array<{ candidateId: string; privateData: { release: Release; physicalKey: string } | undefined }> = candidateIds.map((candidateId: string) => ({ candidateId, privateData: this.deps.store.getCandidate(request.searchId, candidateId, now())?.privateData as { release: Release; physicalKey: string } | undefined }));
     if (data.some(d => !d.privateData)) return { searchId: request.searchId, optionId: request.optionId, outcome: 'rejected', candidateIds: [], outcomes: [] };
     if (data.some(d => d.privateData!.release.protocol !== client.protocol)) return { searchId: request.searchId, optionId: request.optionId, outcome: 'rejected', candidateIds: [], outcomes: [] };
+    if (policy.dryRun) return { searchId: request.searchId, optionId: request.optionId, outcome: 'dry-run', candidateIds, outcomes: candidateIds.map((candidateId: string) => ({candidateId,outcome:'dry-run'})) };
     const payload = { ...payloadBase, hash, candidateIds, physicalReleases: data.map(d => d.privateData!.physicalKey) };
     const reservation = this.deps.store.reserveSubmission({ idempotencyKey: request.idempotencyKey, payload, owner, targets: payloadBase.targets, physicalReleases: data.map(d => d.privateData!.physicalKey), now: now(), graceMs: Math.max(0, policy.queueGraceMinutes) * 60_000 });
     if (reservation.kind === 'replay') return resultFrom(reservation.receipt);

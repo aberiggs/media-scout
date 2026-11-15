@@ -75,3 +75,14 @@ docker exec -i <container-name> node_modules/.bin/tsx src/mcp/server.ts
 ```
 
 It shares SQLite state with the daemon. Stop the daemon and every MCP, CLI, and other database writer before a filesystem backup. The server uses stdio and has no built-in user identity/authentication; review the host's tool-approval policy, especially for `ma_review_action` and `ma_pick`. The unauthenticated HTTP API is also loopback-bound by default. See [operations and safety](operations.md) and [operator recovery](operator-recovery.md).
+# Search-first database boundary
+
+The replacement uses a fresh SQLite path (for example,
+`DB_PATH=data/media-scout-search.db`). Stop existing writers before switching
+versions. Existing legacy databases are refused without modification; there is
+no migration or need to delete your old database. Configure connections and
+preferences in Settings; monitoring starts disabled and dry-run starts enabled.
+Normal restarts retain the replacement's own search and submission state.
+Keep the old database and matching binary if you want to roll back. Changing
+paths does not undo existing downloads; account for those before re-enabling
+either engine. Never run the old and replacement schedulers together.

@@ -17,7 +17,7 @@
 - SQLite persistence/migrations live in `src/core/state.ts`; work eligibility and dashboard projections live in `work-queue.ts` and `operations.ts`.
 - `planner.ts`, `picker.ts`, and `queue-association.ts` own the LLM steps. `src/clients/` owns upstream API access.
 - `src/daemon.ts` exposes the HTTP API/scheduler; `src/mcp/server.ts` and `src/operator-cli.ts` share core behavior. The React/Vite UI is in `web/`.
-- Preserve owner-checked claims, submission reservations, queue association safety, unknown-vs-empty observation semantics, and conservative recovery checks. A search result or download submission is not proof of import.
+- Search-first replacement approved in `openspec/changes/replace-tracking-with-search-service/` (#24): use fresh Arr library/queue observations as authority. Preserve owner-checked leases, atomic finite submission/appearance grace, source backoff, unknown-vs-empty observations and fresh pre-submit checks. Replace indefinite reservations, vanished-coverage holds and manual reviews; unmatched retries after finite grace intentionally accept duplicate-download risk. A search result or submission is not proof of import. Do not introduce a parallel legacy engine or migrate old state; refuse legacy databases without modifying them and use a fresh path.
 - Keep existing `media-agent` runtime identifiers unless a task explicitly includes compatibility migration.
 
 ## Setup and checks
@@ -41,7 +41,7 @@ For OpenSpec work, record actual check commands/results and blockers in the acti
 ## Safety
 
 - Read `docs/operations.md` and `docs/operator-recovery.md` before runtime/integration work. Default to an isolated database, monitoring disabled, and dry-run enabled.
-- Dry-run can still call LLMs and indexers. Ordinary tests must stay offline/deterministic; live evaluation must be explicit, bounded, and unable to grab downloads or change production state.
+- Dry-run can still call LLMs and indexers. Ordinary tests must stay offline/deterministic; live evaluation must be explicit, bounded, and unable to grab downloads or change production state. For the approved search-first change, live evaluation is authorized up to six synthetic/sanitized requests, 36 Prowlarr searches and 60 model decisions in total, including at most one tuning repeat. Saved credentials may be retrieved read-only via `ssh zimablade` from the named deployment; keep them in private local files, never logs or commits. Do not run the production scheduler or submit downloads during evaluation.
 - Never commit or publish `.env`, API keys, SQLite databases/backups/WAL files, private release URLs, hashes, or raw production exports. Redact issue evidence and evaluation fixtures; obtain permission before sending private data to a model provider.
 - Do not start the daemon against production data, trigger cycles, change upstream services, or run dependency auto-fixes as part of a routine verification pass.
 - State storage can contain credentials, and the settings API exposes saved keys. Keep development listeners on trusted/local interfaces; do not expose the app publicly.

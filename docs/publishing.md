@@ -76,3 +76,13 @@ No automated deployment or database restore is configured by this project. Keep 
 ## Episode-progress upgrade and rollback
 
 Stop all application writers before upgrading and make a consistent SQLite backup. Never run old and new writer versions concurrently: older binaries do not honor per-episode retry state. There is no destructive down migration. To roll back, stop writers and restore the pre-upgrade backup with its matching binary; observations made after upgrade will be discarded and must be reconciled deliberately.
+# Search-first rollout
+
+The approved search-first replacement (#24) requires a fresh `DB_PATH`, not a
+legacy migration. Existing old nonempty databases are refused before writes and
+are never automatically deleted. Stop all writers when switching versions;
+retain the old database/binary if rollback is desired. A new database starts
+with automation disabled and dry-run enabled. External downloads are not undone
+by switching binaries or database paths: inspect/account for them before
+enabling automatic retries. Publishing/deployment and real download submissions
+are separate from implementation and dry-run evaluation authorization.

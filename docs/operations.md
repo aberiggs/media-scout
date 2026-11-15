@@ -1,5 +1,15 @@
 # Operations and safety
 
+> Search-first replacement (#24): the approved implementation in
+> `openspec/changes/replace-tracking-with-search-service/` supersedes the legacy
+> tracking/recovery policy below. Its runtime uses a fresh database, Arr-derived
+> eligibility, finite 30-minute appearance grace, and automatic bounded retries.
+> An unmatched download can remain active when a new attempt becomes eligible;
+> that accepted risk replaces indefinite reservations/manual reviews. Never
+> interpret a submission or queue disappearance as proof of import. During
+> implementation, the sections below describe only the old engine and will be
+> replaced at cutover; do not run both schedulers.
+
 This reference describes current behavior; it is not a guarantee that every cycle searches or that a result will be imported.
 
 ## Costs, network access, and safe rollout

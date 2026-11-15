@@ -1,5 +1,12 @@
 # Operator recovery lane
 
+> Legacy engine only. The approved search-first replacement (#24) removes this
+> lane rather than migrating its holds. New automation trusts fresh Arr state,
+> retains owner-checked finite appearance grace and provider backoff, and accepts
+> unmatched duplicate risk after grace expires. It never cancels client jobs and
+> never treats queue absence as proof of import. Use a fresh database path; do
+> not clear a running production database or invoke legacy recovery to upgrade.
+
 This is an isolated administrative lane for a human to repair an existing queue association or release an eligible local reservation. It is not called by the normal runner, planner, picker, queue associator, or automatic MCP batch actions. It has no search/grab/download-client mutation path. A successful release only writes `released_at` and an audit note; the original intent status, capture, receipt, markers, source identity and history remain intact.
 
 ## Enablement and approval boundary

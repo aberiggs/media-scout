@@ -133,7 +133,7 @@ export class SearchRuntime {
     const settings = this.getSettings(), clients = this.clients(settings);
     if (!clients.prowlarr) return { searchId: request.searchId, optionId: request.optionId, outcome: 'failed', candidateIds: [], outcomes: [] };
     const bound = this.store.getSetting(`search-arr:${request.searchId}`) as ArrTarget | null;
-    const context = bound ? { targets: [bound.key], validate: () => this.createObserver().validateTarget(bound), fingerprint: () => this.createObserver().sourceFingerprint(bound.provider) ?? 'source-removed' } : serverContext;
+    const context = bound ? { targets: [bound.key], validate: () => this.createObserver().validateTarget(bound), fingerprint: () => this.createObserver().sourceFingerprint(bound.provider) ?? 'source-removed', available: serverContext.available } : serverContext;
     const result = await new SubmissionService({ prowlarr: clients.prowlarr, store: this.store, getPolicy: () => this.submissionPolicy(), clock: this.clock }).submit(request, this.submissionContext(context));
     this.store.appendEvent(request.searchId, { type: 'submission', data: result }, this.clock());
     return result;
@@ -242,10 +242,15 @@ export class SearchRuntime {
   private createAutomation(observer: ArrObserver, _prowlarr: NonNullable<RuntimeClients['prowlarr']>): ArrAutomation {
     const getPolicy = () => { const s = this.getSettings(); return { enabled: s.monitoring.enabled, dryRun: s.safety.dryRun, preferences: s.ai.preferences, queueGraceMinutes: s.monitoring.queueGraceMinutes, minRetryHours: s.monitoring.minRetryHours, failureBackoffMinMinutes: s.monitoring.failureBackoffMinMinutes, failureBackoffMaxMinutes: s.monitoring.failureBackoffMaxMinutes }; };
     const search = { run: async (request: SearchRequest, limits?: any, signal?: AbortSignal, context?: SearchServerContext) => {
-      const s = this.getSettings(); const job = new SearchService({ llm: this.llm(s), prowlarr: this.clients(s).prowlarr!, store: this.store, clock: this.clock, limits: { decisions: s.search.maxDecisions, searches: s.search.maxSearches, deadlineMs: s.search.deadlineMinutes * 60_000 } }).start(request, limits, signal, context);
-      this.store.setSetting(`search-source:${job.searchId}`, 'automation');
-      return job.completion;
-    } };
+       const s = this.getSettings(); const job = new SearchService({ llm: this.llm(s), prowlarr: this.clients(s).prowlarr!, store: this.store, clock: this.clock, limits: { decisions: s.search.maxDecisions, searches: s.search.maxSearches, deadlineMs: s.search.deadlineMinutes * 60_000 } }).start(request, limits, signal, context);
+       for (const key of context?.targetKeys ?? []) for (const provider of ['sonarr', 'radarr'] as const) {
+         const observation = this.store.getObservation(provider)?.payload as { targets?: ArrTarget[] } | undefined;
+         const target = observation?.targets?.find(item => item.key === key);
+         if (target) this.store.setSetting(`search-arr:${job.searchId}`, target);
+       }
+       this.store.setSetting(`search-source:${job.searchId}`, 'automation');
+       return job.completion;
+     } };
     const submission = { submit: async (request: SubmissionRequest, context?: any) => this.submit(request, context) };
     return new ArrAutomation({ store: this.store, observer: { observe: () => observer.observe(), validateTarget: (target: ArrTarget) => this.createObserver().validateTarget(target), sourceFingerprint: (provider) => this.createObserver().sourceFingerprint(provider) }, search, submission, getPolicy, clock: this.clock });
   }

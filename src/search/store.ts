@@ -79,6 +79,7 @@ export class SearchStore {
   setProviderDeadline(provider:string,deadline:number):void { this.db.prepare('INSERT INTO provider_deadlines VALUES(?,?) ON CONFLICT(provider) DO UPDATE SET deadline=excluded.deadline').run(provider,deadline); }
   getProviderDeadline(provider:string):number|null { return (this.db.prepare('SELECT deadline FROM provider_deadlines WHERE provider=?').get(provider) as {deadline:number}|undefined)?.deadline ?? null; }
   getGrace(kind: 'target' | 'release', identity: string, now: number): number | null { return (this.db.prepare('SELECT expires_at FROM grace WHERE kind=? AND identity=? AND expires_at>?').get(kind, identity, now) as { expires_at: number } | undefined)?.expires_at ?? null; }
+  clearGraceForSubmission(key: string): void { this.db.prepare('DELETE FROM grace WHERE submission_key=?').run(key); }
   listSubmissions(): SubmissionReceipt[] { return (this.db.prepare('SELECT key FROM submissions ORDER BY created_at DESC').all() as Array<{ key: string }>).map(row => this.getSubmission(row.key)!); }
   acquireLease(resource:string,owner:string,now:number,ttl:number):boolean { return this.db.prepare('INSERT INTO leases VALUES(?,?,?) ON CONFLICT(resource) DO UPDATE SET owner=excluded.owner,expires_at=excluded.expires_at WHERE leases.expires_at<=? OR leases.owner=excluded.owner').run(resource,owner,now+ttl,now).changes===1; }
   ownsLease(resource: string, owner: string, now: number): boolean { return !!this.db.prepare('SELECT 1 FROM leases WHERE resource=? AND owner=? AND expires_at>?').get(resource, owner, now); }

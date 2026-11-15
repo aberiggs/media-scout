@@ -51,6 +51,39 @@ describe('SubmissionService', () => {
       expect(f.prowlarr.grab).not.toHaveBeenCalled();
     } finally { f.store.close(); }
   });
+  it('does not POST when a cached candidate expires during fresh validation', async () => {
+    const f = fixture();
+    let clock = 20;
+    const service = new SubmissionService({ prowlarr: f.prowlarr, store: f.store, getPolicy: () => ({ dryRun: false, tvClient: 'Torrent', movieClient: 'Torrent', queueGraceMinutes: 30 }), clock: () => clock });
+    try {
+      const result = await service.submit({ searchId: 's', optionId: 'o', idempotencyKey: 'expires-during-validation' }, { targets: ['episode:1'], validate: async () => { clock = 101; return true; } });
+      expect(result.outcome).toBe('failed');
+      expect(f.prowlarr.grab).not.toHaveBeenCalled();
+      expect(f.store.getGrace('target', 'episode:1', clock)).toBeNull();
+      expect(f.store.getGrace('release', 'physical', clock)).toBeNull();
+      expect(await service.submit({ searchId: 's', optionId: 'o', idempotencyKey: 'expires-during-validation' })).toEqual(result);
+      expect(f.prowlarr.grab).not.toHaveBeenCalled();
+      f.store.updateCandidate({ searchId: 's', candidateId: 'c', safe: {}, privateData: { release, physicalKey: 'physical' }, expiresAt: 1000 });
+      expect((await service.submit({ searchId: 's', optionId: 'o', idempotencyKey: 'renewed-capability' })).outcome).toBe('submitted');
+      expect(f.prowlarr.grab).toHaveBeenCalledTimes(1);
+    } finally { f.store.close(); }
+  });
+  it('retains grace for an already-submitted release when a later plan capability expires', async () => {
+    const f = fixture();
+    let clock = 20, validations = 0;
+    f.store.addCandidate({ searchId: 's', candidateId: 'second', safe: {}, privateData: { release: { ...release, guid: 'second-guid' }, physicalKey: 'second-physical' }, expiresAt: 100 });
+    f.store.finishSearch('s', 'matched', { options: [{ optionId: 'o', releases: [{ candidateId: 'c' }, { candidateId: 'second' }] }] }, 2);
+    f.store.updateCandidate({ searchId: 's', candidateId: 'c', safe: {}, privateData: { release, physicalKey: 'physical' }, expiresAt: 1000 });
+    const service = new SubmissionService({ prowlarr: f.prowlarr, store: f.store, getPolicy: () => ({ dryRun: false, tvClient: 'Torrent', movieClient: 'Torrent', queueGraceMinutes: 30 }), clock: () => clock });
+    try {
+      const result = await service.submit({ searchId: 's', optionId: 'o', idempotencyKey: 'partial-expiry' }, { targets: ['episode:1'], validate: async () => { if (++validations === 2) clock = 101; return true; } });
+      expect(result).toMatchObject({ outcome: 'failed', outcomes: [{ candidateId: 'c', outcome: 'submitted' }, { candidateId: 'second', outcome: 'failed' }] });
+      expect(f.prowlarr.grab).toHaveBeenCalledTimes(1);
+      expect(f.store.getGrace('target', 'episode:1', clock)).not.toBeNull();
+      expect(f.store.getGrace('release', 'physical', clock)).not.toBeNull();
+      expect(f.store.getGrace('release', 'second-physical', clock)).not.toBeNull();
+    } finally { f.store.close(); }
+  });
   it('serializes overlapping live workers even after short appearance grace expires', async () => {
     const f = fixture();
     let clock = 20, releaseValidation!: () => void;
@@ -116,6 +149,18 @@ describe('SubmissionService', () => {
       expect(f.prowlarr.grab).toHaveBeenCalledWith(release, 8);
       expect((await f.service.submit({ searchId: 's', optionId: 'o', idempotencyKey: 'another', downloadClientId: 8 })).outcome).toBe('deferred');
       expect(f.prowlarr.grab).toHaveBeenCalledTimes(1);
+    } finally { f.store.close(); }
+  });
+  it('does not fall back to a different sole client when the configured media route is missing', async () => {
+    const f = fixture();
+    f.store.createSearch({ searchId: 'tv', prompt: '{"context":{"kind":"tv"}}', status: 'matched', createdAt: 1 });
+    f.store.finishSearch('tv', 'matched', { options: [{ optionId: 'o', releases: [{ candidateId: 'c' }] }] }, 2);
+    f.store.addCandidate({ searchId: 'tv', candidateId: 'c', safe: {}, privateData: { release, physicalKey: 'physical-tv' }, expiresAt: 100 });
+    const service = new SubmissionService({ prowlarr: f.prowlarr, store: f.store, getPolicy: () => ({ dryRun: false, enabled: true, tvClient: 'TV', movieClient: 'Movies', queueGraceMinutes: 15 }), clock: () => 20 });
+    try {
+      f.prowlarr.getDownloadClients.mockResolvedValue([{ id: 8, name: 'Movies', enable: true, protocol: 'torrent', supportsCategories: true, categories: [] }]);
+      expect((await service.submit({ searchId: 'tv', optionId: 'o', idempotencyKey: 'missing-tv-route' })).outcome).toBe('rejected');
+      expect(f.prowlarr.grab).not.toHaveBeenCalled();
     } finally { f.store.close(); }
   });
   it('stops a partial season submission at the first failed POST', async () => {

@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { openSearchStore } from '../src/search/store';
-import { SearchRuntime } from '../src/search/runtime';
+import { SearchRuntime, type RuntimeClients } from '../src/search/runtime';
 import { defaultSettings, type Settings } from '../src/search/settings';
 import type { LLMClient } from '../src/clients/llm';
 import { releaseSchema } from '../src/types/prowlarr';
@@ -52,6 +52,77 @@ describe('search runtime', () => {
     release(); await poll;
     expect(calls).toEqual(['http://old-source', 'http://old-source']);
     expect(runtime.automationStatus().providers.find(p => p.provider === 'sonarr')?.known).toBe(false);
+  });
+  it('keeps automated search target bindings so later manual submission revalidates fresh Arr state', async () => {
+    const store = openSearchStore(':memory:'), settings = structuredClone(defaultSettings);
+    settings.integrations.prowlarr = { url: 'http://prowlarr', apiKey: 'private', tvClient: 'TV', movieClient: 'Movies' };
+    settings.integrations.sonarr = { url: 'http://sonarr', apiKey: 'sonarr-secret' };
+    settings.ai.apiKey = 'model-secret';
+    settings.monitoring.enabled = true;
+    settings.safety.dryRun = true;
+    let hasFile = false, clock = 1_800_000_000_000;
+    const release = releaseSchema.parse({ guid: 'release-guid', age: 1, size: null, files: null, grabs: null, indexerId: 1, indexer: 'Test', subGroup: null, title: 'Example S01E01', tvdbId: null, tmdbId: null, publishDate: '', downloadUrl: 'https://private.test/release', indexerFlags: [], categories: [], magnetUrl: null, infoHash: 'a'.repeat(40), seeders: 3, leechers: 0, protocol: 'torrent', downloadClientId: null });
+    const clients = () => ({
+      prowlarr: {
+        getIndexers: async () => [{ id: 1, name: 'Test', enable: true }],
+        getIndexerStatuses: async () => [],
+        search: async () => [release],
+        getDownloadClients: async () => [{ id: 7, name: 'TV', enable: true, protocol: 'torrent' as const, supportsCategories: false, categories: [] }],
+        grab: async () => { throw new Error('must not grab after the episode imports'); },
+      },
+      sonarr: {
+        getSeries: async () => [{ id: 1, tvdbId: 20, title: 'Example', titleSlug: 'example', seriesType: 'standard' as const, monitored: true, seasons: [], alternateTitles: [] }],
+        getEpisodes: async () => [{ id: 2, seriesId: 1, seasonNumber: 1, episodeNumber: 1, absoluteEpisodeNumber: null, title: 'Pilot', airDate: '2020-01-01', airDateUtc: null, finaleType: null, monitored: true, hasFile }],
+        getQueue: async () => [],
+      },
+    } as RuntimeClients);
+    const llm = { json: async ({ user }: { user: string }) => {
+      const input = JSON.parse(user) as { candidates: Array<{ candidateId: string }>; request: { context?: { targets?: Array<{ targetId: string }> } } };
+      if (!input.candidates.length) return { action: 'search_releases', query: 'Example S01E01', categories: [], indexerIds: [1], status: null, options: null, message: null };
+      return { action: 'finish', query: null, categories: null, indexerIds: null, status: 'matched', options: [{ optionId: 'rank-one', rank: 1, releases: [{ candidateId: input.candidates[0]!.candidateId }], coveredTargetIds: input.request.context?.targets?.map(t => t.targetId) ?? [], reason: 'Correct episode', uncertainty: '' }], message: null };
+    } } as unknown as LLMClient;
+    const runtime = new SearchRuntime({ store, now: () => clock, initialSettings: settings, clients, llm });
+    try {
+      await runtime.poll();
+      const item = runtime.activity().items[0];
+      expect(item?.status).toBe('matched');
+      expect(store.getSetting(`search-arr:${item!.searchId}`)).toMatchObject({ provider: 'sonarr', episodeId: 2 });
+      hasFile = true;
+      runtime.saveSettings({ ...settings, safety: { dryRun: false } });
+      expect((await runtime.submit({ searchId: item!.searchId, optionId: 'rank-one', idempotencyKey: 'manual-after-import' })).outcome).toBe('failed');
+    } finally { await runtime.close(); }
+  });
+  it('does not grab when automation is paused during fresh pre-submit validation', async () => {
+    const store = openSearchStore(':memory:'), settings = structuredClone(defaultSettings);
+    settings.integrations.prowlarr = { url: 'http://prowlarr', apiKey: 'private', tvClient: 'TV', movieClient: 'Movies' };
+    settings.integrations.sonarr = { url: 'http://sonarr', apiKey: 'sonarr-secret' };
+    settings.ai.apiKey = 'model-secret';
+    settings.safety.dryRun = false;
+    let paused = false, episodeReads = 0, clock = 1_800_000_000_000;
+    const episode = { id: 2, seriesId: 1, seasonNumber: 1, episodeNumber: 1, absoluteEpisodeNumber: null, title: 'Pilot', airDate: '2020-01-01', airDateUtc: null, finaleType: null, monitored: true, hasFile: false };
+    const release = releaseSchema.parse({ guid: 'release-guid', age: 1, size: null, files: null, grabs: null, indexerId: 1, indexer: 'Test', subGroup: null, title: 'Example S01E01', tvdbId: null, tmdbId: null, publishDate: '', downloadUrl: 'https://private.test/release', indexerFlags: [], categories: [], magnetUrl: null, infoHash: 'b'.repeat(40), seeders: 3, leechers: 0, protocol: 'torrent', downloadClientId: null });
+    const grab = vi.fn(async () => {});
+    const clients = () => ({
+      prowlarr: { getIndexers: async () => [], getIndexerStatuses: async () => [], search: async () => [], getDownloadClients: async () => [{ id: 7, name: 'TV', enable: true, protocol: 'torrent' as const, supportsCategories: false, categories: [] }], grab },
+      sonarr: {
+        getSeries: async () => [{ id: 1, tvdbId: 20, title: 'Example', titleSlug: 'example', seriesType: 'standard' as const, monitored: true, seasons: [], alternateTitles: [] }],
+        getEpisodes: async () => { if (++episodeReads > 1) paused = true; return [episode]; },
+        getQueue: async () => [],
+      },
+    } as RuntimeClients);
+    const runtime = new SearchRuntime({ store, now: () => clock, initialSettings: settings, clients });
+    try {
+      await runtime.poll();
+      const observation = store.getObservation('sonarr')?.payload as { targets: Array<{ key: string; provider: string }> };
+      const target = observation.targets[0]!;
+      store.createSearch({ searchId: 'automated', prompt: '{"context":{"kind":"tv"}}', status: 'matched', createdAt: clock, finishedAt: clock, result: { options: [{ optionId: 'rank-one', rank: 1, releases: [{ candidateId: 'candidate' }], coveredTargetIds: [], reason: 'Match', uncertainty: '' }] } });
+      store.addCandidate({ searchId: 'automated', candidateId: 'candidate', safe: {}, privateData: { release, physicalKey: 'physical' }, expiresAt: clock + 60_000 });
+      store.setSetting('search-arr:automated', target);
+      const result = await runtime.submit({ searchId: 'automated', optionId: 'rank-one', idempotencyKey: 'pause-during-validation' }, { available: () => !paused });
+      expect(result.outcome).toBe('failed');
+      expect(paused).toBe(true);
+      expect(grab).not.toHaveBeenCalled();
+    } finally { await runtime.close(); }
   });
   it('recovers an abandoned job after a restart within its still-live lease', async () => {
     const f = setup();

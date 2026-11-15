@@ -11,7 +11,7 @@ import { ArrObserver, type ArrProvider, type ArrTarget } from './arr';
 import { SearchService, safeText, type SearchResult, type SearchServerContext } from './service';
 import { SubmissionService, type SubmissionResult } from './submission';
 import { openSearchStore, type SearchStore, type SearchRecord } from './store';
-import { defaultSettings, missingSettings, settingsSchema, type Settings } from './settings';
+import { defaultSettings, migrateSettings, missingSettings, settingsSchema, type Settings } from './settings';
 import type { SearchRequest, SubmissionRequest } from './contracts';
 
 export interface RuntimeClients {
@@ -59,9 +59,10 @@ export class SearchRuntime {
     this.store = options.store ?? openSearchStore(options.databasePath ?? 'data/media-scout-search.db');
     const saved = this.store.getSetting('application-settings');
     const candidate = saved ?? options.initialSettings ?? defaultSettings;
-    const parsed = settingsSchema.safeParse(candidate);
-    if (!parsed.success) throw new Error('Saved application settings are invalid');
-    if (!saved) this.store.setSetting('application-settings', parsed.data);
+    const migrated = migrateSettings(candidate);
+    const parsed = settingsSchema.parse(migrated.settings);
+    if (migrated.migrated) this.store.migrateLegacySearchDeadlines(this.clock(), parsed.monitoring.searchRetryMinutes * 60_000);
+    if (!saved || migrated.migrated) this.store.setSetting('application-settings', parsed);
     if (!this.store.hasLiveLease('search-worker', this.clock())) this.store.interruptRunning(this.clock());
     this.maintain();
     this.maintenanceTimer = setInterval(() => { try { this.maintain(); } catch { /* Request paths surface database failures safely. */ } }, 60_000);
@@ -170,11 +171,11 @@ export class SearchRuntime {
         const title = typeof target.context === 'object' && target.context !== null && typeof (target.context as any).title === 'string' ? (target.context as any).title : 'Unknown item';
         const targetId = this.targetId(target as unknown as ArrTarget);
         const context = target.context as Record<string, unknown> | undefined;
-        if (target.hasFile || !target.monitored) continue;
+        if (!cached?.complete || target.hasFile || !target.monitored || target.available !== true) continue;
         const key = String(target.key), attempt = this.store.getAutomationAttempt(key);
         const grace = this.store.getGrace('target', key, this.clock());
         const deadline = Math.max(attempt?.deadline ?? 0, this.store.getDeadline(key) ?? 0, this.store.getProviderDeadline(provider) ?? 0, this.store.getProviderDeadline('prowlarr') ?? 0, this.store.getProviderDeadline('model') ?? 0);
-        const status = !cached?.complete ? 'unknown' : target.available && !target.eligible ? 'downloading' : !target.available ? 'waiting' : grace ? 'grace' : deadline > this.clock() ? (attempt?.failCount ? 'backoff' : 'cooldown') : 'missing';
+        const status = target.available && !target.eligible ? 'downloading' : grace ? 'grace' : deadline > this.clock() ? (attempt?.failCount ? 'backoff' : 'cooldown') : 'missing';
         items.push({ targetId, title: safeText(title), kind: provider === 'sonarr' ? 'tv' : 'movie', ...(target.serviceId === undefined ? {} : { seriesId: String(target.serviceId) }), ...(context?.seasonNumber === undefined ? {} : { seasonNumber: context.seasonNumber as number }), ...(context?.episodeNumber === undefined ? {} : { episodeNumber: context.episodeNumber as number }), status, eligible: !!target.eligible && !grace && deadline <= this.clock(), observedAt: iso(cached?.observedAt)!, ...(Math.max(grace ?? 0, deadline) > this.clock() ? { nextAttemptAt: iso(Math.max(grace ?? 0, deadline)) } : {}), ...(attempt ? { lastAttemptAt: iso(attempt.lastAttempt) } : {}) });
       }
     }
@@ -240,7 +241,7 @@ export class SearchRuntime {
     });
   }
   private createAutomation(observer: ArrObserver, _prowlarr: NonNullable<RuntimeClients['prowlarr']>): ArrAutomation {
-    const getPolicy = () => { const s = this.getSettings(); return { enabled: s.monitoring.enabled, dryRun: s.safety.dryRun, preferences: s.ai.preferences, queueGraceMinutes: s.monitoring.queueGraceMinutes, minRetryHours: s.monitoring.minRetryHours, failureBackoffMinMinutes: s.monitoring.failureBackoffMinMinutes, failureBackoffMaxMinutes: s.monitoring.failureBackoffMaxMinutes }; };
+    const getPolicy = () => { const s = this.getSettings(); return { enabled: s.monitoring.enabled, dryRun: s.safety.dryRun, preferences: s.ai.preferences, queueGraceMinutes: s.monitoring.queueGraceMinutes, searchRetryMinutes: s.monitoring.searchRetryMinutes, failureBackoffMinMinutes: s.monitoring.failureBackoffMinMinutes, failureBackoffMaxMinutes: s.monitoring.failureBackoffMaxMinutes }; };
     const search = { run: async (request: SearchRequest, limits?: any, signal?: AbortSignal, context?: SearchServerContext) => {
        const s = this.getSettings(); const job = new SearchService({ llm: this.llm(s), prowlarr: this.clients(s).prowlarr!, store: this.store, clock: this.clock, limits: { decisions: s.search.maxDecisions, searches: s.search.maxSearches, deadlineMs: s.search.deadlineMinutes * 60_000 } }).start(request, limits, signal, context);
        for (const key of context?.targetKeys ?? []) for (const provider of ['sonarr', 'radarr'] as const) {

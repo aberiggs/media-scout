@@ -142,6 +142,31 @@ it('keeps search available in dry-run and distinguishes a saved refresh from a l
   await waitFor(() => assert.equal(calls.filter(c => c.url.endsWith('/poll')).length, 1))
 })
 
+it('distinguishes a known empty actionable list from unavailable Arr observations', async () => {
+  window.history.replaceState(null, '', '/#automation')
+  let known = true
+  let partialInventory = false
+  globalThis.fetch = async input => {
+    const url = String(input)
+    if (url === '/api/settings') return Response.json(env)
+    if (url === '/api/v2/automation') return Response.json({ enabled: false, dryRun: true, running: false, providers: ['sonarr', 'radarr'].map(provider => ({ provider, known, observedAt: '2026-11-15T00:00:00Z', unidentifiedQueueRows: 0, ...(partialInventory && provider === 'sonarr' ? { unknownSeriesIds: ['42'] } : {}) })), items: [] })
+    return Response.json({ items: [] })
+  }
+  render(<App />)
+  assert.ok(await screen.findByRole('heading', { name: 'No items to watch right now' }))
+  cleanup()
+  partialInventory = true
+  render(<App />)
+  assert.ok(await screen.findByRole('heading', { name: 'No items to show' }))
+  assert.ok(screen.getByText(/could not be fully checked/i))
+  cleanup()
+  partialInventory = false
+  known = false
+  render(<App />)
+  assert.ok(await screen.findByRole('heading', { name: 'No items to show' }))
+  assert.ok(screen.getByText(/list may be incomplete/i))
+})
+
 it('keeps Settings sections scannable and distinguishes required from optional services', async () => {
   window.history.replaceState(null, '', '/#settings')
   globalThis.fetch = async input => String(input) === '/api/settings' ? Response.json(env) : Response.json({ items: [] })
@@ -150,6 +175,7 @@ it('keeps Settings sections scannable and distinguishes required from optional s
   assert.ok(screen.getByRole('complementary', { name: 'Instance information' }))
   assert.equal(screen.getAllByText('Optional').length, 2)
   assert.ok(screen.getByRole('button', { name: 'Reveal Prowlarr API key' }))
+  assert.ok(screen.getByRole('spinbutton', { name: /Search-only retry \(minutes\)/ }))
 })
 
 it('shows server validation details as an error and preserves the rejected form values', async () => {

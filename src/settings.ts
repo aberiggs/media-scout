@@ -1,1 +1,1 @@
-export { defaultSettings, missingSettings, settingsSchema, type Settings } from './search/settings';
+export { defaultSettings, migrateSettings, missingSettings, settingsSchema, type Settings } from './search/settings';

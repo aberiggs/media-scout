@@ -76,6 +76,37 @@ export class SearchStore {
   getSetting(key:string):unknown|null { const r=this.db.prepare('SELECT value_json FROM settings WHERE key=?').get(key) as {value_json:string}|undefined; return r?parse(r.value_json):null; }
   setDeadline(target:string,deadline:number):void { this.db.prepare('INSERT INTO target_deadlines VALUES(?,?) ON CONFLICT(target) DO UPDATE SET deadline=excluded.deadline').run(target,deadline); }
   getDeadline(target:string):number|null { return (this.db.prepare('SELECT deadline FROM target_deadlines WHERE target=?').get(target) as {deadline:number}|undefined)?.deadline ?? null; }
+  migrateLegacySearchDeadlines(now:number,retryMs:number):void {
+    this.db.transaction(() => {
+      const marker = 'migration:search-only-deadlines-v1';
+      if (this.getSetting(marker)) return;
+      const rows = this.db.prepare('SELECT * FROM automation_attempts').all() as Array<{target:string;last_attempt:number;fail_count:number;deadline:number;grace_until:number}>;
+      const updateAttempt = this.db.prepare('UPDATE automation_attempts SET deadline=? WHERE target=?');
+      const updateDeadline = this.db.prepare('UPDATE target_deadlines SET deadline=? WHERE target=?');
+      const bindings = this.db.prepare("SELECT key,value_json FROM settings WHERE key LIKE 'search-arr:%'").all() as Array<{key:string;value_json:string}>;
+      for (const row of rows) {
+        const mirrored = this.getDeadline(row.target);
+        if (row.fail_count !== 0 || row.grace_until > 0 || row.deadline <= now || mirrored !== row.deadline ||
+          this.hasLiveLease(`target:${row.target}`, now)) continue;
+        const hasSearchOnlyOutcome = bindings.some(binding => {
+          try {
+            if ((parse<Record<string, unknown>>(binding.value_json)).key !== row.target) return false;
+            const searchId = binding.key.slice('search-arr:'.length);
+            if (this.getSetting(`search-source:${searchId}`) !== 'automation') return false;
+            const search = this.db.prepare('SELECT status,created_at FROM searches WHERE id=?').get(searchId) as {status:string;created_at:number}|undefined;
+            return !!search && search.created_at >= row.last_attempt - 60_000 && ['matched','no-match','needs-input'].includes(search.status);
+          } catch { return false; }
+        });
+        if (!hasSearchOnlyOutcome) continue;
+        const hasReceipt = this.db.prepare("SELECT 1 FROM submissions WHERE outcome IN ('submitted','uncertain','submitting') AND EXISTS (SELECT 1 FROM json_each(submissions.payload_json,'$.targets') WHERE value=?) LIMIT 1").get(row.target);
+        if (hasReceipt) continue;
+        const shortened = Math.min(row.deadline, row.last_attempt + retryMs);
+        updateAttempt.run(shortened, row.target);
+        updateDeadline.run(shortened, row.target);
+      }
+      this.setSetting(marker, { completedAt: now });
+    })();
+  }
   setProviderDeadline(provider:string,deadline:number):void { this.db.prepare('INSERT INTO provider_deadlines VALUES(?,?) ON CONFLICT(provider) DO UPDATE SET deadline=excluded.deadline').run(provider,deadline); }
   getProviderDeadline(provider:string):number|null { return (this.db.prepare('SELECT deadline FROM provider_deadlines WHERE provider=?').get(provider) as {deadline:number}|undefined)?.deadline ?? null; }
   getGrace(kind: 'target' | 'release', identity: string, now: number): number | null { return (this.db.prepare('SELECT expires_at FROM grace WHERE kind=? AND identity=? AND expires_at>?').get(kind, identity, now) as { expires_at: number } | undefined)?.expires_at ?? null; }

@@ -44,6 +44,27 @@ describe('search store persistence and ownership', () => {
     expect(store.getSearch('rollback')).toBeNull();
     store.close();
   });
+  it('shortens only mirrored search-only legacy deadlines and preserves submission or grace holds', () => {
+    const store = openSearchStore(':memory:'), now = 10_000, retry = 30 * 60_000;
+    for (const target of ['search-only', 'receipt', 'grace', 'unmirrored']) {
+      const deadline = now + 6 * 60 * 60_000;
+      store.setAutomationAttempt(target, { lastAttempt: now, failCount: 0, deadline, graceUntil: target === 'grace' ? deadline : 0 });
+      store.setDeadline(target, target === 'unmirrored' ? deadline - 1 : deadline);
+    }
+    store.createSearch({ searchId: 'legacy-search', prompt: 'Find', status: 'matched', createdAt: now });
+    store.setSetting('search-arr:legacy-search', { key: 'search-only' });
+    store.setSetting('search-source:legacy-search', 'automation');
+    store.recordSubmission({ idempotencyKey: 'grab', payload: { targets: ['receipt'] }, outcome: 'submitted', createdAt: now });
+    store.migrateLegacySearchDeadlines(now, retry);
+    expect(store.getAutomationAttempt('search-only')?.deadline).toBe(now + retry);
+    expect(store.getDeadline('search-only')).toBe(now + retry);
+    expect(store.getAutomationAttempt('receipt')?.deadline).toBe(now + 6 * 60 * 60_000);
+    expect(store.getAutomationAttempt('grace')?.deadline).toBe(now + 6 * 60 * 60_000);
+    expect(store.getDeadline('unmirrored')).toBe(now + 6 * 60 * 60_000 - 1);
+    store.migrateLegacySearchDeadlines(now, 60 * 60_000);
+    expect(store.getDeadline('search-only')).toBe(now + retry);
+    store.close();
+  });
   it('prunes old search history without deleting submission receipts', () => {
     const store = openSearchStore(':memory:');
     store.createSearch({ searchId: 'old', prompt: 'old', status: 'matched', createdAt: 1, finishedAt: 1 });

@@ -11,12 +11,12 @@ const makeTarget = (key: string, episodeNumber: number, eligible = true): ArrTar
 const result = (status: SearchResult['status'] = 'matched'): SearchResult => ({ searchId: 's', status, options: status === 'matched' ? [{ optionId: 'rank1', rank: 1, releases: [{ candidateId: 'c' }], coveredTargetIds: [], reason: 'match', uncertainty: '' }] : [], candidates: [], counts: { decisions: 1, searches: 1, candidates: 1 }, events: [], promptVersion: 'v1' });
 
 describe('ArrAutomation', () => {
-  it('uses the finite six-hour ordinary retry for no-match', async () => {
+  it('uses the configured search-only retry for no-match', async () => {
     const clock = Date.parse('2026-01-01'), target = makeTarget('no-match', 1), store = openSearchStore(':memory:');
     const observer: any = { observe: async () => ({ observedAt: clock, sonarr: { known: true }, radarr: { known: false }, targets: [target] }) };
     try {
-      const pass = await new ArrAutomation({ store, observer, search: { run: async () => result('no-match') }, submission: { submit: vi.fn() }, getPolicy: () => ({ enabled: true, dryRun: false }), clock: () => clock }).runPass();
-      expect(pass.nextAttemptAt).toBe(clock + 6 * 60 * 60_000);
+      const pass = await new ArrAutomation({ store, observer, search: { run: async () => result('no-match') }, submission: { submit: vi.fn() }, getPolicy: () => ({ enabled: true, dryRun: false, searchRetryMinutes: 30 }), clock: () => clock }).runPass();
+      expect(pass.nextAttemptAt).toBe(clock + 30 * 60_000);
       expect(store.getAutomationAttempt(target.key)?.failCount).toBe(0);
     } finally { store.close(); }
   });
@@ -67,6 +67,32 @@ describe('ArrAutomation', () => {
       clock += 5 * 60_000;
       expect((await automation.runPass()).nextAttemptAt).toBe(clock + 10 * 60_000);
       expect(store.getAutomationAttempt(target.key)?.failCount).toBe(2);
+    } finally { store.close(); }
+  });
+  it.each(['failed', 'budget-exhausted', 'interrupted'] as const)('uses exponential backoff for %s searches even in dry-run', async status => {
+    let clock = Date.parse('2026-01-01'); const target = makeTarget(`dry-run-${status}`, 1), store = openSearchStore(':memory:');
+    const observer: any = { observe: async () => ({ observedAt: clock, sonarr: { known: true }, radarr: { known: false }, targets: [target] }) };
+    const search = { run: vi.fn(async () => result(status)) }, submission = { submit: vi.fn() };
+    try {
+      const automation = new ArrAutomation({ store, observer, search, submission, getPolicy: () => ({ enabled: true, dryRun: true }), clock: () => clock });
+      let pass = await automation.runPass();
+      expect(pass.nextAttemptAt).toBe(clock + 5 * 60_000);
+      expect(store.getAutomationAttempt(target.key)?.failCount).toBe(1);
+      expect(submission.submit).not.toHaveBeenCalled();
+      clock = pass.nextAttemptAt!;
+      pass = await automation.runPass();
+      expect(pass.nextAttemptAt).toBe(clock + 10 * 60_000);
+      expect(store.getAutomationAttempt(target.key)?.failCount).toBe(2);
+    } finally { store.close(); }
+  });
+  it('uses a short search retry for a matched dry-run without creating submission grace', async () => {
+    const clock = Date.parse('2026-01-01'), target = makeTarget('dry-run-match', 1), store = openSearchStore(':memory:');
+    const observer: any = { observe: async () => ({ observedAt: clock, sonarr: { known: true }, radarr: { known: false }, targets: [target] }) };
+    try {
+      const pass = await new ArrAutomation({ store, observer, search: { run: async () => result('matched') }, submission: { submit: vi.fn() }, getPolicy: () => ({ enabled: true, dryRun: true, searchRetryMinutes: 30 }), clock: () => clock }).runPass();
+      expect(pass.reason).toBe('paused-after-search');
+      expect(pass.nextAttemptAt).toBe(clock + 30 * 60_000);
+      expect(store.getAutomationAttempt(target.key)).toMatchObject({ failCount: 0, deadline: clock + 30 * 60_000, graceUntil: 0 });
     } finally { store.close(); }
   });
   it('stores dry-run cooldown in SQLite and does not repeat across automation restart', async () => {
@@ -124,6 +150,8 @@ describe('ArrAutomation', () => {
       const pass = await new ArrAutomation({ store, observer, search, submission, getPolicy: () => policy, clock: () => clock }).runPass();
       expect(pass.reason).toBe('paused-after-search');
       expect(submission.submit).not.toHaveBeenCalled();
+      expect(store.getAutomationAttempt(target.key)?.deadline).toBe(0);
+      expect(store.getDeadline(target.key) ?? 0).toBe(0);
     } finally { store.close(); }
   });
 

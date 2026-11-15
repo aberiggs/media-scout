@@ -10,7 +10,7 @@ import { safeText } from './service';
 
 const MINUTE = 60_000;
 const POLL_INTERVAL = 5 * MINUTE;
-const ORDINARY_RETRY = 6 * 60 * MINUTE;
+const ORDINARY_RETRY = 30 * MINUTE;
 const SUBMISSION_GRACE = 30 * MINUTE;
 const FAILURE_MIN = 5 * MINUTE;
 const FAILURE_MAX = 60 * MINUTE;
@@ -18,7 +18,7 @@ const EXCLUSION = 24 * 60 * MINUTE;
 
 export interface AutomationSearch { run(raw: SearchRequest, limits?: SearchLimits, signal?: AbortSignal, server?: SearchServerContext): Promise<SearchResult> }
 export interface AutomationSubmit { submit(raw: SubmissionRequest, serverContext?: SubmissionServerContext): Promise<SubmissionResult> }
-export interface AutomationPolicy { enabled: boolean; dryRun: boolean; preferences?: string; queueGraceMinutes?: number; minRetryHours?: number; failureBackoffMinMinutes?: number; failureBackoffMaxMinutes?: number }
+export interface AutomationPolicy { enabled: boolean; dryRun: boolean; preferences?: string; queueGraceMinutes?: number; searchRetryMinutes?: number; failureBackoffMinMinutes?: number; failureBackoffMaxMinutes?: number }
 export interface ArrAutomationDependencies {
   store: SearchStore; observer: Pick<ArrObserver, 'observe' | 'validateTarget'> & Partial<Pick<ArrObserver, 'sourceFingerprint'>>; search: AutomationSearch; submission: AutomationSubmit;
   getPolicy(): AutomationPolicy; clock?: () => number;
@@ -32,7 +32,7 @@ export class ArrAutomation {
 
   async runPass(signal?: AbortSignal): Promise<AutomationPass> {
     const now = (this.deps.clock ?? Date.now)(), policy = this.deps.getPolicy();
-    const ordinaryRetry = (policy.minRetryHours ?? 6) * 60 * MINUTE;
+    const ordinaryRetry = (policy.searchRetryMinutes ?? 30) * MINUTE;
     const failureDelay = (failures: number) => Math.min((policy.failureBackoffMaxMinutes ?? 60) * MINUTE, (policy.failureBackoffMinMinutes ?? 5) * MINUTE * 2 ** (failures - 1));
     if (!policy.enabled) return { observedAt: now, ran: false, reason: 'disabled' };
     if (now - this.lastPoll < POLL_INTERVAL) return { observedAt: now, ran: false, reason: 'poll-interval' };
@@ -73,22 +73,30 @@ export class ArrAutomation {
         ...(target.context.profileContext && typeof target.context.profileContext === 'object' ? { profileContext: target.context.profileContext as { qualities?: string[]; customFormats?: string[]; unknown: boolean } } : {}),
       } }, {}, signal, { targetKeys: [target.key] });
       if (signal?.aborted) return { observedAt: now, ran: true, reason: 'cancelled-after-search', targetKey: target.key, search };
-      if (!this.deps.getPolicy().enabled || this.deps.getPolicy().dryRun) {
-        const deadline = now + ordinaryRetry;
-        this.deps.store.setAutomationAttempt(target.key, { lastAttempt: now, failCount: 0, deadline, graceUntil: 0, physicalKey: null });
-        this.deps.store.setDeadline(target.key, deadline);
-        return { observedAt: now, ran: true, reason: 'paused-after-search', targetKey: target.key, search, nextAttemptAt: deadline };
-      }
       if (['failed','budget-exhausted','interrupted'].includes(search.status)) {
         const failures = (prior?.failCount ?? 0) + 1;
-        const deadline = now + failureDelay(failures);
-        this.deps.store.setAutomationAttempt(target.key, { lastAttempt: now, failCount: failures, deadline, graceUntil: 0, physicalKey: null });
+        const completedAt = (this.deps.clock ?? Date.now)();
+        const deadline = completedAt + failureDelay(failures);
+        this.deps.store.setAutomationAttempt(target.key, { lastAttempt: completedAt, failCount: failures, deadline, graceUntil: 0, physicalKey: null });
         this.deps.store.setDeadline(target.key, deadline);
         return { observedAt: now, ran: true, targetKey: target.key, search, nextAttemptAt: deadline };
       }
-      if (search.status !== 'matched' || policy.dryRun) {
-        const deadline = now + ordinaryRetry;
-        this.deps.store.setAutomationAttempt(target.key, { lastAttempt: now, failCount: 0, deadline, graceUntil: 0, physicalKey: null });
+      if (!this.deps.getPolicy().enabled) {
+        this.deps.store.setAutomationAttempt(target.key, { lastAttempt: now, failCount: prior?.failCount ?? 0, deadline: 0, graceUntil: prior?.graceUntil ?? 0, physicalKey: prior?.physicalKey });
+        this.deps.store.setDeadline(target.key, 0);
+        return { observedAt: now, ran: true, reason: 'paused-after-search', targetKey: target.key, search };
+      }
+      if (this.deps.getPolicy().dryRun) {
+        const completedAt = (this.deps.clock ?? Date.now)();
+        const deadline = completedAt + ordinaryRetry;
+        this.deps.store.setAutomationAttempt(target.key, { lastAttempt: completedAt, failCount: 0, deadline, graceUntil: 0, physicalKey: null });
+        this.deps.store.setDeadline(target.key, deadline);
+        return { observedAt: now, ran: true, reason: 'paused-after-search', targetKey: target.key, search, nextAttemptAt: deadline };
+      }
+      if (search.status !== 'matched') {
+        const completedAt = (this.deps.clock ?? Date.now)();
+        const deadline = completedAt + ordinaryRetry;
+        this.deps.store.setAutomationAttempt(target.key, { lastAttempt: completedAt, failCount: 0, deadline, graceUntil: 0, physicalKey: null });
         this.deps.store.setDeadline(target.key, deadline);
         return { observedAt: now, ran: true, targetKey: target.key, search, nextAttemptAt: deadline };
       }
@@ -101,8 +109,9 @@ export class ArrAutomation {
       const submission = await this.deps.submission.submit({ searchId: search.searchId, optionId: rankOne.optionId, idempotencyKey: randomUUID() }, serverContext);
       if (['failed', 'deferred', 'conflict'].includes(submission.outcome)) {
         const failures = (prior?.failCount ?? 0) + 1;
-        const deadline = now + failureDelay(failures);
-        this.deps.store.setAutomationAttempt(target.key, { lastAttempt: now, failCount: failures, deadline, graceUntil: 0, physicalKey: null });
+        const completedAt = (this.deps.clock ?? Date.now)();
+        const deadline = completedAt + failureDelay(failures);
+        this.deps.store.setAutomationAttempt(target.key, { lastAttempt: completedAt, failCount: failures, deadline, graceUntil: 0, physicalKey: null });
         this.deps.store.setDeadline(target.key, deadline);
         return { observedAt: now, ran: true, targetKey: target.key, search, submission, nextAttemptAt: deadline };
       }
@@ -111,8 +120,9 @@ export class ArrAutomation {
       return { observedAt: now, ran: true, targetKey: target.key, search, submission, ...(graceUntil ? { nextAttemptAt: graceUntil } : {}) };
     } catch {
       const failures = (prior?.failCount ?? 0)+1;
-      const deadline = now + failureDelay(failures);
-      this.deps.store.setAutomationAttempt(target.key, { lastAttempt: now, failCount: failures, deadline, graceUntil: 0, physicalKey: null });
+      const completedAt = (this.deps.clock ?? Date.now)();
+      const deadline = completedAt + failureDelay(failures);
+      this.deps.store.setAutomationAttempt(target.key, { lastAttempt: completedAt, failCount: failures, deadline, graceUntil: 0, physicalKey: null });
       this.deps.store.setDeadline(target.key, deadline);
       return { observedAt: now, ran: true, targetKey: target.key, reason: 'attempt-failed', nextAttemptAt: deadline };
     }

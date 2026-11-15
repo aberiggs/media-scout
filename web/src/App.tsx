@@ -75,7 +75,7 @@ export default function App() {
              <Section title="Automation and retries" description="Control scheduled Arr searches, safety mode, and retry timing." icon={<Radio size={18}/>}>
               <Toggle label="Automatic monitoring" description="Scheduled Arr searches can submit the best suitable recommendation when dry-run is off." checked={settings.monitoring.enabled} onChange={enabled => setSettings(s => ({ ...s, monitoring: { ...s.monitoring, enabled } }))}/>
               <Toggle label="Dry-run mode" description="Search and compare, but never submit a download. Live searches still use model/indexer calls." checked={settings.safety.dryRun} onChange={dryRun => setSettings(s => ({ ...s, safety: { dryRun } }))}/>
-               <div className="field-grid">{([['Check interval (minutes)', 'intervalMinutes', 35791], ['No-match retry (hours)', 'minRetryHours', 8760], ['Initial failure backoff (minutes)', 'failureBackoffMinMinutes', 35791], ['Maximum failure backoff (minutes)', 'failureBackoffMaxMinutes', 35791], ['Queue appearance grace (minutes)', 'queueGraceMinutes', 1440]] as const).map(([label, key, max]) => <label className="field number-field" key={key}>{label}<input type="number" min="1" max={max} step="1" required value={Number.isNaN(settings.monitoring[key]) ? '' : settings.monitoring[key]} onChange={event => setSettings(s => ({ ...s, monitoring: { ...s.monitoring, [key]: numericValue(event.target.value) } }))}/><span className="field-hint">1–{max.toLocaleString()}</span></label>)}</div>
+               <div className="field-grid">{([['Check interval (minutes)', 'intervalMinutes', 35791], ['Search-only retry (minutes)', 'searchRetryMinutes', 525600], ['Initial failure backoff (minutes)', 'failureBackoffMinMinutes', 35791], ['Maximum failure backoff (minutes)', 'failureBackoffMaxMinutes', 35791], ['Queue appearance grace (minutes)', 'queueGraceMinutes', 1440]] as const).map(([label, key, max]) => <label className="field number-field" key={key}>{label}<input type="number" min="1" max={max} step="1" required value={Number.isNaN(settings.monitoring[key]) ? '' : settings.monitoring[key]} onChange={event => setSettings(s => ({ ...s, monitoring: { ...s.monitoring, [key]: numericValue(event.target.value) } }))}/><span className="field-hint">1–{max.toLocaleString()}</span></label>)}</div>
               <p className="field-hint">After finite appearance grace, unmatched downloads may be retried. Scout does not inspect or cancel qBittorrent jobs.</p>
              </Section>
            </div><aside className="right-rail" aria-label="Instance information">
@@ -126,7 +126,7 @@ const settingsFieldLabels: Record<string, string> = {
   'integrations.radarr.url': 'Radarr URL', 'integrations.radarr.apiKey': 'Radarr API key',
   'ai.apiKey': 'AI API key', 'ai.model': 'Model', 'ai.baseUrl': 'AI API base URL',
   'ai.preferences': 'Default preferences', 'monitoring.intervalMinutes': 'Check interval (minutes)',
-  'monitoring.minRetryHours': 'No-match retry (hours)', 'monitoring.failureBackoffMinMinutes': 'Initial failure backoff (minutes)',
+  'monitoring.searchRetryMinutes': 'Search-only retry (minutes)', 'monitoring.failureBackoffMinMinutes': 'Initial failure backoff (minutes)',
   'monitoring.failureBackoffMaxMinutes': 'Maximum failure backoff (minutes)', 'monitoring.queueGraceMinutes': 'Queue appearance grace (minutes)',
   'search.maxDecisions': 'Model decisions', 'search.maxSearches': 'Indexer searches', 'search.deadlineMinutes': 'Time limit (minutes)',
 }

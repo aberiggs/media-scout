@@ -37,7 +37,7 @@ describe('search-first HTTP contract', () => {
     expect((await app.inject('/api/v2/activity?status=dry-run')).json()).toMatchObject({ total: 1, items: [{ submission: { outcome: 'dry-run', outcomes: [{ outcome: 'dry-run' }] } }] });
     expect(grabs()).toBe(0);
     const settings = runtime.getSettings();
-    expect((await app.inject({ method: 'PUT', url: '/api/settings', payload: { ...settings, monitoring: { ...settings.monitoring, minRetryHours: 1e15 } } })).statusCode).toBe(400);
+    expect((await app.inject({ method: 'PUT', url: '/api/settings', payload: { ...settings, monitoring: { ...settings.monitoring, searchRetryMinutes: 1e15 } } })).statusCode).toBe(400);
   });
   it('starts a standalone search and exposes its persisted flat result', async () => {
     const { app, runtime } = await fixture();
@@ -74,7 +74,7 @@ describe('search-first HTTP contract', () => {
   });
   it('uses v2 settings with optional Arr and omits all legacy mutation routes', async () => {
     const { app, grabs } = await fixture();
-    expect((await app.inject('/api/settings')).json()).toMatchObject({ settings: { version: 2 }, status: { ready: true } });
+    expect((await app.inject('/api/settings')).json()).toMatchObject({ settings: { version: 3 }, status: { ready: true } });
     expect((await app.inject({ method: 'POST', url: '/cycle' })).statusCode).toBe(404);
     expect((await app.inject({ method: 'POST', url: '/api/operations/work/action', payload: { action: 'reset' } })).statusCode).toBe(404);
     expect(grabs()).toBe(0);

@@ -9,7 +9,7 @@ const stores: ReturnType<typeof openSearchStore>[] = [];
 afterEach(() => { for (const store of stores.splice(0)) store.close(); });
 function setup() {
   const store = openSearchStore(':memory:'); stores.push(store);
-  const settings = { version: 2, integrations: { prowlarr: { url: 'http://localhost:9696', apiKey: 'private', tvClient: '', movieClient: '' }, sonarr: { url: '', apiKey: '' }, radarr: { url: '', apiKey: '' } }, ai: { apiKey: 'private-ai', model: 'test/model', baseUrl: 'https://example.test/v1', preferences: '' }, monitoring: { enabled: false, intervalMinutes: 5, minRetryHours: 6, failureBackoffMinMinutes: 5, failureBackoffMaxMinutes: 60, queueGraceMinutes: 30 }, search: { maxDecisions: 20, maxSearches: 12, deadlineMinutes: 10 }, safety: { dryRun: true } } satisfies Settings;
+  const settings = { version: 3, integrations: { prowlarr: { url: 'http://localhost:9696', apiKey: 'private', tvClient: '', movieClient: '' }, sonarr: { url: '', apiKey: '' }, radarr: { url: '', apiKey: '' } }, ai: { apiKey: 'private-ai', model: 'test/model', baseUrl: 'https://example.test/v1', preferences: '' }, monitoring: { enabled: false, intervalMinutes: 5, searchRetryMinutes: 30, failureBackoffMinMinutes: 5, failureBackoffMaxMinutes: 60, queueGraceMinutes: 30 }, search: { maxDecisions: 20, maxSearches: 12, deadlineMinutes: 10 }, safety: { dryRun: true } } satisfies Settings;
   const llm = { json: async () => ({ action: 'finish', query: null, categories: null, indexerIds: null, status: 'no-match', options: null, message: 'Nothing suitable' }) } as unknown as LLMClient;
   let indexerReads = 0;
   let now = 1_800_000_000_000;
@@ -22,6 +22,29 @@ function matched(f: ReturnType<typeof setup>, expires: number) {
 }
 
 describe('search runtime', () => {
+  it('migrates saved v2 settings and shortens only legacy search-only deadlines once', async () => {
+    const store = openSearchStore(':memory:'); stores.push(store);
+    const now = 1_800_000_000_000, longDeadline = now + 6 * 60 * 60_000;
+    const legacy = { ...defaultSettings, version: 2, monitoring: { ...defaultSettings.monitoring, minRetryHours: 6 } };
+    store.setSetting('application-settings', legacy);
+    for (const target of ['search', 'grab']) {
+      store.setAutomationAttempt(target, { lastAttempt: now - 5 * 60_000, failCount: 0, deadline: longDeadline, graceUntil: 0 });
+      store.setDeadline(target, longDeadline);
+    }
+    store.createSearch({ searchId: 'legacy-search', prompt: 'Find', status: 'matched', createdAt: now });
+    store.setSetting('search-arr:legacy-search', { key: 'search' });
+    store.setSetting('search-source:legacy-search', 'automation');
+    store.createSearch({ searchId: 'legacy-grab', prompt: 'Find', status: 'matched', createdAt: now });
+    store.setSetting('search-arr:legacy-grab', { key: 'grab' });
+    store.setSetting('search-source:legacy-grab', 'automation');
+    store.recordSubmission({ idempotencyKey: 'receipt', payload: { targets: ['grab'] }, outcome: 'submitted', createdAt: now });
+    const runtime = new SearchRuntime({ store, now: () => now, initialSettings: legacy as Settings, llm: {} as LLMClient });
+    expect(runtime.getSettings()).toMatchObject({ version: 3, monitoring: { searchRetryMinutes: 30 } });
+    expect(store.getAutomationAttempt('search')?.deadline).toBe(now + 25 * 60_000);
+    expect(store.getDeadline('search')).toBe(now + 25 * 60_000);
+    expect(store.getAutomationAttempt('grab')?.deadline).toBe(longDeadline);
+    await runtime.close();
+  });
   it('filters Activity by persisted media context and inclusive creation-time bounds', () => {
     const f = setup();
     for (const [id, kind, createdAt] of [['tv', 'tv', f.now], ['movie', 'movie', f.now + 1], ['contextless', undefined, f.now + 2]] as const) {
@@ -52,6 +75,30 @@ describe('search runtime', () => {
     release(); await poll;
     expect(calls).toEqual(['http://old-source', 'http://old-source']);
     expect(runtime.automationStatus().providers.find(p => p.provider === 'sonarr')?.known).toBe(false);
+  });
+  it('shows only available missing work while retaining available queued and cooldown items', () => {
+    const f = setup();
+    const target = (key: string, available: boolean, eligible: boolean, overrides: Record<string, unknown> = {}) => ({
+      key, provider: 'sonarr' as const, sourceFingerprint: 'source', serviceId: 1, externalId: 20, episodeId: 1,
+      monitored: true, hasFile: false, available, eligible,
+      context: { title: key, seasonNumber: 1, episodeNumber: 1 }, ...overrides,
+    });
+    const targets = [
+      target('future', false, false),
+      target('unknown-airtime', false, false),
+      target('available', true, true),
+      target('queued', true, false),
+      target('cooldown', true, true),
+    ];
+    f.store.saveObservation('sonarr', { observedAt: f.now, complete: true, payload: { observedAt: f.now, targets, queue: [], diagnostics: { unidentifiedQueueRows: 0 } } });
+    f.store.saveObservation('radarr', { observedAt: f.now, complete: true, payload: { observedAt: f.now, targets: [], queue: [], diagnostics: { unidentifiedQueueRows: 0 } } });
+    f.store.setAutomationAttempt('cooldown', { lastAttempt: f.now, failCount: 0, deadline: f.now + 60_000, graceUntil: 0 });
+    f.store.setDeadline('cooldown', f.now + 60_000);
+
+    const items = f.runtime.automationStatus().items;
+    expect(items.map(item => item.title).sort()).toEqual(['available', 'cooldown', 'queued']);
+    expect(items.find(item => item.title === 'queued')?.status).toBe('downloading');
+    expect(items.find(item => item.title === 'cooldown')?.status).toBe('cooldown');
   });
   it('keeps automated search target bindings so later manual submission revalidates fresh Arr state', async () => {
     const store = openSearchStore(':memory:'), settings = structuredClone(defaultSettings);
@@ -144,9 +191,9 @@ describe('search runtime', () => {
     expect(f.store.getCandidate('matched', 'candidate', 0)).toBeNull();
     expect(f.store.getSubmission('retained')).not.toBeNull();
   });
-  it('rejects extreme deadlines instead of accepting settings that break ISO projections', () => {
+  it('rejects extreme retry intervals instead of accepting settings that break ISO projections', () => {
     const f = setup();
-    expect(f.runtime.saveSettings({ ...f.settings, monitoring: { ...f.settings.monitoring, minRetryHours: 1_000_000_000_000_000 } }).ok).toBe(false);
+    expect(f.runtime.saveSettings({ ...f.settings, monitoring: { ...f.settings.monitoring, searchRetryMinutes: 1_000_000_000_000_000 } }).ok).toBe(false);
   });
   it('reports expiry distinctly and records dry-run confirmation outcomes in Activity', async () => {
     const f = setup(); matched(f, f.now - 1);
@@ -159,7 +206,7 @@ describe('search runtime', () => {
     expect(activity.total).toBe(1);
     expect(activity.items[0]?.submission).toMatchObject({ outcome: 'dry-run' });
   });
-  it('uses strict version 2 settings and requires only standalone search integrations', async () => {
+  it('uses strict version 3 settings and requires only standalone search integrations', async () => {
     const { runtime, settings } = setup();
     expect(runtime.getSettings()).toEqual(settings);
     expect(runtime.missingSettings()).toEqual([]);

@@ -27,8 +27,8 @@ export interface SearchRuntimeOptions {
   clients?: (settings: Settings) => RuntimeClients;
   initialSettings?: Settings;
 }
-export interface ActivityQuery { limit?: number; offset?: number; q?: string; status?: string; source?: 'manual' | 'automation' }
-export interface ActivityItem { searchId: string; prompt: string; status: string; createdAt: string; finishedAt?: string; source: 'manual' | 'automation'; counts?: SearchResult['counts']; submission?: { outcome: string; outcomes?: SubmissionResult['outcomes'] } }
+export interface ActivityQuery { limit?: number; offset?: number; q?: string; status?: string; source?: 'manual' | 'automation'; kind?: 'tv' | 'movie' | 'other'; createdAtFrom?: string; createdAtTo?: string }
+export interface ActivityItem { searchId: string; prompt: string; status: string; createdAt: string; finishedAt?: string; source: 'manual' | 'automation'; kind?: 'tv' | 'movie'; counts?: SearchResult['counts']; submission?: { outcome: string; outcomes?: SubmissionResult['outcomes'] } }
 export interface PublicSearchStatus {
   searchId: string; status: string; createdAt: string; finishedAt?: string; prompt: string;
   options: SearchResult['options']; candidates: SearchResult['candidates']; events: SearchResult['events'];
@@ -116,7 +116,11 @@ export class SearchRuntime {
     const limit = Math.max(1, Math.min(query.limit ?? 50, 100));
     const offset = Math.max(0, query.offset ?? 0);
     const records = this.store.listSearches(10000, false).map((record) => this.activityItem(record));
-    const matches = records.filter((item) => (!query.q || item.prompt.toLocaleLowerCase().includes(query.q.toLocaleLowerCase())) && (!query.status || item.status === query.status || item.submission?.outcome === query.status) && (!query.source || item.source === query.source));
+    const from = query.createdAtFrom ? Date.parse(query.createdAtFrom) : undefined, to = query.createdAtTo ? Date.parse(query.createdAtTo) : undefined;
+    const matches = records.filter((item) => {
+      const kind = item.kind;
+      return (!query.q || item.prompt.toLocaleLowerCase().includes(query.q.toLocaleLowerCase())) && (!query.status || item.status === query.status || item.submission?.outcome === query.status) && (!query.source || item.source === query.source) && (!query.kind || (query.kind === 'other' ? !kind : kind === query.kind)) && (from === undefined || Date.parse(item.createdAt) >= from) && (to === undefined || Date.parse(item.createdAt) <= to);
+    });
     return { items: matches.slice(offset, offset + limit), total: matches.length, retention: { days: 30, maxEntries: 10000 } };
   }
 
@@ -209,7 +213,9 @@ export class SearchRuntime {
     const fallback = receipt ? { outcome: receipt.outcome === 'submitting' ? 'uncertain' : receipt.outcome, outcomes: receiptResult?.outcomes?.map(({candidateId,outcome}) => ({candidateId,outcome})) } : undefined;
     const event = events.filter(e => e.type === 'submission').at(-1);
     const submission = receipt && (!event || receipt.createdAt > event.recordedAt) ? fallback : event?.data ?? fallback;
-    return { searchId: record.searchId, prompt: safeText(parsePrompt(record.prompt)), status: record.status, createdAt: new Date(record.createdAt).toISOString(), ...(record.finishedAt === undefined ? {} : { finishedAt: new Date(record.finishedAt).toISOString() }), source: this.store.getSetting(`search-source:${record.searchId}`) === 'automation' ? 'automation' : 'manual', ...(result?.counts ? { counts: result.counts } : {}), ...(submission ? { submission: { outcome: submission.outcome, outcomes: submission.outcomes } } : {}) };
+    let kind: 'tv' | 'movie' | undefined;
+    try { const parsed = JSON.parse(record.prompt).context?.kind; if (parsed === 'tv' || parsed === 'movie') kind = parsed; } catch { /* contextless request */ }
+    return { searchId: record.searchId, prompt: safeText(parsePrompt(record.prompt)), status: record.status, createdAt: new Date(record.createdAt).toISOString(), ...(record.finishedAt === undefined ? {} : { finishedAt: new Date(record.finishedAt).toISOString() }), source: this.store.getSetting(`search-source:${record.searchId}`) === 'automation' ? 'automation' : 'manual', ...(kind ? { kind } : {}), ...(result?.counts ? { counts: result.counts } : {}), ...(submission ? { submission: { outcome: submission.outcome, outcomes: submission.outcomes } } : {}) };
   }
   private llm(settings: Settings): LLMClient {
     if (this.options.llm) return this.options.llm;

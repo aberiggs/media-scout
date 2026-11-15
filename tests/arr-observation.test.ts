@@ -5,8 +5,57 @@ import type { RadarrClient } from '../src/clients/radarr';
 
 const series = { id: 1, tvdbId: 10, title: 'Show', titleSlug: 'show', seriesType: 'standard' as const, monitored: true, seasons: [], alternateTitles: [], overview: 'overview', originalLanguage: { id: 1, name: 'English' } };
 const episodes = [1,2].map(id => ({ id, seriesId: 1, seasonNumber: 1, episodeNumber: id, absoluteEpisodeNumber: null, title: `E${id}`, airDate: '2020-01-01', airDateUtc: null, finaleType: null, monitored: true, hasFile: false }));
+const sources = { radarr: { id: 'r', url: 'http://r', apiKey: 'k' } };
 
 describe('ArrObserver', () => {
+  it.each([
+    ['date-only before UTC midnight', '2020-01-01', null, Date.parse('2020-01-01T23:59:59Z'), false],
+    ['date-only at following UTC midnight', '2020-01-01', null, Date.parse('2020-01-02T00:00:00Z'), true],
+    ['precise airtime', '2020-01-01', '2020-01-01T12:00:00Z', Date.parse('2020-01-01T12:00:00Z'), true],
+    ['unknown invalid timing', 'bad-date', null, Date.parse('2026-01-01'), false],
+  ])('ArrObserver handles %s eligibility', async (_name, airDate, airDateUtc, now, eligible) => {
+    const episode = { ...episodes[0], airDate, airDateUtc };
+    const observer = new ArrObserver({ sonarr: { getSeries: async () => [series], getEpisodes: async () => [episode], getQueue: async () => [] } as any, source: { sonarr: { id: 's', url: 'http://s', apiKey: 'k' } }, clock: () => now });
+    expect((await observer.observe()).targets[0]?.eligible).toBe(eligible);
+  });
+  it.each([
+    ['available monitored missing', true, true, false, true, true],
+    ['unavailable', false, true, false, false, false],
+    ['unmonitored', true, false, false, true, false],
+    ['already has file', true, true, true, true, false],
+  ])('Radarr %s movie eligibility', async (_name, isAvailable, monitored, hasFile, expectedAvailable, eligible) => {
+    const movie = { id: 7, tmdbId: 70, title: 'Film', year: 2024, monitored, hasFile, isAvailable };
+    const observer = new ArrObserver({ radarr: { getMovies: async () => [movie], getQueue: async () => [] } as any, source: sources, clock: () => Date.parse('2026-01-01') });
+    const target = (await observer.observe()).targets[0]!;
+    expect([target.available, target.eligible]).toEqual([expectedAvailable, eligible]);
+  });
+  it('suppresses direct movie queues and scopes coarse TV rows to season or series', async () => {
+    const movieObserver = new ArrObserver({ radarr: { getMovies: async () => [{ id: 7, tmdbId: 70, title: 'Film', monitored: true, hasFile: false, isAvailable: true }], getQueue: async () => [{ movieId: 7, status: 'downloading' }] } as any, source: sources });
+    expect((await movieObserver.observe()).targets[0]?.eligible).toBe(false);
+    const seasonEpisodes = [1, 2].map(id => ({ ...episodes[0], id, seasonNumber: id }));
+    const queue: Array<{ seriesId: number; seasonNumber?: number; status: string }> = [{ seriesId: 1, seasonNumber: 1, status: 'downloading' }];
+    const observer = new ArrObserver({ sonarr: { getSeries: async () => [series], getEpisodes: async () => seasonEpisodes, getQueue: async () => queue } as any, source: { sonarr: { id: 's', url: 'http://s', apiKey: 'k' } }, clock: () => Date.parse('2021-01-01') });
+    expect((await observer.observe()).targets.map(t => t.eligible)).toEqual([false, true]);
+    queue[0] = { seriesId: 1, status: 'warning' };
+    expect((await observer.observe()).targets.map(t => t.eligible)).toEqual([false, false]);
+    queue.splice(0);
+    expect((await observer.observe()).targets.map(t => t.eligible)).toEqual([true, true]);
+  });
+  it.each(['failed', 'removed', 'warning', 'importPending'])('treats queue state %s according to terminal/import policy', async status => {
+    const observer = new ArrObserver({ sonarr: { getSeries: async () => [series], getEpisodes: async () => episodes, getQueue: async () => [{ seriesId: 1, episodeId: 1, status }] } as any, source: { sonarr: { id: 's', url: 'http://s', apiKey: 'k' } }, clock: () => Date.parse('2021-01-01') });
+    const target = (await observer.observe()).targets.find(t => t.episodeId === 1)!;
+    expect(target.eligible).toBe(status === 'failed' || status === 'removed');
+  });
+  it('invalidates observed targets when source or external identity changes', async () => {
+    let source = { sonarr: { id: 's', url: 'http://s', apiKey: 'k' } }, tvdbId = 10;
+    const observer = new ArrObserver({ sonarr: { getSeries: async () => [{ ...series, tvdbId }], getEpisodes: async () => episodes, getQueue: async () => [] } as any, source: () => source, clock: () => Date.parse('2021-01-01') });
+    const original = (await observer.observe()).targets[0]!;
+    tvdbId++;
+    expect(await observer.validateTarget(original)).toBe(false);
+    const next = (await observer.observe()).targets[0]!;
+    source = { sonarr: { id: 's', url: 'http://different', apiKey: 'k' } };
+    expect(await observer.validateTarget(next)).toBe(false);
+  });
   it('provides allowed nested qualities separately from scored custom formats', async () => {
     const sonarr = { getSeries: async () => [{ ...series, qualityProfileId: 5 }], getEpisodes: async () => episodes, getQueue: async () => [], getQualityProfiles: async () => [{ id: 5, name: 'HD', items: [{ name: 'HD group', allowed: true, items: [{ quality: { name: 'WEB 1080p' }, allowed: true }, { quality: { name: 'SDTV' }, allowed: false }] }], formatItems: [{ format: 1, name: 'Multi subs', score: 100 }] }] };
     const observer = new ArrObserver({ sonarr: sonarr as any, source: { sonarr: { id: 'a', url: 'http://s', apiKey: 'key' } }, clock: () => Date.parse('2026-01-01') });

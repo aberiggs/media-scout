@@ -1,128 +1,46 @@
 # Operations and safety
 
-> Search-first replacement (#24): the approved implementation in
-> `openspec/changes/replace-tracking-with-search-service/` supersedes the legacy
-> tracking/recovery policy below. Its runtime uses a fresh database, Arr-derived
-> eligibility, finite 30-minute appearance grace, and automatic bounded retries.
-> An unmatched download can remain active when a new attempt becomes eligible;
-> that accepted risk replaces indefinite reservations/manual reviews. Never
-> interpret a submission or queue disappearance as proof of import. During
-> implementation, the sections below describe only the old engine and will be
-> replaced at cutover; do not run both schedulers.
+Media Scout's current runtime is the search-first service (#24), not the former tracking/review engine. It searches neutrally, returns ranked alternatives, and downloads only after an explicit submission (or an enabled automation policy selects rank 1). A submission means Prowlarr accepted a request; it does not prove a download, queue match, or import.
 
-This reference describes current behavior; it is not a guarantee that every cycle searches or that a result will be imported.
+## Safe operation
 
-## Costs, network access, and safe rollout
+Fresh settings have automation disabled and dry-run enabled. Scheduled polling runs every five minutes only while monitoring is enabled. Dry-run prevents grab POSTs, but searches can still call the configured LLM and Prowlarr, incur charges, and use indexer quota. A manual search is also network activity. Keep the unauthenticated HTTP interface on loopback or a trusted network; do not expose it publicly. MCP is stdio and has no built-in user identity: require host approval for `ma_submit_v2` and `ma_automation_poll_v2`.
 
-`dryRun` defaults to `true`. It blocks an actual grab, but a normal due-work cycle can still call the LLM planner/picker and search Prowlarr. Those operations may incur model-provider charges, use indexer quota, and contact configured indexers. Monitoring defaults to disabled; when enabled, cycles use the configured interval. Planning/search is gated by each work unit's due time, not a guarantee that each interval is free. `POST /cycle`, `ma_cycle`, and `ma_search` can trigger network work.
+Configure Prowlarr and LLM for standalone search. Sonarr and Radarr are optional for that use; automation requires the relevant Arr connection. Configure integration credentials in Settings, not `.env`. The database and backups contain saved credentials and must be treated as secrets.
 
-The container is bound to `127.0.0.1` by default. `POST /cycle` has no authentication; do not expose the UI/API to a LAN or the internet without a separately reviewed access-control layer. MCP uses stdio without built-in user identity/authentication; review the host tool-approval policy, especially for `ma_review_action` and `ma_pick`.
+## Search and submission
 
-Keep dry-run enabled while checking configuration and reviewing logs. Dry runs may persist ordinary scheduling and decision state, but do not create active grab intents or successful-grab dedupe markers. Only consider disabling dry-run after an operator has reviewed real candidates and routing. It is not a substitute for an import test or operator review.
+Search is read-only toward indexers/download clients and bounded by server settings: defaults are 20 model decisions, 12 Prowlarr search calls, and a 10-minute deadline. Per-request limits can only lower these bounds. Search exposes all safely representable candidates supplied by each Prowlarr result, not a seed-ranked top-N list; upstream incompleteness or context overflow is reported and cannot authorize automated submission. Result statuses distinguish `matched`, `no-match`, `needs-input`, `budget-exhausted`, `failed`, and `interrupted`; only validated matched options can be submitted.
 
-## Search, selection, and review
+Submission is an explicit separate operation. It accepts an opaque search/option reference and idempotency key, with an optional enabled Prowlarr download-client ID. Client choices are server-listed and protocol-checked; otherwise the configured TV/movie routing applies. Reusing a key replays its result and never sends another POST. Ambiguous POST outcomes are not retried automatically. Private URLs, GUIDs, hashes, and credentials are excluded from public projections and model context. Submit-capable candidate references expire 30 minutes after completion; retained activity defaults to 30 days/10,000 searches.
 
-- The watcher reads Sonarr/Radarr libraries and tracked queues. TV availability retries are per episode; the season entry groups planning and progress. Movie and operational-failure scheduling retain their work-unit retry gates.
-- TV episode eligibility prefers Sonarr's valid UTC `airDateUtc`. When it is absent or unusable, a valid `airDate` calendar day becomes eligible at midnight UTC on the following day; an absent or invalid date and timestamp remain timing-unknown and are not searched. Exact airtime overrides a conflicting calendar date.
-- The LLM plans Prowlarr queries and judges fuzzy identity and quality; deterministic code does not add title/quality matching heuristics.
-- Planner context distinguishes season airing confidence, imported/known aired missing/future/timing-unknown episodes, normalized eligibility times, and actual download-held coverage. A continuing series does not imply that each season is airing; no known future episode is not proof a season finished. One or two due TV episodes use explicit episode-first searches. A substantial backlog (three or more due episodes in the group) tries pack/batch searches first, then explicit episode fallback for uncovered targets when capacity remains. A missing or rejected pack does not by itself prove individual episodes unavailable.
-- Each grouped acquisition pass permits up to three primary and three fallback queries, and at most three distinct physical releases. Fallback excludes provisionally selected coverage and manual identity holds; the complete non-overlapping selection is validated before any POST and each submission uses a fresh library/queue check. Episode queries have exact validated target attribution. Unattempted capacity-deferred episodes stay due and are prioritized by oldest attempt time, then stable episode identity, across restarts. All applicable source backoff and safety holds still apply.
-- TV guardrails require explicit episode coverage or a single matching-season-only pack claim. Inferred pack coverage is labeled inferred, not proof of torrent contents. Known wrong seasons and malformed/conflicting scopes are rejected.
-- The picker sees at most 100 candidates. Media preferences are optional soft ranking guidance, not a filter, identity rule, or override of guardrails. For example, `Prefer 1080p over 4K.` can be entered in the UI. Saved settings apply to subsequent operations without container recreation.
-- Successful real grabs are deduplicated by `(indexerId, guid)` and infoHash when available. Hashless releases have weaker cross-indexer detection. Dry runs and failed grabs do not create successful-grab markers.
-- Unparseable/ambiguous candidates and repeated ordinary operational failures can enter manual review. An ordinary search with no admitted release schedules a retry only for already-eligible content; unreleased movies and future episodes wait for source metadata. Unknown, paused, active, import-blocked, uncertain, or ambiguous queue evidence remains held rather than being automatically resubmitted.
+## Automation and Arr observations
 
-## Cadence and failure behavior
+Automation uses current Arr library and queue reads, never audit history as authority. Sonarr observations read series, each series' episodes, queue, and (when available) quality profiles. TV eligibility requires monitored series and episode, no file, and reached airtime. Valid `airDateUtc` is preferred; date-only fallback becomes eligible at the following UTC midnight; unknown timing is not eligible. Context may include title/alternate titles, year/TVDB ID, seasonal and absolute episode numbering, episode title/overview, original language, series type, and summarized quality/custom-format profile. Radarr observations read movies and queue, and optionally quality profiles. Movie eligibility requires monitored, no file, and Radarr's `isAvailable`; context may include title/year/TMDb ID, overview, original language, and summarized profile.
 
-- The UI interval defaults to 5 minutes and has a maximum of 35,791 minutes (the largest whole-minute interval within Node's timer limit). It is reconciliation cadence, not a promise to call the planner every interval. Saves apply to new operations; an in-progress cycle finishes with its original settings snapshot.
-- A picker `skip` or dry-run decision is cooled down by the UI retry window (default 6 hours). For TV, a successful search with no candidate admitted by guardrails records `release-unavailable` for the attempted episodes and retries automatically after that same configured window. A newly aired sibling does not inherit or reset that episode's availability deadline. An available movie with no admitted candidate uses the same finite work-item retry cadence; unavailable movies wait for Radarr metadata without a retry deadline or paid search. Rate limits, operational backoff, identity/configuration reviews, and uncertain downloads remain separate holds; availability does not override them.
-- UI failure-backoff defaults are 5/60 minutes and cap exponential failure delay; a longer upstream `Retry-After` takes precedence. The third consecutive ordinary operational failure enters manual review; rate limits stay on backoff and do not escalate solely due to quota.
-- Diagnostics include safe stage, error code/type, HTTP status, and retry seconds, not exception messages, response bodies, or authenticated URLs.
+Queue association uses Arr IDs: Sonarr series/episode/season IDs and queue status/tracked status/tracked state; Radarr movie IDs and the corresponding status fields. Nonterminal associated records suppress only their directly associated scope (season/series rows conservatively suppress that scope for the current poll). Failed/removed terminal rows do not suppress. Unidentified rows are diagnostic, not durable holds. Failed or incomplete provider reads remain unknown, never empty; one provider's failure does not turn the other provider's result into absence. Submission performs fresh applicable Arr checks before side effects.
 
-## Queue and manual review
+Supported API fields are Sonarr series `id`, `tvdbId`, `title`, `alternateTitles[].title`, `monitored`, `seriesType`, `overview`, `originalLanguage`, and `qualityProfileId`/`qualityProfile`; episodes `id`, `seasonNumber`, `episodeNumber`, `absoluteEpisodeNumber`, `title`, `overview`, `monitored`, `hasFile`, `airDateUtc`, and `airDate`; queue `seriesId`, `episodeId`, `seasonNumber`, `status`, `trackedDownloadStatus`, and `trackedDownloadState`. Radarr uses movie `id`, `tmdbId`, `title`, `year`, `overview`, `originalLanguage`, `monitored`, `hasFile`, `isAvailable`, and quality-profile fields, plus queue `movieId` and the same status fields. Queue clients walk all pages; failed/inconsistent pagination is unknown. Profile context summarizes allowed qualities and named/scored custom formats, not a reimplementation of Arr scoring.
 
-Queue grace defaults to 30 minutes for a submitted job to appear in the tracked *arr queue; it is an appearance deadline, not a download-duration limit. `ma_status` exposes safe queue counts, next-search times, coverage IDs, freshness, and coarse hold reasons; it omits credentials, URLs, hashes, GUIDs, and raw queue messages.
+Automated TV work is attempted episode-by-episode, oldest last-attempt first. Defaults: 5-minute poll cadence, 6-hour no-match/dry-run retry, operational failure backoff from 5 to 60 minutes exponentially, 30-minute appearance grace for submitted/uncertain attempts, and a 24-hour target-scoped exclusion for known releases not observed after grace or explicitly failed. Provider `Retry-After` takes precedence. After grace, if fresh Arr data still says missing and no matching queue coverage exists, an attempt can recur; this accepts the risk that an unmatched prior download may still exist. Scout never cancels or edits download-client/Arr jobs. Dry-run recommendations get a six-hour cooldown but no submission/grace.
 
-The HTTP operations dashboard's Queue scope excludes fulfilled/inactive history by default; select a terminal status or the all-history scope to view it. Queue freshness is unknown when queue completeness/timestamps are missing, and stale when either library or queue observation is older than 24 hours. Review projections identify media type and TV season without exposing work-unit internals. See [operations dashboard](operations-dashboard.md) for response scopes and user actions.
+## HTTP and MCP
 
-Obsolete, unlinked TV title reviews tagged `legacy-ineligible` are automatically deleted during normal library reconciliation when a fresh, known, identity-matched read shows a nonempty, fully imported inventory for their exact season and any saved work targets have files. Missing historical review targets are not a reason to leave these completed-season warnings open forever. This cleanup needs no operator-action opt-in and does not retry work, release reservations, or delete intent/queue-linked reviews, decisions, dedupe markers, or audit records. Unknown/partial, empty, stale, identity-changed, or incomplete evidence leaves the reviews untouched; a truly orphaned row still needs a durable identity before cleanup. Dashboard Refresh alone does not run reconciliation.
-
-A confirmed intent can link to one unique, fresh, healthy physical job whose direct Sonarr/Radarr IDs cover all remaining captured targets. The link is monitoring evidence; it does not prove submission provenance, torrent contents, or import. Missing jobs after the appearance grace period, disappeared linked jobs, and unhealthy or ambiguous observations go to review while captured holds and successful dedupe records are preserved. Work is fulfilled only after the library reports `hasFile`.
-
-During known library reconciliation, positive `hasFile` evidence for every previously tracked TV target or for a tracked movie takes precedence over the item's becoming unmonitored, including on later polls after the item first becomes terminal. The original TV target IDs remain private reconciliation evidence; terminal status and safe projections, not an empty target list, express completion. For a legacy terminal TV row whose saved target list is already empty, completion is recovered only from a nonempty, known inventory for that exact season where every listed episode has a file. Library removal, a missing target ID, an empty season inventory, zero remaining eligible targets, or an unknown read alone is not completion evidence. A complete target set is fulfilled on the normal poll; incomplete unmonitored work becomes inactive and unknown observations remain held.
-
-MCP `ma_review_action` with `resolve` resolves an open review; it is not the dashboard's Retry action and does not discharge vanished queue coverage. The HTTP operations dashboard provides guarded Retry for ordinary scheduling/review reasons and Reset item for rebuilding local tracking when **Safety → Allow operator actions** is enabled. Reset resolves unlinked reviews as history and clears current scheduling, but retains linked reviews and all queue reservations, coverage, receipts, dedupe markers, decisions and association history. It waits for a later known library observation before work becomes visible/actionable again. Neither action starts an immediate cycle, search, or grab. Fresh saved observations, provider throttling and owner-checked claims remain enforced. For an explicit human release choice, `ma_pick` is a fresh, guarded manual pick. A matching-season-only pack may proceed with explicitly labeled inferred coverage; it is not proof that the torrent contains every missing episode.
-
-`ma_pick`'s `releaseIndex` selects from a candidate list built fresh on every call (planner queries → Prowlarr search → guardrail filtering → seeders sort → cap). The list is not stable across calls and nothing is reserved. A dry-run call does not pin an index for later. Check the returned `releaseTitle` to see what was selected; outcomes include `grabbed`, `dry-run`, `missing-download-client`, and `reverify-failed`. An index from `ma_search` raw results does not transfer.
-
-Successful manual-pick searches update episode attempt clocks for their actual eligible search scope, including dry runs. Their final retry/cooldown is persisted with the season outcome so the next automatic poll does not immediately repeat the same search. Future, imported, and download-held siblings outside that scope retain their clocks. Picker identity-manual decisions are persisted under the live claim before a later fallback stage; a fallback error or different selection rationale cannot erase or relabel that hold.
-
-For the separate opt-in administrative recovery lane, see [operator recovery](operator-recovery.md). `allowOperatorActions` defaults to `false` in the UI, and host approval is required for every MCP call if enabled. The lane does not search, grab, invoke an LLM, or call the normal runner.
-
-## HTTP and MCP interfaces
-
-| Endpoint | Purpose |
+| HTTP route | Purpose |
 |---|---|
-| `GET /health` | Liveness response |
-| `GET /api/settings` | Full settings document and readiness/scheduler status |
-| `PUT /api/settings` | Validate and atomically persist the complete settings document |
-| `POST /cycle` | Trigger one full cycle (unauthenticated; may incur LLM/indexer activity) |
+| `GET /health`, `GET/PUT /api/settings` | Health, settings and readiness |
+| `POST /api/v2/searches`, `GET /api/v2/searches/:id` | Start search (202) and read progress/result |
+| `GET /api/v2/activity` | Filtered, paginated activity |
+| `GET /api/v2/download-clients` | Enabled safe client choices |
+| `POST /api/v2/submissions`, `GET /api/v2/submissions/:id` | Explicit submit and recorded outcome |
+| `GET /api/v2/automation` | Saved automation settings and observations only |
+| `POST /api/v2/automation/poll` | Explicitly poll; scheduler does so when enabled |
+| `POST /api/v2/automation/search` | Search an eligible Arr target read-only |
 
-| MCP stdio tool | Purpose |
-|---|---|
-| `ma_status` | Config-safe status, review count, and work-queue state |
-| `ma_cycle` | Run one full cycle |
-| `ma_review_list` | List manual-review rows |
-| `ma_review_action` | Resolve a review; optional operator recovery actions require explicit opt-in and fresh evidence |
-| `ma_search` | Search Prowlarr and return URL-free release summaries |
-| `ma_pick` | Manually select a fresh candidate; guardrails and the dry-run safety check still apply |
+MCP tools are `ma_status`, `ma_search_v2`, `ma_search_status_v2`, `ma_activity_v2`, `ma_download_clients_v2`, `ma_submit_v2`, `ma_automation_status_v2`, `ma_automation_poll_v2`, and `ma_automation_search_v2`. Status/activity/observation reads do not start searches. There is no `/cycle`, legacy review/queue interface, recovery CLI, or old MCP alias.
 
-## SQLite, backups, and idempotence
+## Database, backup, and rollback
 
-`DB_PATH` defaults to `data/media-agent.db` under `./data`, which Compose bind-mounts. To make a filesystem copy, stop the daemon and every separate MCP/operator/CLI process or other writer, then back up the entire `data/` directory, retaining SQLite `-wal`/`-shm` sidecars. Do not copy only the main database file while any connection may be writing. Alternatively, use SQLite's backup API with a deliberate consistent snapshot. See [publishing](publishing.md) for rollback and schema-compatibility cautions.
+Default `DB_PATH` is `data/media-scout-search.db`. Startup refuses a nonempty database without the search schema, read-only and without modifying it; configure a fresh path rather than deleting or migrating the old database. New search, submission, settings, deadlines, and observations persist across normal restarts. Running searches are marked interrupted at restart; they are not resumed. The rollback path is deliberate: stop all daemon/MCP/other writers, take a consistent backup, switch to the matching prior binary and its matching database backup/path. Never run old and new writers together. Downloads already submitted externally are not undone by restoring a database; account for those jobs before resuming the old runtime.
 
-Durable `(indexerId, guid)` release identity plus seen-infoHash dedupe is used when a hash is available; hashless releases have weaker cross-indexer detection. A decided work unit is not re-attempted until its retry window is due; indexer `429` and `Retry-After` are honored. Do not clear SQLite state to force retries.
-
-## Troubleshooting
-
-- **DB permission error on Linux:** the container's `node` user is UID 1000. If `./data` was pre-created as another user or auto-created root-owned, fix ownership deliberately, for example `sudo chown 1000:1000 data`, then restart.
-- **Arr imports do not appear:** verify the Prowlarr download-client entry/category, Sonarr/Radarr client category, root folder, and Completed Download Handling. Media Scout does not write directly to the download client or library.
-- **Repeatedly reaching `/cycle` from the LAN:** the default mapping is loopback-only because the endpoint is unauthenticated and can trigger paid LLM cycles/searches. Do not widen the bind address without a separately reviewed access-control design.
-- **Operator recovery:** read [operator recovery](operator-recovery.md) before enabling `allowOperatorActions` in the UI; do not release a reservation based on an empty *arr queue alone.
-
-## Episode progress persistence
-
-Episode progress is stored additively beside the existing season work, intent, and review identities. Before upgrading, stop every writer and take a consistent SQLite backup; do not run old and new writer versions together. Rollback requires stopping writers and restoring the pre-upgrade backup with its matching binary. There is no destructive down migration; post-upgrade observations are lost on restore.
-
-Known observations retain all episodes of a tracked season, including imported and future episodes. Episode availability deadlines determine the next searchable subset; the season work row remains the coordination and aggregate scheduling entry. Download reservations and queue coverage remain authoritative safety evidence rather than a second episode reservation ledger. Unknown/partial reads do not erase prior observations or prove imports, and an uncertain or vanished download can still conservatively hold the season. An operational retry changes only the successfully searched episodes from that attempt; it does not clear a sibling's availability deadline.
-
-On a fresh, identity-matched known poll, an old unlinked TV or movie `no-suitable-release` review can be converted to ordinary availability handling only when no conflicting review, configuration, claim, reservation, or queue uncertainty applies. The review remains as resolved history; eligible content receives a finite retry deadline without fabricating a historical search or an import, while unavailable movies wait for Radarr metadata without an availability retry deadline. Linked, unknown/stale, identity-changed, active/ambiguous-download, and other blocking review cases remain held. An existing later ordinary retry deadline is not shortened by conversion. This policy does not require operator-action opt-in and does not release reservations.
-
-## Queue review evidence and cleanup
-
-Queue-related reviews retain a private, versioned cause and affected scope. The
-evidence contains Arr identity and episode IDs (or movie scope), not queue
-references, request URLs, or raw service messages. Repeated reads of the same
-unresolved cause and scope do not create new review incidents; resolved history
-does not suppress a later occurrence. Existing evidence-less reviews remain
-unknown and are not assigned targets retroactively.
-
-Captured-target reviews are retired only after a fresh, non-regressing known
-library observation confirms every captured file under the same service and
-external identity. Unknown or broad ambiguous scopes, stale reads, missing
-targets, and changed identities remain open. Linked intent reviews additionally
-require that their actual intent is fulfilled; clearing a review never releases
-an independent download reservation.
-
-An unidentified queue row still blocks potentially overlapping work, but does not
-create a durable review for unreleased-only items with no captured work at risk.
-Directly identified episodes positively observed with files no longer hold their
-future siblings because of a lingering uncertain queue row. Missing IDs and
-unknown inventory do not establish that completion.
-
-Reset or source metadata removal/unmonitoring also does not discharge retained
-external queue coverage. Missing captured episode IDs keep their protection until
-positive file evidence accounts for them; inactive work retains that private
-ledger. New causal evidence is kept out of both public operations projections and
-the MCP review list. The final manual-pick queue recheck records the same causal
-review evidence as automatic reconciliation.
+Do not start the daemon against production data, run live evaluation, or submit real downloads without separate authorization. Ordinary tests must use isolated databases and synthetic/offline services.

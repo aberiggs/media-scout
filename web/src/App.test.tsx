@@ -29,6 +29,7 @@ it('starts with Search, submits a prompt without downloading, and displays ranke
   assert.equal(screen.queryByRole('link', { name: 'Queue' }), null)
   const nav = screen.getByRole('navigation', { name: 'Workspace' })
   for (const label of ['Search', 'Activity', 'Automation', 'Settings']) assert.ok(within(nav).getByRole('link', { name: label }))
+  assert.equal(screen.getByLabelText('What are you looking for?').getAttribute('aria-label'), 'What are you looking for?')
   fireEvent.change(screen.getByLabelText('What are you looking for?'), { target: { value: 'Find North Shore' } })
   fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
   await screen.findByText('Best evidence')
@@ -49,6 +50,47 @@ it('opens saved search details from Activity after navigating to Search', async 
   render(<App />)
   fireEvent.click(await screen.findByRole('button', { name: 'View search details' }))
   assert.ok(await screen.findByText('Best evidence'))
+})
+
+it('filters Activity by media and inclusive local dates and offers every submission outcome', async () => {
+  window.history.replaceState(null, '', '/#activity')
+  const queries: URLSearchParams[] = []
+  globalThis.fetch = async input => {
+    const url = String(input)
+    if (url === '/api/settings') return Response.json(env)
+    queries.push(new URL(url, 'http://localhost').searchParams)
+    return Response.json({ items: [], total: 0 })
+  }
+  render(<App />)
+  await screen.findByText('No matching activity')
+  fireEvent.change(screen.getByLabelText('Media'), { target: { value: 'tv' } })
+  fireEvent.change(screen.getByLabelText('Created from'), { target: { value: '2026-11-01' } })
+  fireEvent.change(screen.getByLabelText('Created through'), { target: { value: '2026-11-15' } })
+  await waitFor(() => {
+    const query = queries.at(-1)!
+    assert.equal(query.get('kind'), 'tv')
+    assert.equal(query.get('createdAtFrom'), new Date('2026-11-01T00:00:00').toISOString())
+    assert.equal(query.get('createdAtTo'), new Date('2026-11-15T23:59:59.999').toISOString())
+    assert.equal(query.get('offset'), '0')
+  })
+  const statuses = within(screen.getByLabelText('Status'))
+  for (const name of ['queued', 'rejected', 'deferred', 'expired']) assert.ok(statuses.queryByRole('option', { name }), `${name} is filterable`)
+})
+
+it('shows recorded per-release submission outcomes in saved search details without claiming import', async () => {
+  window.history.replaceState(null, '', '/#activity')
+  globalThis.fetch = async input => {
+    const url = String(input)
+    if (url === '/api/settings') return Response.json(env)
+    if (url.startsWith('/api/v2/activity')) return Response.json({ items: [{ searchId: 's1', prompt: 'Saved request', status: 'matched', source: 'manual', createdAt: matched.createdAt }], total: 1 })
+    return Response.json({ ...matched, events: [{ type: 'submission', data: { outcome: 'uncertain', outcomes: [{ candidateId: 'c1', outcome: 'submitted' }, { candidateId: 'c2', outcome: 'uncertain' }] } }] })
+  }
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: 'View search details' }))
+  assert.ok(await screen.findByRole('heading', { name: 'Submission history' }))
+  assert.ok(screen.getByText('Example 1080p: submitted'))
+  assert.ok(screen.getByText('Release 2: uncertain'))
+  assert.ok(screen.getByText('Submission is not proof of downloading or import.'))
 })
 
 it('sends numeric configured client IDs and reuses a submission key after transport failure', async () => {
@@ -93,4 +135,52 @@ it('keeps search available in dry-run and distinguishes a saved refresh from a l
   assert.equal(calls.some(c => c.url.endsWith('/poll')), false)
   fireEvent.click(screen.getByRole('button', { name: 'Poll now' }))
   await waitFor(() => assert.equal(calls.filter(c => c.url.endsWith('/poll')).length, 1))
+})
+
+it('explains that expired results require a new search', async () => {
+  globalThis.fetch = async input => {
+    const url = String(input)
+    if (url === '/api/settings') return Response.json(env)
+    if (url === '/api/v2/searches') return Response.json({ searchId: 's1' }, { status: 202 })
+    if (url === '/api/v2/searches/s1') return Response.json(matched)
+    if (url === '/api/v2/download-clients') return Response.json({ items: [] })
+    if (url === '/api/v2/submissions') return Response.json({ outcome: 'expired', message: 'Search results expired; start a new search.' })
+    return Response.json({ items: [] })
+  }
+  render(<App />)
+  fireEvent.change(screen.getByLabelText('What are you looking for?'), { target: { value: 'Find Example' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Preview submission' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Confirm option' }))
+  assert.ok(await screen.findByText('Search results expired. Start a new search before submitting.'))
+})
+
+it('manages confirmation focus for keyboard users and restores the option trigger', async () => {
+  globalThis.fetch = async input => {
+    const url = String(input)
+    if (url === '/api/settings') return Response.json(env)
+    if (url === '/api/v2/searches') return Response.json({ searchId: 's1' }, { status: 202 })
+    if (url === '/api/v2/searches/s1') return Response.json(matched)
+    if (url === '/api/v2/download-clients') return Response.json({ items: [{ id: 7, name: 'TV category', protocol: 'torrent', categories: true }] })
+    return Response.json({ items: [] })
+  }
+  render(<App />)
+  fireEvent.change(screen.getByLabelText('What are you looking for?'), { target: { value: 'Find Example' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
+  const trigger = await screen.findByRole('button', { name: 'Preview submission' })
+  trigger.focus()
+  fireEvent.click(trigger)
+  const dialog = await screen.findByRole('dialog', { name: 'Confirm this option' })
+  const close = within(dialog).getByRole('button', { name: 'Close confirmation' })
+  assert.equal(document.activeElement, close)
+  await screen.findByRole('option', { name: /TV category/ })
+  const confirm = within(dialog).getByRole('button', { name: 'Confirm option' })
+  fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })
+  assert.ok(document.activeElement === confirm, 'reverse Tab wraps to the final control')
+  confirm.focus()
+  fireEvent.keyDown(document, { key: 'Tab' })
+  assert.equal(document.activeElement, close)
+  fireEvent.keyDown(document, { key: 'Escape' })
+  await waitFor(() => assert.equal(screen.queryByRole('dialog'), null))
+  assert.ok(document.activeElement === trigger, 'focus returns to the option trigger')
 })

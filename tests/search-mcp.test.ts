@@ -5,6 +5,10 @@ import { createSearchMcpServer } from '../src/search/mcp';
 import { SearchRuntime, type SearchRuntimeOptions } from '../src/search/runtime';
 import { openSearchStore } from '../src/search/store';
 import { defaultSettings } from '../src/search/settings';
+import { buildApp } from '../src/daemon';
+import type { Stack } from '../src/compose';
+import pino from 'pino';
+import { releaseSchema } from '../src/types/prowlarr';
 
 let client: Client | undefined;
 let transport: InMemoryTransport | undefined;
@@ -21,6 +25,36 @@ async function connect(settings = defaultSettings, options: Partial<SearchRuntim
 }
 
 describe('search MCP adapter', () => {
+  it('serializes concurrent HTTP and MCP confirmations and retains different-key physical grace', async () => {
+    const settings = structuredClone(defaultSettings);
+    settings.safety.dryRun = false;
+    settings.integrations.prowlarr = { url: 'http://synthetic.invalid', apiKey: 'synthetic', tvClient: 'TV', movieClient: '' };
+    let grabs = 0, releaseGrab!: () => void, grabStarted!: () => void;
+    const started = new Promise<void>(resolve => { grabStarted = resolve; });
+    const gate = new Promise<void>(resolve => { releaseGrab = resolve; });
+    const mcp = await connect(settings, { clients: () => ({ prowlarr: {
+      getIndexers: async () => [], getIndexerStatuses: async () => [], search: async () => [],
+      getDownloadClients: async () => [{ id: 7, name: 'TV', protocol: 'torrent', enable: true, supportsCategories: true, categories: [] }],
+      grab: async () => { grabs++; grabStarted(); await gate; },
+    } }) });
+    const now = Date.now();
+    runtime!.store.createSearch({ searchId: 'match', prompt: '{"prompt":"Example"}', status: 'matched', createdAt: now, finishedAt: now, result: { options: [{ optionId: 'option', rank: 1, releases: [{ candidateId: 'candidate' }], coveredTargetIds: [], reason: 'Fit', uncertainty: '' }] } });
+    runtime!.store.addCandidate({ searchId: 'match', candidateId: 'candidate', safe: {}, privateData: { release: releaseSchema.parse({ guid: 'synthetic-locator', indexerId: 1, indexer: 'Synthetic', title: 'Example', publishDate: '', protocol: 'torrent' }), physicalKey: 'synthetic-physical' }, expiresAt: now + 60_000 });
+    const app = await buildApp({ runtime, logger: pino({ level: 'silent' }) } as unknown as Stack, { webRoot: '/nonexistent-ui' });
+    const request = { searchId: 'match', optionId: 'option', downloadClientId: 7 };
+    try {
+      const first = app.inject({ method: 'POST', url: '/api/v2/submissions', payload: { ...request, idempotencyKey: 'http' } }).then(response => response.json());
+      await started;
+      const concurrent = await mcp.callTool({ name: 'ma_submit_v2', arguments: { ...request, idempotencyKey: 'mcp' } });
+      expect(JSON.parse((concurrent.content as Array<{ text: string }>)[0]!.text)).toMatchObject({ outcome: 'deferred' });
+      releaseGrab();
+      expect(await first).toMatchObject({ outcome: 'submitted' });
+      const later = await mcp.callTool({ name: 'ma_submit_v2', arguments: { ...request, idempotencyKey: 'mcp-later' } });
+      expect(JSON.parse((later.content as Array<{ text: string }>)[0]!.text)).toMatchObject({ outcome: 'deferred' });
+      expect(grabs).toBe(1);
+      expect(JSON.stringify(await mcp.callTool({ name: 'ma_activity_v2', arguments: {} }))).not.toContain('synthetic-locator');
+    } finally { releaseGrab(); await app.close(); }
+  });
   it('shares asynchronous search, expiry and Activity contracts with HTTP without live calls', async () => {
     const settings = structuredClone(defaultSettings);
     settings.ai.apiKey = 'synthetic'; settings.integrations.prowlarr.url = 'http://indexer.test'; settings.integrations.prowlarr.apiKey = 'synthetic';
@@ -58,5 +92,15 @@ describe('search MCP adapter', () => {
     expect(tools.find(t => t.name === 'ma_submit_v2')?.annotations?.destructiveHint).toBe(true);
     expect(tools.find(t => t.name === 'ma_automation_poll_v2')?.annotations?.destructiveHint).toBe(true);
     expect(tools.find(t => t.name === 'ma_search_v2')?.annotations?.readOnlyHint).toBe(true);
+  });
+
+  it('filters Activity by media/time and rejects invalid or reversed timestamps', async () => {
+    const mcp = await connect(), now = Date.now();
+    runtime!.store.createSearch({ searchId: 'tv', prompt: '{"prompt":"Example","context":{"kind":"tv"}}', status: 'no-match', createdAt: now });
+    const result = await mcp.callTool({ name: 'ma_activity_v2', arguments: { kind: 'tv', createdAtFrom: new Date(now).toISOString(), createdAtTo: new Date(now).toISOString() } });
+    expect(JSON.parse((result.content as Array<{ text: string }>)[0]!.text)).toMatchObject({ total: 1, items: [{ kind: 'tv' }] });
+    for (const args of [{ kind: 'invalid' }, { createdAtFrom: 'not-a-date' }, { createdAtFrom: '2026-02-01T00:00:00Z', createdAtTo: '2026-01-01T00:00:00Z' }]) {
+      expect((await mcp.callTool({ name: 'ma_activity_v2', arguments: args })).isError).toBe(true);
+    }
   });
 });

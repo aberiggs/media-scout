@@ -7,6 +7,7 @@ import { openSearchStore } from '../src/search/store';
 import { defaultSettings } from '../src/search/settings';
 import type { LLMClient } from '../src/clients/llm';
 import { releaseSchema } from '../src/types/prowlarr';
+import { existsSync } from 'node:fs';
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of cleanups.splice(0)) await close(); });
@@ -20,6 +21,11 @@ async function fixture() {
 }
 
 describe('search-first HTTP contract', () => {
+  it('contains no retired engine modules or operator CLI compatibility stub', () => {
+    for (const path of ['core/runner.ts', 'core/state.ts', 'core/work-queue.ts', 'core/operations.ts', 'core/operator-actions.ts', 'operator-cli.ts']) {
+      expect(existsSync(new URL(`../src/${path}`, import.meta.url)), path).toBe(false);
+    }
+  });
   it('reports expired options explicitly and filters recorded dry-run confirmation outcomes', async () => {
     const { app, runtime, grabs } = await fixture(), now = Date.now();
     runtime.store.createSearch({ searchId: 'match', prompt: '{"prompt":"Example"}', status: 'matched', createdAt: now, finishedAt: now, result: { options: [{ optionId: 'option', rank: 1, releases: [{ candidateId: 'candidate' }], coveredTargetIds: [], reason: 'Fit', uncertainty: '' }] } });
@@ -49,6 +55,14 @@ describe('search-first HTTP contract', () => {
     expect((await app.inject('/api/v2/activity')).statusCode).toBe(200);
     expect((await app.inject('/api/v2/automation')).json()).toMatchObject({ enabled: false, dryRun: true, items: [] });
     expect(reads()).toBe(0);
+  });
+  it('validates bounded Activity media/time filters and rejects reversed ranges', async () => {
+    const { app, runtime } = await fixture(), now = Date.now();
+    runtime.store.createSearch({ searchId: 'tv', prompt: '{"prompt":"Example","context":{"kind":"tv"}}', status: 'no-match', createdAt: now });
+    expect((await app.inject(`/api/v2/activity?kind=tv&createdAtFrom=${encodeURIComponent(new Date(now).toISOString())}&createdAtTo=${encodeURIComponent(new Date(now).toISOString())}`)).json()).toMatchObject({ total: 1, items: [{ kind: 'tv' }] });
+    expect((await app.inject('/api/v2/activity?kind=bogus')).statusCode).toBe(400);
+    expect((await app.inject('/api/v2/activity?createdAtFrom=not-a-date')).statusCode).toBe(400);
+    expect((await app.inject('/api/v2/activity?createdAtFrom=2026-02-01T00%3A00%3A00Z&createdAtTo=2026-01-01T00%3A00%3A00Z')).statusCode).toBe(400);
   });
   it('requires valid input and rejects cross-origin mutations without network work', async () => {
     const { app, reads } = await fixture();

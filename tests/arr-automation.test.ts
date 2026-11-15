@@ -11,6 +11,48 @@ const makeTarget = (key: string, episodeNumber: number, eligible = true): ArrTar
 const result = (status: SearchResult['status'] = 'matched'): SearchResult => ({ searchId: 's', status, options: status === 'matched' ? [{ optionId: 'rank1', rank: 1, releases: [{ candidateId: 'c' }], coveredTargetIds: [], reason: 'match', uncertainty: '' }] : [], candidates: [], counts: { decisions: 1, searches: 1, candidates: 1 }, events: [], promptVersion: 'v1' });
 
 describe('ArrAutomation', () => {
+  it('uses the finite six-hour ordinary retry for no-match', async () => {
+    const clock = Date.parse('2026-01-01'), target = makeTarget('no-match', 1), store = openSearchStore(':memory:');
+    const observer: any = { observe: async () => ({ observedAt: clock, sonarr: { known: true }, radarr: { known: false }, targets: [target] }) };
+    try {
+      const pass = await new ArrAutomation({ store, observer, search: { run: async () => result('no-match') }, submission: { submit: vi.fn() }, getPolicy: () => ({ enabled: true, dryRun: false }), clock: () => clock }).runPass();
+      expect(pass.nextAttemptAt).toBe(clock + 6 * 60 * 60_000);
+      expect(store.getAutomationAttempt(target.key)?.failCount).toBe(0);
+    } finally { store.close(); }
+  });
+  it('caps repeated operational failures without creating a permanent hold', async () => {
+    let clock = Date.parse('2026-01-01'); const target = makeTarget('failure', 1), store = openSearchStore(':memory:');
+    const observer: any = { observe: async () => ({ observedAt: clock, sonarr: { known: true }, radarr: { known: false }, targets: [target] }) };
+    try {
+      const automation = new ArrAutomation({ store, observer, search: { run: async () => result('failed') }, submission: { submit: vi.fn() }, getPolicy: () => ({ enabled: true, dryRun: false }), clock: () => clock });
+      let pass: any, fifthAttemptAt = 0;
+      for (let i = 0; i < 5; i++) { fifthAttemptAt = clock; pass = await automation.runPass(); clock = pass.nextAttemptAt; }
+      expect(pass.nextAttemptAt - fifthAttemptAt).toBe(60 * 60_000);
+      expect(store.getAutomationAttempt(target.key)).toMatchObject({ failCount: 5, deadline: clock });
+      expect(store.getDeadline(target.key)).toBe(clock);
+    } finally { store.close(); }
+  });
+  it('does not search through an active provider deadline', async () => {
+    const clock = Date.parse('2026-01-01'), target = makeTarget('throttled', 1), store = openSearchStore(':memory:'), search = { run: vi.fn(async () => result()) };
+    const observer: any = { observe: async () => ({ observedAt: clock, sonarr: { known: true }, radarr: { known: false }, targets: [target] }) };
+    try {
+      store.setProviderDeadline('prowlarr', clock + 60_000);
+      const pass = await new ArrAutomation({ store, observer, search, submission: { submit: vi.fn() }, getPolicy: () => ({ enabled: true, dryRun: false }), clock: () => clock }).runPass();
+      expect(pass.reason).toBe('nothing-due'); expect(search.run).not.toHaveBeenCalled();
+    } finally { store.close(); }
+  });
+  it('validates the chosen rank one before submission and never promotes rank two', async () => {
+    const clock = Date.parse('2026-01-01'), target = makeTarget('stale', 1), store = openSearchStore(':memory:'), grabs: string[] = [];
+    const observer: any = { observe: async () => ({ observedAt: clock, sonarr: { known: true }, radarr: { known: false }, targets: [target] }), validateTarget: async () => false, sourceFingerprint: () => 'fp' };
+    const matched = { ...result(), options: [{ optionId: 'first', rank: 1, releases: [{ candidateId: '1' }], coveredTargetIds: [], reason: 'best', uncertainty: '' }, { optionId: 'second', rank: 2, releases: [{ candidateId: '2' }], coveredTargetIds: [], reason: 'next', uncertainty: '' }] };
+    try {
+      const submission = { submit: vi.fn(async (request: { optionId: string }, context: { validate(): Promise<boolean> }) => { if (await context.validate()) grabs.push(request.optionId); return { outcome: 'rejected', searchId: 's', optionId: request.optionId, candidateIds: [], outcomes: [] } as any; }) };
+      await new ArrAutomation({ store, observer, search: { run: async () => matched }, submission, getPolicy: () => ({ enabled: true, dryRun: false }), clock: () => clock }).runPass();
+      expect(submission.submit).toHaveBeenCalledTimes(1);
+      expect(submission.submit.mock.calls[0]![0]).toMatchObject({ optionId: 'first' });
+      expect(grabs).toEqual([]);
+    } finally { store.close(); }
+  });
   it('uses operational backoff rather than a six-hour no-match deadline for a failed search result', async () => {
     let clock = Date.parse('2026-01-01');
     const target: any = { key: 'tv:episode', provider: 'sonarr', sourceFingerprint: 'source', serviceId: 1, externalId: 2, episodeId: 3, monitored: true, hasFile: false, eligible: true, available: true, context: { title: 'Show', titles: ['Show'], seasonNumber: 2, episodeNumber: 1, absoluteEpisodeNumber: 26 } };

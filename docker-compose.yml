@@ -10,20 +10,20 @@ services:
       - path: .env
         required: false
     environment:
-      DB_PATH: ${DB_PATH:-data/media-agent.db}
+      DB_PATH: ${DB_PATH:-data/media-scout-search.db}
       HTTP_PORT: ${HTTP_PORT:-7877}
       HTTP_HOST: 0.0.0.0
       LOG_LEVEL: ${LOG_LEVEL:-info}
     ports:
-      # Web UI, GET /health, settings API, and POST /cycle on HTTP_PORT (default 7877).
+      # Web UI, health, settings, and v2 search/automation API on HTTP_PORT (default 7877).
       # The explicit container HTTP_PORT and this mapping share the same Compose
       # interpolation, keeping listener, HEALTHCHECK, and host port in sync. Loopback-only
-      # by default: POST /cycle
-      # is unauthenticated (paid LLM cycles + Prowlarr searches) — to reach it from the
+      # by default: the API
+      # is unauthenticated (paid model/indexer calls and explicit submissions) — to reach it from the
       # LAN, change this binding consciously. See README Troubleshooting.
       - "127.0.0.1:${HTTP_PORT:-7877}:${HTTP_PORT:-7877}"
     volumes:
-      # SQLite state (DB_PATH default data/media-agent.db) survives rebuilds.
+      # SQLite state (DB_PATH default data/media-scout-search.db) survives rebuilds.
       # Bind mount keeps the DB inspectable/back-up-able from the host.
       # The image pre-creates /app/data owned by UID 1000 (node); on Linux, pre-create
       # the host dir too (`mkdir -p data`) or Docker creates it root-owned and the

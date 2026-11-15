@@ -6,6 +6,7 @@ type Option = { optionId: string; rank: number; releases: Array<{ candidateId: s
 type Candidate = { candidateId: string; observations: Array<{ title: string; indexer?: string; size?: number | null; seeders?: number | null }>; excluded?: boolean }
 type SearchResult = { searchId: string; status: string; prompt: string; options: Option[]; candidates: Candidate[]; events: Array<{ type: string; data: Record<string, unknown> }>; counts: { decisions: number; searches: number; candidates: number }; message?: string }
 type Client = { id: number; name: string; protocol: string; categories: boolean }
+type SubmissionEvent = { outcome: string; outcomes?: Array<{ candidateId: string; outcome: string }> }
 const running = (status?: string) => status === 'queued' || status === 'running'
 
 export function SearchPage({ settings, searchId }: { settings: Settings; searchId?: string }) {
@@ -82,19 +83,20 @@ export function SearchPage({ settings, searchId }: { settings: Settings; searchI
     setSubmitting(true)
     try {
       const response = await fetch('/api/v2/submissions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ searchId: result.searchId, optionId: selected.optionId, idempotencyKey: key, ...(client ? { downloadClientId: Number(client) } : {}) }) })
-      const data = await response.json() as { outcome: string; error?: string }
+      const data = await response.json() as { outcome: string; error?: string; message?: string }
       if (!response.ok) throw new Error(data.error ?? 'Submission status is uncertain. Retry this confirmation to check the same submission, not create another.')
-      setConfirm(false); setNotice(`Submission outcome: ${data.outcome}. Submitted does not mean imported.`)
+      setConfirm(false); setNotice(data.outcome === 'expired' ? 'Search results expired. Start a new search before submitting.' : `Submission outcome: ${data.outcome}. Submitted does not mean imported.`)
     } catch (failure) { setNotice(failure instanceof Error ? failure.message : 'Submission status is uncertain. Retry to check the same submission.') }
     finally { setSubmitting(false) }
   }
 
   const byId = new Map((result?.candidates ?? []).map(candidate => [candidate.candidateId, candidate]))
+  const submissions = (result?.events ?? []).filter(event => event.type === 'submission').map(event => event.data as unknown as SubmissionEvent)
   const progress = busy || running(result?.status)
   return <>
     <div className="page-heading"><div><h1>Search<span className="heading-period">.</span></h1><p className="page-intro">Describe what you’re looking for. Scout compares releases; you choose what to download.</p></div></div>
     <form className="search-composer" onSubmit={search}>
-      <label className="field" htmlFor="search-prompt">What are you looking for?<textarea id="search-prompt" rows={3} value={prompt} onChange={event => setPrompt(event.target.value)} placeholder="Find the film, episode, or season you want…" maxLength={4000}/></label>
+      <label className="field" htmlFor="search-prompt">What are you looking for?<textarea id="search-prompt" aria-label="What are you looking for?" rows={3} value={prompt} onChange={event => setPrompt(event.target.value)} placeholder="Find the film, episode, or season you want…" maxLength={4000}/></label>
       <div className="search-form-actions"><button className="text-button" type="button" aria-expanded={advanced} onClick={() => setAdvanced(!advanced)}>{advanced ? 'Hide optional details' : 'Add optional details'}</button><button className="button button-primary" type="submit" disabled={progress || !prompt.trim()}>{progress ? <LoaderCircle className="spin" size={16}/> : <SearchIcon size={16}/>}Search releases</button></div>
       {advanced && <div className="search-optional"><label className="field">Preferences<textarea rows={2} value={preferences} onChange={event => setPreferences(event.target.value)} placeholder={settings.ai.preferences || 'Original audio, English or multi-sub, preferably 1080p'}/></label><label className="field">Structured context (JSON, optional)<textarea rows={4} value={context} onChange={event => setContext(event.target.value)} placeholder={'{"kind":"tv","titles":["Example"],"scope":{"type":"episode","seasonNumber":1,"episodeNumber":2}}'}/></label></div>}
       <p className="field-hint">Search never downloads. Model and indexer calls may cost money. Saved preferences apply unless overridden. Don’t include passwords or private links.</p>
@@ -104,6 +106,7 @@ export function SearchPage({ settings, searchId }: { settings: Settings; searchI
     {result && <section className="search-results" aria-live="polite">
       <div className="search-result-heading"><div><h2>{result.status === 'matched' ? 'Ranked options' : running(result.status) ? 'Searching…' : result.status === 'no-match' ? 'No suitable match' : `Search ${result.status}`}</h2><p>{result.message ?? `${result.counts.candidates} candidates · ${result.counts.searches} searches · ${result.counts.decisions} model decisions`}</p></div><span className="ops-status">{result.status}</span></div>
       {result.events.some(event => event.type.startsWith('query-')) && <details className="query-trail" open><summary>Search trail</summary><ol>{result.events.filter(event => event.type.startsWith('query-')).map((event, index) => <li key={index}><strong>{event.type === 'query-start' ? 'Query' : 'Results'}:</strong> {String(event.data.query ?? 'Indexer query')}{event.data.count !== undefined && ` · ${String(event.data.count)} results`}</li>)}</ol></details>}
+      {submissions.length > 0 && <section className="query-trail" aria-labelledby="submission-history"><h3 id="submission-history">Submission history</h3><p>Submission is not proof of downloading or import.</p>{submissions.map((submission, index) => <div key={index}><p>Outcome: {submission.outcome}</p><ul>{submission.outcomes?.map((release, releaseIndex) => <li key={releaseIndex}>{byId.get(release.candidateId)?.observations[0]?.title ?? `Release ${releaseIndex + 1}`}: {release.outcome}</li>)}</ul></div>)}</section>}
       {running(result.status) ? <p role="status" className="ops-state-panel"><LoaderCircle className="spin"/>Checking indexers and comparing releases…</p> : !result.options.length ? <div className="ops-state-panel ops-empty"><h2>{result.status === 'no-match' ? 'No suitable releases found' : 'Search did not produce a recommendation'}</h2><p>{result.message ?? 'Try an alternate title or add more context.'}</p></div> : <div className="ranked-options">{result.options.map(option => <article className="ranked-option" key={option.optionId}>
         <div className="option-title"><h3>{option.rank === 1 ? 'Best match' : `Alternative ${option.rank - 1}`}</h3><span>Option {option.rank}</span></div>
         <p className="option-reason">{option.reason}</p>{option.uncertainty && <p className="option-uncertainty">{option.uncertainty}</p>}

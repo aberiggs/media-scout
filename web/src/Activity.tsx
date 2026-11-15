@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import type { Settings } from './types'
 
-type ActivityItem = { searchId: string; prompt: string; status: string; createdAt: string; source: 'manual' | 'automation'; counts?: { candidates: number }; submission?: { outcome: string } }
+type ActivityItem = { searchId: string; prompt: string; status: string; createdAt: string; source: 'manual' | 'automation'; kind?: 'tv' | 'movie'; counts?: { candidates: number }; submission?: { outcome: string } }
 type AutomationItem = { targetId: string; title: string; kind: 'tv' | 'movie'; seriesId?: string; seasonNumber?: number; episodeNumber?: number; status: string; eligible: boolean; observedAt?: string; nextAttemptAt?: string; lastAttemptAt?: string }
 type Automation = { enabled: boolean; dryRun: boolean; running: boolean; providers: Array<{ provider: string; known: boolean; observedAt?: string; error?: string; unidentifiedQueueRows: number; unknownSeriesIds?: string[] }>; items: AutomationItem[] }
 const date = (value?: string) => value && Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString() : 'Not observed yet'
@@ -9,12 +9,14 @@ const date = (value?: string) => value && Number.isFinite(Date.parse(value)) ? n
 export function ActivityPage({ onOpenSearch }: { onOpenSearch(id: string): void }) {
   const [items, setItems] = useState<ActivityItem[]>([]), [total, setTotal] = useState(0)
   const [q, setQ] = useState(''), [source, setSource] = useState(''), [status, setStatus] = useState('')
+  const [kind, setKind] = useState(''), [createdAtFrom, setCreatedAtFrom] = useState(''), [createdAtTo, setCreatedAtTo] = useState('')
   const [offset, setOffset] = useState(0), [loading, setLoading] = useState(true), [error, setError] = useState('')
   const [retention, setRetention] = useState({ days: 30, maxEntries: 10000 })
   useEffect(() => {
     const controller = new AbortController()
     setLoading(true)
-    const params = new URLSearchParams({ limit: '50', offset: String(offset), q, source, status })
+    const params = new URLSearchParams({ limit: '50', offset: String(offset) })
+    for (const [key, value] of Object.entries({ q, source, status, kind, createdAtFrom: createdAtFrom ? new Date(`${createdAtFrom}T00:00:00`).toISOString() : '', createdAtTo: createdAtTo ? new Date(`${createdAtTo}T23:59:59.999`).toISOString() : '' })) if (value) params.set(key, value)
     fetch(`/api/v2/activity?${params}`, { signal: controller.signal }).then(async response => {
       if (!response.ok) throw new Error('Activity could not be loaded.')
       const data = await response.json()
@@ -23,19 +25,22 @@ export function ActivityPage({ onOpenSearch }: { onOpenSearch(id: string): void 
     }).catch(failure => { if (!controller.signal.aborted) setError(failure.message) })
       .finally(() => { if (!controller.signal.aborted) setLoading(false) })
     return () => controller.abort()
-  }, [q, source, status, offset])
+  }, [q, source, status, kind, createdAtFrom, createdAtTo, offset])
   return <>
     <Heading title="Activity" intro="What Scout searched, recommended and submitted."/>
     <div className="ops-list-card">
       <div className="ops-controls">
         <label className="field">Filter searches<input value={q} onChange={event => { setQ(event.target.value); setOffset(0) }} placeholder="Search request"/></label>
         <label className="field">Source<select value={source} onChange={event => { setSource(event.target.value); setOffset(0) }}><option value="">All sources</option><option value="manual">Manual</option><option value="automation">Automation</option></select></label>
-        <label className="field">Status<select value={status} onChange={event => { setStatus(event.target.value); setOffset(0) }}><option value="">All statuses</option>{['running', 'matched', 'no-match', 'needs-input', 'budget-exhausted', 'failed', 'interrupted', 'dry-run', 'submitted', 'uncertain'].map(value => <option key={value}>{value}</option>)}</select></label>
+        <label className="field">Media<select value={kind} onChange={event => { setKind(event.target.value); setOffset(0) }}><option value="">All media</option><option value="tv">TV</option><option value="movie">Movie</option><option value="other">Other / no context</option></select></label>
+        <label className="field">Created from<input type="date" value={createdAtFrom} onChange={event => { setCreatedAtFrom(event.target.value); setOffset(0) }}/></label>
+        <label className="field">Created through<input type="date" value={createdAtTo} onChange={event => { setCreatedAtTo(event.target.value); setOffset(0) }}/></label>
+        <label className="field">Status<select value={status} onChange={event => { setStatus(event.target.value); setOffset(0) }}><option value="">All statuses</option>{['queued', 'running', 'matched', 'no-match', 'needs-input', 'budget-exhausted', 'failed', 'interrupted', 'dry-run', 'submitted', 'rejected', 'uncertain', 'deferred', 'expired'].map(value => <option key={value}>{value}</option>)}</select></label>
       </div>
       {error && <p role="alert" className="notice notice-error">{error}</p>}
       {loading ? <p role="status" className="ops-state-panel">Loading activity…</p> : !items.length && !error ? <div className="ops-state-panel ops-empty"><h2>No matching activity</h2><p>Search attempts will appear here, including unsuccessful searches.</p></div> : <div className="ops-activity-list">{items.map(item => <article className="ops-activity-row" key={item.searchId}>
         <div className="ops-activity-top"><strong>{item.prompt}</strong><span className="ops-status">{item.status}</span></div>
-        <div className="ops-activity-date">{date(item.createdAt)} · {item.source}{item.counts && ` · ${item.counts.candidates} candidates`}{item.submission && ` · Submission: ${item.submission.outcome}`}</div>
+        <div className="ops-activity-date">{date(item.createdAt)} · {item.kind ?? 'other'} · {item.source}{item.counts && ` · ${item.counts.candidates} candidates`}{item.submission && ` · Submission: ${item.submission.outcome}`}</div>
         <button className="text-button" onClick={() => onOpenSearch(item.searchId)}>View search details</button>
       </article>)}</div>}
       <div className="ops-pagination"><span>{total} searches · kept up to {retention.days} days / {retention.maxEntries.toLocaleString()} entries</span><div><button className="button button-secondary" disabled={!offset || loading} onClick={() => setOffset(Math.max(0, offset - 50))}>Previous</button><button className="button button-secondary" disabled={offset + 50 >= total || loading} onClick={() => setOffset(offset + 50)}>Next</button></div></div>

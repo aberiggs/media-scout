@@ -22,6 +22,14 @@ function matched(f: ReturnType<typeof setup>, expires: number) {
 }
 
 describe('search runtime', () => {
+  it('filters Activity by persisted media context and inclusive creation-time bounds', () => {
+    const f = setup();
+    for (const [id, kind, createdAt] of [['tv', 'tv', f.now], ['movie', 'movie', f.now + 1], ['contextless', undefined, f.now + 2]] as const) {
+      f.store.createSearch({ searchId: id, prompt: JSON.stringify({ prompt: id, ...(kind ? { context: { kind } } : {}) }), status: 'no-match', createdAt });
+    }
+    expect(f.runtime.activity({ kind: 'tv', createdAtFrom: new Date(f.now).toISOString(), createdAtTo: new Date(f.now + 1).toISOString() }).items.map(x => x.searchId)).toEqual(['tv']);
+    expect(f.runtime.activity({ kind: 'other' }).items.map(x => x.searchId)).toEqual(['contextless']);
+  });
   it('projects durable receipt evidence even if a crash prevented the Activity event', () => {
     const f = setup(); matched(f, f.now + 1000);
     f.store.appendEvent('matched', { type: 'submission', data: { outcome: 'dry-run', outcomes: [] } }, f.now - 1);

@@ -12,13 +12,12 @@
 
 ## Architecture
 
-- TypeScript ESM backend; `src/compose.ts` wires clients and core services with dependency-injection seams.
-- `src/core/watcher.ts` observes Sonarr/Radarr; `runner.ts` coordinates reconciliation, planning, searches, picking, and submission.
-- SQLite persistence/migrations live in `src/core/state.ts`; work eligibility and dashboard projections live in `work-queue.ts` and `operations.ts`.
-- `planner.ts`, `picker.ts`, and `queue-association.ts` own the LLM steps. `src/clients/` owns upstream API access.
-- `src/daemon.ts` exposes the HTTP API/scheduler; `src/mcp/server.ts` and `src/operator-cli.ts` share core behavior. The React/Vite UI is in `web/`.
+- TypeScript ESM backend; `src/compose.ts` wires upstream clients and the shared search runtime with dependency-injection seams.
+- `src/search/` owns neutral search, selection, explicit submission, Arr observations/automation, settings, and SQLite persistence. `src/clients/` owns upstream API access.
+- `src/daemon.ts` exposes the v2 HTTP API and scheduled automation; `src/search/mcp.ts` exposes the matching MCP tools. The React/Vite Search, Activity, Automation, and Settings UI is in `web/`.
 - Search-first replacement approved in `openspec/changes/replace-tracking-with-search-service/` (#24): use fresh Arr library/queue observations as authority. Preserve owner-checked leases, atomic finite submission/appearance grace, source backoff, unknown-vs-empty observations and fresh pre-submit checks. Replace indefinite reservations, vanished-coverage holds and manual reviews; unmatched retries after finite grace intentionally accept duplicate-download risk. A search result or submission is not proof of import. Do not introduce a parallel legacy engine or migrate old state; refuse legacy databases without modifying them and use a fresh path.
-- Keep existing `media-agent` runtime identifiers unless a task explicitly includes compatibility migration.
+- The default database is `data/media-scout-search.db`. A nonempty database without the search schema is refused without modification; use a fresh path. There is no legacy-engine migration or compatibility runtime.
+- Keep existing `media-agent` container/service identifiers unless a task explicitly includes compatibility migration.
 
 ## Setup and checks
 

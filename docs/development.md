@@ -21,7 +21,7 @@ npm --prefix web test
 npm run build
 ```
 
-For a focused backend suite: `npm test -- tests/runner.test.ts`. No API keys or running *arr services are needed for the ordinary tests. Container build/SQLite smoke checks are additional CI checks, not covered by these commands.
+For a focused backend suite, use the relevant `tests/search-*.test.ts` file. No API keys or running *arr services are needed for ordinary tests. Container build/SQLite smoke checks are additional CI checks, not covered by these commands.
 
 See [setup](setup.md#local-web-development) for running the backend and Vite. Use a disposable development database; never copy production settings into a committed fixture. Monitoring starts disabled and dry-run starts enabled, but dry-run searches still consume API calls. Vite's development command binds to all interfaces, so use it only on a trusted network or pass `--host 127.0.0.1` via `npm --prefix web run dev -- --host 127.0.0.1`.
 
@@ -38,7 +38,9 @@ openspec context --json
 
 Use the installed `openspec-propose` workflow for proposals and `openspec-apply-change` only after implementation approval. Record software verification in an active change's `progress.md`; OpenSpec validation alone does not test the app.
 
-## Verified local baseline — 2026-10-10
+## Historical verified baseline — 2026-10-10
+
+This table records an earlier checkout and its legacy-engine test suite; it is not evidence for the current search-first revision or current test counts.
 
 Checkout: `32b05b37727c3a43ce15b8feb8240b7a5488a623`, Ubuntu/Linux, Node `v24.21.0`, npm `11.19.0`.
 
@@ -57,4 +59,4 @@ Checkout: `32b05b37727c3a43ce15b8feb8240b7a5488a623`, Ubuntu/Linux, Node `v24.21
 
 Both installs reported install-script approval warnings, but the subsequent test/build checks passed, including SQLite-backed tests. npm audit reported **4 backend** advisories (1 moderate, 1 high, 2 critical) and **7 frontend** advisories (2 moderate, 5 high). These are dependency audit findings, not evidence of production exploitability; they were not changed in this investigation. Suggested fixes include major Vitest/Tailwind upgrades and need a separately scoped dependency review, not `npm audit fix --force`.
 
-No daemon, live API evaluations, production database reads, Docker image builds, deployment, or push were performed. Production feedback remains to be reproduced with sanitized evidence.
+No daemon, live API evaluations, production database reads, Docker image builds, deployment, or push were performed for that historical baseline. Current behavior is described in [operations](operations.md); use a disposable fresh database for local development.

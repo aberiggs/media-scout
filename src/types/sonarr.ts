@@ -24,6 +24,9 @@ export const alternateTitleSchema = z.object({
   title: z.string(),
 });
 
+const languageSchema = z.object({ id: z.number().int().optional(), name: z.string().optional() }).passthrough();
+const profileContextSchema = z.object({ quality: z.unknown().optional(), items: z.array(z.unknown()).optional() }).passthrough();
+
 export const seriesSchema = z.object({
   id: z.number().int(),
   tvdbId: z.number().int(),
@@ -34,6 +37,11 @@ export const seriesSchema = z.object({
   status: z.enum(['continuing', 'ended']).nullable().optional().catch(null),
   seasons: z.array(seasonSchema).catch([]),
   alternateTitles: z.array(alternateTitleSchema).catch([]),
+  overview: z.string().nullable().optional().catch(null),
+  originalLanguage: languageSchema.nullable().optional().catch(null),
+  qualityProfileId: z.number().int().nullable().optional().catch(null),
+  qualityProfile: profileContextSchema.nullable().optional().catch(null),
+  genres: z.array(z.string()).optional().catch([]),
 });
 export type Series = z.infer<typeof seriesSchema>;
 export const seriesListSchema = z.array(seriesSchema);
@@ -55,6 +63,8 @@ export const episodeSchema = z.object({
   finaleType: z.string().nullable().optional().catch(null),
   monitored: z.boolean(),
   hasFile: z.boolean(),
+  overview: z.string().nullable().optional().catch(null),
+  originalLanguage: languageSchema.nullable().optional().catch(null),
 });
 export type Episode = z.infer<typeof episodeSchema>;
 export const episodeListSchema = z.array(episodeSchema);

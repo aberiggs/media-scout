@@ -1,6 +1,7 @@
 import { Http } from '../http';
 import { getAllQueueRecords } from './arr-queue';
 import { type Movie, movieListSchema, radarrQueuePageSchema, type RadarrQueueRecord } from '../types/radarr';
+import { qualityProfileListSchema, type QualityProfile } from '../types/quality-profile';
 
 /** Thin Radarr adapter: reads the movie library. All mutations are out of scope (I6). */
 export class RadarrClient {
@@ -18,5 +19,9 @@ export class RadarrClient {
       params: { includeUnknownMovieItems: true, includeMovie: false },
       schema: radarrQueuePageSchema,
     });
+  }
+
+  getQualityProfiles(): Promise<QualityProfile[]> {
+    return this.http.getJson('/api/v3/qualityprofile').then(qualityProfileListSchema.parse);
   }
 }

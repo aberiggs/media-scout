@@ -67,12 +67,19 @@ The Node package version is not, by itself, a published-release signal. No semve
 
 ## 6. Database backup and rollback
 
-The image uses the persistent SQLite database under `./data`. Before upgrading or changing image references, create a consistent backup. For a filesystem backup, stop the Compose service `media-agent` and **all separate MCP servers, operator CLI processes, and any other SQLite writer**, then archive/copy the entire `data/` directory, including any `-wal` or `-shm` sidecars that exist. Never copy only the main database file while a writer may be open. Alternatively, use SQLite's online backup API with a deliberate consistent snapshot.
+The image uses the persistent SQLite database under `./data`. Before upgrading or changing image references, create a consistent backup. For a filesystem backup, stop the Compose service `media-agent` and **all separate MCP servers and any other SQLite writer**, then archive/copy the entire `data/` directory, including any `-wal` or `-shm` sidecars that exist. Never copy only the main database file while a writer may be open. Alternatively, use SQLite's online backup API with a deliberate consistent snapshot.
 
-To roll the application image back, set `MEDIA_AGENT_IMAGE` to the prior full-commit tag or digest and explicitly pull/recreate with `docker-compose.ghcr.yml`. Image rollback does not roll back SQLite. Newer code may have changed or migrated the schema; an older image may not be compatible with a newer database. Before restoring a database backup, stop all writers and confirm the backup's schema is compatible with the selected image. Do not assume migrations have a downgrade path, and do not clear the database to force work to retry.
+To roll the application image back, set `MEDIA_AGENT_IMAGE` to the prior full-commit tag or digest and explicitly pull/recreate with `docker-compose.ghcr.yml`. Image rollback does not roll back SQLite. Stop all writers and restore the consistent pre-upgrade database together with the matching prior binary/path; do not point the prior binary at the new search database. Do not clear a database to force retries.
 
 No automated deployment or database restore is configured by this project. Keep a known-good compatible backup before each change and validate the selected image/database pair under the operator's own rollout procedure.
 
-## Episode-progress upgrade and rollback
+## Search-first rollout
 
-Stop all application writers before upgrading and make a consistent SQLite backup. Never run old and new writer versions concurrently: older binaries do not honor per-episode retry state. There is no destructive down migration. To roll back, stop writers and restore the pre-upgrade backup with its matching binary; observations made after upgrade will be discarded and must be reconciled deliberately.
+The approved search-first replacement (#24) requires a fresh `DB_PATH`, not a
+legacy migration. Existing old nonempty databases are refused before writes and
+are never automatically deleted. Stop all writers when switching versions;
+retain the old database/binary if rollback is desired. A new database starts
+with automation disabled and dry-run enabled. External downloads are not undone
+by switching binaries or database paths: inspect/account for them before
+enabling automation. Publishing/deployment and real download submissions are
+separate authorizations.

@@ -8,6 +8,7 @@ import {
   sonarrQueuePageSchema,
   type SonarrQueueRecord,
 } from '../types/sonarr';
+import { qualityProfileListSchema, type QualityProfile } from '../types/quality-profile';
 
 /** Thin Sonarr /api/v3 adapter — auth and wire parsing via Http + zod schemas. */
 export class SonarrClient {
@@ -31,5 +32,9 @@ export class SonarrClient {
       params: { includeUnknownSeriesItems: true, includeSeries: false, includeEpisode: false },
       schema: sonarrQueuePageSchema,
     });
+  }
+
+  getQualityProfiles(): Promise<QualityProfile[]> {
+    return this.http.getJson('/api/v3/qualityprofile').then(qualityProfileListSchema.parse);
   }
 }

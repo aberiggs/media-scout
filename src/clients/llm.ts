@@ -17,6 +17,9 @@ export interface LLMClient {
     label: string;
     /** Explicit provider-compatible JSON Schema for refinements/nullable wire fields. */
     jsonSchema?: { name: string; schema: Record<string, unknown> };
+    signal?: AbortSignal;
+    maxAttempts?: 1 | 2;
+    retryTransport?: boolean;
   }): Promise<T>;
 }
 
@@ -79,9 +82,15 @@ export class OpenRouterLLM implements LLMClient {
     schema: z.ZodType<T>;
     label: string;
     jsonSchema?: { name: string; schema: Record<string, unknown> };
+    signal?: AbortSignal;
+    maxAttempts?: 1 | 2;
+    retryTransport?: boolean;
   }): Promise<T> {
     const controller = new AbortController();
     const timeoutMs = this.deps.timeoutMs ?? JSON_DEADLINE_MS;
+    const abortFromCaller = () => controller.abort(args.signal?.reason);
+    if (args.signal?.aborted) abortFromCaller();
+    else args.signal?.addEventListener('abort', abortFromCaller, { once: true });
     let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<never>((_resolve, reject) => {
       deadlineTimer = setTimeout(() => {
@@ -101,6 +110,7 @@ export class OpenRouterLLM implements LLMClient {
           args.jsonSchema,
           attempt > 0,
           controller.signal,
+          args.retryTransport ?? true,
         );
         try {
           const parsed = JSON.parse(stripFences(content)) as unknown;
@@ -110,7 +120,7 @@ export class OpenRouterLLM implements LLMClient {
             throw e; // zod failure at the LLM boundary (I8): no retry.
           }
           const last = e instanceof Error ? e : undefined;
-          if (attempt === 1) {
+          if (attempt + 1 >= (args.maxAttempts ?? 2)) {
             throw new Error(
               `LLM ${args.label}: unparseable JSON after retry: ${last?.message ?? String(e)}`,
             );
@@ -122,6 +132,7 @@ export class OpenRouterLLM implements LLMClient {
       return await Promise.race([operation, deadline]);
     } finally {
       if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+      args.signal?.removeEventListener('abort', abortFromCaller);
     }
   }
 
@@ -132,6 +143,7 @@ export class OpenRouterLLM implements LLMClient {
     jsonSchema: { name: string; schema: Record<string, unknown> } | undefined,
     correcting: boolean,
     signal: AbortSignal,
+    retryTransport: boolean,
   ): Promise<string> {
     const generatedSchema = jsonSchema?.schema ?? withoutMetaSchema(z.toJSONSchema(schema));
     let completion: Awaited<ReturnType<OpenRouter['chat']['send']>>;
@@ -157,7 +169,7 @@ export class OpenRouterLLM implements LLMClient {
           },
         },
         provider: { requireParameters: true },
-      }, signal);
+      }, signal, retryTransport);
     } catch (error) {
       throw normalizeOpenRouterError(error);
     }
@@ -179,6 +191,7 @@ export class OpenRouterLLM implements LLMClient {
   private async sendWithRetry(
     chatRequest: Parameters<OpenRouter['chat']['send']>[0]['chatRequest'],
     signal: AbortSignal,
+    retryTransport: boolean,
   ): Promise<Awaited<ReturnType<OpenRouter['chat']['send']>>> {
     const startedAt = Date.now();
     let retryIndex = 0;
@@ -193,6 +206,7 @@ export class OpenRouterLLM implements LLMClient {
         });
       } catch (error) {
         if (signal.aborted) throw signal.reason ?? error;
+        if (!retryTransport) throw error;
         if (!(error instanceof OpenRouterError) || error.statusCode < 500 || error.statusCode >= 600) {
           throw error;
         }

@@ -1,5 +1,7 @@
-import type { ParsedReleaseCoverage } from './group-types';
-export type { ParsedReleaseCoverage } from './group-types';
+export type ParsedReleaseCoverage =
+  | { kind: 'invalid' }
+  | { kind: 'none' }
+  | { kind: 'claims'; seasonClaims: Array<{ seasonNumber: number; episodes: number[] | null }>; absoluteEpisodes: number[] | null; unqualifiedEpisodes: number[] | null; wholeSeries: boolean };
 
 export interface ParsedTitle {
   /** Season number from a complete season label; null when absent. */

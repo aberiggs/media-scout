@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import nock from 'nock';
 import { ApiError, Http } from '../src/http';
 import { RadarrClient } from '../src/clients/radarr';
+import { movieListSchema } from '../src/types/radarr';
 import movieFixture from './fixtures/radarr-movie.json';
 
 const BASE = 'http://radarr.test';
@@ -10,6 +11,10 @@ const KEY = 'test-key';
 afterEach(() => nock.cleanAll());
 
 describe('RadarrClient.getMovies', () => {
+  it('preserves allowlisted descriptive metadata needed by search automation', () => {
+    const [movie] = movieListSchema.parse([{ id: 1, tmdbId: 2, title: 'Example', titleSlug: 'example', year: 2024, monitored: true, hasFile: false, isAvailable: true, sizeOnDisk: 0, overview: 'Safe synopsis', originalLanguage: { id: 8, name: 'Japanese' }, qualityProfileId: 4 }]);
+    expect(movie).toMatchObject({ overview: 'Safe synopsis', originalLanguage: { id: 8, name: 'Japanese' }, qualityProfileId: 4 });
+  });
   it('GETs /api/v3/movie and parses the movie list', async () => {
     const scope = nock(BASE)
       .matchHeader('X-Api-Key', KEY)

@@ -1,8 +1,8 @@
 # Media Scout
 
-LLM-assisted torrent searching and release picking. Media Scout helps turn what you're looking for into indexer searches, evaluates the results, and selects suitable releases.
+LLM-assisted release search and selection. Media Scout turns a natural-language request into bounded Prowlarr searches and ranked alternatives. Search is separate from explicit download submission; Arr-based automation is optional.
 
-Currently, it uses Prowlarr for searching and downloading, with Sonarr/Radarr supplying missing-media requests. It's an early-stage homelab project; broader search workflows are on the [ideas list](docs/future-features.md).
+Prowlarr provides indexer search and routed submissions. Sonarr/Radarr supply current library and queue observations for optional automation. New installs use a fresh search database; existing tracking-engine databases are refused, not migrated. It's an early-stage homelab project; broader ideas are on the [ideas list](docs/future-features.md).
 
 ## Get started
 
@@ -19,10 +19,10 @@ See [setup and configuration](docs/setup.md) for prerequisites, Docker details, 
 
 ## Project notes
 
-- [Development](docs/development.md) — Ubuntu bootstrap, verification commands, and agent/planning workflow.
+- [Development](docs/development.md) — Ubuntu bootstrap and verification commands.
 - [Feedback triage](docs/feedback-triage.md) — investigated concerns and links to the GitHub backlog.
 - [Future features](docs/future-features.md) — high-level ideas under consideration, not commitments.
-- [Operator recovery](docs/operator-recovery.md) — details for the opt-in administrative recovery lane.
+- [Operator recovery](docs/operator-recovery.md) — current finite retry behavior and deliberate fresh-database rollback.
 - [Publishing](docs/publishing.md) — development-image publishing and rollout notes.
 
 Licensed under [MIT](LICENSE).

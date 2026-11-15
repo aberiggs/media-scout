@@ -3,6 +3,7 @@ import nock from 'nock';
 import { readFileSync } from 'node:fs';
 import { ApiError, Http } from '../src/http';
 import { SonarrClient } from '../src/clients/sonarr';
+import { seriesListSchema } from '../src/types/sonarr';
 
 const BASE = 'http://sonarr.test';
 const KEY = 'test-key';
@@ -26,6 +27,10 @@ const catchAs = async (p: Promise<unknown>): Promise<ApiError> => {
 afterEach(() => nock.cleanAll());
 
 describe('SonarrClient.getSeries', () => {
+  it('preserves allowlisted descriptive metadata needed by search automation', () => {
+    const [series] = seriesListSchema.parse([{ id: 1, tvdbId: 2, title: 'Example', titleSlug: 'example', seriesType: 'anime', monitored: true, seasons: [], alternateTitles: [], overview: 'Safe synopsis', originalLanguage: { id: 8, name: 'Japanese' }, qualityProfileId: 4 }]);
+    expect(series).toMatchObject({ overview: 'Safe synopsis', originalLanguage: { id: 8, name: 'Japanese' }, qualityProfileId: 4 });
+  });
   it('GETs /api/v3/series and parses the fixture through seriesListSchema', async () => {
     const scope = nock(BASE)
       .matchHeader('X-Api-Key', KEY)

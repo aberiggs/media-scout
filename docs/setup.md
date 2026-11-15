@@ -2,12 +2,12 @@
 
 Media Scout is an early-stage homelab application. This guide starts its own container; it does not deploy or alter your other applications.
 
-The runtime still uses existing `media-agent` service, configuration, file, and MCP identifiers; the public project/display name is Media Scout.
+The runtime keeps the `media-agent` container/service identifier. The v2 search interface is new; there is no migration or compatibility layer for the former tracking engine.
 
 ## Requirements
 
 - Docker Engine and Docker Compose v2.24 or later. The Compose files use an optional `.env` declaration supported by Compose 2.24+.
-- For automated monitoring: reachable Sonarr and Radarr instances, Prowlarr, a torrent client configured in Prowlarr, and an LLM API endpoint. Sonarr/Radarr libraries, quality profiles, and root folders should already be configured.
+- For standalone searching/submission: reachable Prowlarr with indexers and enabled download clients, plus an LLM API endpoint. For TV/movie automation, configure the corresponding Sonarr/Radarr services and libraries.
 - Node.js 22+ is only needed for host-side source development or MCP use; it is not needed to run the container.
 
 ## Start from source with Compose
@@ -43,7 +43,7 @@ Before enabling monitoring, prepare the *arr/Prowlarr routing:
 3. Review Prowlarr application sync before changing indexer configuration. Synced indexers can let Sonarr/Radarr continue their own searches; removing them can change existing search/RSS behavior. Make such changes manually only if intended. Media Scout does not edit those applications or remove indexers.
 4. Verify Prowlarr can route grabs through the intended entries and that *arr root folders, categories, and Completed Download Handling are set up for the media you expect to import.
 
-Settings default to monitoring disabled and dry-run enabled. Dry-run prevents actual grabs, but search/planning may still contact indexers and call the configured LLM; see [operations and safety](operations.md) before starting cycles or enabling monitoring.
+Settings default to monitoring disabled and dry-run enabled. Dry-run prevents grab POSTs, but searches may still contact indexers and call the configured LLM; see [operations and safety](operations.md) before searching or enabling monitoring.
 
 ## Local web development
 
@@ -64,7 +64,7 @@ npx tsx src/daemon.ts
 npm run web:dev
 ```
 
-Open <http://localhost:5173/>. Vite proxies `/api`, `/health`, and `/cycle` to the backend on port 7877. For a local production-style run, build with `npm run web:build`, then start the daemon; Fastify serves `web/dist`.
+Open <http://localhost:5173/>. Vite proxies `/api` and `/health` to the backend on port 7877. For a local production-style run, build with `npm run web:build`, then start the daemon; Fastify serves `web/dist`.
 
 ## MCP stdio
 
@@ -74,4 +74,7 @@ Run the MCP server inside a source-build container:
 docker exec -i <container-name> node_modules/.bin/tsx src/mcp/server.ts
 ```
 
-It shares SQLite state with the daemon. Stop the daemon and every MCP, CLI, and other database writer before a filesystem backup. The server uses stdio and has no built-in user identity/authentication; review the host's tool-approval policy, especially for `ma_review_action` and `ma_pick`. The unauthenticated HTTP API is also loopback-bound by default. See [operations and safety](operations.md) and [operator recovery](operator-recovery.md).
+It shares SQLite state with the daemon. Stop the daemon and every MCP or other database writer before a filesystem backup. The server uses stdio and has no built-in user identity/authentication; require host approval for `ma_submit_v2` and `ma_automation_poll_v2`. The unauthenticated HTTP API is loopback-bound by default. See [operations and safety](operations.md) and [operator recovery](operator-recovery.md).
+# Search-first database boundary
+
+The fresh search runtime uses `DB_PATH=data/media-scout-search.db` by default. Stop existing writers before switching versions. Existing nonempty legacy databases are refused without modification; there is no migration and no need to delete the old database. Configure connections and preferences in Settings; monitoring starts disabled and dry-run starts enabled. Normal restarts retain search and submission state. Keep the old database and matching binary for rollback. Changing paths does not undo external downloads; account for them before starting the prior runtime. Never run old and new writers together.

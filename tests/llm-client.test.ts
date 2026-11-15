@@ -274,4 +274,23 @@ describe('OpenRouterLLM.json', () => {
     );
     expect(calls).toBe(1);
   });
+
+  it('does not correct invalid JSON when maxAttempts is one', async () => {
+    let calls = 0;
+    const llm = new OpenRouterLLM({
+      client: {
+        chat: {
+          send: async () => {
+            calls++;
+            return { choices: [{ message: { content: 'nope' } }] };
+          },
+        },
+      } as unknown as OpenRouter,
+      model: MODEL,
+    });
+    await expect(llm.json({
+      system: 's', user: 'u', schema, label: 'search', maxAttempts: 1, retryTransport: false,
+    })).rejects.toThrow(/unparseable JSON/);
+    expect(calls).toBe(1);
+  });
 });

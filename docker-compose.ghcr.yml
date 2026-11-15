@@ -7,7 +7,7 @@ services:
       - path: .env
         required: false
     environment:
-      DB_PATH: ${DB_PATH:-data/media-agent.db}
+      DB_PATH: ${DB_PATH:-data/media-scout-search.db}
       HTTP_PORT: ${HTTP_PORT:-7877}
       HTTP_HOST: 0.0.0.0
       LOG_LEVEL: ${LOG_LEVEL:-info}

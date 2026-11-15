@@ -2,7 +2,7 @@
 
 ## State
 
-Implementation approved with revised scope: explicit server-listed download-client choice for manual submissions, descriptive language preferences (no hard-language v1 gate), bounded authorized live Prowlarr/model dry-run evaluation, and a fresh-database-only boundary replacing migration/legacy compatibility. Branch/task audit reconciled implementation and evidence: **14/17 tasks complete**. Remaining: full acceptance checks (8.2), container/native-addon portion of 8.3, and final publication/CI acceptance (8.4). No production state changed.
+Implementation approved with revised scope: explicit server-listed download-client choice for manual submissions, descriptive language preferences (no hard-language v1 gate), bounded authorized live Prowlarr/model dry-run evaluation, and a fresh-database-only boundary replacing migration/legacy compatibility. Branch/task audit reconciled implementation and evidence: **17/17 tasks complete**. Full checks and both container/native-addon jobs passed on the audited code revision; see final CI acceptance below. No production state changed.
 
 ## Proposal verification — 2026-11-15
 
@@ -107,3 +107,20 @@ Older changes retain their historical checkbox/evidence state: `support-ongoing-
 - Published merge checkpoint `147ec32` normally. GitHub REST read confirmed PR #26 head `147ec3215d47864954b1aa3ddb7c6bd504964b0e`, `mergeable: true` (conflict resolved), `draft: true`, and `mergeable_state: unstable` because checks were still running. The current-head `changes` check succeeded and `checks` was in progress; container jobs had not completed. Only older checkpoints have completed green CI; do not attribute those to this head.
 - Updated PR description through REST after `gh pr edit` failed on the repository's deprecated Projects-classic GraphQL field. No authentication blocker and no force push. Final tracking update marks HANDOFF historical so a later agent does not repeat its stale remaining-work list.
 - Next action is **external CI acceptance**, not more implementation or live evaluation: inspect the current-head full checks and amd64/arm64/native-addon jobs, then reconcile 8.2/8.3/8.4 from their actual results. Keep those three boxes unchecked until evidence arrives. The user explicitly requested focused local sanity checking; no additional broad local run/container build was launched.
+
+## Final CI acceptance — 2026-11-15
+
+- OpenChamber reported every check passed. Independently read PR #26 and run [43746174243](https://github.com/aberiggs/media-scout/actions/runs/43746174243): successful on **`c9ef1a9acaffb0bd5e876174e6b2fb2f270b833d`**, matching the then-current remote head. PR is mergeable; no outstanding conflict or publication blocker.
+- Inspected actual job steps and checks log, not merely the workflow's overall conclusion:
+  - `npm ci` and `npm run web:install`: success.
+  - `npm run typecheck` and `npm --prefix web run typecheck`: success.
+  - `npm test`: **27 files / 377 tests passed**, 5.14 seconds; no failures.
+  - `npm --prefix web test`: **8 passed, 0 failed**.
+  - `npm run build`: success (frontend TypeScript and Vite bundle).
+  - `container-build / linux/amd64`: image build/load **and** `Smoke-test SQLite native addon` succeeded.
+  - `container-build / linux/arm64`: image build/load **and** `Smoke-test SQLite native addon` succeeded.
+  - `changes` and aggregate `container-build`: success. `publish-dev` was correctly skipped on the PR; no image publication or deployment.
+- This supplies 8.2's full software check evidence and 8.3's remaining build/native-addon evidence in CI rather than claiming an unrun local container build. Previously recorded bounded live evaluation remains unchanged and exhausted. Local whitespace/strict artifact validation are rerun for this documentation-only completion update.
+- Task 8.4 combines the recorded independent reviews/fixes, parent verification, normally pushed topic checkpoints, updated issue-linked PR and this current-code CI evidence. All **17/17** criteria are now evidenced. This final receipt changes only OpenSpec tracking documents, not the tested application/container/workflow files.
+- Residual limits: six live requests are not statistical model accuracy; actual deployed Arr-version compatibility and production behavior remain unverified. The separately user-requested local LAN preview uses an isolated fresh database, monitoring off and dry-run on; no production deployment, real submission, PR merge or archive was performed.
+- Next product action is human PR review/merge when desired; production rollout and real downloads remain separate decisions. Do not reopen completed implementation solely to restate this evidence or rerun live calls.

@@ -1,10 +1,11 @@
 # Fresh-agent handoff
 
 > Historical handoff from `17a1943`, superseded by the branch reconciliation in
-> `progress.md`. Current checklist: 14/17 complete, not 7/17. Operator docs,
+> `progress.md`. Current checklist: 17/17 complete, not 7/17. Operator docs,
 > focused coverage, filters/history and main-conflict resolution are now
 > checkpointed; consult the progress record and current PR checks before acting
-> on the remaining-work list below. Live evaluation remains exhausted.
+> on the historical remaining-work list below. CI acceptance is now recorded;
+> do not rerun the exhausted live evaluation or infer production rollout approval.
 
 ## Authorization and intent
 

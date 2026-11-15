@@ -19,7 +19,7 @@ See [setup and configuration](docs/setup.md) for prerequisites, Docker details, 
 
 ## Project notes
 
-- [Development](docs/development.md) — Ubuntu bootstrap, verification commands, and agent/planning workflow.
+- [Development](docs/development.md) — Ubuntu bootstrap and verification commands.
 - [Feedback triage](docs/feedback-triage.md) — investigated concerns and links to the GitHub backlog.
 - [Future features](docs/future-features.md) — high-level ideas under consideration, not commitments.
 - [Operator recovery](docs/operator-recovery.md) — current finite retry behavior and deliberate fresh-database rollback.

@@ -28,7 +28,7 @@ The running server, database, and upstream services were not accessed. Exact pro
 
 ## Setup and verification
 
-- Added root `AGENTS.md`, [Ubuntu development guidance](development.md), and a root OpenSpec setup for future approved feature work. No legacy project-local OpenCode config/skills were present to migrate; global skills are reused without provider/model overrides.
-- Installed locked backend/frontend dependencies locally. Backend typecheck and **650 tests across 42 files** passed; frontend typecheck and **36 tests** passed; production frontend build passed. Commands and dependency-audit caveats are recorded in [the baseline](development.md#verified-local-baseline--2026-10-10).
+- Added [Ubuntu development guidance](development.md). No project-local OpenCode config/skills were present at the time; global settings were used.
+- Installed locked backend/frontend dependencies locally. Backend typecheck and **650 tests across 42 files** passed; frontend typecheck and **36 tests** passed; production frontend build passed. Commands and dependency-audit caveats are recorded in the [historical baseline](development.md#historical-local-baseline--2026-10-10).
 - Independent read-only review checked draft issue coverage, source claims, and setup safety. Corrected its listener-command finding to use direct frontend npm argument forwarding.
 - No application source, dependency versions/lockfiles, production data, runtime settings, or the original feedback note were changed. No live model/indexer runs, grabs, deployments, or pushes were performed.

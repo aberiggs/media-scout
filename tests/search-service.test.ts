@@ -40,6 +40,19 @@ describe('bounded neutral search', () => {
     const { service } = setup(() => action({ status: 'matched' }));
     expect((await service.run({ prompt: 'Find' })).status).toBe('failed');
   });
+  it('tells the model that invalid parsed scope evidence must never be selected', async () => {
+    const { service } = setup(() => action({ status: 'no-match' }));
+    let system = '';
+    (service as any).deps.llm.json = async (args: { system: string }) => {
+      system = args.system;
+      return action({ status: 'no-match' });
+    };
+
+    expect((await service.run({ prompt: 'Find Show S02E06' })).status).toBe('no-match');
+    expect(system).toMatch(/scope\.kind.*invalid/i);
+    expect(system).toMatch(/never select that candidate/i);
+    expect(system).toMatch(/selected candidates have usable scope evidence/i);
+  });
   it('permits one evidence-based correction of an invalid final selection', async () => {
     const { service } = setup(input => {
       if (!input.candidates.length) return action({ action: 'search_releases', query: 'Show' });

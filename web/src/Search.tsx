@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
-import { LoaderCircle, Search as SearchIcon } from 'lucide-react'
+import { Check, CircleAlert, LoaderCircle, Search as SearchIcon, ShieldCheck, Waves } from 'lucide-react'
 import type { Settings } from './types'
 
 type Option = { optionId: string; rank: number; releases: Array<{ candidateId: string }>; coveredTargetIds: string[]; reason: string; uncertainty: string }
@@ -93,7 +93,8 @@ export function SearchPage({ settings, searchId }: { settings: Settings; searchI
   const byId = new Map((result?.candidates ?? []).map(candidate => [candidate.candidateId, candidate]))
   const submissions = (result?.events ?? []).filter(event => event.type === 'submission').map(event => event.data as unknown as SubmissionEvent)
   const progress = busy || running(result?.status)
-  return <>
+  const searchReady = Boolean(settings.integrations.prowlarr.url && settings.integrations.prowlarr.apiKey && settings.ai.apiKey)
+  return <div className="search-layout"><div className="search-main">
     <div className="page-heading"><div><h1>Search<span className="heading-period">.</span></h1><p className="page-intro">Describe what you’re looking for. Scout compares releases; you choose what to download.</p></div></div>
     <form className="search-composer" onSubmit={search}>
       <label className="field" htmlFor="search-prompt">What are you looking for?<textarea id="search-prompt" aria-label="What are you looking for?" rows={3} value={prompt} onChange={event => setPrompt(event.target.value)} placeholder="Find the film, episode, or season you want…" maxLength={4000}/></label>
@@ -117,5 +118,9 @@ export function SearchPage({ settings, searchId }: { settings: Settings; searchI
       {!!result.candidates.length && <details className="all-candidates"><summary>All candidates ({result.candidates.length})</summary><ul>{result.candidates.map(candidate => <li key={candidate.candidateId}>{candidate.observations[0]?.title ?? 'Untitled candidate'}{candidate.excluded && ' · Temporarily excluded'}</li>)}</ul></details>}
     </section>}
     {confirm && selected && <div className="ops-dialog-backdrop"><section ref={dialog} className="ops-dialog search-confirm" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><div className="ops-dialog-head"><div><h2 id="confirm-title">Confirm this option</h2><p>Choose the configured client and category route.</p></div><button className="icon-button" aria-label="Close confirmation" disabled={submitting} onClick={() => setConfirm(false)}>×</button></div><div className="ops-dialog-body"><p>{selected.reason}</p><p className={settings.safety.dryRun ? 'ops-info-box' : 'ops-warning-box'}>{settings.safety.dryRun ? 'Dry-run is on. No download will be submitted.' : 'Confirming may start a download. Scout does not cancel existing jobs.'}</p>{clientError && <p role="alert">{clientError}</p>}<label className="field">Download client (optional)<select value={client} disabled={submitting} onChange={event => setClient(event.target.value)}><option value="">Use configured default route</option>{clients.map(item => <option key={item.id} value={item.id}>{item.name} · {item.protocol}{item.categories ? ' · categories' : ''}</option>)}</select></label><div className="ops-dialog-actions"><button className="button button-secondary" disabled={submitting} onClick={() => setConfirm(false)}>Cancel</button><button className="button button-primary" disabled={submitting || !!clientError} onClick={() => void submitOption()}>{submitting ? 'Submitting…' : 'Confirm option'}</button></div></div></section></div>}
-  </>
+    </div><aside className="search-rail" aria-label="Search information">
+      <section className="rail-card search-rail-status"><div className="search-rail-icon"><Waves size={17}/></div><strong>{searchReady ? 'Search setup complete' : 'Setup needed'}</strong><p>{searchReady ? 'Services are configured. Run a search to test live connections.' : 'Add a Prowlarr URL, API key, and model API key in Settings.'}</p><div className="search-checks"><span className={settings.integrations.prowlarr.url && settings.integrations.prowlarr.apiKey ? 'configured' : ''}>{settings.integrations.prowlarr.url && settings.integrations.prowlarr.apiKey ? <Check size={14}/> : <CircleAlert size={14}/>} Prowlarr {settings.integrations.prowlarr.url && settings.integrations.prowlarr.apiKey ? 'configured' : 'needed'}</span><span className={settings.ai.apiKey ? 'configured' : ''}>{settings.ai.apiKey ? <Check size={14}/> : <CircleAlert size={14}/>} AI model {settings.ai.apiKey ? 'configured' : 'needed'}</span></div></section>
+      <section className={`rail-card search-safety ${settings.safety.dryRun ? 'is-dry-run' : 'is-live'}`}><div className="search-rail-icon">{settings.safety.dryRun ? <ShieldCheck size={17}/> : <CircleAlert size={17}/>}</div><strong>{settings.safety.dryRun ? 'Dry-run is on' : 'Downloads enabled'}</strong><p>{settings.safety.dryRun ? 'Search and review real results safely. Confirmations are recorded, but no download is sent.' : 'Search does not download. A download starts only after you confirm an option.'}</p><a href="#settings">Review safety settings</a></section>
+      <p className="search-rail-footnote">Searches use live model and indexer calls, which may incur provider costs.</p>
+    </aside></div>
 }

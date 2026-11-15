@@ -30,6 +30,8 @@ it('starts with Search, submits a prompt without downloading, and displays ranke
   const nav = screen.getByRole('navigation', { name: 'Workspace' })
   for (const label of ['Search', 'Activity', 'Automation', 'Settings']) assert.ok(within(nav).getByRole('link', { name: label }))
   assert.equal(screen.getByLabelText('What are you looking for?').getAttribute('aria-label'), 'What are you looking for?')
+  assert.ok(screen.getByRole('complementary', { name: 'Search information' }))
+  assert.ok(screen.getByText('Dry-run is on'))
   fireEvent.change(screen.getByLabelText('What are you looking for?'), { target: { value: 'Find North Shore' } })
   fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
   await screen.findByText('Best evidence')

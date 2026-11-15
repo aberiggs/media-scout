@@ -1,5 +1,11 @@
 # Fresh-agent handoff
 
+> Historical handoff from `17a1943`, superseded by the branch reconciliation in
+> `progress.md`. Current checklist: 14/17 complete, not 7/17. Operator docs,
+> focused coverage, filters/history and main-conflict resolution are now
+> checkpointed; consult the progress record and current PR checks before acting
+> on the remaining-work list below. Live evaluation remains exhausted.
+
 ## Authorization and intent
 
 The user approved implementation of this change, including the latest refinements in `review.md`, then requested a verified commit and a fresh-agent handoff to reduce context/token cost. Continue autonomously after they send this handoff to you. Do not start another proposal or redesign. Favor the beautifully simple ideal: neutral read-only LLM search; separate explicit Prowlarr download-client-selected submission; thin Arr automation using upstream truth; audit/retries/finite grace, not a second media manager. No legacy migration/compatibility work: the user is happy to start with a fresh DB.

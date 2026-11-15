@@ -6,7 +6,9 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     proxy: {
-      '/api': 'http://127.0.0.1:7877',
+      // Keep the browser-facing Host so the API's origin check sees the same
+      // origin as the LAN client instead of the loopback proxy target.
+      '/api': { target: 'http://127.0.0.1:7877', changeOrigin: false },
       '/health': 'http://127.0.0.1:7877',
     },
   },

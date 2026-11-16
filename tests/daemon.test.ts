@@ -12,6 +12,6 @@ it('does not schedule when disabled and stops scheduling on shutdown', async () 
 });
 it('drains current work before close and ignores repeated signals', async () => {
   const order: string[] = [];
-  const stop = createShutdown({ stopTimer: () => { order.push('stop'); }, awaitSettled: async () => { order.push('drain'); }, close: async () => { order.push('close'); }, exit: () => { order.push('exit'); } });
-  stop('SIGINT'); stop('SIGTERM'); await vi.waitFor(() => expect(order).toEqual(['stop', 'drain', 'close', 'exit']));
+  const stop = createShutdown({ stopTimer: () => { order.push('stop'); }, quiesce: () => { order.push('quiesce'); }, awaitSettled: async () => { order.push('drain'); }, close: async () => { order.push('close'); }, exit: () => { order.push('exit'); } });
+  stop('SIGINT'); stop('SIGTERM'); await vi.waitFor(() => expect(order).toEqual(['stop', 'quiesce', 'drain', 'close', 'exit']));
 });

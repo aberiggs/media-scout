@@ -118,7 +118,13 @@ export class ArrAutomation {
       const graceUntil = submission.outcome === 'submitted' || submission.outcome === 'uncertain' ? now + Math.max(1, policy.queueGraceMinutes ?? 30)*MINUTE : 0;
       this.deps.store.setAutomationAttempt(target.key, { lastAttempt: now, failCount: submission.outcome === 'submitted' ? 0 : prior?.failCount ?? 0, deadline: graceUntil, graceUntil, physicalKey: null });
       return { observedAt: now, ran: true, targetKey: target.key, search, submission, ...(graceUntil ? { nextAttemptAt: graceUntil } : {}) };
-    } catch {
+    } catch (error) {
+      if (signal?.aborted) return { observedAt: now, ran: false, reason: 'cancelled', targetKey: target.key };
+      if (error instanceof Error && error.message === 'automation-capacity-deferred') {
+        if (prior) this.deps.store.setAutomationAttempt(target.key, prior); else this.deps.store.deleteAutomationAttempt(target.key);
+        this.deps.store.setDeadline(target.key, prior?.deadline ?? 0);
+        return { observedAt: now, ran: false, reason: 'search-capacity', targetKey: target.key };
+      }
       const failures = (prior?.failCount ?? 0)+1;
       const completedAt = (this.deps.clock ?? Date.now)();
       const deadline = completedAt + failureDelay(failures);

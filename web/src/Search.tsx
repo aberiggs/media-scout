@@ -4,7 +4,7 @@ import type { Settings } from './types'
 
 type Option = { optionId: string; rank: number; releases: Array<{ candidateId: string }>; coveredTargetIds: string[]; reason: string; uncertainty: string }
 type Candidate = { candidateId: string; observations: Array<{ title: string; indexer?: string; size?: number | null; seeders?: number | null }>; excluded?: boolean }
-type SearchResult = { searchId: string; status: string; prompt: string; options: Option[]; candidates: Candidate[]; events: Array<{ type: string; data: Record<string, unknown> }>; counts: { decisions: number; searches: number; candidates: number }; message?: string }
+type SearchResult = { searchId: string; status: string; prompt: string; options: Option[]; candidates: Candidate[]; events: Array<{ type: string; data: Record<string, unknown> }>; counts: { decisions: number; searches: number; candidates: number }; queuePosition?: number; waitingReason?: string; retryAt?: string; message?: string }
 type Client = { id: number; name: string; protocol: string; categories: boolean }
 type SubmissionEvent = { outcome: string; outcomes?: Array<{ candidateId: string; outcome: string }> }
 const running = (status?: string) => status === 'queued' || status === 'running'
@@ -54,7 +54,7 @@ export function SearchPage({ settings, searchId }: { settings: Settings; searchI
   }
   async function search(event: FormEvent) {
     event.preventDefault()
-    if (!prompt.trim() || busy || running(result?.status)) return
+    if (!prompt.trim() || busy) return
     controller.current?.abort(); window.clearTimeout(timer.current)
     setError(''); setNotice(''); setResult(null); setBusy(true)
     try {
@@ -92,7 +92,7 @@ export function SearchPage({ settings, searchId }: { settings: Settings; searchI
 
   const byId = new Map((result?.candidates ?? []).map(candidate => [candidate.candidateId, candidate]))
   const submissions = (result?.events ?? []).filter(event => event.type === 'submission').map(event => event.data as unknown as SubmissionEvent)
-  const progress = busy || running(result?.status)
+  const progress = busy
   const searchReady = Boolean(settings.integrations.prowlarr.url && settings.integrations.prowlarr.apiKey && settings.ai.apiKey)
   return <div className="search-layout"><div className="search-main">
     <div className="page-heading"><div><h1>Search<span className="heading-period">.</span></h1><p className="page-intro">Describe what you’re looking for. Scout compares releases; you choose what to download.</p></div></div>
@@ -105,10 +105,10 @@ export function SearchPage({ settings, searchId }: { settings: Settings; searchI
     {error && <div role="alert" className="notice notice-error">{error}</div>}
     {notice && <div role="status" className="notice">{notice}</div>}
     {result && <section className="search-results" aria-live="polite">
-      <div className="search-result-heading"><div><h2>{result.status === 'matched' ? 'Ranked options' : running(result.status) ? 'Searching…' : result.status === 'no-match' ? 'No suitable match' : `Search ${result.status}`}</h2><p>{result.message ?? `${result.counts.candidates} candidates · ${result.counts.searches} searches · ${result.counts.decisions} model decisions`}</p></div><span className="ops-status">{result.status}</span></div>
+      <div className="search-result-heading"><div><h2>{result.status === 'matched' ? 'Ranked options' : result.status === 'queued' ? 'Search queued' : result.status === 'running' ? 'Searching…' : result.status === 'no-match' ? 'No suitable match' : `Search ${result.status}`}</h2><p>{result.message ?? `${result.counts.candidates} candidates · ${result.counts.searches} searches · ${result.counts.decisions} model decisions`}</p></div><span className="ops-status">{result.status}</span></div>
       {result.events.some(event => event.type.startsWith('query-')) && <details className="query-trail" open><summary>Search trail</summary><ol>{result.events.filter(event => event.type.startsWith('query-')).map((event, index) => <li key={index}><strong>{event.type === 'query-start' ? 'Query' : 'Results'}:</strong> {String(event.data.query ?? 'Indexer query')}{event.data.count !== undefined && ` · ${String(event.data.count)} results`}</li>)}</ol></details>}
       {submissions.length > 0 && <section className="query-trail" aria-labelledby="submission-history"><h3 id="submission-history">Submission history</h3><p>Submission is not proof of downloading or import.</p>{submissions.map((submission, index) => <div key={index}><p>Outcome: {submission.outcome}</p><ul>{submission.outcomes?.map((release, releaseIndex) => <li key={releaseIndex}>{byId.get(release.candidateId)?.observations[0]?.title ?? `Release ${releaseIndex + 1}`}: {release.outcome}</li>)}</ul></div>)}</section>}
-      {running(result.status) ? <p role="status" className="ops-state-panel"><LoaderCircle className="spin"/>Checking indexers and comparing releases…</p> : !result.options.length ? <div className="ops-state-panel ops-empty"><h2>{result.status === 'no-match' ? 'No suitable releases found' : 'Search did not produce a recommendation'}</h2><p>{result.message ?? 'Try an alternate title or add more context.'}</p></div> : <div className="ranked-options">{result.options.map(option => <article className="ranked-option" key={option.optionId}>
+      {result.status === 'queued' ? <p role="status" className="ops-state-panel"><LoaderCircle className="spin"/>Queued{result.queuePosition ? ` · ${Math.max(0, result.queuePosition - 1)} ahead` : ''}{result.waitingReason === 'provider-cooldown' && result.retryAt ? ` · Provider cooldown until ${new Date(result.retryAt).toLocaleTimeString()}` : result.waitingReason === 'settings-incomplete' ? ' · Complete Settings to start it' : result.waitingReason === 'capacity' ? ' · Waiting for an execution slot' : ''}. Your search will start automatically.</p> : result.status === 'running' ? <p role="status" className="ops-state-panel"><LoaderCircle className="spin"/>Checking indexers and comparing releases…</p> : !result.options.length ? <div className="ops-state-panel ops-empty"><h2>{result.status === 'no-match' ? 'No suitable releases found' : ['failed', 'interrupted', 'budget-exhausted'].includes(result.status) ? 'Search could not complete' : 'Search did not produce a recommendation'}</h2><p>{result.message ?? 'Try an alternate title or add more context.'}</p></div> : <div className="ranked-options">{result.options.map(option => <article className="ranked-option" key={option.optionId}>
         <div className="option-title"><h3>{option.rank === 1 ? 'Best match' : `Alternative ${option.rank - 1}`}</h3><span>Option {option.rank}</span></div>
         <p className="option-reason">{option.reason}</p>{option.uncertainty && <p className="option-uncertainty">{option.uncertainty}</p>}
         <ul className="option-releases">{option.releases.map(release => { const candidate = byId.get(release.candidateId), evidence = candidate?.observations[0]; return <li key={release.candidateId}><strong>{evidence?.title ?? 'Release details unavailable'}</strong>{evidence && <span>{[evidence.indexer, evidence.size ? `${(evidence.size / 1e9).toFixed(1)} GB` : null, evidence.seeders != null ? `${evidence.seeders} seeders` : 'Seeders unknown'].filter(Boolean).join(' · ')}</span>}{candidate?.excluded && <span>Temporarily excluded after a previous attempt</span>}</li> })}</ul>

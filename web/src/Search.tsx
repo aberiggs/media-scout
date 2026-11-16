@@ -17,7 +17,7 @@ function newSubmissionKey() {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
 }
 
-export function SearchPage({ settings, searchId, active, onSearchStarted }: { settings: Settings; searchId?: string; active: boolean; onSearchStarted(id: string): void }) {
+export function SearchPage({ settings, searchId, searchRevision, active, onSearchStarted }: { settings: Settings; searchId?: string; searchRevision: number; active: boolean; onSearchStarted(id: string, startingRevision: number): void }) {
   const [prompt, setPrompt] = useState(''), [advanced, setAdvanced] = useState(false)
   const [context, setContext] = useState(''), [preferences, setPreferences] = useState('')
   const [result, setResult] = useState<SearchResult | null>(null), [busy, setBusy] = useState(false)
@@ -34,7 +34,7 @@ export function SearchPage({ settings, searchId, active, onSearchStarted }: { se
     setResult(null)
     setError('')
     void loadResult(searchId)
-  }, [searchId])
+  }, [searchId, searchRevision])
   useEffect(() => () => { controller.current?.abort(); window.clearTimeout(timer.current) }, [])
   useEffect(() => {
     if (!confirm) return
@@ -72,6 +72,7 @@ export function SearchPage({ settings, searchId, active, onSearchStarted }: { se
   async function search(event: FormEvent) {
     event.preventDefault()
     if (!prompt.trim() || busy) return
+    const startingRevision = searchRevision
     controller.current?.abort(); window.clearTimeout(timer.current)
     setError(''); setNotice(''); setResult(null); setBusy(true)
     try {
@@ -80,7 +81,7 @@ export function SearchPage({ settings, searchId, active, onSearchStarted }: { se
       const response = await fetch('/api/v2/searches', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       const data = await response.json() as { searchId?: string; error?: string }
       if (!response.ok || !data.searchId) throw new Error(data.error ?? 'Search could not start. Check your search settings.')
-      onSearchStarted(data.searchId)
+      onSearchStarted(data.searchId, startingRevision)
     } catch (failure) { setError(failure instanceof SyntaxError ? 'Context must be valid JSON.' : failure instanceof Error ? failure.message : 'Search could not start.') }
     finally { setBusy(false) }
   }

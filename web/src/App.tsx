@@ -8,7 +8,8 @@ type Page = 'search' | 'activity' | 'automation' | 'settings'
 function pageFromHash(): Page { const value = location.hash.slice(1); return ['activity', 'automation', 'settings'].includes(value) ? value as Page : 'search' }
 
 export default function App() {
-  const [page, setPage] = useState<Page>(pageFromHash), [openedSearch, setOpenedSearch] = useState<string>()
+  const [page, setPage] = useState<Page>(pageFromHash), [selectedSearch, setSelectedSearch] = useState<{ id?: string; revision: number }>({ revision: 0 })
+  const selectionRevision = useRef(0)
   const [settings, setSettings] = useState<Settings>(defaults), [committed, setCommitted] = useState<Settings | null>(null), [status, setStatus] = useState<SettingsEnvelope['status'] | null>(null)
   const [loading, setLoading] = useState(true), [saving, setSaving] = useState(false), [message, setMessage] = useState(''), [messageIsError, setMessageIsError] = useState(false), [saved, setSaved] = useState('')
   const dirty = useMemo(() => JSON.stringify(settings) !== saved, [settings, saved])
@@ -51,8 +52,17 @@ export default function App() {
     const current = (await response.json() as SettingsEnvelope).settings
     await persist({ ...current, monitoring: { ...current.monitoring, enabled: !current.monitoring.enabled } }, true)
   }
-  const openSearch = (id: string) => { setOpenedSearch(id); setPage('search'); location.hash = '#search' }
-  const searchStarted = (id: string) => setOpenedSearch(id)
+  const openSearch = (id: string) => {
+    const revision = ++selectionRevision.current
+    setSelectedSearch({ id, revision })
+    setPage('search')
+    location.hash = '#search'
+  }
+  const searchStarted = (id: string, startingRevision: number) => {
+    if (selectionRevision.current !== startingRevision) return
+    const revision = ++selectionRevision.current
+    setSelectedSearch({ id, revision })
+  }
   const labels: Record<Page, string> = { search: 'Search', activity: 'Activity', automation: 'Automation', settings: 'Settings' }
   return <div className="app-shell">
     <aside className="sidebar" aria-label="Main navigation"><a className="brand" href="#search"><span className="brand-mark"><Waves size={19}/></span><span className="brand-name">media<span>scout</span></span></a><div className="workspace-label">Workspace</div><nav className="primary-nav" aria-label="Workspace">{([['search', SearchIcon], ['activity', ActivityIcon], ['automation', Radio], ['settings', Settings2]] as const).map(([key, Icon]) => <a key={key} className={`nav-item ${page === key ? 'active' : ''}`} href={`#${key}`} aria-current={page === key ? 'page' : undefined}><Icon size={17}/>{labels[key]}</a>)}</nav><div className="sidebar-bottom"><div className="local-note"><Waves size={15}/>Running on your network</div><div className="version-note">Self-hosted · local control</div></div></aside>
@@ -60,7 +70,7 @@ export default function App() {
       <main className="page-wrap" id={page}>
         <UnsavedNotice dirty={Boolean(committed) && dirty}/>
         {committed && <div id="search-workspace" hidden={page !== 'search'} aria-hidden={page !== 'search'}>
-          <SearchPage settings={committed} searchId={openedSearch} active={page === 'search'} onSearchStarted={searchStarted}/>
+          <SearchPage settings={committed} searchId={selectedSearch.id} searchRevision={selectedSearch.revision} active={page === 'search'} onSearchStarted={searchStarted}/>
         </div>}
         {page === 'search' && !committed && <SettingsUnavailable loading={loading} message={message} retry={() => void load()}/>}
         {page === 'activity' && <ActivityPage onOpenSearch={openSearch}/>}

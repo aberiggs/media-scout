@@ -168,6 +168,88 @@ it('continues polling a running search while its workspace is hidden', async () 
   assert.ok(await screen.findByText('Best evidence'))
 })
 
+it('ignores a delayed manual-search response after a newer history selection', async () => {
+  window.history.replaceState(null, '', '/#search')
+  let finishPost!: (response: Response) => void
+  const latePost = new Promise<Response>(resolve => { finishPost = resolve })
+  const reads: string[] = []
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/settings') return Response.json(env)
+    if (url === '/api/v2/searches' && init?.method === 'POST') return latePost
+    if (url.startsWith('/api/v2/searches/')) {
+      const id = url.split('/').at(-1)!
+      reads.push(id)
+      return Response.json({ ...matched, searchId: id, options: [{ ...matched.options[0], reason: id === 'history-a' ? 'History A evidence' : 'Late manual evidence' }] })
+    }
+    if (url.startsWith('/api/v2/activity')) return Response.json({ items: [{ searchId: 'history-a', prompt: 'Saved A', status: 'matched', source: 'manual', createdAt: matched.createdAt }], total: 1 })
+    return Response.json({ items: [] })
+  }
+  render(<App />)
+  fireEvent.change(await screen.findByLabelText('What are you looking for?'), { target: { value: 'Manual request' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
+  fireEvent.click(document.querySelector('a[href="#activity"]')!); fireEvent(window, new dom.window.Event('hashchange'))
+  fireEvent.click(await screen.findByRole('button', { name: 'View search details' }))
+  assert.ok(await screen.findByText('History A evidence'))
+  finishPost(Response.json({ searchId: 'late-manual' }, { status: 202 }))
+  await waitFor(() => assert.equal((screen.getByRole('button', { name: 'Search releases' }) as HTMLButtonElement).disabled, false))
+  assert.deepEqual(reads, ['history-a'])
+})
+
+it('makes a delayed manual search discoverable after ordinary navigation', async () => {
+  window.history.replaceState(null, '', '/#search')
+  let finishPost!: (response: Response) => void
+  const latePost = new Promise<Response>(resolve => { finishPost = resolve })
+  const reads: string[] = []
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/settings') return Response.json(env)
+    if (url === '/api/v2/searches' && init?.method === 'POST') return latePost
+    if (url === '/api/v2/searches/late-manual') {
+      reads.push('late-manual')
+      return Response.json({ ...matched, searchId: 'late-manual', options: [{ ...matched.options[0], reason: 'Late manual evidence' }] })
+    }
+    if (url.startsWith('/api/v2/activity')) return Response.json({ items: [], total: 0 })
+    return Response.json({ items: [] })
+  }
+  render(<App />)
+  fireEvent.change(await screen.findByLabelText('What are you looking for?'), { target: { value: 'Manual request' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
+  fireEvent.click(document.querySelector('a[href="#activity"]')!); fireEvent(window, new dom.window.Event('hashchange'))
+  await screen.findByText('A record of searches, recommendations, and submission outcomes.')
+  finishPost(Response.json({ searchId: 'late-manual' }, { status: 202 }))
+  await waitFor(() => assert.deepEqual(reads, ['late-manual']))
+  fireEvent.click(screen.getByRole('link', { name: 'Search' })); fireEvent(window, new dom.window.Event('hashchange'))
+  assert.ok(await screen.findByText('Late manual evidence'))
+})
+
+it('reloads an explicitly reopened history result when its ID is already selected', async () => {
+  window.history.replaceState(null, '', '/#activity')
+  let historyReads = 0
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/settings') return Response.json(env)
+    if (url.startsWith('/api/v2/activity')) return Response.json({ items: [{ searchId: 'history-a', prompt: 'Saved A', status: 'matched', source: 'manual', createdAt: matched.createdAt }], total: 1 })
+    if (url === '/api/v2/searches/history-a') {
+      historyReads++
+      return Response.json({ ...matched, searchId: 'history-a', options: [{ ...matched.options[0], reason: 'History A evidence' }] })
+    }
+    if (url === '/api/v2/searches' && init?.method === 'POST') return Response.json({ error: 'Manual request failed' }, { status: 503 })
+    return Response.json({ items: [] })
+  }
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: 'View search details' }))
+  assert.ok(await screen.findByText('History A evidence'))
+  fireEvent.change(await screen.findByLabelText('What are you looking for?'), { target: { value: 'Manual request' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
+  await screen.findByRole('alert')
+  assert.equal(screen.queryByText('History A evidence'), null)
+  fireEvent.click(document.querySelector('a[href="#activity"]')!); fireEvent(window, new dom.window.Event('hashchange'))
+  fireEvent.click(await screen.findByRole('button', { name: 'View search details' }))
+  assert.ok(await screen.findByText('History A evidence'))
+  assert.equal(historyReads, 2)
+})
+
 it('filters Activity by media and inclusive local dates and offers every submission outcome', async () => {
   window.history.replaceState(null, '', '/#activity')
   const queries: URLSearchParams[] = []

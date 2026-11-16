@@ -8,14 +8,17 @@ type Automation = { enabled: boolean; dryRun: boolean; running: boolean; provide
 const date = (value?: string) => value && Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString() : 'Not observed yet'
 
 export function ActivityPage({ onOpenSearch }: { onOpenSearch(id: string): void }) {
-  const [items, setItems] = useState<ActivityItem[]>([]), [total, setTotal] = useState(0)
+  const [items, setItems] = useState<ActivityItem[]>([]), [total, setTotal] = useState<number | null>(null)
   const [q, setQ] = useState(''), [source, setSource] = useState(''), [status, setStatus] = useState('')
   const [kind, setKind] = useState(''), [createdAtFrom, setCreatedAtFrom] = useState(''), [createdAtTo, setCreatedAtTo] = useState('')
   const [offset, setOffset] = useState(0), [loading, setLoading] = useState(true), [error, setError] = useState('')
+  const [retryVersion, setRetryVersion] = useState(0)
   const [retention, setRetention] = useState({ days: 30, maxEntries: 10000 })
   useEffect(() => {
     const controller = new AbortController()
     setLoading(true)
+    setError('')
+    setTotal(null)
     const params = new URLSearchParams({ limit: '50', offset: String(offset) })
     for (const [key, value] of Object.entries({ q, source, status, kind, createdAtFrom: createdAtFrom ? new Date(`${createdAtFrom}T00:00:00`).toISOString() : '', createdAtTo: createdAtTo ? new Date(`${createdAtTo}T23:59:59.999`).toISOString() : '' })) if (value) params.set(key, value)
     fetch(`/api/v2/activity?${params}`, { signal: controller.signal }).then(async response => {
@@ -23,10 +26,10 @@ export function ActivityPage({ onOpenSearch }: { onOpenSearch(id: string): void 
       const data = await response.json()
       if (controller.signal.aborted) return
       setItems(data.items); setTotal(data.total); setRetention(data.retention ?? { days: 30, maxEntries: 10000 }); setError('')
-    }).catch(failure => { if (!controller.signal.aborted) setError(failure.message) })
+    }).catch(failure => { if (!controller.signal.aborted) setError(failure instanceof Error ? failure.message : 'Activity could not be loaded.') })
       .finally(() => { if (!controller.signal.aborted) setLoading(false) })
     return () => controller.abort()
-  }, [q, source, status, kind, createdAtFrom, createdAtTo, offset])
+  }, [q, source, status, kind, createdAtFrom, createdAtTo, offset, retryVersion])
   return <>
     <Heading title="Activity" intro="A record of searches, recommendations, and submission outcomes." eyebrow="SEARCH RECORD" icon={<ActivityIcon size={15}/>}/>
     <div className="activity-layout"><div className="ops-page"><div className="ops-list-card">
@@ -38,15 +41,15 @@ export function ActivityPage({ onOpenSearch }: { onOpenSearch(id: string): void 
         <label className="field">Created through<input type="date" value={createdAtTo} onChange={event => { setCreatedAtTo(event.target.value); setOffset(0) }}/></label>
         <label className="field">Status<select value={status} onChange={event => { setStatus(event.target.value); setOffset(0) }}><option value="">All statuses</option>{['queued', 'running', 'matched', 'no-match', 'needs-input', 'budget-exhausted', 'failed', 'interrupted', 'dry-run', 'submitted', 'rejected', 'uncertain', 'deferred', 'expired'].map(value => <option key={value}>{value}</option>)}</select></label>
       </div>
-      {error && <p role="alert" className="notice notice-error">{error}</p>}
-      {loading ? <p role="status" className="ops-state-panel">Loading activity…</p> : !items.length && !error ? <div className="ops-state-panel ops-empty"><span className="ops-empty-mark"><SearchIcon size={19}/></span><h2>No matching activity</h2><p>Search attempts will appear here, including unsuccessful searches.</p></div> : <div className="ops-activity-list">{items.map(item => <article className="ops-activity-row" key={item.searchId}>
+      {error && <div role="alert" className="notice notice-error"><span>{error}</span><button className="text-button activity-open" type="button" onClick={() => setRetryVersion(version => version + 1)}>Retry</button></div>}
+      {loading ? <p role="status" className="ops-state-panel">Loading activity…</p> : error ? null : !items.length ? <div className="ops-state-panel ops-empty"><span className="ops-empty-mark"><SearchIcon size={19}/></span><h2>No matching activity</h2><p>Search attempts will appear here, including unsuccessful searches.</p></div> : <div className="ops-activity-list">{items.map(item => <article className="ops-activity-row" key={item.searchId}>
         <div className="ops-activity-top"><div className="activity-request"><SearchIcon size={15}/><strong>{item.prompt}</strong></div><span className={`ops-status ${item.status === 'matched' ? 'status-mint' : item.status === 'failed' ? 'status-amber' : 'status-quiet'}`}>{item.status}</span></div>
         <div className="activity-meta"><span><Clock3 size={14}/>{date(item.createdAt)}</span><span>{item.kind === 'tv' ? <Tv size={14}/> : item.kind === 'movie' ? <Film size={14}/> : <Database size={14}/>} {item.kind ?? 'Other media'}</span><span>{item.source === 'automation' ? <Radio size={14}/> : <SearchIcon size={14}/>} {item.source === 'automation' ? 'Automation' : 'Manual search'}</span>{item.counts && <span>{item.counts.candidates} candidates</span>}{item.submission && <span>Submission: {item.submission.outcome}</span>}</div>
         <button className="text-button activity-open" onClick={() => onOpenSearch(item.searchId)}>View search details <ArrowRight size={15}/></button>
       </article>)}</div>}
-      <div className="ops-pagination"><span>{total} searches · kept up to {retention.days} days / {retention.maxEntries.toLocaleString()} entries</span><div><button className="button button-secondary" disabled={!offset || loading} onClick={() => setOffset(Math.max(0, offset - 50))}>Previous</button><button className="button button-secondary" disabled={offset + 50 >= total || loading} onClick={() => setOffset(offset + 50)}>Next</button></div></div>
+      <div className="ops-pagination"><span>{total === null ? '— searches · Count unavailable' : `${total.toLocaleString()} searches`} · kept up to {retention.days} days / {retention.maxEntries.toLocaleString()} entries</span><div><button className="button button-secondary" disabled={!offset || loading || !!error} onClick={() => setOffset(Math.max(0, offset - 50))}>Previous</button><button className="button button-secondary" disabled={total === null || offset + 50 >= total || loading || !!error} onClick={() => setOffset(offset + 50)}>Next</button></div></div>
     </div></div><aside className="right-rail activity-rail" aria-label="Activity information">
-      <div className="rail-card"><div className="rail-overline">SEARCH HISTORY</div><div className="activity-total"><strong>{total.toLocaleString()}</strong><span>recorded searches</span></div><div className="rail-rule"/><p>History is kept for up to {retention.days} days or {retention.maxEntries.toLocaleString()} entries.</p></div>
+      <div className="rail-card"><div className="rail-overline">SEARCH HISTORY</div><div className="activity-total"><strong>{total === null ? '—' : total.toLocaleString()}</strong><span>{total === null ? 'Count unavailable' : 'recorded searches'}</span></div><div className="rail-rule"/><p>History is kept for up to {retention.days} days or {retention.maxEntries.toLocaleString()} entries.</p></div>
       <div className="rail-card activity-key"><div className="rail-icon"><ShieldCheck size={17}/></div><strong>Private by design</strong><p>Search terms can reveal what you watch. This history stays on your Media Scout instance.</p></div>
       <div className="rail-card activity-key"><div className="rail-icon"><RefreshCw size={17}/></div><strong>Need the full result?</strong><p>Open any search to review its recommendations, evidence, and submission record.</p></div>
     </aside></div>

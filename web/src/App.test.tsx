@@ -118,6 +118,85 @@ it('filters Activity by media and inclusive local dates and offers every submiss
   for (const name of ['queued', 'rejected', 'deferred', 'expired']) assert.ok(statuses.queryByRole('option', { name }), `${name} is filterable`)
 })
 
+it('shows an unknown count while the initial Activity request is pending', async () => {
+  window.history.replaceState(null, '', '/#activity')
+  let finishRequest!: (response: Response) => void
+  globalThis.fetch = async input => {
+    if (String(input) === '/api/settings') return Response.json(env)
+    return new Promise<Response>(resolve => { finishRequest = resolve })
+  }
+  render(<App />)
+  await screen.findByText('Loading activity…')
+  const rail = screen.getByRole('complementary', { name: 'Activity information' })
+  assert.ok(within(rail).getByText('—'))
+  assert.ok(within(rail).getByText('Count unavailable'))
+  assert.ok(screen.getByText(/— searches · Count unavailable/))
+  assert.ok(screen.getByRole('button', { name: 'Next' }).hasAttribute('disabled'))
+  finishRequest(Response.json({ items: [], total: 0 }))
+  await waitFor(() => assert.ok(within(rail).getByText('0')))
+})
+
+it('offers retry after initial Activity failure and displays the recovered count', async () => {
+  window.history.replaceState(null, '', '/#activity')
+  let attempts = 0
+  globalThis.fetch = async input => {
+    if (String(input) === '/api/settings') return Response.json(env)
+    if (++attempts === 1) return Response.json({ error: 'Unavailable' }, { status: 503 })
+    return Response.json({ items: [], total: 7 })
+  }
+  render(<App />)
+  await screen.findByRole('alert')
+  const rail = screen.getByRole('complementary', { name: 'Activity information' })
+  assert.ok(within(rail).getByText('—'))
+  assert.ok(within(rail).getByText('Count unavailable'))
+  assert.ok(screen.getByText(/— searches · Count unavailable/))
+  fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+  await waitFor(() => assert.ok(within(rail).getByText('7')))
+  assert.ok(within(rail).getByText('recorded searches'))
+  assert.equal(attempts, 2)
+})
+
+it('shows a real zero count after a successful empty Activity response', async () => {
+  window.history.replaceState(null, '', '/#activity')
+  globalThis.fetch = async input => String(input) === '/api/settings' ? Response.json(env) : Response.json({ items: [], total: 0 })
+  render(<App />)
+  await screen.findByText('No matching activity')
+  const rail = screen.getByRole('complementary', { name: 'Activity information' })
+  assert.ok(within(rail).getByText('0'))
+  assert.ok(within(rail).getByText('recorded searches'))
+  assert.equal(within(rail).queryByText('Count unavailable'), null)
+})
+
+it('hides stale Activity rows and disables pagination when a filtered request fails', async () => {
+  window.history.replaceState(null, '', '/#activity')
+  let activityRequests = 0
+  const queries: URLSearchParams[] = []
+  globalThis.fetch = async input => {
+    if (String(input) === '/api/settings') return Response.json(env)
+    queries.push(new URL(String(input), 'http://localhost').searchParams)
+    activityRequests++
+    if (activityRequests === 1) return Response.json({ items: [{ searchId: 'old', prompt: 'Old result', status: 'matched', source: 'manual', createdAt: matched.createdAt }], total: 51 })
+    if (activityRequests === 2) return Response.json({ error: 'Filter request failed' }, { status: 503 })
+    return Response.json({ items: [{ searchId: 'fresh', prompt: 'Filtered result', status: 'matched', source: 'manual', createdAt: matched.createdAt }], total: 1 })
+  }
+  render(<App />)
+  assert.ok(await screen.findByText('Old result'))
+  assert.equal(screen.getByRole('button', { name: 'Next' }).hasAttribute('disabled'), false)
+  const query = screen.getByRole('textbox', { name: 'Filter searches' })
+  fireEvent.change(query, { target: { value: 'new filter' } })
+  await screen.findByRole('alert')
+  assert.equal((query as HTMLInputElement).value, 'new filter')
+  assert.equal(screen.queryByText('Old result'), null)
+  assert.equal(screen.getByRole('button', { name: 'Previous' }).hasAttribute('disabled'), true)
+  assert.equal(screen.getByRole('button', { name: 'Next' }).hasAttribute('disabled'), true)
+  assert.ok(screen.getByText('Count unavailable'))
+  assert.ok(screen.getByText(/— searches · Count unavailable/))
+  fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+  assert.ok(await screen.findByText('Filtered result'))
+  assert.equal(queries.at(-1)?.get('q'), 'new filter')
+  assert.equal(queries.at(-1)?.get('offset'), '0')
+})
+
 it('shows per-release submission history in saved search details', async () => {
   window.history.replaceState(null, '', '/#activity')
   globalThis.fetch = async input => {

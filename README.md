@@ -1,28 +1,38 @@
 # Media Scout
 
-LLM-assisted release search and selection. Media Scout turns a natural-language request into bounded Prowlarr searches and ranked alternatives. Search is separate from explicit download submission; Arr-based automation is optional.
+Media Scout turns a natural-language request into bounded Prowlarr searches and ranked release alternatives. Search is separate from explicit download submission; Sonarr/Radarr automation is optional.
 
-Prowlarr provides indexer search and routed submissions. Sonarr/Radarr supply current library and queue observations for optional automation. New installs use a fresh search database; existing tracking-engine databases are refused, not migrated. It's an early-stage homelab project; broader ideas are on the [ideas list](docs/future-features.md).
+Prowlarr provides indexer search and routed submissions. Sonarr/Radarr supply library and queue observations for optional automation.
 
-## Get started
+> [!WARNING]
+> Media Scout is in early development and breaking changes should be expected. If that concerns you, pin a specific image version rather than following `latest`.
 
-From a checkout, run:
+## Quickstart
 
 ```sh
-mkdir -p data
-docker compose up -d --build
+docker pull ghcr.io/aberiggs/media-scout:latest
+docker run -d \
+  --name media-scout \
+  --restart unless-stopped \
+  -p 127.0.0.1:7877:7877 \
+  -v media-scout-data:/app/data \
+  ghcr.io/aberiggs/media-scout:latest
 ```
 
-Open <http://127.0.0.1:7877/> to configure the app. Monitoring starts disabled and dry-run starts enabled.
+With Docker installed, these commands pull and run the published image—no clone or source build needed. Open <http://127.0.0.1:7877/> to configure the app. Docker creates the named volume `media-scout-data` to persist settings and history.
 
-See [setup and configuration](docs/setup.md) for prerequisites, Docker details, and building from source. Read [operations and safety](docs/operations.md) before enabling live downloads.
+For a fixed image, replace `ghcr.io/aberiggs/media-scout:latest` in both commands with `ghcr.io/aberiggs/media-scout:sha-<full-commit-sha>` or an image digest. There are no semver release tags.
 
-## Project notes
+## Setup and safety
 
-- [Development](docs/development.md) — Ubuntu bootstrap and verification commands.
-- [Feedback triage](docs/feedback-triage.md) — investigated concerns and links to the GitHub backlog.
-- [Future features](docs/future-features.md) — high-level ideas under consideration, not commitments.
-- [Operator recovery](docs/operator-recovery.md) — current finite retry behavior and deliberate fresh-database rollback.
-- [Publishing](docs/publishing.md) — development-image publishing and rollout notes.
+- Prowlarr with configured indexers and enabled download clients, and an LLM API endpoint, are needed for searching. Sonarr/Radarr are optional.
+- Settings, including integration credentials, are stored in SQLite in the data volume; protect that volume and its backups as secrets. Monitoring starts disabled and dry-run enabled. Dry-run prevents download submission, but searches can still incur indexer and LLM costs.
+- The web interface and API have no authentication. The quickstart binds to loopback; expose it only on trusted networks.
+
+Configure Prowlarr, LLM, and optional Arr connection details in the web UI. For Arr automation, configure download-client categories consistently between Prowlarr and Sonarr/Radarr, then enter the exact Prowlarr client names in Media Scout.
+
+## Develop from source
+
+See [source development and checks](src/README.md). The default `docker-compose.yml` builds the source image; use `docker-compose.ghcr.yml` explicitly for the published image.
 
 Licensed under [MIT](LICENSE).

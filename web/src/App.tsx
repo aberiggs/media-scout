@@ -9,10 +9,10 @@ function pageFromHash(): Page { const value = location.hash.slice(1); return ['a
 
 export default function App() {
   const [page, setPage] = useState<Page>(pageFromHash), [openedSearch, setOpenedSearch] = useState<string>()
-  const [settings, setSettings] = useState<Settings>(defaults), [status, setStatus] = useState<SettingsEnvelope['status'] | null>(null)
+  const [settings, setSettings] = useState<Settings>(defaults), [committed, setCommitted] = useState<Settings | null>(null), [status, setStatus] = useState<SettingsEnvelope['status'] | null>(null)
   const [loading, setLoading] = useState(true), [saving, setSaving] = useState(false), [message, setMessage] = useState(''), [messageIsError, setMessageIsError] = useState(false), [saved, setSaved] = useState('')
   const dirty = useMemo(() => JSON.stringify(settings) !== saved, [settings, saved])
-  const accept = (envelope: SettingsEnvelope) => { const next = mergeSettings(envelope.settings); setSettings(next); setStatus(envelope.status); setSaved(JSON.stringify(next)) }
+  const accept = (envelope: SettingsEnvelope) => { const next = mergeSettings(envelope.settings); setSettings(next); setCommitted(next); setStatus(envelope.status); setSaved(JSON.stringify(next)) }
   const load = useCallback(async () => {
     setLoading(true)
     try { const response = await fetch('/api/settings'); if (!response.ok) throw new Error(); accept(await response.json()); setMessage(''); setMessageIsError(false) }
@@ -20,7 +20,7 @@ export default function App() {
     finally { setLoading(false) }
   }, [])
   useEffect(() => { void load(); const change = () => setPage(pageFromHash()); window.addEventListener('hashchange', change); return () => window.removeEventListener('hashchange', change) }, [load])
-  async function persist(next: Settings) {
+  async function persist(next: Settings, preserveDraft = false) {
     const response = await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(next) })
     if (!response.ok) {
       let payload: { issues?: Array<{ path?: Array<string | number>; message?: string }> } = {}
@@ -33,7 +33,11 @@ export default function App() {
       })
       throw new Error(details.length ? `Settings could not be saved. ${details.join('; ')}` : `Settings could not be saved (HTTP ${response.status}). Check the values and try again.`)
     }
-    accept(await response.json())
+    const envelope = await response.json() as SettingsEnvelope
+    const savedSettings = mergeSettings(envelope.settings)
+    setCommitted(savedSettings)
+    setSettings(draft => preserveDraft ? { ...draft, monitoring: { ...draft.monitoring, enabled: draft.monitoring.enabled === committed?.monitoring.enabled ? savedSettings.monitoring.enabled : draft.monitoring.enabled } } : savedSettings)
+    setStatus(envelope.status); setSaved(JSON.stringify(savedSettings))
   }
   async function save(event: FormEvent) {
     event.preventDefault(); setSaving(true); setMessage(''); setMessageIsError(false)
@@ -45,20 +49,21 @@ export default function App() {
     const response = await fetch('/api/settings')
     if (!response.ok) throw new Error('Settings unavailable')
     const current = (await response.json() as SettingsEnvelope).settings
-    await persist({ ...current, monitoring: { ...current.monitoring, enabled: !current.monitoring.enabled } })
+    await persist({ ...current, monitoring: { ...current.monitoring, enabled: !current.monitoring.enabled } }, true)
   }
   const openSearch = (id: string) => { setOpenedSearch(id); setPage('search'); location.hash = '#search' }
   const labels: Record<Page, string> = { search: 'Search', activity: 'Activity', automation: 'Automation', settings: 'Settings' }
   return <div className="app-shell">
     <aside className="sidebar" aria-label="Main navigation"><a className="brand" href="#search"><span className="brand-mark"><Waves size={19}/></span><span className="brand-name">media<span>scout</span></span></a><div className="workspace-label">Workspace</div><nav className="primary-nav" aria-label="Workspace">{([['search', SearchIcon], ['activity', ActivityIcon], ['automation', Radio], ['settings', Settings2]] as const).map(([key, Icon]) => <a key={key} className={`nav-item ${page === key ? 'active' : ''}`} href={`#${key}`} aria-current={page === key ? 'page' : undefined}><Icon size={17}/>{labels[key]}</a>)}</nav><div className="sidebar-bottom"><div className="local-note"><Waves size={15}/>Running on your network</div><div className="version-note">Self-hosted · local control</div></div></aside>
-    <div className="main-column"><header className="topbar"><div className="crumb"><span>Workspace</span><span className="crumb-divider">/</span><strong>{labels[page]}</strong></div><div className="topbar-right"><span className="connection-chip">{settings.safety.dryRun ? 'Dry-run on' : 'Downloads enabled'}</span>{page === 'settings' && <button className="button button-primary" type="submit" form="settings-form" disabled={!dirty || loading || saving}>{saving ? 'Saving…' : dirty ? 'Save changes' : 'All changes saved'}</button>}</div></header>
+    <div className="main-column"><header className="topbar"><div className="crumb"><span>Workspace</span><span className="crumb-divider">/</span><strong>{labels[page]}</strong></div><div className="topbar-right">{committed && <span className="connection-chip">{committed.safety.dryRun ? 'Dry-run on' : 'Downloads enabled'}</span>}{page === 'settings' && <button className="button button-primary" type="submit" form="settings-form" disabled={!dirty || loading || saving}>{saving ? 'Saving…' : dirty ? 'Save changes' : 'All changes saved'}</button>}</div></header>
       <main className="page-wrap" id={page}>
-        {page === 'search' && <SearchPage settings={settings} searchId={openedSearch}/>}
+        <UnsavedNotice dirty={Boolean(committed) && dirty}/>
+        {page === 'search' && (committed ? <SearchPage settings={committed} searchId={openedSearch}/> : <SettingsUnavailable loading={loading} message={message} retry={() => void load()}/>)}
         {page === 'activity' && <ActivityPage onOpenSearch={openSearch}/>}
-        {page === 'automation' && <AutomationPage settings={settings} onOpenSearch={openSearch} onToggle={toggleAutomation}/>}
+        {page === 'automation' && (committed ? <AutomationPage settings={committed} onOpenSearch={openSearch} onToggle={toggleAutomation}/> : <SettingsUnavailable loading={loading} message={message} retry={() => void load()}/>)}
         {page === 'settings' && <>
           <div className="page-heading"><div><h1>Settings<span className="heading-period">.</span></h1><p className="page-intro">Connect search services. Add Arr only if you want automation.</p></div></div>
-          {message && <div className={`notice ${messageIsError ? 'notice-error' : 'notice-success'}`} role={messageIsError ? 'alert' : 'status'}>{messageIsError ? <CircleAlert size={17}/> : <CheckCircle2 size={17}/>}<span>{message}</span></div>}
+           {message && <div className={`notice ${messageIsError ? 'notice-error' : 'notice-success'}`} role={messageIsError ? 'alert' : 'status'}>{messageIsError ? <CircleAlert size={17}/> : <CheckCircle2 size={17}/>}<span>{message}</span></div>}
           {loading ? <p role="status">Loading settings…</p> : <form id="settings-form" onSubmit={save}><div className="content-grid"><div className="settings-stack">
              <Section title="Search services" description="Connect the indexers and model Scout uses to find and compare releases." icon={<SearchIcon size={18}/>}>
               <Group title="Prowlarr" fields={[["Prowlarr URL", settings.integrations.prowlarr.url, 'url'], ["Prowlarr API key", settings.integrations.prowlarr.apiKey, 'apiKey'], ["TV download client", settings.integrations.prowlarr.tvClient, 'tvClient'], ["Movie download client", settings.integrations.prowlarr.movieClient, 'movieClient']]} update={(key, value) => setSettings(s => ({ ...s, integrations: { ...s.integrations, prowlarr: { ...s.integrations.prowlarr, [key]: value } } }))}/>
@@ -79,10 +84,10 @@ export default function App() {
               <p className="field-hint">After finite appearance grace, unmatched downloads may be retried. Scout does not inspect or cancel qBittorrent jobs.</p>
              </Section>
            </div><aside className="right-rail" aria-label="Instance information">
-             <div className="rail-card setup-card"><div className="rail-overline">INSTANCE STATUS</div><div className="ready-visual"><div className={`ready-orbit ${status?.ready ? 'orbit-ready' : ''}`}><span>{status?.ready ? <CheckCircle2 size={20}/> : <CircleAlert size={20}/>}</span></div><div className="ready-copy"><strong>{status?.ready ? 'Ready to search' : 'Setup needed'}</strong><span>{status?.ready ? 'Required services are configured.' : 'Add the required services to get started.'}</span></div></div><div className="rail-rule"/><div className="check-list"><StatusRow label="Prowlarr" done={Boolean(settings.integrations.prowlarr.url && settings.integrations.prowlarr.apiKey)}/><StatusRow label="AI model" done={Boolean(settings.ai.apiKey && settings.ai.model && settings.ai.baseUrl)}/><StatusRow label="Sonarr" done={Boolean(settings.integrations.sonarr.url && settings.integrations.sonarr.apiKey)} optional/><StatusRow label="Radarr" done={Boolean(settings.integrations.radarr.url && settings.integrations.radarr.apiKey)} optional/></div></div>
+              <div className="rail-card setup-card"><div className="rail-overline">INSTANCE STATUS</div><div className="ready-visual"><div className={`ready-orbit ${status?.ready ? 'orbit-ready' : ''}`}><span>{status?.ready ? <CheckCircle2 size={20}/> : <CircleAlert size={20}/>}</span></div><div className="ready-copy"><strong>{status?.ready ? 'Ready to search' : 'Setup needed'}</strong><span>{status?.ready ? 'Required services are configured.' : 'Add the required services to get started.'}</span></div></div><div className="rail-rule"/><div className="check-list"><StatusRow label="Prowlarr" done={Boolean(settings.integrations.prowlarr.url && settings.integrations.prowlarr.apiKey)}/><StatusRow label="AI model" done={Boolean(settings.ai.apiKey && settings.ai.model && settings.ai.baseUrl)}/><StatusRow label="Sonarr" done={Boolean(settings.integrations.sonarr.url && settings.integrations.sonarr.apiKey)} optional/><StatusRow label="Radarr" done={Boolean(settings.integrations.radarr.url && settings.integrations.radarr.apiKey)} optional/></div></div>
              <div className="rail-card cycle-card"><div className="rail-icon"><Radio size={17}/></div><div className="cycle-title"><strong>Automatic monitoring</strong><span className={status?.monitoringEnabled ? 'state-on' : 'state-off'}><span className="tiny-dot"/>{status?.monitoringEnabled ? 'Enabled' : 'Paused'}</span></div><p>Scheduled checks use your Arr libraries. You can still search manually while monitoring is paused.</p></div>
              <div className="privacy-card"><div className="privacy-icon"><KeyRound size={16}/></div><div><strong>Keep this instance private</strong><p>API keys are stored here and visible to anyone with access. Only expose this app on a trusted network.</p></div></div>
-             {settings.safety.dryRun && <div className="dry-run-note"><ShieldCheck size={15}/><span>Dry-run prevents download submission. Searches still call your model and indexers.</span></div>}
+             {committed?.safety.dryRun && <div className="dry-run-note"><ShieldCheck size={15}/><span>Dry-run prevents download submission. Searches still call your model and indexers.</span></div>}
            </aside></div></form>}
         </>}
         <footer className="page-footer"><span>Media Scout</span><span className="footer-divider"/><span>Made for your home lab</span></footer>
@@ -91,6 +96,8 @@ export default function App() {
   </div>
 }
 function Section({ title, description, icon, children }: { title: string; description: string; icon: ReactNode; children: ReactNode }) { return <section className="settings-card"><div className="section-heading"><div className="section-icon">{icon}</div><div className="section-title"><h2>{title}</h2><p>{description}</p></div></div><div className="section-body">{children}</div></section> }
+function UnsavedNotice({ dirty }: { dirty: boolean }) { return dirty ? <div className="notice notice-error" role="status"><CircleAlert size={17}/><span>Unsaved settings. Search and automation use the last saved settings.</span></div> : null }
+function SettingsUnavailable({ loading, message, retry }: { loading: boolean; message: string; retry(): void }) { return <div className={`notice ${loading ? '' : 'notice-error'}`} role={loading ? 'status' : 'alert'}>{loading ? 'Loading committed settings…' : message}<button className="text-button" type="button" disabled={loading} onClick={retry}>Retry</button></div> }
 function Field({ label, value, onChange, multiline = false }: { label: string; value: string; onChange(value: string): void; multiline?: boolean }) {
   const id = useId(), inputRef = useRef<HTMLInputElement>(null), [revealed, setRevealed] = useState(false), [copied, setCopied] = useState(false), [copyFailed, setCopyFailed] = useState(false), secret = label.includes('API key')
   useEffect(() => { if (!copied) return; const timeout = window.setTimeout(() => setCopied(false), 1600); return () => window.clearTimeout(timeout) }, [copied])

@@ -1,4 +1,4 @@
-import { Http } from '../http';
+import { Http, type HttpRequestOptions } from '../http';
 import {
   type DownloadClient,
   downloadClientListSchema,
@@ -20,7 +20,7 @@ export class ProwlarrClient {
     categories: number[];
     indexerIds?: number[];
     limit?: number;
-  }): Promise<Release[]> {
+  }, options?: HttpRequestOptions): Promise<Release[]> {
     const query: Record<string, string | number | (string | number)[]> = {
       query: params.query,
       type: 'search',
@@ -29,7 +29,7 @@ export class ProwlarrClient {
     if (params.indexerIds !== undefined) query.indexerIds = params.indexerIds;
     if (params.limit !== undefined) query.limit = params.limit;
     return releaseListSchema.parse(
-      await this.http.getJson('/api/v1/search', query),
+      await this.http.getJson('/api/v1/search', query, options),
     );
   }
 

@@ -125,11 +125,25 @@ export class SearchService {
           searches++;
           record('query-start', { query: safeText(action.query!), indexerIds: ids });
           let releases: Release[];
-          try { checkCooldown('prowlarr'); releases = await wait(this.deps.prowlarr.search({ query: action.query!, categories: action.categories ?? [], indexerIds: ids })); }
+          const searchController = new AbortController();
+          const abortSearch = () => searchController.abort(signal?.reason);
+          if (signal?.aborted) abortSearch(); else signal?.addEventListener('abort', abortSearch, { once: true });
+          const searchTimer = setTimeout(() => searchController.abort(new SearchDeadline()), Math.max(0, remaining()));
+          try {
+            checkCooldown('prowlarr');
+            releases = await wait(this.deps.prowlarr.search(
+              { query: action.query!, categories: action.categories ?? [], indexerIds: ids },
+              { timeoutMs: Math.min(120_000, Math.max(1, remaining())), signal: searchController.signal },
+            ));
+          }
           catch (error) {
             if (error instanceof ApiError && error.retryAfter !== undefined) this.deps.store.setProviderDeadline('prowlarr', now() + error.retryAfter * 1000);
+            if (searchController.signal.reason instanceof SearchDeadline) throw new SearchDeadline();
+            if (signal?.aborted) throw new SearchInterrupted();
+            if (error instanceof ApiError && error.timedOut) throw new ProwlarrSearchTimeout();
+            if (error instanceof ApiError && error.status === 0) throw new ProwlarrSearchNetworkFailure();
             throw error;
-          }
+          } finally { clearTimeout(searchTimer); signal?.removeEventListener('abort', abortSearch); }
           // All rows reach the model. Repeated physical observations retain their separate evidence.
           if (remaining() <= 0) throw new SearchDeadline();
           if (!(claimedOwner ? this.deps.store.ownsSearch(id, claimedOwner, now()) : this.deps.store.ownsLease(`search:${id}`, owner, now()))) throw new SearchInterrupted();
@@ -175,7 +189,7 @@ export class SearchService {
     } catch (error) {
       status = error instanceof SearchDeadline ? 'budget-exhausted' : error instanceof SearchInterrupted ? 'interrupted' : 'failed';
       const knownReason = error instanceof Error && ['search-busy', 'source-throttled', 'no-healthy-indexers'].includes(error.message) ? error.message : undefined;
-      message = error instanceof ApiError ? `Upstream HTTP ${error.status}` : error instanceof SearchDeadline ? 'Search deadline exceeded' : error instanceof SearchInterrupted ? 'Search interrupted' :
+      message = error instanceof ProwlarrSearchTimeout ? 'Prowlarr search timed out. Check indexer responsiveness and retry.' : error instanceof ProwlarrSearchNetworkFailure ? 'Prowlarr search network failure. Check Prowlarr availability and retry.' : error instanceof ApiError ? `Upstream HTTP ${error.status}` : error instanceof SearchDeadline ? 'Search deadline exceeded' : error instanceof SearchInterrupted ? 'Search interrupted' :
         knownReason === 'search-busy' ? 'Another search is already running. Please retry after it finishes.' :
         knownReason === 'source-throttled' ? 'A provider is temporarily throttled. Retry after its cooldown.' :
         knownReason === 'no-healthy-indexers' ? 'No enabled, available indexers can be searched right now.' :
@@ -192,6 +206,8 @@ export class SearchService {
 }
 class SearchDeadline extends Error {}
 class SearchInterrupted extends Error {}
+class ProwlarrSearchTimeout extends Error {}
+class ProwlarrSearchNetworkFailure extends Error {}
 function bounded<T>(promise: Promise<T>, ms: number, signal?: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
     let timer: ReturnType<typeof setTimeout>;

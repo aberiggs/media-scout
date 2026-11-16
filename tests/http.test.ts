@@ -92,6 +92,7 @@ describe('Http.getJson', () => {
     expect(err).toBeInstanceOf(ApiError);
     expect(err.status).toBe(0);
     expect(err.body.toLowerCase()).toMatch(/abort|timeout/);
+    expect(err.timedOut).toBe(true);
   });
 
   it('wraps a pre-response timeout in ApiError with status 0', async () => {
@@ -104,6 +105,14 @@ describe('Http.getJson', () => {
     const err = await catchAs(http.getJson('/api/v1/search', { query: 'x' }));
     expect(err).toBeInstanceOf(ApiError);
     expect(err.status).toBe(0);
+  });
+
+  it('uses an optional per-call timeout without changing the client default', async () => {
+    nock(BASE).get('/slow').delayConnection(80).reply(200, {});
+    const http = new Http({ baseUrl: BASE, apiKey: KEY });
+    const err = await catchAs(http.getJson('/slow', undefined, { timeoutMs: 10 }));
+    expect(err.status).toBe(0);
+    expect(err.timedOut).toBe(true);
   });
 });
 

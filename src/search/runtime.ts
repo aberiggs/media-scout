@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { OpenRouter } from '@openrouter/sdk';
 import type { LLMClient } from '../clients/llm';
 import { OpenRouterLLM } from '../clients/llm';
@@ -8,11 +8,11 @@ import { RadarrClient } from '../clients/radarr';
 import { Http } from '../http';
 import { ArrAutomation, type AutomationPass } from './automation';
 import { ArrObserver, type ArrProvider, type ArrTarget } from './arr';
-import { SearchService, safeText, type SearchResult, type SearchServerContext } from './service';
+import { SearchService, safeText, SEARCH_PROMPT_VERSION, type SearchResult, type SearchServerContext, type SearchLimits } from './service';
 import { SubmissionService, type SubmissionResult } from './submission';
 import { openSearchStore, type SearchStore, type SearchRecord } from './store';
 import { defaultSettings, migrateSettings, missingSettings, settingsSchema, type Settings } from './settings';
-import type { SearchRequest, SubmissionRequest } from './contracts';
+import { searchRequestSchema, type SearchRequest, type SubmissionRequest } from './contracts';
 
 export interface RuntimeClients {
   prowlarr?: Pick<ProwlarrClient, 'getIndexers' | 'getIndexerStatuses' | 'search' | 'getDownloadClients' | 'grab'>;
@@ -31,7 +31,7 @@ export interface ActivityQuery { limit?: number; offset?: number; q?: string; st
 export interface ActivityItem { searchId: string; prompt: string; status: string; createdAt: string; finishedAt?: string; source: 'manual' | 'automation'; kind?: 'tv' | 'movie'; counts?: SearchResult['counts']; submission?: { outcome: string; outcomes?: SubmissionResult['outcomes'] } }
 export interface PublicSearchStatus {
   searchId: string; status: string; createdAt: string; finishedAt?: string; prompt: string;
-  options: SearchResult['options']; candidates: SearchResult['candidates']; events: SearchResult['events'];
+  options: SearchResult['options']; candidates: SearchResult['candidates']; events: SearchResult['events']; queuePosition?: number; waitingReason?: string; retryAt?: string;
   counts: SearchResult['counts']; message?: string;
 }
 const iso = (time: number | undefined): string | undefined => time === undefined || !Number.isFinite(new Date(time).getTime()) ? undefined : new Date(time).toISOString();
@@ -51,6 +51,9 @@ export class SearchRuntime {
   private readonly clock: () => number;
   private readonly jobs = new Map<string, Promise<SearchResult>>();
   private closed = false;
+  private closing = false;
+  private closeJob?: Promise<void>;
+  private passController?: AbortController;
   private pollJob?: Promise<AutomationPass>;
   private readonly maintenanceTimer: ReturnType<typeof setInterval>;
 
@@ -63,10 +66,11 @@ export class SearchRuntime {
     const parsed = settingsSchema.parse(migrated.settings);
     if (migrated.migrated) this.store.migrateLegacySearchDeadlines(this.clock(), parsed.monitoring.searchRetryMinutes * 60_000);
     if (!saved || migrated.migrated) this.store.setSetting('application-settings', parsed);
-    if (!this.store.hasLiveLease('search-worker', this.clock())) this.store.interruptRunning(this.clock());
+    this.store.migrateLegacySearchWork(this.clock());
     this.maintain();
-    this.maintenanceTimer = setInterval(() => { try { this.maintain(); } catch { /* Request paths surface database failures safely. */ } }, 60_000);
+    this.maintenanceTimer = setInterval(() => { try { this.maintain(); this.dispatchQueued(); } catch { /* Request paths surface database failures safely. */ } }, 1_000);
     this.maintenanceTimer.unref();
+    this.dispatchQueued();
   }
 
   getSettings(): Settings {
@@ -82,19 +86,15 @@ export class SearchRuntime {
     return { ok: true, settings: parsed.data };
   }
 
-  startSearch(request: SearchRequest, serverContext: SearchServerContext = {}): { searchId: string; status: 'running' } {
-    if (this.closed) throw new Error('runtime-closed');
+  startSearch(request: SearchRequest, serverContext: SearchServerContext = {}): { searchId: string; status: 'queued' } {
+    if (this.closed || this.closing) throw new Error('runtime-closed');
     const settings = this.getSettings();
-    if (this.missingSettings(settings).length) throw new Error('settings-incomplete');
-    const clients = this.clients(settings);
-    if (!clients.prowlarr) throw new Error('prowlarr-unavailable');
-    const service = new SearchService({ llm: this.llm(settings), prowlarr: clients.prowlarr, store: this.store, clock: this.clock, limits: { decisions: settings.search.maxDecisions, searches: settings.search.maxSearches, deadlineMs: settings.search.deadlineMinutes * 60_000 } });
     const effective = settings.ai.preferences && !request.preferences ? { ...request, preferences: { notes: settings.ai.preferences.slice(0, 2000) } } : request;
-    const { searchId, completion } = service.start(effective, {}, undefined, serverContext);
-    this.store.setSetting(`search-source:${searchId}`, 'manual');
-    this.jobs.set(searchId, completion);
-    void completion.catch(() => undefined).finally(() => this.jobs.delete(searchId));
-    return { searchId, status: 'running' };
+    searchRequestSchema.parse(effective);
+    const searchId = randomUUID();
+    this.store.enqueueSearch({ searchId, prompt: JSON.stringify(effective), now: this.clock(), context: serverContext });
+    this.dispatchQueued();
+    return { searchId, status: 'queued' };
   }
 
   async getSearch(searchId: string): Promise<PublicSearchStatus | null> {
@@ -105,10 +105,15 @@ export class SearchRuntime {
     const candidates = result?.candidates ?? this.store.listCandidates(searchId, this.clock()).map(row => row.safe as SearchResult['candidates'][number]);
     const events = this.store.getEvents(searchId) as SearchResult['events'];
     const counts = result?.counts ?? { decisions: 0, searches: 0, candidates: candidates.length };
+    const queued = record.status === 'queued';
+    const settings = queued ? this.getSettings() : undefined;
+    const cooldown = queued ? ['prowlarr','model'].map(provider => this.store.getProviderDeadline(provider) ?? 0).reduce((a,b)=>Math.max(a,b),0) : 0;
+    const waitingReason = queued ? this.missingSettings(settings).length ? 'settings-incomplete' : cooldown > this.clock() ? 'provider-cooldown' : this.store.activeSearchCount(this.clock()) >= 3 ? 'capacity' : undefined : undefined;
     return {
       searchId, status: record.status, createdAt: new Date(record.createdAt).toISOString(),
       ...(record.finishedAt === undefined ? {} : { finishedAt: new Date(record.finishedAt).toISOString() }), prompt: safeText(parsePrompt(record.prompt)),
       options: result?.options ?? [], candidates, events, counts, ...(result?.message ? { message: result.message } : {}),
+      ...(queued ? { queuePosition: this.store.queuePosition(searchId) ?? undefined, ...(waitingReason ? { waitingReason } : {}), ...(cooldown > this.clock() ? { retryAt: new Date(cooldown).toISOString() } : {}) } : {}),
     };
   }
 
@@ -142,18 +147,28 @@ export class SearchRuntime {
 
   /** Explicit poll; observers are refreshed even when automation is paused. */
   async poll(): Promise<AutomationPass> {
+    if (this.closing || this.closed) return { observedAt: this.clock(), ran: false, reason: 'runtime-closing' };
     this.maintain();
     if (this.pollJob) return this.pollJob;
     const policy = this.getSettings();
     const observer = this.createObserver();
+    const passOwner = this.store.newOwner();
+    if (!this.store.acquireLease('automation-pass', passOwner, this.clock(), 15 * 60_000))
+      return { observedAt: this.clock(), ran: false, reason: 'already-running' };
+    const passController = new AbortController();
+    this.passController = passController;
+    const passHeartbeat = setInterval(() => {
+      if (!this.store.renewLease('automation-pass', passOwner, this.clock(), 15 * 60_000)) passController.abort();
+    }, 30_000);
+    passHeartbeat.unref();
     const poll = async () => {
       if (!policy.monitoring.enabled || this.missingSettings(policy).length) { await observer.observe(); return { observedAt: this.clock(), ran: false, reason: policy.monitoring.enabled ? 'search-unavailable' : 'disabled' }; }
       const clients = this.clients(this.getSettings());
       if (!clients.prowlarr) return { observedAt: this.clock(), ran: false, reason: 'search-unavailable' };
       const automation = this.createAutomation(observer, clients.prowlarr);
-      return automation.runPass();
+      return automation.runPass(passController.signal);
     };
-    this.pollJob = poll().finally(() => { this.pollJob = undefined; });
+    this.pollJob = poll().finally(() => { clearInterval(passHeartbeat); this.store.releaseLease('automation-pass', passOwner); if (this.passController === passController) this.passController = undefined; this.pollJob = undefined; });
     return this.pollJob;
   }
 
@@ -179,13 +194,32 @@ export class SearchRuntime {
         items.push({ targetId, title: safeText(title), kind: provider === 'sonarr' ? 'tv' : 'movie', ...(target.serviceId === undefined ? {} : { seriesId: String(target.serviceId) }), ...(context?.seasonNumber === undefined ? {} : { seasonNumber: context.seasonNumber as number }), ...(context?.episodeNumber === undefined ? {} : { episodeNumber: context.episodeNumber as number }), status, eligible: !!target.eligible && !grace && deadline <= this.clock(), observedAt: iso(cached?.observedAt)!, ...(Math.max(grace ?? 0, deadline) > this.clock() ? { nextAttemptAt: iso(Math.max(grace ?? 0, deadline)) } : {}), ...(attempt ? { lastAttemptAt: iso(attempt.lastAttempt) } : {}) });
       }
     }
-    return { enabled: settings.monitoring.enabled, dryRun: settings.safety.dryRun, running: !!this.pollJob, providers, items };
+    return { enabled: settings.monitoring.enabled, dryRun: settings.safety.dryRun, running: !!this.pollJob || this.store.hasLiveLease('automation-pass', this.clock()), providers, items };
   }
 
-  async drain(): Promise<void> { await Promise.allSettled([...this.jobs.values(), ...(this.pollJob ? [this.pollJob.then(() => undefined)] : [])]); }
-  async close(): Promise<void> { if (this.closed) return; this.closed = true; clearInterval(this.maintenanceTimer); await this.drain(); this.store.close(); }
+  async drain(): Promise<void> {
+    while (this.jobs.size || this.pollJob) {
+      await Promise.allSettled([...this.jobs.values(), ...(this.pollJob ? [this.pollJob.then(() => undefined)] : [])]);
+      if (this.jobs.size || this.pollJob) await new Promise(resolve => setTimeout(resolve, 25));
+    }
+  }
+  async close(): Promise<void> {
+    if (this.closeJob) return this.closeJob;
+    if (this.closed) return;
+    this.quiesce();
+    this.closeJob = (async () => {
+      await this.drain();
+      this.closed = true; clearInterval(this.maintenanceTimer); this.store.close();
+    })();
+    return this.closeJob;
+  }
+  quiesce(): void {
+    if (this.closed || this.closing) return;
+    this.closing = true;
+    this.passController?.abort();
+  }
 
-  async startArrSearch(targetId: string): Promise<{ searchId: string; status: 'running' }> {
+  async startArrSearch(targetId: string): Promise<{ searchId: string; status: 'queued' }> {
     const snapshot = await this.createObserver().observe();
     const target = snapshot.targets.find(t => this.targetId(t) === targetId);
     if (!target || !snapshot[target.provider].known || !target.eligible) throw new Error('target-not-eligible');
@@ -199,9 +233,7 @@ export class SearchRuntime {
       scope: target.episodeId ? { type: 'episode', seasonNumber: context.seasonNumber as number, episodeNumber: context.episodeNumber as number, ...(typeof context.absoluteEpisodeNumber === 'number' ? { absoluteEpisodeNumber: context.absoluteEpisodeNumber } : {}) } : { type: 'movie' },
       targets: [{ targetId: target.key }], ...(typeof context.year === 'number' ? { year: context.year } : {}),
     } };
-    const result = this.startSearch(request, { targetKeys: [target.key] });
-    this.store.setSetting(`search-arr:${result.searchId}`, target);
-    return result;
+    return this.startSearch(request, { targetKeys: [target.key], targetBindings: [target] });
   }
 
   private targetId(target: ArrTarget): string { return createHash('sha256').update(target.key ?? `${target.provider}:${target.serviceId}:${target.episodeId ?? target.movieId}`).digest('hex').slice(0, 24); }
@@ -242,15 +274,17 @@ export class SearchRuntime {
   }
   private createAutomation(observer: ArrObserver, _prowlarr: NonNullable<RuntimeClients['prowlarr']>): ArrAutomation {
     const getPolicy = () => { const s = this.getSettings(); return { enabled: s.monitoring.enabled, dryRun: s.safety.dryRun, preferences: s.ai.preferences, queueGraceMinutes: s.monitoring.queueGraceMinutes, searchRetryMinutes: s.monitoring.searchRetryMinutes, failureBackoffMinMinutes: s.monitoring.failureBackoffMinMinutes, failureBackoffMaxMinutes: s.monitoring.failureBackoffMaxMinutes }; };
-    const search = { run: async (request: SearchRequest, limits?: any, signal?: AbortSignal, context?: SearchServerContext) => {
-       const s = this.getSettings(); const job = new SearchService({ llm: this.llm(s), prowlarr: this.clients(s).prowlarr!, store: this.store, clock: this.clock, limits: { decisions: s.search.maxDecisions, searches: s.search.maxSearches, deadlineMs: s.search.deadlineMinutes * 60_000 } }).start(request, limits, signal, context);
+    const search = { run: async (request: SearchRequest, _limits?: any, signal?: AbortSignal, context?: SearchServerContext) => {
+       const targetBindings: ArrTarget[] = [];
        for (const key of context?.targetKeys ?? []) for (const provider of ['sonarr', 'radarr'] as const) {
-         const observation = this.store.getObservation(provider)?.payload as { targets?: ArrTarget[] } | undefined;
-         const target = observation?.targets?.find(item => item.key === key);
-         if (target) this.store.setSetting(`search-arr:${job.searchId}`, target);
-       }
-       this.store.setSetting(`search-source:${job.searchId}`, 'automation');
-       return job.completion;
+          const observation = this.store.getObservation(provider)?.payload as { targets?: ArrTarget[] } | undefined;
+          const target = observation?.targets?.find(item => item.key === key);
+          if (target) targetBindings.push(target);
+        }
+         const searchId = randomUUID(), owner = this.store.newOwner(), executionContext = { ...context, targetBindings };
+         const work = this.store.startAutomationSearch({ searchId, prompt: JSON.stringify(request), owner, now: this.clock(), ttl: 900_000, maxActive: 3, context: executionContext });
+         if (!work) throw new Error('automation-capacity-deferred');
+         return this.executeWork(work, _limits ?? {}, signal);
      } };
     const submission = { submit: async (request: SubmissionRequest, context?: any) => this.submit(request, context) };
     return new ArrAutomation({ store: this.store, observer: { observe: () => observer.observe(), validateTarget: (target: ArrTarget) => this.createObserver().validateTarget(target), sourceFingerprint: (provider) => this.createObserver().sourceFingerprint(provider) }, search, submission, getPolicy, clock: this.clock });
@@ -264,11 +298,49 @@ export class SearchRuntime {
     };
   }
   private maintain(): void {
+    this.store.recoverExpiredSearchWork(this.clock());
     for (const search of this.store.activeSearches()) {
+      if (search.status === 'queued') continue;
+      const workOwner = this.store.searchWorkOwner(search.searchId);
+      if (workOwner !== null) continue;
       const owner = this.store.getSetting(`search-owner:${search.searchId}`);
-      if (typeof owner === 'string' ? !this.store.ownsLease('search-worker', owner, this.clock()) : !this.store.hasLiveLease('search-worker', this.clock())) this.store.interruptSearch(search.searchId, this.clock());
+      if (typeof owner === 'string' && !this.store.ownsLease(`search:${search.searchId}`, owner, this.clock())) this.store.interruptSearch(search.searchId, this.clock());
     }
     this.store.maintain(this.clock());
+  }
+  private dispatching = false;
+  private dispatchQueued(): void {
+    if (this.closed || this.closing || this.dispatching || this.missingSettings().length) return;
+    if (['prowlarr','model'].some(provider => (this.store.getProviderDeadline(provider) ?? 0) > this.clock())) return;
+    this.dispatching = true;
+    try {
+      const settings = this.getSettings(), clients = this.clients(settings);
+      if (!clients.prowlarr) return;
+      for (;;) {
+        const owner = this.store.newOwner();
+        const work = this.store.claimNextSearch(owner, this.clock(), 900_000, 3);
+        if (!work) break;
+        void this.executeWork(work).catch(() => undefined);
+      }
+    } finally { this.dispatching = false; }
+  }
+  private executeWork(work: import('./store').SearchWork, limits: SearchLimits = {}, signal?: AbortSignal): Promise<SearchResult> {
+    let completion: Promise<SearchResult>;
+    try {
+      const settings = this.getSettings(), prowlarr = this.clients(settings).prowlarr;
+      if (!prowlarr) throw new Error('prowlarr-unavailable');
+      const request = JSON.parse(work.prompt) as SearchRequest;
+      const service = new SearchService({ llm: this.llm(settings), prowlarr, store: this.store, clock: this.clock, limits: { decisions: settings.search.maxDecisions, searches: settings.search.maxSearches, deadlineMs: settings.search.deadlineMinutes * 60_000 } });
+      completion = service.run(request, limits, signal, work.context as SearchServerContext, work.searchId, work.owner);
+    } catch (error) {
+      const message = error instanceof Error ? safeText(error.message) : 'Search could not start';
+      const result: SearchResult = { searchId: work.searchId, status: 'failed', message, options: [], candidates: [], counts: { decisions: 0, searches: 0, candidates: 0 }, events: [{ type: 'error', data: { code: 'worker-start-failed' } }], promptVersion: SEARCH_PROMPT_VERSION };
+      this.store.finishOwnedSearch(work.searchId, work.owner, 'failed', result, this.clock());
+      return Promise.resolve(result);
+    }
+    this.jobs.set(work.searchId, completion);
+    void completion.catch(() => undefined).finally(() => { this.jobs.delete(work.searchId); });
+    return completion;
   }
 }
 

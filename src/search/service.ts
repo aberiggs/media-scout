@@ -18,7 +18,7 @@ export interface CandidateObservation {
   scope: ReturnType<typeof parseReleaseCoverage>;
 }
 export interface PublicCandidate { candidateId: string; observations: CandidateObservation[]; excluded?: boolean }
-export interface SearchServerContext { targetKeys?: string[] }
+export interface SearchServerContext { targetKeys?: string[]; targetBindings?: unknown[] }
 export interface SearchResult {
   searchId: string; status: SearchStatus; message?: string; options: RankedOption[];
   candidates: PublicCandidate[]; counts: { decisions: number; searches: number; candidates: number };
@@ -53,28 +53,40 @@ export class SearchService {
     return { searchId, completion: this.run(raw, overrides, signal, server, searchId) };
   }
 
-  async run(raw: SearchRequest, overrides: SearchLimits = {}, signal?: AbortSignal, server: SearchServerContext = {}, internalId?: string): Promise<SearchResult> {
+  async run(raw: SearchRequest, overrides: SearchLimits = {}, signal?: AbortSignal, server: SearchServerContext = {}, internalId?: string, claimedOwner?: string): Promise<SearchResult> {
     const request = searchRequestSchema.parse(raw);
     const id = internalId ?? randomUUID(), owner = randomUUID(), now = this.deps.clock ?? Date.now;
     const cap = (key: keyof SearchLimits, fallback: number) => Math.max(1, Math.min(overrides[key] ?? fallback, this.deps.limits?.[key] ?? fallback));
     const limits = { decisions: cap('decisions', 20), searches: cap('searches', 12), deadlineMs: cap('deadlineMs', 600_000) };
     const started = now();
-    this.deps.store.createSearch({ searchId: id, prompt: JSON.stringify(request), status: 'running', createdAt: started });
+    if (!claimedOwner) this.deps.store.createSearch({ searchId: id, prompt: JSON.stringify(request), status: 'running', createdAt: started });
     const events: SearchEvent[] = [], candidates = new Map<string, PublicCandidate>(), refs = new Map<string, string>();
     let decisions = 0, searches = 0, status: SearchStatus = 'failed', message: string | undefined, options: RankedOption[] = [];
     let selectionCorrections = 0;
-    const record = (type: string, data: unknown) => { const event = { type, data }; this.deps.store.appendEvent(id, event, now()); events.push(event); };
+    const record = (type: string, data: unknown) => {
+      if (claimedOwner && !this.deps.store.ownsSearch(id, claimedOwner, now())) return;
+      const event = { type, data }; this.deps.store.appendEvent(id, event, now()); events.push(event);
+    };
     const remaining = () => limits.deadlineMs - (now() - started);
     const wait = <T>(operation: Promise<T>) => bounded(operation, remaining(), signal);
     let owned = false;
+    const checkCooldown = (provider: 'prowlarr' | 'model') => {
+      if ((this.deps.store.getProviderDeadline(provider) ?? 0) > now()) throw new Error('source-throttled');
+    };
     try {
       if (signal?.aborted) throw new SearchInterrupted();
-      for (const source of ['prowlarr', 'model']) if ((this.deps.store.getProviderDeadline(source) ?? 0) > now()) throw new Error('source-throttled');
-      owned = this.deps.store.acquireLease('search-worker', owner, now(), 900_000);
+      checkCooldown('prowlarr'); checkCooldown('model');
+      owned = claimedOwner ? this.deps.store.ownsSearch(id, claimedOwner, now()) : this.deps.store.acquireLease(`search:${id}`, owner, now(), 900_000);
       if (!owned) throw new Error('search-busy');
-      this.deps.store.setSetting(`search-owner:${id}`, owner);
+      if (!claimedOwner) this.deps.store.setSetting(`search-owner:${id}`, owner);
       const initialization = async () => {
-        try { return { indexers: await wait(this.deps.prowlarr.getIndexers()), states: await wait(this.deps.prowlarr.getIndexerStatuses()) }; }
+        try {
+          checkCooldown('prowlarr');
+          const indexers = await wait(this.deps.prowlarr.getIndexers());
+          checkCooldown('prowlarr');
+          const states = await wait(this.deps.prowlarr.getIndexerStatuses());
+          return { indexers, states };
+        }
         catch (error) {
           if (error instanceof ApiError && error.retryAfter !== undefined) this.deps.store.setProviderDeadline('prowlarr', now() + error.retryAfter * 1000);
           throw error;
@@ -86,7 +98,7 @@ export class SearchService {
       if (!enabled.length) throw new Error('no-healthy-indexers');
       while (decisions < limits.decisions) {
         if (remaining() <= 0) throw new SearchDeadline();
-        if (!this.deps.store.ownsLease('search-worker', owner, now())) throw new SearchInterrupted();
+        if (!(claimedOwner ? this.deps.store.ownsSearch(id, claimedOwner, now()) : this.deps.store.ownsLease(`search:${id}`, owner, now()))) throw new SearchInterrupted();
         decisions++;
         let next: unknown;
         try {
@@ -95,6 +107,7 @@ export class SearchService {
           if (signal?.aborted) abortModel(); else signal?.addEventListener('abort', abortModel, { once: true });
           const timer = setTimeout(() => modelController.abort(new SearchDeadline()), Math.max(0, remaining()));
           try {
+            checkCooldown('model');
             next = await wait(this.deps.llm.json({ system: SYSTEM, user: JSON.stringify({ request, enabledIndexers: enabled, transcript: events, candidates: [...candidates.values()], remaining: { decisions: limits.decisions - decisions, searches: limits.searches - searches } }), schema: searchActionSchema, label: 'search-next-action', jsonSchema: { name: 'search_action', schema: actionSchema }, signal: modelController.signal, maxAttempts: 1, retryTransport: false }));
           } finally { clearTimeout(timer); signal?.removeEventListener('abort', abortModel); }
         } catch (error) {
@@ -103,7 +116,7 @@ export class SearchService {
         }
         const action = searchActionSchema.parse(next);
         if (remaining() <= 0) throw new SearchDeadline();
-        if (!this.deps.store.ownsLease('search-worker', owner, now())) throw new SearchInterrupted();
+        if (!(claimedOwner ? this.deps.store.ownsSearch(id, claimedOwner, now()) : this.deps.store.ownsLease(`search:${id}`, owner, now()))) throw new SearchInterrupted();
         if (action.action === 'list_indexers') { record('indexers', { items: enabled }); continue; }
         if (action.action === 'search_releases') {
           if (searches >= limits.searches) { status = 'budget-exhausted'; message = 'Search-call budget exhausted'; break; }
@@ -112,14 +125,14 @@ export class SearchService {
           searches++;
           record('query-start', { query: safeText(action.query!), indexerIds: ids });
           let releases: Release[];
-          try { releases = await wait(this.deps.prowlarr.search({ query: action.query!, categories: action.categories ?? [], indexerIds: ids })); }
+          try { checkCooldown('prowlarr'); releases = await wait(this.deps.prowlarr.search({ query: action.query!, categories: action.categories ?? [], indexerIds: ids })); }
           catch (error) {
             if (error instanceof ApiError && error.retryAfter !== undefined) this.deps.store.setProviderDeadline('prowlarr', now() + error.retryAfter * 1000);
             throw error;
           }
           // All rows reach the model. Repeated physical observations retain their separate evidence.
           if (remaining() <= 0) throw new SearchDeadline();
-          if (!this.deps.store.ownsLease('search-worker', owner, now())) throw new SearchInterrupted();
+          if (!(claimedOwner ? this.deps.store.ownsSearch(id, claimedOwner, now()) : this.deps.store.ownsLease(`search:${id}`, owner, now()))) throw new SearchInterrupted();
           for (const release of releases) {
             const key = physicalRelease(release);
             const candidateId = refs.get(key) ?? randomUUID();
@@ -161,13 +174,19 @@ export class SearchService {
       if (!events.some(e => e.type === 'finish') && status === 'failed') { status = 'budget-exhausted'; message = 'Model decision budget exhausted'; }
     } catch (error) {
       status = error instanceof SearchDeadline ? 'budget-exhausted' : error instanceof SearchInterrupted ? 'interrupted' : 'failed';
-      message = error instanceof ApiError ? `Upstream HTTP ${error.status}` : error instanceof SearchDeadline ? 'Search deadline exceeded' : error instanceof SearchInterrupted ? 'Search interrupted' : 'Search unavailable or invalid model output';
-      record('error', { code: status, ...(error instanceof ApiError ? { httpStatus: error.status, retryAfter: error.retryAfter } : {}) });
+      const knownReason = error instanceof Error && ['search-busy', 'source-throttled', 'no-healthy-indexers'].includes(error.message) ? error.message : undefined;
+      message = error instanceof ApiError ? `Upstream HTTP ${error.status}` : error instanceof SearchDeadline ? 'Search deadline exceeded' : error instanceof SearchInterrupted ? 'Search interrupted' :
+        knownReason === 'search-busy' ? 'Another search is already running. Please retry after it finishes.' :
+        knownReason === 'source-throttled' ? 'A provider is temporarily throttled. Retry after its cooldown.' :
+        knownReason === 'no-healthy-indexers' ? 'No enabled, available indexers can be searched right now.' :
+        'Search unavailable or invalid model output';
+      record('error', { code: knownReason ?? status, ...(error instanceof ApiError ? { httpStatus: error.status, retryAfter: error.retryAfter } : {}) });
       options = [];
-    } finally { if (owned) this.deps.store.releaseLease('search-worker', owner); }
+    } finally { if (owned && !claimedOwner) this.deps.store.releaseLease(`search:${id}`, owner); }
     const result: SearchResult = { searchId: id, status, ...(message ? { message } : {}), options, candidates: [...candidates.values()], counts: { decisions, searches, candidates: candidates.size }, events, promptVersion: SEARCH_PROMPT_VERSION };
     this.deps.store.expireCandidatesAt(id, now() + 1_800_000);
-    this.deps.store.finishSearch(id, status, result, now());
+    if (claimedOwner) this.deps.store.finishOwnedSearch(id, claimedOwner, status, result, now());
+    else this.deps.store.finishSearch(id, status, result, now());
     return result;
   }
 }

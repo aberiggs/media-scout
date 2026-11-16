@@ -40,6 +40,43 @@ it('starts with Search, submits a prompt without downloading, and displays ranke
   assert.equal(calls.some((call) => call.url === '/api/v2/submissions'), false)
 })
 
+it('labels failed searches as an operational error and shows the actionable cause', async () => {
+  window.history.replaceState(null, '', '/#search')
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/settings') return Response.json(env)
+    if (url === '/api/v2/searches' && init?.method === 'POST') return Response.json({ searchId: 'busy-search', status: 'running' }, { status: 202 })
+    if (url === '/api/v2/searches/busy-search') return Response.json({ searchId: 'busy-search', status: 'failed', prompt: 'Find Example', options: [], candidates: [], events: [{ type: 'error', data: { code: 'search-busy' } }], counts: { decisions: 0, searches: 0, candidates: 0 }, message: 'Another search is already running. Please retry after it finishes.' })
+    return Response.json({ items: [] })
+  }
+  render(<App />)
+  fireEvent.change(await screen.findByLabelText('What are you looking for?'), { target: { value: 'Find Example' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
+  assert.ok(await screen.findByRole('heading', { name: 'Search could not complete' }))
+  assert.ok(screen.getAllByText(/another search is already running/i).length > 0)
+})
+
+it('shows a queued search and lets another request be submitted', async () => {
+  window.history.replaceState(null, '', '/#search')
+  let posts = 0
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/settings') return Response.json(env)
+    if (url === '/api/v2/searches' && init?.method === 'POST') return Response.json({ searchId: `queued-${++posts}`, status: 'queued' }, { status: 202 })
+    if (url.startsWith('/api/v2/searches/')) return Response.json({ searchId: url.split('/').at(-1), status: 'queued', prompt: 'Find Example', options: [], candidates: [], events: [], counts: { decisions: 0, searches: 0, candidates: 0 }, queuePosition: 2 })
+    return Response.json({ items: [] })
+  }
+  render(<App />)
+  const input = await screen.findByLabelText('What are you looking for?')
+  fireEvent.change(input, { target: { value: 'Find Example' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
+  assert.ok(await screen.findByText(/queued · 1 ahead/i))
+  fireEvent.change(input, { target: { value: 'Find Another' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
+  await screen.findByText(/queued · 1 ahead/i)
+  assert.equal(posts, 2)
+})
+
 it('opens saved search details from Activity after navigating to Search', async () => {
   window.history.replaceState(null, '', '/#activity')
   globalThis.fetch = async input => {

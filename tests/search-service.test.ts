@@ -40,6 +40,58 @@ describe('bounded neutral search', () => {
     const { service } = setup(() => action({ status: 'matched' }));
     expect((await service.run({ prompt: 'Find' })).status).toBe('failed');
   });
+  it('explains when another worker already owns this search id', async () => {
+    const { service, store, searches } = setup(() => action({ status: 'no-match' }));
+    const now = Date.now();
+    store.acquireLease('search:already-running', 'existing-worker', now, 60_000);
+
+    const result = await service.run({ prompt: 'Find' }, {}, undefined, {}, 'already-running');
+
+    expect(result.status).toBe('failed');
+    expect(result.message).toMatch(/another search is already running/i);
+    expect(result.events.at(-1)?.data).toMatchObject({ code: 'search-busy' });
+    expect(searches).toHaveLength(0);
+  });
+  it('runs independent searches concurrently even while a legacy global worker lease is live', async () => {
+    const { service, store } = setup(() => action({ status: 'no-match' }));
+    store.acquireLease('search-worker', 'legacy-worker', Date.now(), 60_000);
+
+    const results = await Promise.all([
+      service.run({ prompt: 'Find Example A' }),
+      service.run({ prompt: 'Find Example B' }),
+    ]);
+
+    expect(results.map(result => result.status)).toEqual(['no-match', 'no-match']);
+    expect(new Set(results.map(result => result.searchId)).size).toBe(2);
+  });
+  it('checks a provider cooldown again before each later outbound operation', async () => {
+    const store = openSearchStore(':memory:'); stores.push(store);
+    let prowlarrCalls = 0;
+    const llm = { json: async () => {
+      store.setProviderDeadline('prowlarr', Date.now() + 60_000);
+      return action({ action: 'search_releases', query: 'Example', categories: [] });
+    } } as unknown as LLMClient;
+    const service = new SearchService({ llm, store, prowlarr: {
+      getIndexers: async () => [{ id: 1, name: 'Index', enable: true }], getIndexerStatuses: async () => [],
+      search: async () => { prowlarrCalls++; return []; },
+    } });
+
+    const result = await service.run({ prompt: 'Find Example' });
+
+    expect(result.message).toMatch(/temporarily throttled/i);
+    expect(prowlarrCalls).toBe(0);
+  });
+  it('does not make a second initialization call after a peer establishes a provider cooldown', async () => {
+    const store = openSearchStore(':memory:'); stores.push(store);
+    let statusCalls = 0;
+    const service = new SearchService({ llm: { json: async () => action({ status: 'no-match' }) } as unknown as LLMClient, store, prowlarr: {
+      getIndexers: async () => { store.setProviderDeadline('prowlarr', Date.now() + 60_000); return [{ id: 1, name: 'Index', enable: true }]; },
+      getIndexerStatuses: async () => { statusCalls++; return []; }, search: async () => [],
+    } });
+    const result = await service.run({ prompt: 'Find Example' });
+    expect(result.message).toMatch(/temporarily throttled/i);
+    expect(statusCalls).toBe(0);
+  });
   it('tells the model that invalid parsed scope evidence must never be selected', async () => {
     const { service } = setup(() => action({ status: 'no-match' }));
     let system = '';

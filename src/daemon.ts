@@ -83,7 +83,7 @@ export async function startDaemon(stack: Stack): Promise<void> {
   });
   app.refreshScheduler = scheduler.refresh;
   scheduler.refresh();
-  const shutdown = createShutdown({ stopTimer: scheduler.stop, awaitSettled: () => stack.runtime.drain(), close: async () => { await app.close(); await stack.runtime.close(); }, exit: code => process.exit(code) });
+  const shutdown = createShutdown({ stopTimer: scheduler.stop, quiesce: () => stack.runtime.quiesce(), awaitSettled: () => stack.runtime.drain(), close: async () => { await app.close(); await stack.runtime.close(); }, exit: code => process.exit(code) });
   process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);
 }
 
@@ -98,8 +98,8 @@ export function createMonitorScheduler(getSettings: () => Settings, run: () => P
   };
   return { refresh, stop: () => { stopped = true; if (timer) timers.clear(timer); timer = undefined; } };
 }
-export function createShutdown(deps: { stopTimer(): void; awaitSettled(): Promise<void>; close(): Promise<void>; exit(code: number): void }): (signal: string) => void {
+export function createShutdown(deps: { stopTimer(): void; quiesce?(): void; awaitSettled(): Promise<void>; close(): Promise<void>; exit(code: number): void }): (signal: string) => void {
   let draining = false;
-  return () => { if (draining) return; draining = true; deps.stopTimer(); void (async () => { await deps.awaitSettled(); await deps.close(); deps.exit(0); })(); };
+  return () => { if (draining) return; draining = true; deps.stopTimer(); deps.quiesce?.(); void (async () => { await deps.awaitSettled(); await deps.close(); deps.exit(0); })(); };
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) startDaemon(buildStack({ config: loadConfig() })).catch(() => { console.error('Media Scout startup failed; check configuration and use a fresh database path.'); process.exitCode = 1; });

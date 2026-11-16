@@ -41,6 +41,16 @@ describe('ArrAutomation', () => {
       expect(pass.reason).toBe('nothing-due'); expect(search.run).not.toHaveBeenCalled();
     } finally { store.close(); }
   });
+  it('defers automation when the shared search pool is full without recording a target failure', async () => {
+    const clock = Date.parse('2026-01-01'), target = makeTarget('pool-full', 1), store = openSearchStore(':memory:');
+    const observer: any = { observe: async () => ({ observedAt: clock, sonarr: { known: true }, radarr: { known: false }, targets: [target] }) };
+    try {
+      const pass = await new ArrAutomation({ store, observer, search: { run: async () => { throw new Error('automation-capacity-deferred'); } }, submission: { submit: vi.fn() }, getPolicy: () => ({ enabled: true, dryRun: false }), clock: () => clock }).runPass();
+      expect(pass).toMatchObject({ ran: false, reason: 'search-capacity' });
+      expect(store.getAutomationAttempt(target.key)).toBeNull();
+      expect(store.getDeadline(target.key)).toBe(0);
+    } finally { store.close(); }
+  });
   it('validates the chosen rank one before submission and never promotes rank two', async () => {
     const clock = Date.parse('2026-01-01'), target = makeTarget('stale', 1), store = openSearchStore(':memory:'), grabs: string[] = [];
     const observer: any = { observe: async () => ({ observedAt: clock, sonarr: { known: true }, radarr: { known: false }, targets: [target] }), validateTarget: async () => false, sourceFingerprint: () => 'fp' };

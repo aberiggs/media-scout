@@ -17,7 +17,7 @@ function newSubmissionKey() {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
 }
 
-export function SearchPage({ settings, searchId }: { settings: Settings; searchId?: string }) {
+export function SearchPage({ settings, searchId, searchRevision, active, onSearchStarted }: { settings: Settings; searchId?: string; searchRevision: number; active: boolean; onSearchStarted(id: string, startingRevision: number): void }) {
   const [prompt, setPrompt] = useState(''), [advanced, setAdvanced] = useState(false)
   const [context, setContext] = useState(''), [preferences, setPreferences] = useState('')
   const [result, setResult] = useState<SearchResult | null>(null), [busy, setBusy] = useState(false)
@@ -29,10 +29,16 @@ export function SearchPage({ settings, searchId }: { settings: Settings; searchI
   const opener = useRef<HTMLElement | null>(null), dialog = useRef<HTMLElement | null>(null)
   const submissionKeys = useRef(new Map<string, string>())
 
-  useEffect(() => { if (searchId) void loadResult(searchId) }, [searchId])
+  useEffect(() => {
+    if (!searchId) return
+    setResult(null)
+    setError('')
+    void loadResult(searchId)
+  }, [searchId, searchRevision])
   useEffect(() => () => { controller.current?.abort(); window.clearTimeout(timer.current) }, [])
   useEffect(() => {
     if (!confirm) return
+    if (!active) { setConfirm(false); return }
     opener.current = document.activeElement as HTMLElement
     dialog.current?.querySelector<HTMLElement>('button')?.focus()
     const key = (event: KeyboardEvent) => {
@@ -44,8 +50,11 @@ export function SearchPage({ settings, searchId }: { settings: Settings; searchI
       else if (!event.shiftKey && document.activeElement === items.at(-1)) { event.preventDefault(); items[0]?.focus() }
     }
     document.addEventListener('keydown', key)
-    return () => { document.removeEventListener('keydown', key); opener.current?.focus() }
-  }, [confirm])
+    return () => {
+      document.removeEventListener('keydown', key)
+      if (!opener.current?.closest('[hidden], [inert]')) opener.current?.focus()
+    }
+  }, [confirm, active])
 
   async function loadResult(id: string) {
     window.clearTimeout(timer.current)
@@ -63,6 +72,7 @@ export function SearchPage({ settings, searchId }: { settings: Settings; searchI
   async function search(event: FormEvent) {
     event.preventDefault()
     if (!prompt.trim() || busy) return
+    const startingRevision = searchRevision
     controller.current?.abort(); window.clearTimeout(timer.current)
     setError(''); setNotice(''); setResult(null); setBusy(true)
     try {
@@ -71,7 +81,7 @@ export function SearchPage({ settings, searchId }: { settings: Settings; searchI
       const response = await fetch('/api/v2/searches', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       const data = await response.json() as { searchId?: string; error?: string }
       if (!response.ok || !data.searchId) throw new Error(data.error ?? 'Search could not start. Check your search settings.')
-      await loadResult(data.searchId)
+      onSearchStarted(data.searchId, startingRevision)
     } catch (failure) { setError(failure instanceof SyntaxError ? 'Context must be valid JSON.' : failure instanceof Error ? failure.message : 'Search could not start.') }
     finally { setBusy(false) }
   }

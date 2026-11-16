@@ -145,6 +145,55 @@ describe('bounded neutral search', () => {
     expect((await service.run({ prompt: 'Find again' })).status).toBe('failed');
     expect(inputs).toHaveLength(before);
   });
+  it('uses the remaining overall budget to bound and abort the Prowlarr search request', async () => {
+    vi.useFakeTimers();
+    let receivedOptions: any;
+    let resolveSearch!: (value: any[]) => void;
+    const { service } = setup(() => action({ action: 'search_releases', query: 'Show' }), async () => new Promise(resolve => { resolveSearch = resolve; }), { deadlineMs: 40 });
+    const original = (service as any).deps.prowlarr.search;
+    (service as any).deps.prowlarr.search = (args: unknown, options: unknown) => {
+      receivedOptions = options;
+      return original(args);
+    };
+    const pending = service.run({ prompt: 'Find' });
+    await vi.advanceTimersByTimeAsync(41);
+    expect(receivedOptions.timeoutMs).toBeLessThanOrEqual(40);
+    expect(receivedOptions.signal.aborted).toBe(true);
+    expect((await pending).status).toBe('budget-exhausted');
+    resolveSearch([]);
+  });
+  it('reports a Prowlarr timeout without exposing upstream locators or credentials', async () => {
+    const { service } = setup(() => action({ action: 'search_releases', query: 'private query' }), async () => {
+      throw new ApiError(0, 'https://private.test/?apikey=secret', 'private query secret', undefined, true);
+    });
+    const result = await service.run({ prompt: 'Find' });
+    expect(result.message).toMatch(/Prowlarr search timed out.*check.*indexer/i);
+    expect(JSON.stringify(result)).not.toMatch(/private\.test|apikey=|secret/);
+  });
+  it('reports Prowlarr network failure safely without exposing upstream details', async () => {
+    const { service } = setup(() => action({ action: 'search_releases', query: 'private query' }), async () => {
+      throw new ApiError(0, 'https://private.test/?apikey=secret', 'socket refused private query secret');
+    });
+    const result = await service.run({ prompt: 'Find' });
+    expect(result.message).toMatch(/Prowlarr search.*network.*check.*Prowlarr/i);
+    expect(JSON.stringify(result)).not.toMatch(/private\.test|apikey=|secret|socket refused/);
+  });
+  it('keeps caller cancellation as interrupted and aborts the search signal', async () => {
+    const controller = new AbortController();
+    let requestSignal!: AbortSignal;
+    const { service } = setup(() => action({ action: 'search_releases', query: 'Show' }), async () => {
+      controller.abort();
+      return new Promise(() => {});
+    });
+    const original = (service as any).deps.prowlarr.search;
+    (service as any).deps.prowlarr.search = (args: unknown, options: any) => {
+      requestSignal = options.signal;
+      return original(args);
+    };
+    const result = await service.run({ prompt: 'Find' }, {}, controller.signal);
+    expect(result.status).toBe('interrupted');
+    expect(requestSignal.aborted).toBe(true);
+  });
   it('honors Retry-After during initialization without recontacting the provider', async () => {
     const { service, store, prowlarr, inputs } = setup(() => action({ status: 'no-match' }));
     let calls = 0;

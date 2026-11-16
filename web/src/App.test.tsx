@@ -10,10 +10,11 @@ Object.defineProperty(globalThis, 'IS_REACT_ACT_ENVIRONMENT', { configurable: tr
 const { cleanup, fireEvent, render, screen, within, waitFor } = await import('@testing-library/react')
 const { default: App } = await import('./App')
 const originalFetch = globalThis.fetch
+const originalCrypto = globalThis.crypto
 const env = { settings: defaults, status: { ready: false, missing: [], monitoringEnabled: false, cycleRunning: false } }
 const matched = { searchId: 's1', status: 'matched', createdAt: '2026-11-15T00:00:00Z', prompt: 'Find Example', options: [{ optionId: 'o1', rank: 1, releases: [{ candidateId: 'c1' }], coveredTargetIds: [], reason: 'Best evidence', uncertainty: 'Audio not verified' }], candidates: [{ candidateId: 'c1', observations: [{ title: 'Example 1080p', indexer: 'Index', seeders: 20 }] }], events: [], counts: { decisions: 2, searches: 1, candidates: 1 } }
 
-afterEach(() => { cleanup(); window.history.replaceState(null, '', '/'); globalThis.fetch = originalFetch })
+afterEach(() => { cleanup(); window.history.replaceState(null, '', '/'); globalThis.fetch = originalFetch; Object.defineProperty(globalThis, 'crypto', { configurable: true, value: originalCrypto }) })
 
 it('starts with Search, submits a prompt without downloading, and displays ranked evidence', async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = []
@@ -135,6 +136,7 @@ it('shows recorded per-release submission outcomes in saved search details witho
 
 it('sends numeric configured client IDs and reuses a submission key after transport failure', async () => {
   const bodies: Array<Record<string, unknown>> = []
+  Object.defineProperty(globalThis, 'crypto', { configurable: true, value: { getRandomValues: (bytes: Uint8Array) => { bytes.fill(42); return bytes } } })
   globalThis.fetch = async (input, init) => {
     const url = String(input)
     if (url === '/api/settings') return Response.json(env)

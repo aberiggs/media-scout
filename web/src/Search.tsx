@@ -8,6 +8,14 @@ type SearchResult = { searchId: string; status: string; prompt: string; options:
 type Client = { id: number; name: string; protocol: string; categories: boolean }
 type SubmissionEvent = { outcome: string; outcomes?: Array<{ candidateId: string; outcome: string }> }
 const running = (status?: string) => status === 'queued' || status === 'running'
+function newSubmissionKey() {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID()
+  const bytes = crypto.getRandomValues(new Uint8Array(16))
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80
+  const hex = [...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
 
 export function SearchPage({ settings, searchId }: { settings: Settings; searchId?: string }) {
   const [prompt, setPrompt] = useState(''), [advanced, setAdvanced] = useState(false)
@@ -78,7 +86,7 @@ export function SearchPage({ settings, searchId }: { settings: Settings; searchI
   async function submitOption() {
     if (!result || !selected || submitting) return
     const identity = `${result.searchId}:${selected.optionId}:${client}`
-    const key = submissionKeys.current.get(identity) ?? crypto.randomUUID()
+    const key = submissionKeys.current.get(identity) ?? newSubmissionKey()
     submissionKeys.current.set(identity, key)
     setSubmitting(true)
     try {

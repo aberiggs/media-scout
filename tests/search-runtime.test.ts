@@ -10,10 +10,10 @@ import { releaseSchema } from '../src/types/prowlarr';
 
 const stores: ReturnType<typeof openSearchStore>[] = [];
 afterEach(() => { for (const store of stores.splice(0)) store.close(); });
-function setup() {
+function setup(llmOverride?: LLMClient) {
   const store = openSearchStore(':memory:'); stores.push(store);
   const settings = { version: 3, integrations: { prowlarr: { url: 'http://localhost:9696', apiKey: 'private', tvClient: '', movieClient: '' }, sonarr: { url: '', apiKey: '' }, radarr: { url: '', apiKey: '' } }, ai: { apiKey: 'private-ai', model: 'test/model', baseUrl: 'https://example.test/v1', preferences: '' }, monitoring: { enabled: false, intervalMinutes: 5, searchRetryMinutes: 30, failureBackoffMinMinutes: 5, failureBackoffMaxMinutes: 60, queueGraceMinutes: 30 }, search: { maxDecisions: 20, maxSearches: 12, deadlineMinutes: 10 }, safety: { dryRun: true } } satisfies Settings;
-  const llm = { json: async () => ({ action: 'finish', query: null, categories: null, indexerIds: null, status: 'no-match', options: null, message: 'Nothing suitable' }) } as unknown as LLMClient;
+  const llm = llmOverride ?? { json: async () => ({ action: 'finish', query: null, categories: null, indexerIds: null, status: 'no-match', options: null, message: 'Nothing suitable' }) } as unknown as LLMClient;
   let indexerReads = 0;
   let now = 1_800_000_000_000;
   const runtime = new SearchRuntime({ store, now: () => now, clients: () => ({ prowlarr: { getIndexers: async () => { indexerReads++; return [{ id: 1, name: 'Test', enable: true }]; }, getIndexerStatuses: async () => [], search: async () => [], getDownloadClients: async () => [{ id: 7, name: 'TV', enable: true, protocol: 'torrent', supportsCategories: false, categories: [] }], grab: async () => {} } }), llm, initialSettings: settings });
@@ -25,6 +25,38 @@ function matched(f: ReturnType<typeof setup>, expires: number) {
 }
 
 describe('search runtime', () => {
+  it.each([2019, 4000])('passes all %s default preference characters through to the model', async length => {
+    let received: unknown;
+    const llm = { json: async ({ user }: { user: string }) => {
+      received = JSON.parse(user).request.preferences.notes;
+      return { action: 'finish', query: null, categories: null, indexerIds: null, status: 'no-match', options: null, message: null };
+    } } as unknown as LLMClient;
+    const f = setup(llm), notes = `${'p'.repeat(length - 1)}${length === 4000 ? 'Z' : 'Y'}`;
+    f.settings.ai.preferences = notes;
+    f.runtime.saveSettings(f.settings);
+    const started = f.runtime.startSearch({ prompt: 'Find' });
+    await f.runtime.drain();
+    expect(received).toBe(notes);
+    expect((await f.runtime.getSearch(started.searchId))?.status).toBe('no-match');
+  });
+  it('preserves an explicit per-request preference over the configured default', async () => {
+    let received: unknown;
+    const llm = { json: async ({ user }: { user: string }) => {
+      received = JSON.parse(user).request.preferences.notes;
+      return { action: 'finish', query: null, categories: null, indexerIds: null, status: 'no-match', options: null, message: null };
+    } } as unknown as LLMClient;
+    const f = setup(llm);
+    f.settings.ai.preferences = 'Configured default';
+    f.runtime.saveSettings(f.settings);
+    const started = f.runtime.startSearch({ prompt: 'Find', preferences: { notes: 'Per-request choice' } });
+    await f.runtime.drain();
+    expect(received).toBe('Per-request choice');
+    expect((await f.runtime.getSearch(started.searchId))?.status).toBe('no-match');
+  });
+  it('rejects per-request preference notes longer than 4000 characters', () => {
+    const f = setup();
+    expect(() => f.runtime.startSearch({ prompt: 'Find', preferences: { notes: 'x'.repeat(4001) } })).toThrow();
+  });
   it('durably queues requests in FIFO order and shares a three-search execution cap', () => {
     const f = setup();
     for (let i = 1; i <= 4; i++) f.store.enqueueSearch({ searchId: `queued-${i}`, prompt: JSON.stringify({prompt:`Find ${i}`}), now: f.now + i });

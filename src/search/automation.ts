@@ -15,6 +15,10 @@ const SUBMISSION_GRACE = 30 * MINUTE;
 const FAILURE_MIN = 5 * MINUTE;
 const FAILURE_MAX = 60 * MINUTE;
 const EXCLUSION = 24 * 60 * MINUTE;
+function safePreferenceText(value: string): string {
+  // Keep redaction from growing valid 4000-character preference text past the request schema.
+  return safeText(value.replace(/(?:https?:\/\/|magnet:\?)[^\s"<>]+/giu, '[link]'));
+}
 
 export interface AutomationSearch { run(raw: SearchRequest, limits?: SearchLimits, signal?: AbortSignal, server?: SearchServerContext): Promise<SearchResult> }
 export interface AutomationSubmit { submit(raw: SubmissionRequest, serverContext?: SubmissionServerContext): Promise<SubmissionResult> }
@@ -61,7 +65,7 @@ export class ArrAutomation {
     try {
       const title = safeText(String(target.context.title ?? 'this item'));
       const episodeTitle = safeText(String(target.context.episodeTitle ?? ''));
-      const search = await this.deps.search.run({ prompt: `Find ${title}${episodeTitle ? ` — ${episodeTitle}` : ''}${target.provider === 'sonarr' ? ` S${String(target.context.seasonNumber).padStart(2,'0')}E${String(target.context.episodeNumber).padStart(2,'0')}` : ''}`, ...(policy.preferences?.trim() ? { preferences: { notes: safeText(policy.preferences).slice(0,2000) } } : {}), context: {
+      const search = await this.deps.search.run({ prompt: `Find ${title}${episodeTitle ? ` — ${episodeTitle}` : ''}${target.provider === 'sonarr' ? ` S${String(target.context.seasonNumber).padStart(2,'0')}E${String(target.context.episodeNumber).padStart(2,'0')}` : ''}`, ...(policy.preferences?.trim() ? { preferences: { notes: safePreferenceText(policy.preferences) } } : {}), context: {
         kind: target.provider === 'sonarr' ? 'tv' : 'movie', titles: Array.isArray(target.context.titles) ? target.context.titles.map(s => safeText(String(s))) : [title],
         ...(typeof target.context.year === 'number' ? { year: target.context.year } : {}), externalIds: target.provider === 'sonarr' ? { tvdb: target.externalId } : { tmdb: target.externalId },
         scope: target.provider === 'sonarr' ? { type: 'episode', seasonNumber: target.context.seasonNumber as number, episodeNumber: target.context.episodeNumber as number, ...(typeof target.context.absoluteEpisodeNumber === 'number' ? { absoluteEpisodeNumber: target.context.absoluteEpisodeNumber } : {}) } : { type: 'movie' },

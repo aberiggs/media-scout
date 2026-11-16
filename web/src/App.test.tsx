@@ -148,7 +148,7 @@ it('sends numeric configured client IDs and reuses a submission key after transp
     return Response.json({ items: [] })
   }
   render(<App />)
-  fireEvent.change(screen.getByLabelText('What are you looking for?'), { target: { value: 'Find Example' } })
+  fireEvent.change(await screen.findByLabelText('What are you looking for?'), { target: { value: 'Find Example' } })
   fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
   fireEvent.click(await screen.findByRole('button', { name: 'Preview submission' }))
   await screen.findByRole('option', { name: /TV category/ })
@@ -179,7 +179,7 @@ it('keeps live confirmation focused on the configured route without extra caveat
     return Response.json({ items: [] })
   }
   render(<App />)
-  fireEvent.change(screen.getByLabelText('What are you looking for?'), { target: { value: 'Find Example' } })
+  fireEvent.change(await screen.findByLabelText('What are you looking for?'), { target: { value: 'Find Example' } })
   fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
   fireEvent.click(await screen.findByRole('button', { name: 'Choose and confirm download' }))
   const dialog = await screen.findByRole('dialog', { name: 'Confirm this option' })
@@ -267,6 +267,78 @@ it('shows server validation details as an error and preserves the rejected form 
   assert.equal(submitted?.monitoring.failureBackoffMaxMinutes, 30)
 })
 
+it('uses committed safety settings across navigation while preserving drafts and failed saves', async () => {
+  window.history.replaceState(null, '', '/#settings')
+  const committed = structuredClone(defaults)
+  committed.safety.dryRun = false
+  let putFails = true
+  globalThis.fetch = async (input, init) => {
+    if (String(input) === '/api/settings' && init?.method === 'PUT') {
+      if (putFails) return Response.json({ error: 'no' }, { status: 500 })
+      const value = JSON.parse(String(init.body))
+      return Response.json({ ...env, settings: value })
+    }
+    if (String(input) === '/api/settings') return Response.json({ ...env, settings: committed })
+    if (String(input).startsWith('/api/v2/activity')) return Response.json({ items: [{ searchId: 's1', prompt: 'Saved request', status: 'matched', source: 'manual', createdAt: matched.createdAt }], total: 1 })
+    if (String(input).startsWith('/api/v2/searches/')) return Response.json(matched)
+    return Response.json({ items: [] })
+  }
+  render(<App />)
+  fireEvent.click(await screen.findByRole('switch', { name: 'Dry-run mode' }))
+  fireEvent.click(screen.getByRole('link', { name: 'Activity' }))
+  assert.ok(await screen.findByText(/unsaved settings/i))
+  fireEvent.click(await screen.findByRole('button', { name: 'View search details' }))
+  assert.ok(await screen.findByRole('button', { name: 'Choose and confirm download' }))
+  assert.ok(screen.getAllByText('Downloads enabled').length > 0)
+  fireEvent.click(screen.getByRole('link', { name: 'Settings' }))
+  assert.equal((await screen.findByRole('switch', { name: 'Dry-run mode' })).getAttribute('aria-checked'), 'true')
+  fireEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+  await screen.findByRole('alert')
+  assert.ok(screen.getByText(/unsaved settings/i))
+  fireEvent.click(screen.getByRole('link', { name: 'Search' }))
+  assert.ok(await screen.findByRole('button', { name: 'Choose and confirm download' }))
+})
+
+it('blocks operational search when committed settings cannot be loaded and allows retry', async () => {
+  let attempts = 0
+  globalThis.fetch = async input => {
+    if (String(input) === '/api/settings') {
+      if (++attempts === 1) return Response.json({ error: 'offline' }, { status: 503 })
+      return Response.json(env)
+    }
+    return Response.json({ items: [] })
+  }
+  render(<App />)
+  assert.ok(await screen.findByText(/could not load settings/i))
+  assert.equal(screen.queryByRole('button', { name: 'Search releases' }), null)
+  fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+  assert.ok(await screen.findByRole('button', { name: 'Search releases' }))
+  assert.equal(attempts, 2)
+})
+
+it('uses committed dry-run after a draft turns it off, and save success commits the draft', async () => {
+  window.history.replaceState(null, '', '/#settings')
+  const committed = structuredClone(defaults)
+  committed.safety.dryRun = true
+  globalThis.fetch = async (input, init) => {
+    if (String(input) === '/api/settings' && init?.method === 'PUT') return Response.json({ ...env, settings: JSON.parse(String(init.body)) })
+    if (String(input) === '/api/settings') return Response.json({ ...env, settings: committed })
+    if (String(input).startsWith('/api/v2/activity')) return Response.json({ items: [{ searchId: 's1', prompt: 'Saved request', status: 'matched', source: 'manual', createdAt: matched.createdAt }], total: 1 })
+    if (String(input).startsWith('/api/v2/searches/')) return Response.json(matched)
+    return Response.json({ items: [] })
+  }
+  render(<App />)
+  fireEvent.click(await screen.findByRole('switch', { name: 'Dry-run mode' }))
+  fireEvent.click(screen.getByRole('link', { name: 'Activity' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'View search details' }))
+  assert.ok(await screen.findByRole('button', { name: 'Preview submission' }))
+  fireEvent.click(screen.getByRole('link', { name: 'Settings' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Save changes' }))
+  await screen.findByText('Settings saved.')
+  fireEvent.click(screen.getByRole('link', { name: 'Search' }))
+  assert.ok(await screen.findByRole('button', { name: 'Choose and confirm download' }))
+})
+
 it('keeps a cleared numeric field blank instead of silently turning it into zero', async () => {
   window.history.replaceState(null, '', '/#settings')
   const writes: string[] = []
@@ -320,7 +392,7 @@ it('explains that expired results require a new search', async () => {
     return Response.json({ items: [] })
   }
   render(<App />)
-  fireEvent.change(screen.getByLabelText('What are you looking for?'), { target: { value: 'Find Example' } })
+  fireEvent.change(await screen.findByLabelText('What are you looking for?'), { target: { value: 'Find Example' } })
   fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
   fireEvent.click(await screen.findByRole('button', { name: 'Preview submission' }))
   fireEvent.click(await screen.findByRole('button', { name: 'Confirm option' }))
@@ -337,7 +409,7 @@ it('manages confirmation focus for keyboard users and restores the option trigge
     return Response.json({ items: [] })
   }
   render(<App />)
-  fireEvent.change(screen.getByLabelText('What are you looking for?'), { target: { value: 'Find Example' } })
+  fireEvent.change(await screen.findByLabelText('What are you looking for?'), { target: { value: 'Find Example' } })
   fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
   const trigger = await screen.findByRole('button', { name: 'Preview submission' })
   trigger.focus()

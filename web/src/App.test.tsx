@@ -136,7 +136,8 @@ it('shows recorded per-release submission outcomes in saved search details witho
 
 it('sends numeric configured client IDs and reuses a submission key after transport failure', async () => {
   const bodies: Array<Record<string, unknown>> = []
-  Object.defineProperty(globalThis, 'crypto', { configurable: true, value: { getRandomValues: (bytes: Uint8Array) => { bytes.fill(42); return bytes } } })
+  let randomCalls = 0
+  Object.defineProperty(globalThis, 'crypto', { configurable: true, value: { getRandomValues: (bytes: Uint8Array) => { bytes.fill(++randomCalls); return bytes } } })
   globalThis.fetch = async (input, init) => {
     const url = String(input)
     if (url === '/api/settings') return Response.json(env)
@@ -158,6 +159,8 @@ it('sends numeric configured client IDs and reuses a submission key after transp
   await waitFor(() => assert.equal(bodies.length, 2))
   assert.equal(bodies[0]?.downloadClientId, 7)
   assert.equal(bodies[0]?.idempotencyKey, bodies[1]?.idempotencyKey)
+  assert.match(String(bodies[0]?.idempotencyKey), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+  assert.equal(randomCalls, 1, 'a retry reuses its idempotency key instead of generating a new one')
 })
 
 it('keeps search available in dry-run and distinguishes a saved refresh from a live poll', async () => {

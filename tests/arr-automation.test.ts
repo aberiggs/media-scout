@@ -5,6 +5,7 @@ import { openSearchStore } from '../src/search/store';
 import type { SonarrClient } from '../src/clients/sonarr';
 import type { ArrTarget, ArrSnapshot } from '../src/search/arr';
 import type { SearchRequest } from '../src/search/contracts';
+import { searchRequestSchema } from '../src/search/contracts';
 import type { SearchResult } from '../src/search/service';
 
 const makeTarget = (key: string, episodeNumber: number, eligible = true): ArrTarget => ({ key, provider: 'sonarr', sourceFingerprint: 'fp', serviceId: 1, externalId: 20, episodeId: episodeNumber, monitored: true, hasFile: false, available: true, airAt: episodeNumber, eligible, context: { title: 'Show', titles: ['Show', 'Alias'], seasonNumber: 2, episodeNumber, absoluteEpisodeNumber: 24 + episodeNumber, episodeTitle: 'Pilot' } });
@@ -145,6 +146,47 @@ describe('ArrAutomation', () => {
       expect(request?.context?.scope).toMatchObject({ seasonNumber: 2, episodeNumber: 4, absoluteEpisodeNumber: 28 });
       expect(request?.preferences?.notes).toBe('Prefer anime');
       expect(request?.prompt).toContain('Show');
+    } finally { store.close(); }
+  });
+
+  it('retains sanitized automation preference text through its 4000-character tail', async () => {
+    const clock = Date.parse('2026-02-01'), target = makeTarget('long-preferences', 4);
+    const snapshot: ArrSnapshot = { observedAt: clock, sonarr: { known: true, observedAt: clock, targets: [target], queue: [], diagnostics: { unidentifiedQueueRows: 0 } }, radarr: { known: false, observedAt: clock, targets: [], queue: [], diagnostics: { unidentifiedQueueRows: 0 } }, targets: [target] };
+    const store = openSearchStore(':memory:');
+    const privateLink = 'https://private.test/x', tail = 'TAIL-SENTINEL';
+    const notes = `${'p'.repeat(4000 - privateLink.length - tail.length - 1)}${privateLink} ${tail}`;
+    let request: SearchRequest | undefined;
+    try {
+      const automation = new ArrAutomation({
+        store, observer: { observe: async () => snapshot, validateTarget: async () => true },
+        search: { run: async raw => { request = raw; return result(); } }, submission: { submit: vi.fn() },
+        getPolicy: () => ({ enabled: true, dryRun: true, preferences: notes }), clock: () => clock,
+      });
+      await automation.runPass();
+      expect(request?.preferences?.notes?.length).toBeGreaterThan(2000);
+      expect(request?.preferences?.notes?.length).toBeLessThanOrEqual(4000);
+      expect(request?.preferences?.notes?.endsWith(tail)).toBe(true);
+      expect(request?.preferences?.notes).not.toContain('private.test');
+    } finally { store.close(); }
+  });
+
+  it('redacts short preference URLs without exceeding the 4000-character request contract', async () => {
+    const clock = Date.parse('2026-02-01'), target = makeTarget('short-url-preferences', 4);
+    const snapshot: ArrSnapshot = { observedAt: clock, sonarr: { known: true, observedAt: clock, targets: [target], queue: [], diagnostics: { unidentifiedQueueRows: 0 } }, radarr: { known: false, observedAt: clock, targets: [], queue: [], diagnostics: { unidentifiedQueueRows: 0 } }, targets: [target] };
+    const store = openSearchStore(':memory:');
+    const tail = 'TAIL-SENTINEL', notes = `${'x'.repeat(4000 - 2 - 'http://a'.length - tail.length)} http://a ${tail}`;
+    let request: SearchRequest | undefined;
+    try {
+      const automation = new ArrAutomation({
+        store, observer: { observe: async () => snapshot, validateTarget: async () => true },
+        search: { run: async raw => { request = raw; return result(); } }, submission: { submit: vi.fn() },
+        getPolicy: () => ({ enabled: true, dryRun: true, preferences: notes }), clock: () => clock,
+      });
+      await automation.runPass();
+      expect(request?.preferences?.notes?.length).toBeLessThanOrEqual(4000);
+      expect(request?.preferences?.notes?.endsWith(tail)).toBe(true);
+      expect(request?.preferences?.notes).not.toContain('http://');
+      expect(searchRequestSchema.safeParse(request).success).toBe(true);
     } finally { store.close(); }
   });
 

@@ -10,24 +10,24 @@ Prowlarr provides indexer search and routed submissions. Sonarr/Radarr supply li
 ## Quickstart
 
 ```sh
-git clone https://github.com/aberiggs/media-scout.git
-cd media-scout
-mkdir -p data
-export MEDIA_AGENT_IMAGE=ghcr.io/aberiggs/media-scout:latest
-docker compose -f docker-compose.ghcr.yml pull
-docker compose -f docker-compose.ghcr.yml up -d
+docker pull ghcr.io/aberiggs/media-scout:latest
+docker run -d \
+  --name media-scout \
+  --restart unless-stopped \
+  -p 127.0.0.1:7877:7877 \
+  -v media-scout-data:/app/data \
+  ghcr.io/aberiggs/media-scout:latest
 ```
 
-This pulls and runs the published image (it does not build from source). Open <http://127.0.0.1:7877/> to configure the app. Compose v2.24 or later is required.
+With Docker installed, these commands pull and run the published image—no clone or source build needed. Open <http://127.0.0.1:7877/> to configure the app. Docker creates the named volume `media-scout-data` to persist settings and history.
 
-For a fixed image, use a `sha-<full-commit-sha>` tag or an image digest. There are no semver release tags.
+For a fixed image, replace `ghcr.io/aberiggs/media-scout:latest` in both commands with `ghcr.io/aberiggs/media-scout:sha-<full-commit-sha>` or an image digest. There are no semver release tags.
 
 ## Setup and safety
 
 - Prowlarr with configured indexers and enabled download clients, and an LLM API endpoint, are needed for searching. Sonarr/Radarr are optional.
-- Settings, including integration credentials, are stored in SQLite under `./data`; protect that directory and its backups as secrets. Monitoring starts disabled and dry-run enabled. Dry-run prevents download submission, but searches can still incur indexer and LLM costs.
-- The web interface and API have no authentication. The supplied Compose files bind to loopback; expose them only on trusted networks.
-- On Linux, if the container cannot write its database, ensure `data/` exists and is writable by UID 1000 (`node` in the image). For example, `sudo chown 1000:1000 data` changes ownership of that directory only.
+- Settings, including integration credentials, are stored in SQLite in the data volume; protect that volume and its backups as secrets. Monitoring starts disabled and dry-run enabled. Dry-run prevents download submission, but searches can still incur indexer and LLM costs.
+- The web interface and API have no authentication. The quickstart binds to loopback; expose it only on trusted networks.
 
 Configure Prowlarr, LLM, and optional Arr connection details in the web UI. For Arr automation, configure download-client categories consistently between Prowlarr and Sonarr/Radarr, then enter the exact Prowlarr client names in Media Scout.
 

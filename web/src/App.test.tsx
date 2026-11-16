@@ -92,6 +92,82 @@ it('opens saved search details from Activity after navigating to Search', async 
   assert.ok(await screen.findByText('Best evidence'))
 })
 
+it('retains an unsent search draft and optional details while navigating away and back', async () => {
+  window.history.replaceState(null, '', '/#search')
+  globalThis.fetch = async input => String(input) === '/api/settings' ? Response.json(env) : Response.json({ items: [], total: 0 })
+  render(<App />)
+  const prompt = await screen.findByLabelText('What are you looking for?')
+  fireEvent.change(prompt, { target: { value: 'Find a film' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Add optional details' }))
+  fireEvent.change(screen.getByLabelText('Preferences'), { target: { value: 'Original audio' } })
+  fireEvent.change(screen.getByLabelText(/Structured context/), { target: { value: '{"kind":"movie"}' } })
+  fireEvent.click(document.querySelector('a[href="#activity"]')!); fireEvent(window, new dom.window.Event('hashchange'))
+  await screen.findByText('A record of searches, recommendations, and submission outcomes.')
+  assert.equal(document.querySelector('#search-workspace')?.hasAttribute('hidden'), true)
+  fireEvent.click(screen.getByRole('link', { name: 'Search' })); fireEvent(window, new dom.window.Event('hashchange'))
+  assert.equal(await screen.findByLabelText('What are you looking for?'), prompt)
+  assert.equal((prompt as HTMLTextAreaElement).value, 'Find a film')
+  assert.equal((screen.getByLabelText('Preferences') as HTMLTextAreaElement).value, 'Original audio')
+  assert.equal((screen.getByLabelText(/Structured context/) as HTMLTextAreaElement).value, '{"kind":"movie"}')
+})
+
+it('keeps the current result through navigation and lets Activity replace it with an older result', async () => {
+  window.history.replaceState(null, '', '/#search')
+  const calls: string[] = []
+  globalThis.fetch = async input => {
+    const url = String(input); calls.push(url)
+    if (url === '/api/settings') return Response.json(env)
+    if (url === '/api/v2/searches' ) return Response.json({ searchId: 'new-search' }, { status: 202 })
+    if (url.startsWith('/api/v2/searches/')) {
+      const id = url.split('/').at(-1)
+      return Response.json({ ...matched, searchId: id, prompt: id === 'new-search' ? 'New search' : 'Old search', options: [{ ...matched.options[0], reason: id === 'new-search' ? 'New evidence' : 'Old evidence' }] })
+    }
+    if (url.startsWith('/api/v2/activity')) return Response.json({ items: [{ searchId: 'old-search', prompt: 'Old search', status: 'matched', source: 'manual', createdAt: matched.createdAt }], total: 1 })
+    return Response.json({ items: [] })
+  }
+  render(<App />)
+  fireEvent.change(await screen.findByLabelText('What are you looking for?'), { target: { value: 'New search' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
+  assert.ok(await screen.findByRole('heading', { name: 'Ranked options' }))
+  assert.ok(screen.getByText('New evidence'))
+  fireEvent.click(document.querySelector('a[href="#activity"]')!); fireEvent(window, new dom.window.Event('hashchange'))
+  await screen.findByText('A record of searches, recommendations, and submission outcomes.')
+  fireEvent.click(screen.getByRole('link', { name: 'Search' })); fireEvent(window, new dom.window.Event('hashchange'))
+  assert.ok(await screen.findByText('New evidence'))
+  fireEvent.click(screen.getByRole('link', { name: 'Activity' })); fireEvent(window, new dom.window.Event('hashchange'))
+  fireEvent.click(await screen.findByRole('button', { name: 'View search details' }))
+  assert.ok(await screen.findByText('Old evidence'))
+  assert.equal(calls.filter(url => url === '/api/v2/searches').length, 1)
+  assert.equal(calls.filter(url => url === '/api/v2/searches/new-search').length, 1)
+})
+
+it('continues polling a running search while its workspace is hidden', async () => {
+  window.history.replaceState(null, '', '/#search')
+  let reads = 0
+  let posts = 0
+  globalThis.fetch = async input => {
+    const url = String(input)
+    if (url === '/api/settings') return Response.json(env)
+    if (url === '/api/v2/searches' ) { posts++; return Response.json({ searchId: 'live-search' }, { status: 202 }) }
+    if (url === '/api/v2/searches/live-search') {
+      reads++
+      return Response.json({ ...matched, searchId: 'live-search', status: reads === 1 ? 'running' : 'matched', options: reads === 1 ? [] : matched.options })
+    }
+    if (url.startsWith('/api/v2/activity')) return Response.json({ items: [], total: 0 })
+    return Response.json({ items: [] })
+  }
+  render(<App />)
+  fireEvent.change(await screen.findByLabelText('What are you looking for?'), { target: { value: 'Find Example' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
+  assert.ok(await screen.findByText(/Checking indexers and comparing releases/))
+  fireEvent.click(screen.getByRole('link', { name: 'Activity' })); fireEvent(window, new dom.window.Event('hashchange'))
+  await screen.findByText('A record of searches, recommendations, and submission outcomes.')
+  await waitFor(() => assert.ok(reads >= 2), { timeout: 2500 })
+  assert.equal(posts, 1)
+  fireEvent.click(screen.getByRole('link', { name: 'Search' })); fireEvent(window, new dom.window.Event('hashchange'))
+  assert.ok(await screen.findByText('Best evidence'))
+})
+
 it('filters Activity by media and inclusive local dates and offers every submission outcome', async () => {
   window.history.replaceState(null, '', '/#activity')
   const queries: URLSearchParams[] = []
@@ -427,4 +503,26 @@ it('manages confirmation focus for keyboard users and restores the option trigge
   fireEvent.keyDown(document, { key: 'Escape' })
   await waitFor(() => assert.equal(screen.queryByRole('dialog'), null))
   assert.ok(document.activeElement === trigger, 'focus returns to the option trigger')
+})
+
+it('closes confirmation on navigation without restoring focus into the hidden Search page', async () => {
+  globalThis.fetch = async input => {
+    const url = String(input)
+    if (url === '/api/settings') return Response.json(env)
+    if (url === '/api/v2/searches') return Response.json({ searchId: 's1' }, { status: 202 })
+    if (url === '/api/v2/searches/s1') return Response.json(matched)
+    if (url === '/api/v2/download-clients') return Response.json({ items: [] })
+    if (url.startsWith('/api/v2/activity')) return Response.json({ items: [], total: 0 })
+    return Response.json({ items: [] })
+  }
+  render(<App />)
+  fireEvent.change(await screen.findByLabelText('What are you looking for?'), { target: { value: 'Find Example' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
+  const trigger = await screen.findByRole('button', { name: 'Preview submission' })
+  fireEvent.click(trigger)
+  await screen.findByRole('dialog', { name: 'Confirm this option' })
+  window.history.replaceState(null, '', '/#activity')
+  fireEvent(window, new dom.window.Event('hashchange'))
+  await waitFor(() => assert.equal(screen.queryByRole('dialog'), null))
+  assert.equal(document.activeElement?.closest('#search-workspace'), null)
 })

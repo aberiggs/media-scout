@@ -52,13 +52,17 @@ export default function App() {
     await persist({ ...current, monitoring: { ...current.monitoring, enabled: !current.monitoring.enabled } }, true)
   }
   const openSearch = (id: string) => { setOpenedSearch(id); setPage('search'); location.hash = '#search' }
+  const searchStarted = (id: string) => setOpenedSearch(id)
   const labels: Record<Page, string> = { search: 'Search', activity: 'Activity', automation: 'Automation', settings: 'Settings' }
   return <div className="app-shell">
     <aside className="sidebar" aria-label="Main navigation"><a className="brand" href="#search"><span className="brand-mark"><Waves size={19}/></span><span className="brand-name">media<span>scout</span></span></a><div className="workspace-label">Workspace</div><nav className="primary-nav" aria-label="Workspace">{([['search', SearchIcon], ['activity', ActivityIcon], ['automation', Radio], ['settings', Settings2]] as const).map(([key, Icon]) => <a key={key} className={`nav-item ${page === key ? 'active' : ''}`} href={`#${key}`} aria-current={page === key ? 'page' : undefined}><Icon size={17}/>{labels[key]}</a>)}</nav><div className="sidebar-bottom"><div className="local-note"><Waves size={15}/>Running on your network</div><div className="version-note">Self-hosted · local control</div></div></aside>
     <div className="main-column"><header className="topbar"><div className="crumb"><span>Workspace</span><span className="crumb-divider">/</span><strong>{labels[page]}</strong></div><div className="topbar-right">{committed && <span className="connection-chip">{committed.safety.dryRun ? 'Dry-run on' : 'Downloads enabled'}</span>}{page === 'settings' && <button className="button button-primary" type="submit" form="settings-form" disabled={!dirty || loading || saving}>{saving ? 'Saving…' : dirty ? 'Save changes' : 'All changes saved'}</button>}</div></header>
       <main className="page-wrap" id={page}>
         <UnsavedNotice dirty={Boolean(committed) && dirty}/>
-        {page === 'search' && (committed ? <SearchPage settings={committed} searchId={openedSearch}/> : <SettingsUnavailable loading={loading} message={message} retry={() => void load()}/>)}
+        {committed && <div id="search-workspace" hidden={page !== 'search'} aria-hidden={page !== 'search'}>
+          <SearchPage settings={committed} searchId={openedSearch} active={page === 'search'} onSearchStarted={searchStarted}/>
+        </div>}
+        {page === 'search' && !committed && <SettingsUnavailable loading={loading} message={message} retry={() => void load()}/>}
         {page === 'activity' && <ActivityPage onOpenSearch={openSearch}/>}
         {page === 'automation' && (committed ? <AutomationPage settings={committed} onOpenSearch={openSearch} onToggle={toggleAutomation}/> : <SettingsUnavailable loading={loading} message={message} retry={() => void load()}/>)}
         {page === 'settings' && <>

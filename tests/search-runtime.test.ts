@@ -218,13 +218,15 @@ describe('search runtime', () => {
     settings.integrations.prowlarr={url:'http://prowlarr',apiKey:'private',tvClient:'TV',movieClient:'Movies'};
     settings.integrations.sonarr={url:'http://sonarr',apiKey:'sonarr-secret'};
     settings.ai.apiKey='model-secret';
+    settings.safety.dryRun=false;
     let hasFile=false, clock=1_800_000_000_000;
+    const grab=vi.fn(async()=>{throw new Error('must not grab imported media');});
     const release=releaseSchema.parse({guid:'manual-release',age:1,size:null,files:null,grabs:null,indexerId:1,indexer:'Test',subGroup:null,title:'Example S01E01',tvdbId:null,tmdbId:null,publishDate:'',downloadUrl:'https://private.test/release',indexerFlags:[],categories:[],magnetUrl:null,infoHash:'c'.repeat(40),seeders:3,leechers:0,protocol:'torrent',downloadClientId:null});
     const clients=()=>({
-      prowlarr:{getIndexers:async()=>[{id:1,name:'Test',enable:true}],getIndexerStatuses:async()=>[],search:async()=>[release],getDownloadClients:async()=>[],grab:async()=>{throw new Error('must not grab imported media');}},
+      prowlarr:{getIndexers:async()=>[{id:1,name:'Test',enable:true}],getIndexerStatuses:async()=>[],search:async()=>[release],getDownloadClients:async()=>[{id:7,name:'TV',enable:true,protocol:'torrent' as const,supportsCategories:false,categories:[]}],grab},
       sonarr:{getSeries:async()=>[{id:1,tvdbId:20,title:'Example',titleSlug:'example',seriesType:'standard' as const,monitored:true,seasons:[],alternateTitles:[]}],getEpisodes:async()=>[{id:2,seriesId:1,seasonNumber:1,episodeNumber:1,absoluteEpisodeNumber:null,title:'Pilot',airDate:'2020-01-01',airDateUtc:null,finaleType:null,monitored:true,hasFile}],getQueue:async()=>[]},
     } as RuntimeClients);
-    const llm={json:async({user}:{user:string})=>{const input=JSON.parse(user) as {candidates:Array<{candidateId:string}>};return input.candidates.length?{action:'finish',query:null,categories:null,indexerIds:null,status:'matched',options:[{optionId:'rank-one',rank:1,releases:[{candidateId:input.candidates[0]!.candidateId}],coveredTargetIds:[],reason:'match',uncertainty:''}],message:null}:{action:'search_releases',query:'Example S01E01',categories:[],indexerIds:[1],status:null,options:null,message:null};}} as unknown as LLMClient;
+    const llm={json:async({user}:{user:string})=>{const input=JSON.parse(user) as {candidates:Array<{candidateId:string}>;request:{context?:{targets?:Array<{targetId:string}>}}};return input.candidates.length?{action:'finish',query:null,categories:null,indexerIds:null,status:'matched',options:[{optionId:'rank-one',rank:1,releases:[{candidateId:input.candidates[0]!.candidateId}],coveredTargetIds:input.request.context?.targets?.map(target=>target.targetId)??[],reason:'match',uncertainty:''}],message:null}:{action:'search_releases',query:'Example S01E01',categories:[],indexerIds:[1],status:null,options:null,message:null};}} as unknown as LLMClient;
     const runtime=new SearchRuntime({store,now:()=>clock,initialSettings:settings,clients,llm});
     try {
       await runtime.poll();
@@ -233,8 +235,11 @@ describe('search runtime', () => {
       const started=await runtime.startArrSearch(targetId);
       expect(store.getSetting(`search-arr:${started.searchId}`)).toMatchObject({provider:'sonarr',episodeId:2});
       await runtime.drain();
-      hasFile=true; runtime.saveSettings(settings);
-      expect((await runtime.submit({searchId:started.searchId,optionId:'rank-one',idempotencyKey:'manual-arr-validation'})).outcome).toBe('rejected');
+      const searched=await runtime.getSearch(started.searchId); expect(searched).toMatchObject({status:'matched'});
+      hasFile=true;
+      const submission=await runtime.submit({searchId:started.searchId,optionId:'rank-one',idempotencyKey:'manual-arr-validation'});
+      expect(submission).toMatchObject({outcome:'failed',outcomes:[{outcome:'failed'}]});
+      expect(grab).not.toHaveBeenCalled();
     } finally { await runtime.close(); }
   });
   it('does not grab when automation is paused during fresh pre-submit validation', async () => {

@@ -118,7 +118,7 @@ it('filters Activity by media and inclusive local dates and offers every submiss
   for (const name of ['queued', 'rejected', 'deferred', 'expired']) assert.ok(statuses.queryByRole('option', { name }), `${name} is filterable`)
 })
 
-it('shows recorded per-release submission outcomes in saved search details without claiming import', async () => {
+it('shows per-release submission history in saved search details', async () => {
   window.history.replaceState(null, '', '/#activity')
   globalThis.fetch = async input => {
     const url = String(input)
@@ -131,7 +131,7 @@ it('shows recorded per-release submission outcomes in saved search details witho
   assert.ok(await screen.findByRole('heading', { name: 'Submission history' }))
   assert.ok(screen.getByText('Example 1080p: submitted'))
   assert.ok(screen.getByText('Release 2: uncertain'))
-  assert.ok(screen.getByText('Submission is not proof of downloading or import.'))
+  assert.equal(screen.queryByText('Submission is not proof of downloading or import.'), null)
 })
 
 it('sends numeric configured client IDs and reuses a submission key after transport failure', async () => {
@@ -152,6 +152,8 @@ it('sends numeric configured client IDs and reuses a submission key after transp
   fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
   fireEvent.click(await screen.findByRole('button', { name: 'Preview submission' }))
   await screen.findByRole('option', { name: /TV category/ })
+  assert.ok(screen.getByText('Dry-run is on. No download will be submitted.'))
+  assert.equal(screen.queryByText(/Scout does not cancel existing jobs/), null)
   fireEvent.change(screen.getByLabelText('Download client (optional)'), { target: { value: '7' } })
   fireEvent.click(screen.getByRole('button', { name: 'Confirm option' }))
   await screen.findByText('Temporary failure')
@@ -161,6 +163,28 @@ it('sends numeric configured client IDs and reuses a submission key after transp
   assert.equal(bodies[0]?.idempotencyKey, bodies[1]?.idempotencyKey)
   assert.match(String(bodies[0]?.idempotencyKey), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
   assert.equal(randomCalls, 1, 'a retry reuses its idempotency key instead of generating a new one')
+  assert.ok(await screen.findByText('Submission outcome: dry-run'))
+  assert.equal(screen.queryByText(/Submitted does not mean imported/), null)
+})
+
+it('keeps live confirmation focused on the configured route without extra caveats', async () => {
+  const settings = structuredClone(defaults)
+  settings.safety.dryRun = false
+  globalThis.fetch = async input => {
+    const url = String(input)
+    if (url === '/api/settings') return Response.json({ ...env, settings })
+    if (url === '/api/v2/searches') return Response.json({ searchId: 's1' }, { status: 202 })
+    if (url === '/api/v2/searches/s1') return Response.json(matched)
+    if (url === '/api/v2/download-clients') return Response.json({ items: [] })
+    return Response.json({ items: [] })
+  }
+  render(<App />)
+  fireEvent.change(screen.getByLabelText('What are you looking for?'), { target: { value: 'Find Example' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Choose and confirm download' }))
+  const dialog = await screen.findByRole('dialog', { name: 'Confirm this option' })
+  assert.ok(within(dialog).getByText('Choose the configured client and category route.'))
+  assert.equal(within(dialog).queryByText(/Confirming may start a download/), null)
 })
 
 it('keeps search available in dry-run and distinguishes a saved refresh from a live poll', async () => {

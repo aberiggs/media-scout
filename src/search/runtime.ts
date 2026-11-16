@@ -89,7 +89,7 @@ export class SearchRuntime {
   startSearch(request: SearchRequest, serverContext: SearchServerContext = {}): { searchId: string; status: 'queued' } {
     if (this.closed || this.closing) throw new Error('runtime-closed');
     const settings = this.getSettings();
-    const effective = settings.ai.preferences && !request.preferences ? { ...request, preferences: { notes: settings.ai.preferences.slice(0, 2000) } } : request;
+    const effective = settings.ai.preferences && !request.preferences ? { ...request, preferences: { notes: settings.ai.preferences } } : request;
     searchRequestSchema.parse(effective);
     const searchId = randomUUID();
     this.store.enqueueSearch({ searchId, prompt: JSON.stringify(effective), now: this.clock(), context: serverContext });

@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 const nonempty = z.string().trim().min(1);
-const languagePreferences = z.object({ audioLanguages: z.array(nonempty).optional(), subtitleLanguages: z.array(nonempty).optional(), resolutions: z.array(nonempty).optional(), notes: z.string().max(2000).optional() }).strict();
+const languagePreferences = z.object({ audioLanguages: z.array(nonempty).optional(), subtitleLanguages: z.array(nonempty).optional(), resolutions: z.array(nonempty).optional(), notes: z.string().max(4000).optional() }).strict();
 const requestContext = z.object({
   kind: z.enum(['tv', 'movie', 'other']).optional(),
   titles: z.array(nonempty).optional(), year: z.number().int().min(1888).max(2200).optional(),

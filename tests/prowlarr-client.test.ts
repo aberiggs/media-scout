@@ -17,6 +17,24 @@ const makeClient = (): ProwlarrClient =>
 afterEach(() => nock.cleanAll());
 
 describe('ProwlarrClient.search', () => {
+  it('accepts per-call timeout and abort options for the HTTP request', async () => {
+    const controller = new AbortController();
+    let requestOptions: unknown;
+    const http = {
+      getJson: async (_path: string, _query: unknown, options?: unknown) => {
+        requestOptions = options;
+        return [];
+      },
+    } as unknown as Http;
+
+    await new ProwlarrClient(http).search(
+      { query: 'x', categories: [] },
+      { timeoutMs: 120_000, signal: controller.signal },
+    );
+
+    expect(requestOptions).toEqual({ timeoutMs: 120_000, signal: controller.signal });
+  });
+
   it('GETs /api/v1/search with repeated-key array params and parses releases', async () => {
     const scope = nock(BASE)
       .get('/api/v1/search')

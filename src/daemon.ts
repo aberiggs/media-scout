@@ -79,7 +79,7 @@ export async function startDaemon(stack: Stack): Promise<void> {
   const app = await buildApp(stack);
   await app.listen({ host: stack.config.HTTP_HOST, port: stack.config.HTTP_PORT });
   const scheduler = createMonitorScheduler(() => stack.runtime.getSettings(), async () => {
-    try { await stack.runtime.poll(); } catch { stack.logger.warn({ code: 'poll-unavailable' }, 'scheduled poll failed'); }
+    try { return await stack.runtime.poll(); } catch { stack.logger.warn({ code: 'poll-unavailable' }, 'scheduled poll failed'); return undefined; }
   });
   app.refreshScheduler = scheduler.refresh;
   scheduler.refresh();
@@ -87,14 +87,30 @@ export async function startDaemon(stack: Stack): Promise<void> {
   process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);
 }
 
-export function createMonitorScheduler(getSettings: () => Settings, run: () => Promise<void>, timers: { set: typeof setTimeout; clear: typeof clearTimeout } = { set: setTimeout, clear: clearTimeout }): { refresh(): void; stop(): void } {
-  let timer: ReturnType<typeof setTimeout> | undefined, stopped = false;
+export function createMonitorScheduler(getSettings: () => Settings, run: () => Promise<{ ran: boolean; nextAttemptAt?: number } | void>, timers: { set: typeof setTimeout; clear: typeof clearTimeout } = { set: setTimeout, clear: clearTimeout }): { refresh(): void; stop(): void } {
+  let timer: ReturnType<typeof setTimeout> | undefined, stopped = false, running = false;
+  const schedule = (delay: number) => {
+    if (stopped || running || !getSettings().monitoring.enabled) return;
+    timer = timers.set(() => {
+      timer = undefined;
+      if (!getSettings().monitoring.enabled) { refresh(); return; }
+      running = true;
+      void run().catch(() => undefined).then(result => {
+        running = false;
+        if (!stopped && getSettings().monitoring.enabled) {
+          const interval = getSettings().monitoring.intervalMinutes * 60_000;
+          const untilDue = result?.nextAttemptAt === undefined ? interval : result.nextAttemptAt - Date.now();
+          schedule(result?.ran ? 0 : Math.max(1, Math.min(interval, untilDue)));
+        }
+      });
+    }, delay);
+  };
   const refresh = () => {
     if (timer) timers.clear(timer);
     timer = undefined;
     const settings = getSettings();
-    if (stopped || !settings.monitoring.enabled) return;
-    timer = timers.set(() => { timer = undefined; if (!getSettings().monitoring.enabled) { refresh(); return; } void run().catch(() => undefined).finally(refresh); }, settings.monitoring.intervalMinutes * 60_000);
+    if (stopped || running || !settings.monitoring.enabled) return;
+    schedule(settings.monitoring.intervalMinutes * 60_000);
   };
   return { refresh, stop: () => { stopped = true; if (timer) timers.clear(timer); timer = undefined; } };
 }

@@ -9,12 +9,12 @@ import type { SearchServerContext } from './service';
 import { safeText } from './service';
 
 const MINUTE = 60_000;
-const POLL_INTERVAL = 5 * MINUTE;
 const ORDINARY_RETRY = 30 * MINUTE;
 const SUBMISSION_GRACE = 30 * MINUTE;
 const FAILURE_MIN = 5 * MINUTE;
 const FAILURE_MAX = 60 * MINUTE;
 const EXCLUSION = 24 * 60 * MINUTE;
+export const showCooldownSettingKey = (sourceFingerprint: string, serviceId: number): string => `automation:show-cooldown:${sourceFingerprint}:${serviceId}`;
 function safePreferenceText(value: string): string {
   // Keep redaction from growing valid 4000-character preference text past the request schema.
   return safeText(value.replace(/(?:https?:\/\/|magnet:\?)[^\s"<>]+/giu, '[link]'));
@@ -22,7 +22,7 @@ function safePreferenceText(value: string): string {
 
 export interface AutomationSearch { run(raw: SearchRequest, limits?: SearchLimits, signal?: AbortSignal, server?: SearchServerContext): Promise<SearchResult> }
 export interface AutomationSubmit { submit(raw: SubmissionRequest, serverContext?: SubmissionServerContext): Promise<SubmissionResult> }
-export interface AutomationPolicy { enabled: boolean; dryRun: boolean; preferences?: string; queueGraceMinutes?: number; searchRetryMinutes?: number; failureBackoffMinMinutes?: number; failureBackoffMaxMinutes?: number }
+export interface AutomationPolicy { enabled: boolean; dryRun: boolean; preferences?: string; queueGraceMinutes?: number; searchRetryMinutes?: number; intervalMinutes?: number; failureBackoffMinMinutes?: number; failureBackoffMaxMinutes?: number }
 export interface ArrAutomationDependencies {
   store: SearchStore; observer: Pick<ArrObserver, 'observe' | 'validateTarget'> & Partial<Pick<ArrObserver, 'sourceFingerprint'>>; search: AutomationSearch; submission: AutomationSubmit;
   getPolicy(): AutomationPolicy; clock?: () => number;
@@ -31,24 +31,24 @@ export interface AutomationPass { observedAt: number; ran: boolean; reason?: str
 
 /** One episode-first target per explicitly invoked pass. Never imports legacy work state. */
 export class ArrAutomation {
-  private lastPoll = 0;
   constructor(private readonly deps: ArrAutomationDependencies) {}
 
   async runPass(signal?: AbortSignal): Promise<AutomationPass> {
-    const now = (this.deps.clock ?? Date.now)(), policy = this.deps.getPolicy();
+    const clock = this.deps.clock ?? Date.now, policy = this.deps.getPolicy();
     const ordinaryRetry = (policy.searchRetryMinutes ?? 30) * MINUTE;
     const failureDelay = (failures: number) => Math.min((policy.failureBackoffMaxMinutes ?? 60) * MINUTE, (policy.failureBackoffMinMinutes ?? 5) * MINUTE * 2 ** (failures - 1));
-    if (!policy.enabled) return { observedAt: now, ran: false, reason: 'disabled' };
-    if (now - this.lastPoll < POLL_INTERVAL) return { observedAt: now, ran: false, reason: 'poll-interval' };
-    this.lastPoll = now;
+    if (!policy.enabled) return { observedAt: clock(), ran: false, reason: 'disabled' };
     const snapshot: ArrSnapshot = await this.deps.observer.observe();
+    const now = clock();
     this.reconcileReceipts(snapshot, now);
     const availableProviders = new Set<ArrTarget['provider']>();
     if (snapshot.sonarr.known) availableProviders.add('sonarr');
     if (snapshot.radarr.known) availableProviders.add('radarr');
     const due = snapshot.targets.filter(t => t.eligible && availableProviders.has(t.provider)).filter(t => {
       const state = this.deps.store.getAutomationAttempt(t.key);
+      const showDeadline = t.provider === 'sonarr' ? Number(this.deps.store.getSetting(this.showCooldownKey(t)) ?? 0) : 0;
       return (!state || state.deadline <= now && state.graceUntil <= now) &&
+        showDeadline <= now &&
         (this.deps.store.getGrace('target', t.key, now) ?? 0) <= now &&
         (this.deps.store.getDeadline(t.key) ?? 0) <= now &&
         ['prowlarr', 'model', t.provider].every(provider => (this.deps.store.getProviderDeadline(provider) ?? 0) <= now);
@@ -58,13 +58,24 @@ export class ArrAutomation {
       return aa-ba || (a.airAt ?? 0)-(b.airAt ?? 0) || a.key.localeCompare(b.key);
     });
     const target = due[0];
-    if (!target) return { observedAt: now, ran: false, reason: 'nothing-due' };
+    if (!target) {
+      const nextAttemptAt = snapshot.targets.filter(t => t.eligible && availableProviders.has(t.provider)).map(t => {
+        const attempt = this.deps.store.getAutomationAttempt(t.key);
+        const show = t.provider === 'sonarr' ? Number(this.deps.store.getSetting(this.showCooldownKey(t)) ?? 0) : 0;
+        return Math.max(attempt?.deadline ?? 0, attempt?.graceUntil ?? 0, this.deps.store.getGrace('target', t.key, now) ?? 0,
+          this.deps.store.getDeadline(t.key) ?? 0, show,
+          ...['prowlarr', 'model', t.provider].map(provider => this.deps.store.getProviderDeadline(provider) ?? 0));
+      }).filter(deadline => deadline > now).sort((a, b) => a - b)[0];
+      return { observedAt: now, ran: false, reason: 'nothing-due', ...(nextAttemptAt ? { nextAttemptAt } : {}) };
+    }
     const prior = this.deps.store.getAutomationAttempt(target.key);
     this.deps.store.setAutomationAttempt(target.key, { lastAttempt: now, failCount: prior?.failCount ?? 0, deadline: now, graceUntil: prior?.graceUntil ?? 0, physicalKey: prior?.physicalKey });
     if (signal?.aborted) return { observedAt: now, ran: false, reason: 'cancelled', targetKey: target.key };
+    let didAttempt = false;
     try {
       const title = safeText(String(target.context.title ?? 'this item'));
       const episodeTitle = safeText(String(target.context.episodeTitle ?? ''));
+      didAttempt = true;
       const search = await this.deps.search.run({ prompt: `Find ${title}${episodeTitle ? ` — ${episodeTitle}` : ''}${target.provider === 'sonarr' ? ` S${String(target.context.seasonNumber).padStart(2,'0')}E${String(target.context.episodeNumber).padStart(2,'0')}` : ''}`, ...(policy.preferences?.trim() ? { preferences: { notes: safePreferenceText(policy.preferences) } } : {}), context: {
         kind: target.provider === 'sonarr' ? 'tv' : 'movie', titles: Array.isArray(target.context.titles) ? target.context.titles.map(s => safeText(String(s))) : [title],
         ...(typeof target.context.year === 'number' ? { year: target.context.year } : {}), externalIds: target.provider === 'sonarr' ? { tvdb: target.externalId } : { tmdb: target.externalId },
@@ -76,6 +87,7 @@ export class ArrAutomation {
         ...(target.context.episodeTitle ? { episodeTitle: String(target.context.episodeTitle) } : {}),
         ...(target.context.profileContext && typeof target.context.profileContext === 'object' ? { profileContext: target.context.profileContext as { qualities?: string[]; customFormats?: string[]; unknown: boolean } } : {}),
       } }, {}, signal, { targetKeys: [target.key] });
+      this.markShowCooldown(target, (this.deps.clock ?? Date.now)(), policy.intervalMinutes ?? 5);
       if (signal?.aborted) return { observedAt: now, ran: true, reason: 'cancelled-after-search', targetKey: target.key, search };
       if (['failed','budget-exhausted','interrupted'].includes(search.status)) {
         const failures = (prior?.failCount ?? 0) + 1;
@@ -111,7 +123,8 @@ export class ArrAutomation {
         validate: async () => this.deps.observer.validateTarget(target),
       };
       const submission = await this.deps.submission.submit({ searchId: search.searchId, optionId: rankOne.optionId, idempotencyKey: randomUUID() }, serverContext);
-      if (['failed', 'deferred', 'conflict'].includes(submission.outcome)) {
+      this.markShowCooldown(target, (this.deps.clock ?? Date.now)(), policy.intervalMinutes ?? 5);
+      if (['failed', 'deferred', 'conflict', 'rejected', 'expired'].includes(submission.outcome)) {
         const failures = (prior?.failCount ?? 0) + 1;
         const completedAt = (this.deps.clock ?? Date.now)();
         const deadline = completedAt + failureDelay(failures);
@@ -123,12 +136,13 @@ export class ArrAutomation {
       this.deps.store.setAutomationAttempt(target.key, { lastAttempt: now, failCount: submission.outcome === 'submitted' ? 0 : prior?.failCount ?? 0, deadline: graceUntil, graceUntil, physicalKey: null });
       return { observedAt: now, ran: true, targetKey: target.key, search, submission, ...(graceUntil ? { nextAttemptAt: graceUntil } : {}) };
     } catch (error) {
-      if (signal?.aborted) return { observedAt: now, ran: false, reason: 'cancelled', targetKey: target.key };
       if (error instanceof Error && error.message === 'automation-capacity-deferred') {
         if (prior) this.deps.store.setAutomationAttempt(target.key, prior); else this.deps.store.deleteAutomationAttempt(target.key);
         this.deps.store.setDeadline(target.key, prior?.deadline ?? 0);
         return { observedAt: now, ran: false, reason: 'search-capacity', targetKey: target.key };
       }
+      if (didAttempt) this.markShowCooldown(target, (this.deps.clock ?? Date.now)(), policy.intervalMinutes ?? 5);
+      if (signal?.aborted) return { observedAt: now, ran: false, reason: 'cancelled', targetKey: target.key };
       const failures = (prior?.failCount ?? 0)+1;
       const completedAt = (this.deps.clock ?? Date.now)();
       const deadline = completedAt + failureDelay(failures);
@@ -136,6 +150,11 @@ export class ArrAutomation {
       this.deps.store.setDeadline(target.key, deadline);
       return { observedAt: now, ran: true, targetKey: target.key, reason: 'attempt-failed', nextAttemptAt: deadline };
     }
+  }
+
+  private showCooldownKey(target: ArrTarget): string { return showCooldownSettingKey(target.sourceFingerprint, target.serviceId); }
+  private markShowCooldown(target: ArrTarget, completedAt: number, minutes: number): void {
+    if (target.provider === 'sonarr') this.deps.store.setSetting(this.showCooldownKey(target), completedAt + Math.max(1, minutes) * MINUTE);
   }
 
   private reconcileReceipts(snapshot: ArrSnapshot, now: number): void {
@@ -168,4 +187,4 @@ export class ArrAutomation {
   }
 }
 
-export const ARR_AUTOMATION_DEFAULTS = { pollIntervalMs: POLL_INTERVAL, ordinaryRetryMs: ORDINARY_RETRY, submissionGraceMs: SUBMISSION_GRACE, failureMinMs: FAILURE_MIN, failureMaxMs: FAILURE_MAX, exclusionMs: EXCLUSION } as const;
+export const ARR_AUTOMATION_DEFAULTS = { ordinaryRetryMs: ORDINARY_RETRY, submissionGraceMs: SUBMISSION_GRACE, failureMinMs: FAILURE_MIN, failureMaxMs: FAILURE_MAX, exclusionMs: EXCLUSION } as const;

@@ -31,6 +31,10 @@ For a fixed image, replace `ghcr.io/aberiggs/media-scout:latest` in both command
 
 Configure Prowlarr, LLM, and optional Arr connection details in the web UI. For Arr automation, configure download-client categories consistently between Prowlarr and Sonarr/Radarr, then enter the exact Prowlarr client names in Media Scout.
 
+## Automation cadence
+
+The saved monitoring `intervalMinutes` setting is both the idle observation cadence and the per-show automation cooldown. After an actual Sonarr search attempt completes, all eligible episodes in that show wait that duration (default five minutes); identity is scoped to the Sonarr source fingerprint and series ID. A different show or Radarr movie can be searched immediately after the preceding automation pass completes. Existing target retry/backoff and provider cooldowns still apply.
+
 ## Develop from source
 
 See [source development and checks](src/README.md). The default `docker-compose.yml` builds the source image; use `docker-compose.ghcr.yml` explicitly for the published image.

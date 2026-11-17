@@ -104,6 +104,8 @@ describe('bounded neutral search', () => {
     expect(system).toMatch(/scope\.kind.*invalid/i);
     expect(system).toMatch(/never select that candidate/i);
     expect(system).toMatch(/selected candidates have usable scope evidence/i);
+    expect(system).toMatch(/season-pack queries/i);
+    expect(system).toMatch(/never claim inferred packs are verified complete/i);
   });
   it('permits one evidence-based correction of an invalid final selection', async () => {
     const { service } = setup(input => {

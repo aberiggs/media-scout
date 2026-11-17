@@ -13,7 +13,7 @@ import type { SonarrQueueRecord } from '../src/types/sonarr';
 
 const directories: string[] = [];
 afterEach(() => { for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true }); });
-function fixture(twoEpisodes = false) {
+function fixture(twoEpisodes = false, packMode = false) {
   let now = Date.parse('2026-02-01'), clientReads = 0, sourceEnabled = true;
   const directory = mkdtempSync(join(tmpdir(), 'scout-lifecycle-')); directories.push(directory);
   const path = join(directory, 'new.sqlite');
@@ -24,7 +24,7 @@ function fixture(twoEpisodes = false) {
   const grabs: string[] = [];
   const prowlarr = {
     getIndexers: async () => [{ id: 1, name: 'Index', enable: true }], getIndexerStatuses: async () => [],
-    search: async () => episodes.flatMap(e => ['popular', 'alternative'].map((variant, i) => releaseSchema.parse({ guid: `${e.id}-${variant}`, indexerId: 1, indexer: 'Index', title: `Example S02E0${e.id} ${variant}`, publishDate: '', protocol: 'torrent', seeders: i ? 50 : 100, downloadUrl: 'http://private/download' }))),
+    search: async () => packMode ? [releaseSchema.parse({ guid: 'season-pack', indexerId: 1, indexer: 'Index', title: 'Example S02 1080p', publishDate: '', protocol: 'torrent', seeders: 100, downloadUrl: 'http://private/season-pack' })] : episodes.flatMap(e => ['popular', 'alternative'].map((variant, i) => releaseSchema.parse({ guid: `${e.id}-${variant}`, indexerId: 1, indexer: 'Index', title: `Example S02E0${e.id} ${variant}`, publishDate: '', protocol: 'torrent', seeders: i ? 50 : 100, downloadUrl: 'http://private/download' }))),
     getDownloadClients: async () => { clientReads++; if (f.changeSourceDuringClientCheck && clientReads === 2) source.url = 'http://replacement'; if (f.removeSourceDuringClientCheck && clientReads === 2) sourceEnabled = false; return [{ id: 7, name: 'TV', enable: true, protocol: 'torrent' as const, supportsCategories: false, categories: [] }]; },
     grab: async (release: { guid: string }) => { grabs.push(release.guid); },
   };
@@ -33,7 +33,7 @@ function fixture(twoEpisodes = false) {
     const base = { action: 'finish', query: null, categories: null, indexerIds: null, status: null, options: null, message: null };
     if (!input.candidates.length) return { ...base, action: 'search_releases', query: 'Example' };
     const episode = input.request.context.scope.episodeNumber;
-    const candidate = input.candidates.find((c: any) => !c.excluded && c.observations.some((o: any) => o.title.includes(`S02E0${episode}`)));
+    const candidate = input.candidates.find((c: any) => !c.excluded && c.observations.some((o: any) => o.title.includes(packMode ? 'S02 1080p' : `S02E0${episode}`)));
     return candidate ? { ...base, status: 'matched', options: [{ optionId: 'best', rank: 1, releases: [{ candidateId: candidate.candidateId }], coveredTargetIds: input.request.context.targets.map((t: any) => t.targetId), reason: 'Relevant supported release', uncertainty: '' }] } : { ...base, status: 'no-match' };
   } } as LLMClient;
   function build() {
@@ -72,6 +72,21 @@ describe('persisted search-first lifecycle', () => {
       await f.runtime.automation.runPass();
       expect(f.grabs).toEqual(['1-popular', '1-alternative']);
       expect(JSON.stringify(f.store.listSearches())).not.toContain('http://private');
+    } finally { f.close(); }
+  });
+  it('selects an evidenced season pack once, then queue season coverage suppresses siblings', async () => {
+    const f = fixture(true, true);
+    try {
+      const first = await f.runtime.automation.runPass();
+      expect(first.submission?.outcome).toBe('submitted');
+      expect(f.grabs).toEqual(['season-pack']);
+      f.now += 300_000;
+      const sibling = await f.runtime.automation.runPass();
+      expect(sibling.submission?.outcome).toBe('deferred');
+      expect(f.grabs).toEqual(['season-pack']);
+      f.setQueue([{ seriesId: 1, seasonNumber: 2, status: 'downloading' }]);
+      const observed = await f.runtime.observer.observe();
+      expect(observed.targets.map(target => target.eligible)).toEqual([false, false]);
     } finally { f.close(); }
   });
   it.each(['changed', 'removed'])('checks the CURRENT %s source after async client validation, not a captured constant', async mode => {

@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { ArrAutomation } from '../src/search/automation';
 import { ArrObserver } from '../src/search/arr';
 import { openSearchStore } from '../src/search/store';
+import { SubmissionService } from '../src/search/submission';
+import type { SubmissionResult } from '../src/search/submission';
 import type { SonarrClient } from '../src/clients/sonarr';
 import type { ArrTarget, ArrSnapshot } from '../src/search/arr';
 import type { SearchRequest } from '../src/search/contracts';
@@ -12,6 +17,65 @@ const makeTarget = (key: string, episodeNumber: number, eligible = true): ArrTar
 const result = (status: SearchResult['status'] = 'matched'): SearchResult => ({ searchId: 's', status, options: status === 'matched' ? [{ optionId: 'rank1', rank: 1, releases: [{ candidateId: 'c' }], coveredTargetIds: [], reason: 'match', uncertainty: '' }] : [], candidates: [], counts: { decisions: 1, searches: 1, candidates: 1 }, events: [], promptVersion: 'v1' });
 
 describe('ArrAutomation', () => {
+  it('admits a sibling when its show cooldown expires during observation', async () => {
+    let clock = Date.parse('2026-01-01'), observationDelay = 0;
+    const store = openSearchStore(':memory:'), targets = [makeTarget('a1', 1), makeTarget('a2', 2)];
+    const observer: any = { observe: async () => { clock += observationDelay; return { observedAt: clock, sonarr: { known: true }, radarr: { known: false }, targets }; } };
+    const automation = new ArrAutomation({ store, observer, search: { run: async () => result('no-match') }, submission: { submit: vi.fn() }, getPolicy: () => ({ enabled: true, dryRun: true }), clock: () => clock });
+    try {
+      expect((await automation.runPass()).targetKey).toBe('a1');
+      clock += 300_000 - 1;
+      observationDelay = 2;
+      expect((await automation.runPass()).targetKey).toBe('a2');
+    } finally { store.close(); }
+  });
+  it('scopes completion-based two-minute cooldown by source and series while continuing other shows and movies', async () => {
+    let clock = Date.parse('2026-01-01'); const started = clock;
+    const a1 = makeTarget('a1', 1), a2 = { ...makeTarget('a2', 2), context: { ...makeTarget('a2', 2).context, seasonNumber: 3 } };
+    const b = { ...makeTarget('b', 1), serviceId: 2 };
+    const c = { ...makeTarget('c', 1), sourceFingerprint: 'different-source' };
+    const movie = { ...makeTarget('movie', 1), provider: 'radarr' as const, sourceFingerprint: 'radarr', serviceId: 8, movieId: 8, episodeId: undefined, context: { title: 'Film', titles: ['Film'], year: 2020 } };
+    const targets = [a1, a2, b, c, movie], store = openSearchStore(':memory:'), search = { run: vi.fn(async () => { clock += 17_000; return result('no-match'); }) };
+    const observer: any = { observe: async () => ({ observedAt: clock, sonarr: { known: true }, radarr: { known: true }, targets }) };
+    const run = () => new ArrAutomation({ store, observer, search, submission: { submit: vi.fn() }, getPolicy: () => ({ enabled: true, dryRun: true, intervalMinutes: 2 }), clock: () => clock }).runPass();
+    try {
+      expect((await run()).targetKey).toBe('a1');
+      expect((await run()).targetKey).toBe('b'); // same source, distinct series ID
+      expect((await run()).targetKey).toBe('c'); // same numeric series ID, different source
+      expect((await run()).targetKey).toBe('movie');
+      clock = started + 2 * 60_000 + 16_999;
+      expect(await run()).toMatchObject({ reason: 'nothing-due', nextAttemptAt: started + 2 * 60_000 + 17_000 });
+      clock++;
+      expect((await run()).targetKey).toBe('a2'); // another season in series A
+      expect(search.run).toHaveBeenCalledTimes(5);
+    } finally { store.close(); }
+  });
+  it('persists a show cooldown across an on-disk store close and reopen', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'show-cooldown-')), path = join(directory, 'state.sqlite');
+    let clock = Date.parse('2026-01-01'); const target = makeTarget('disk-a', 1), sibling = makeTarget('disk-b', 2);
+    const targets = [target, sibling], observer: any = { observe: async () => ({ observedAt: clock, sonarr: { known: true }, radarr: { known: false }, targets }) };
+    const search = { run: vi.fn(async () => result('no-match')) };
+    let store = openSearchStore(path);
+    const automate = () => new ArrAutomation({ store, observer, search, submission: { submit: vi.fn() }, getPolicy: () => ({ enabled: true, dryRun: true, intervalMinutes: 2 }), clock: () => clock });
+    try {
+      expect((await automate().runPass()).targetKey).toBe('disk-a');
+      store.close(); clock += 60_000; store = openSearchStore(path);
+      expect((await automate().runPass()).reason).toBe('nothing-due');
+      clock += 60_000;
+      expect((await automate().runPass()).targetKey).toBe('disk-b');
+      expect(search.run).toHaveBeenCalledTimes(2);
+    } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
+  it('starts the show cooldown after submission returns, not at search completion', async () => {
+    let clock = Date.parse('2026-01-01'); const target = makeTarget('submitted-show', 1), store = openSearchStore(':memory:');
+    const observer: any = { observe: async () => ({ observedAt: clock, sonarr: { known: true }, radarr: { known: false }, targets: [target] }) };
+    const submission = { submit: vi.fn(async () => { clock += 90_000; return { outcome: 'submitted', searchId: 's', optionId: 'rank1', candidateIds: [], outcomes: [] } as SubmissionResult; }) };
+    try {
+      const pass = await new ArrAutomation({ store, observer, search: { run: async () => result() }, submission, getPolicy: () => ({ enabled: true, dryRun: false, intervalMinutes: 2, queueGraceMinutes: 30 }), clock: () => clock }).runPass();
+      expect(pass.submission?.outcome).toBe('submitted');
+      expect(store.getSetting('automation:show-cooldown:fp:1')).toBe(clock + 2 * 60_000);
+    } finally { store.close(); }
+  });
   it('uses the configured search-only retry for no-match', async () => {
     const clock = Date.parse('2026-01-01'), target = makeTarget('no-match', 1), store = openSearchStore(':memory:');
     const observer: any = { observe: async () => ({ observedAt: clock, sonarr: { known: true }, radarr: { known: false }, targets: [target] }) };
@@ -42,6 +106,41 @@ describe('ArrAutomation', () => {
       expect(pass.reason).toBe('nothing-due'); expect(search.run).not.toHaveBeenCalled();
     } finally { store.close(); }
   });
+  it.each(['rejected', 'expired'] as const)('backs off a completed movie attempt with %s submission', async outcome => {
+    const clock = Date.parse('2026-01-01'), base = makeTarget(`movie-${outcome}`, 1);
+    const target = { ...base, provider: 'radarr' as const, serviceId: 9, sourceFingerprint: 'radarr-source', movieId: 9, episodeId: undefined, context: { title: 'Film', titles: ['Film'], year: 2020 } };
+    const store = openSearchStore(':memory:'), search = { run: vi.fn(async () => result()) };
+    const observer: any = { observe: async () => ({ observedAt: clock, sonarr: { known: false }, radarr: { known: true }, targets: [target] }) };
+    const submission = { submit: vi.fn(async () => ({ outcome, searchId: 's', optionId: 'rank1', candidateIds: [], outcomes: [] } as SubmissionResult)) };
+    try {
+      const automation = new ArrAutomation({ store, observer, search, submission, getPolicy: () => ({ enabled: true, dryRun: false }), clock: () => clock });
+      const first = await automation.runPass();
+      expect(first.nextAttemptAt).toBe(clock + 5 * 60_000);
+      expect(store.getAutomationAttempt(target.key)?.failCount).toBe(1);
+      expect((await automation.runPass()).reason).toBe('nothing-due');
+      expect(search.run).toHaveBeenCalledTimes(1);
+    } finally { store.close(); }
+  });
+  it('bounds an actual movie client-name rejection before the scheduler can immediately retry it', async () => {
+    const clock = Date.parse('2026-01-01'), base = makeTarget('actual-movie-rejected', 1);
+    const target = { ...base, provider: 'radarr' as const, serviceId: 9, sourceFingerprint: 'radarr-source', movieId: 9, episodeId: undefined, context: { title: 'Film', titles: ['Film'], year: 2020 } };
+    const store = openSearchStore(':memory:'), passResult = { ...result(), searchId: 'movie-search' };
+    const submission = new SubmissionService({ store, prowlarr: { getDownloadClients: async () => [{ id: 1, name: 'TV', enable: true, protocol: 'torrent' as const, supportsCategories: false, categories: [] }], grab: vi.fn() }, getPolicy: () => ({ dryRun: false, enabled: true, tvClient: 'TV', movieClient: 'Missing', queueGraceMinutes: 30 }), clock: () => clock });
+    const search = { run: vi.fn(async () => {
+      store.createSearch({ searchId: 'movie-search', prompt: JSON.stringify({ context: { kind: 'movie' } }), status: 'matched', createdAt: clock, finishedAt: clock, result: passResult });
+      store.addCandidate({ searchId: 'movie-search', candidateId: 'c', safe: {}, privateData: { release: { protocol: 'torrent' }, physicalKey: 'movie-release' }, expiresAt: clock + 60_000 });
+      return passResult;
+    }) };
+    const observer: any = { observe: async () => ({ observedAt: clock, sonarr: { known: false }, radarr: { known: true }, targets: [target] }) };
+    try {
+      const automation = new ArrAutomation({ store, observer, search, submission, getPolicy: () => ({ enabled: true, dryRun: false }), clock: () => clock });
+      const first = await automation.runPass();
+      expect(first.submission?.outcome).toBe('rejected');
+      expect(first.nextAttemptAt).toBe(clock + 5 * 60_000);
+      expect((await automation.runPass()).reason).toBe('nothing-due');
+      expect(search.run).toHaveBeenCalledTimes(1);
+    } finally { store.close(); }
+  });
   it('defers automation when the shared search pool is full without recording a target failure', async () => {
     const clock = Date.parse('2026-01-01'), target = makeTarget('pool-full', 1), store = openSearchStore(':memory:');
     const observer: any = { observe: async () => ({ observedAt: clock, sonarr: { known: true }, radarr: { known: false }, targets: [target] }) };
@@ -50,6 +149,7 @@ describe('ArrAutomation', () => {
       expect(pass).toMatchObject({ ran: false, reason: 'search-capacity' });
       expect(store.getAutomationAttempt(target.key)).toBeNull();
       expect(store.getDeadline(target.key)).toBe(0);
+      expect(store.getSetting('automation:show-cooldown:fp:1')).toBeNull();
     } finally { store.close(); }
   });
   it('validates the chosen rank one before submission and never promotes rank two', async () => {

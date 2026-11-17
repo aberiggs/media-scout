@@ -6,7 +6,7 @@ import { ProwlarrClient } from '../clients/prowlarr';
 import { SonarrClient } from '../clients/sonarr';
 import { RadarrClient } from '../clients/radarr';
 import { Http } from '../http';
-import { ArrAutomation, type AutomationPass } from './automation';
+import { ArrAutomation, showCooldownSettingKey, type AutomationPass } from './automation';
 import { ArrObserver, type ArrProvider, type ArrTarget } from './arr';
 import { SearchService, safeText, SEARCH_PROMPT_VERSION, type SearchResult, type SearchServerContext, type SearchLimits } from './service';
 import { SubmissionService, type SubmissionResult } from './submission';
@@ -189,7 +189,8 @@ export class SearchRuntime {
         if (!cached?.complete || target.hasFile || !target.monitored || target.available !== true) continue;
         const key = String(target.key), attempt = this.store.getAutomationAttempt(key);
         const grace = this.store.getGrace('target', key, this.clock());
-        const deadline = Math.max(attempt?.deadline ?? 0, this.store.getDeadline(key) ?? 0, this.store.getProviderDeadline(provider) ?? 0, this.store.getProviderDeadline('prowlarr') ?? 0, this.store.getProviderDeadline('model') ?? 0);
+        const showCooldown = provider === 'sonarr' && typeof target.serviceId === 'number' && typeof target.sourceFingerprint === 'string' ? Number(this.store.getSetting(showCooldownSettingKey(target.sourceFingerprint, target.serviceId)) ?? 0) : 0;
+        const deadline = Math.max(attempt?.deadline ?? 0, this.store.getDeadline(key) ?? 0, showCooldown, this.store.getProviderDeadline(provider) ?? 0, this.store.getProviderDeadline('prowlarr') ?? 0, this.store.getProviderDeadline('model') ?? 0);
         const status = target.available && !target.eligible ? 'downloading' : grace ? 'grace' : deadline > this.clock() ? (attempt?.failCount ? 'backoff' : 'cooldown') : 'missing';
         items.push({ targetId, title: safeText(title), kind: provider === 'sonarr' ? 'tv' : 'movie', ...(target.serviceId === undefined ? {} : { seriesId: String(target.serviceId) }), ...(context?.seasonNumber === undefined ? {} : { seasonNumber: context.seasonNumber as number }), ...(context?.episodeNumber === undefined ? {} : { episodeNumber: context.episodeNumber as number }), status, eligible: !!target.eligible && !grace && deadline <= this.clock(), observedAt: iso(cached?.observedAt)!, ...(Math.max(grace ?? 0, deadline) > this.clock() ? { nextAttemptAt: iso(Math.max(grace ?? 0, deadline)) } : {}), ...(attempt ? { lastAttemptAt: iso(attempt.lastAttempt) } : {}) });
       }
@@ -273,7 +274,7 @@ export class SearchRuntime {
     });
   }
   private createAutomation(observer: ArrObserver, _prowlarr: NonNullable<RuntimeClients['prowlarr']>): ArrAutomation {
-    const getPolicy = () => { const s = this.getSettings(); return { enabled: s.monitoring.enabled, dryRun: s.safety.dryRun, preferences: s.ai.preferences, queueGraceMinutes: s.monitoring.queueGraceMinutes, searchRetryMinutes: s.monitoring.searchRetryMinutes, failureBackoffMinMinutes: s.monitoring.failureBackoffMinMinutes, failureBackoffMaxMinutes: s.monitoring.failureBackoffMaxMinutes }; };
+    const getPolicy = () => { const s = this.getSettings(); return { enabled: s.monitoring.enabled, dryRun: s.safety.dryRun, preferences: s.ai.preferences, queueGraceMinutes: s.monitoring.queueGraceMinutes, searchRetryMinutes: s.monitoring.searchRetryMinutes, intervalMinutes: s.monitoring.intervalMinutes, failureBackoffMinMinutes: s.monitoring.failureBackoffMinMinutes, failureBackoffMaxMinutes: s.monitoring.failureBackoffMaxMinutes }; };
     const search = { run: async (request: SearchRequest, _limits?: any, signal?: AbortSignal, context?: SearchServerContext) => {
        const targetBindings: ArrTarget[] = [];
        for (const key of context?.targetKeys ?? []) for (const provider of ['sonarr', 'radarr'] as const) {

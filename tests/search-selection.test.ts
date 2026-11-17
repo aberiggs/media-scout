@@ -24,6 +24,12 @@ describe('ranked option evidence validation', () => {
     const result = validateRankedOptions([{ optionId: 'one', rank: 1, releases: [{ candidateId: 'c' }], coveredTargetIds: ['target'], reason: 'Evidence supplied', uncertainty: 'Contents unverified' }], new Set(['c']), new Set(['target']), { type: 'episode', seasonNumber: 2, episodeNumber: 1, absoluteEpisodeNumber: absoluteEpisodeNumber as number | undefined, candidateScopes: { c: [parseReleaseCoverage(title as string)] } });
     expect(result.valid).toBe(expected);
   });
+  it('allows an evidenced same-season pack for an episode and rejects a wrong-season pack', () => {
+    const option = { optionId: 'pack', rank: 1, releases: [{ candidateId: 'pack' }], coveredTargetIds: ['target'], reason: 'S02 pack covers requested episode', uncertainty: 'Completeness not independently verified' };
+    const check = (title: string) => validateRankedOptions([option], new Set(['pack']), new Set(['target']), { type: 'episode', seasonNumber: 2, episodeNumber: 3, candidateScopes: { pack: [parseReleaseCoverage(title)] } });
+    expect(check('Example S02 1080p').valid).toBe(true);
+    expect(check('Example S01 1080p').valid).toBe(false);
+  });
   it('accepts partial inferred season coverage but rejects overlapping physical plans', () => {
     const option = { optionId: 'one', rank: 1, releases: [{ candidateId: 'a' }], coveredTargetIds: ['e1'], reason: 'Inferred pack', uncertainty: 'May be incomplete' };
     expect(validateRankedOptions([option], new Set(['a']), new Set(['e1', 'e2']), { type: 'season', seasonNumber: 2, candidateScopes: { a: [parseReleaseCoverage('Example S02')] } }).valid).toBe(true);

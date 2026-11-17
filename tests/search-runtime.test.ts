@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openSearchStore } from '../src/search/store';
 import { SearchRuntime, type RuntimeClients } from '../src/search/runtime';
+import { showCooldownSettingKey } from '../src/search/automation';
 import { defaultSettings, type Settings } from '../src/search/settings';
 import type { LLMClient } from '../src/clients/llm';
 import { releaseSchema } from '../src/types/prowlarr';
@@ -25,6 +26,13 @@ function matched(f: ReturnType<typeof setup>, expires: number) {
 }
 
 describe('search runtime', () => {
+  it('projects a source-scoped show cooldown in automation status', () => {
+    const f = setup();
+    const deadline = f.now + 120_000, target = { key: 'sonarr:fp:7:20:2', provider: 'sonarr', sourceFingerprint: 'fp', serviceId: 7, externalId: 20, episodeId: 2, monitored: true, hasFile: false, available: true, eligible: true, context: { title: 'Show', seasonNumber: 3, episodeNumber: 2 } };
+    f.store.saveObservation('sonarr', { observedAt: f.now, complete: true, payload: { targets: [target] } });
+    f.store.setSetting(showCooldownSettingKey('fp', 7), deadline);
+    expect(f.runtime.automationStatus().items[0]).toMatchObject({ status: 'cooldown', eligible: false, nextAttemptAt: new Date(deadline).toISOString() });
+  });
   it.each([2019, 4000])('passes all %s default preference characters through to the model', async length => {
     let received: unknown;
     const llm = { json: async ({ user }: { user: string }) => {
@@ -263,6 +271,8 @@ describe('search runtime', () => {
     try {
       await runtime.poll();
       const targetId=runtime.automationStatus().items[0]!.targetId;
+      const observedTarget=(store.getObservation('sonarr')?.payload as any).targets[0];
+      store.setSetting(showCooldownSettingKey(observedTarget.sourceFingerprint, observedTarget.serviceId), clock + 300_000);
       settings.safety.dryRun=false;
       const started=await runtime.startArrSearch(targetId);
       expect(store.getSetting(`search-arr:${started.searchId}`)).toMatchObject({provider:'sonarr',episodeId:2});

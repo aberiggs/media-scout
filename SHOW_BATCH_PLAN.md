@@ -1,6 +1,14 @@
 # Show-level acquisition planning
 
-**Status: proposed architecture; implementation not started.**
+**Status: approved; implementation in progress.** Torrent inspection and CRW
+remain out of scope. Validation must not send live download-client requests.
+
+Delivery checklist:
+- [ ] Shared batch contracts, workload/context builder, bounded search and selection.
+- [ ] Durable release-level submission, bindings, holds and recovery.
+- [ ] Batch HTTP/MCP entry points and show-level automation without show cooldown.
+- [ ] Plan/partial-outcome presentation and rendered acceptance.
+- [ ] Independent review, regression checks, search-only evaluation and publication.
 
 ## 1. Decision and product behavior
 

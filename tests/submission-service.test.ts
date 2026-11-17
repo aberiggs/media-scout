@@ -18,6 +18,17 @@ function fixture(path = ':memory:') {
 }
 
 describe('SubmissionService', () => {
+  it('rejects episode-set options before the legacy grab path can submit them', async () => {
+    const f = fixture();
+    try {
+      f.store.createSearch({ searchId: 'batch', prompt: JSON.stringify({ context: { scope: { type: 'episode-set' } } }), status: 'matched', createdAt: 1 });
+      f.store.finishSearch('batch', 'matched', { searchId: 'batch', status: 'matched', options: [{ optionId: 'plan', rank: 1, releases: [{ candidateId: 'c', coveredTargetIds: ['t'], coverageReason: 'fit', uncertainty: '' }], coveredTargetIds: ['t'], uncoveredTargetIds: [], coverage: 'complete', reason: 'fit', uncertainty: '' }] }, 2);
+      f.store.addCandidate({ searchId: 'batch', candidateId: 'c', safe: {}, privateData: { release, physicalKey: 'batch-physical' }, expiresAt: 100 });
+      const result = await f.service.submit({ searchId: 'batch', optionId: 'plan', idempotencyKey: 'batch-key' });
+      expect(result.outcome).toBe('rejected');
+      expect(f.prowlarr.grab).not.toHaveBeenCalled();
+    } finally { f.store.close(); }
+  });
   it('never posts if durable receipt storage fails', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'submission-audit-'));
     const path = join(directory, 'state.sqlite'), f = fixture(path);

@@ -48,4 +48,12 @@ describe('ranked option evidence validation', () => {
     context.candidateScopes.a.push(parseReleaseCoverage('Example S01E01'));
     expect(validateRankedOptions([option], new Set(['a']), new Set(), context).valid).toBe(false);
   });
+  it('validates episode-set assignments by requested target, not parsed season overlap', () => {
+    const option = { optionId: 'plan', rank: 1, releases: [
+      { candidateId: 'pack', coveredTargetIds: ['e1', 'e2'], coverageReason: 'Alternate numbering aligns', uncertainty: 'Inferred' },
+      { candidateId: 'single', coveredTargetIds: ['e3'], coverageReason: 'Title matches', uncertainty: '' },
+    ], reason: 'Useful partial plan', uncertainty: '' };
+    expect(validateRankedOptions([option], new Set(['pack', 'single']), new Set(['e1', 'e2', 'e3', 'e4']), { type: 'episode-set' }).valid).toBe(true);
+    expect(validateRankedOptions([{ ...option, releases: [option.releases[0], { ...option.releases[1], coveredTargetIds: ['e2'] }] }], new Set(['pack', 'single']), new Set(['e1', 'e2', 'e3']), { type: 'episode-set' })).toMatchObject({ valid: false, error: 'duplicate target assignment' });
+  });
 });

@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { Client, InMemoryTransport } from '@modelcontextprotocol/client';
 import { createSearchMcpServer } from '../src/search/mcp';
 import { SearchRuntime, type SearchRuntimeOptions } from '../src/search/runtime';
 import { openSearchStore } from '../src/search/store';

@@ -34,7 +34,7 @@ export function buildEpisodeSetRequest(input: {
   const { overview, titles, externalIds, originalLanguage, seriesType, profileContext } = show;
   if (typeof overview === 'string' && safeText(overview).length > 4000)
     throw new Error('episode-set context budget exceeded: show overview exceeds its schema bound');
-  const safeTitles = Array.isArray(titles) ? titles.filter((v): v is string => typeof v === 'string').map(safeText) : undefined;
+  const safeTitles = Array.isArray(titles) ? titles.filter((v): v is string => typeof v === 'string').map(value => safeText(value)) : undefined;
   const safeIds = typeof externalIds === 'object' && externalIds !== null ? Object.fromEntries(Object.entries(externalIds).filter(([, v]) => typeof v === 'string' || typeof v === 'number')) : undefined;
   const targetDetails = selected.map((t, i) => allowedEpisode({ ...t, context: t.episodeContext ?? t.context }, refs[i]!.targetId));
   const fullRelated = input.related.filter(t => !selected.some(s => s.key === t.key)).map((t, i) => allowedEpisode({ ...t, context: t.episodeContext ?? t.context }, undefined, `related-${i + 1}`));

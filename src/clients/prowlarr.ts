@@ -20,29 +20,32 @@ export class ProwlarrClient {
     categories: number[];
     indexerIds?: number[];
     limit?: number;
+    offset?: number;
+    type?: 'search' | 'tvsearch' | 'moviesearch' | 'musicsearch' | 'booksearch';
   }, options?: HttpRequestOptions): Promise<Release[]> {
     const query: Record<string, string | number | (string | number)[]> = {
       query: params.query,
-      type: 'search',
+      type: params.type ?? 'search',
       categories: params.categories,
     };
     if (params.indexerIds !== undefined) query.indexerIds = params.indexerIds;
     if (params.limit !== undefined) query.limit = params.limit;
+    if (params.offset !== undefined) query.offset = params.offset;
     return releaseListSchema.parse(
       await this.http.getJson('/api/v1/search', query, options),
     );
   }
 
   /** Per-indexer backoff signal (I5): non-null `disabledTill` means the indexer is cooling down. */
-  async getIndexerStatuses(): Promise<IndexerStatus[]> {
+  async getIndexerStatuses(options?: HttpRequestOptions): Promise<IndexerStatus[]> {
     return indexerStatusListSchema.parse(
-      await this.http.getJson('/api/v1/indexerstatus'),
+      await this.http.getJson('/api/v1/indexerstatus', undefined, options),
     );
   }
 
   /** Configured indexer entries (I5 allowlist source; healthy set = enabled minus cooling). */
-  async getIndexers(): Promise<Indexer[]> {
-    return indexerListSchema.parse(await this.http.getJson('/api/v1/indexer'));
+  async getIndexers(options?: HttpRequestOptions): Promise<Indexer[]> {
+    return indexerListSchema.parse(await this.http.getJson('/api/v1/indexer', undefined, options));
   }
 
   /** Download-client entries resolved by name to route grabs (D6). */

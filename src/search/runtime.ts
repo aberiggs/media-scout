@@ -8,11 +8,13 @@ import { RadarrClient } from '../clients/radarr';
 import { Http } from '../http';
 import { ArrAutomation, showCooldownSettingKey, type AutomationPass } from './automation';
 import { ArrObserver, type ArrProvider, type ArrTarget } from './arr';
-import { SearchService, safeText, SEARCH_PROMPT_VERSION, type SearchResult, type SearchServerContext, type SearchLimits } from './service';
+import { SearchService, physicalRelease, safeReleaseObservation, safeText, SEARCH_PROMPT_VERSION, type SearchResult, type SearchServerContext, type SearchLimits } from './service';
 import { SubmissionService, type SubmissionResult } from './submission';
 import { openSearchStore, type SearchStore, type SearchRecord } from './store';
 import { defaultSettings, migrateSettings, missingSettings, settingsSchema, type Settings } from './settings';
 import { searchRequestSchema, type SearchRequest, type SubmissionRequest } from './contracts';
+import type { Release } from '../types/prowlarr';
+import { ApiError } from '../http';
 
 export interface RuntimeClients {
   prowlarr?: Pick<ProwlarrClient, 'getIndexers' | 'getIndexerStatuses' | 'search' | 'getDownloadClients' | 'grab'>;
@@ -29,6 +31,7 @@ export interface SearchRuntimeOptions {
 }
 export interface ActivityQuery { limit?: number; offset?: number; q?: string; status?: string; source?: 'manual' | 'automation'; kind?: 'tv' | 'movie' | 'other'; createdAtFrom?: string; createdAtTo?: string }
 export interface ActivityItem { searchId: string; prompt: string; status: string; createdAt: string; finishedAt?: string; source: 'manual' | 'automation'; kind?: 'tv' | 'movie'; counts?: SearchResult['counts']; submission?: { outcome: string; outcomes?: SubmissionResult['outcomes'] } }
+export const MAX_PROWLARR_MCP_CAPABILITY_TTL_MS = 35 * 60_000;
 export interface PublicSearchStatus {
   searchId: string; status: string; createdAt: string; finishedAt?: string; prompt: string;
   options: SearchResult['options']; candidates: SearchResult['candidates']; events: SearchResult['events']; queuePosition?: number; waitingReason?: string; retryAt?: string;
@@ -56,6 +59,10 @@ export class SearchRuntime {
   private passController?: AbortController;
   private pollJob?: Promise<AutomationPass>;
   private readonly maintenanceTimer: ReturnType<typeof setInterval>;
+  private readonly prowlarrCapabilities = new Map<string, { searchId: string; settings: Settings; expiresAt: number; controller: AbortController }>();
+  private readonly prowlarrMcpSessions = new Map<string, { token: string; close: () => Promise<void> }>();
+  private readonly mcpSessionCloseJobs = new Set<Promise<void>>();
+  private readonly mcpOperations = new Set<Promise<unknown>>();
 
   constructor(private readonly options: SearchRuntimeOptions) {
     this.clock = options.now ?? Date.now;
@@ -77,6 +84,137 @@ export class SearchRuntime {
     const parsed = settingsSchema.safeParse(this.store.getSetting('application-settings'));
     if (!parsed.success) throw new Error('Saved application settings are invalid');
     return parsed.data;
+  }
+  /** Backend-only capability for one search worker; never exposed through an HTTP mint route. */
+  createProwlarrMcpCapability(searchId: string, ttlMs = 15 * 60_000): { token: string; expiresAt: number } {
+    if (this.closed || this.closing) throw new Error('runtime-closed');
+    if (!searchId.trim()) throw new Error('invalid-search-scope');
+    if (!this.store.getSearch(searchId)) throw new Error('search-not-found');
+    if (!Number.isSafeInteger(ttlMs) || ttlMs < 1_000 || ttlMs > MAX_PROWLARR_MCP_CAPABILITY_TTL_MS) throw new Error('invalid-capability-lifetime');
+    const token = randomUUID().replaceAll('-', '') + randomUUID().replaceAll('-', ''), expiresAt = this.clock() + ttlMs;
+    this.prowlarrCapabilities.set(token, { searchId, settings: structuredClone(this.getSettings()), expiresAt, controller: new AbortController() });
+    return { token, expiresAt };
+  }
+  revokeProwlarrMcpCapability(token: string): void {
+    const cap = this.prowlarrCapabilities.get(token);
+    if (cap) { cap.controller.abort(); this.prowlarrCapabilities.delete(token); }
+    for (const [sessionId, session] of this.prowlarrMcpSessions) if (session.token === token) void this.closeProwlarrMcpSession(sessionId);
+  }
+  registerProwlarrMcpSession(sessionId: string, token: string, close: () => Promise<void>): boolean {
+    if (!this.hasProwlarrMcpCapability(token) || this.prowlarrMcpSessions.has(sessionId)) return false;
+    this.prowlarrMcpSessions.set(sessionId, { token, close });
+    return true;
+  }
+  unregisterProwlarrMcpSession(sessionId: string): void { this.prowlarrMcpSessions.delete(sessionId); }
+  hasProwlarrMcpSession(sessionId: string, token: string): boolean {
+    const session = this.prowlarrMcpSessions.get(sessionId);
+    return !!session && session.token === token && this.hasProwlarrMcpCapability(token);
+  }
+  async closeProwlarrMcpSessions(): Promise<void> {
+    await Promise.allSettled([...this.prowlarrMcpSessions.keys()].map(id => this.closeProwlarrMcpSession(id)));
+    while (this.mcpSessionCloseJobs.size) await Promise.allSettled([...this.mcpSessionCloseJobs]);
+  }
+  private closeProwlarrMcpSession(sessionId: string): Promise<void> {
+    const session = this.prowlarrMcpSessions.get(sessionId);
+    if (!session) return Promise.resolve();
+    this.prowlarrMcpSessions.delete(sessionId);
+    const job = Promise.resolve().then(session.close);
+    this.mcpSessionCloseJobs.add(job);
+    void job.then(() => this.mcpSessionCloseJobs.delete(job), () => this.mcpSessionCloseJobs.delete(job));
+    return job;
+  }
+  hasProwlarrMcpCapability(token: string): boolean { return this.getProwlarrMcpCapability(token) !== null; }
+  private getProwlarrMcpCapability(token: string) {
+    const cap = this.prowlarrCapabilities.get(token);
+    if (!cap || this.closing || this.closed || cap.expiresAt <= this.clock()) {
+      if (cap) this.revokeProwlarrMcpCapability(token);
+      return null;
+    }
+    return cap;
+  }
+  prowlarrIndexerDiscovery(token: string, requestSignal?: AbortSignal) {
+    return this.trackMcpOperation(this.runProwlarrIndexerDiscovery(token, requestSignal));
+  }
+  private async runProwlarrIndexerDiscovery(token: string, requestSignal?: AbortSignal) {
+    const cap = this.getProwlarrMcpCapability(token);
+    if (!cap) throw new Error('unauthorized');
+    if ((this.store.getProviderDeadline('prowlarr') ?? 0) > this.clock()) throw new Error('provider-cooldown');
+    const client = this.clients(cap.settings).prowlarr;
+    if (!client) throw new Error('prowlarr-unavailable');
+    const controller = new AbortController(), abort = () => controller.abort(cap.controller.signal.reason), abortRequest = () => controller.abort(requestSignal?.reason);
+    cap.controller.signal.addEventListener('abort', abort, { once: true });
+    if (requestSignal?.aborted) abortRequest(); else requestSignal?.addEventListener('abort', abortRequest, { once: true });
+    try {
+      const [indexers, statuses] = await Promise.all([
+        client.getIndexers({ signal: controller.signal, timeoutMs: 15_000 }),
+        client.getIndexerStatuses({ signal: controller.signal, timeoutMs: 15_000 }),
+      ]);
+      if (this.getProwlarrMcpCapability(token) !== cap) throw new Error('capability-expired');
+      const cooling = new Map(statuses.filter(s => s.disabledTill && Date.parse(s.disabledTill) > this.clock()).map(s => [s.indexerId, s.disabledTill]));
+      return indexers.map(({ id, name, enable, supportsSearch, supportsRss, categories, capabilities }) => ({
+        id, name: safeText(name, [cap.settings.integrations.prowlarr.apiKey, cap.settings.integrations.prowlarr.url]), enabled: enable,
+        available: enable && supportsSearch !== false && !cooling.has(id), coolingUntil: cooling.get(id) ?? null,
+        supportsSearch: supportsSearch ?? true, supportsRss: supportsRss ?? false,
+        categories: (categories ?? capabilities?.categories ?? []).map(category => ({ id: category.id, name: safeText(category.name, [cap.settings.integrations.prowlarr.apiKey, cap.settings.integrations.prowlarr.url]) })),
+      }));
+    } catch (error) { this.recordProwlarrFailure(error); throw new Error('Prowlarr discovery failed'); }
+    finally { controller.abort(); cap.controller.signal.removeEventListener('abort', abort); requestSignal?.removeEventListener('abort', abortRequest); }
+  }
+  prowlarrSearch(token: string, input: { query: string; indexerIds?: number[]; categories?: number[]; type?: 'search' | 'tvsearch' | 'moviesearch' | 'musicsearch' | 'booksearch'; limit?: number; offset?: number; timeoutMs?: number }, requestSignal?: AbortSignal) {
+    return this.trackMcpOperation(this.runProwlarrSearch(token, input, requestSignal));
+  }
+  private async runProwlarrSearch(token: string, input: { query: string; indexerIds?: number[]; categories?: number[]; type?: 'search' | 'tvsearch' | 'moviesearch' | 'musicsearch' | 'booksearch'; limit?: number; offset?: number; timeoutMs?: number }, requestSignal?: AbortSignal) {
+    const cap = this.getProwlarrMcpCapability(token);
+    if (!cap) throw new Error('unauthorized');
+    if ((this.store.getProviderDeadline('prowlarr') ?? 0) > this.clock()) throw new Error('provider-cooldown');
+    const client = this.clients(cap.settings).prowlarr;
+    if (!client) throw new Error('prowlarr-unavailable');
+    const timeoutMs = Math.max(100, Math.min(input.timeoutMs ?? 30_000, 120_000));
+    const controller = new AbortController(), abort = () => controller.abort(cap.controller.signal.reason), abortRequest = () => controller.abort(requestSignal?.reason);
+    cap.controller.signal.addEventListener('abort', abort, { once: true });
+    if (requestSignal?.aborted) abortRequest(); else requestSignal?.addEventListener('abort', abortRequest, { once: true });
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const [indexes, statuses] = await Promise.all([
+        client.getIndexers({ signal: controller.signal, timeoutMs }),
+        client.getIndexerStatuses({ signal: controller.signal, timeoutMs }),
+      ]);
+      const cooling = new Set(statuses.filter(s => s.disabledTill && Date.parse(s.disabledTill) > this.clock()).map(s => s.indexerId));
+      const eligible = indexes.filter(i => i.enable && i.supportsSearch !== false && !cooling.has(i.id)).map(i => i.id);
+      if (!eligible.length) throw new Error('no-healthy-indexers');
+      const selected = input.indexerIds === undefined ? eligible : [...new Set(input.indexerIds.filter(id => eligible.includes(id)))];
+      if (!selected.length) throw new Error('no-healthy-indexers');
+      const upstreamRows = await client.search({ query: input.query, categories: input.categories ?? [], indexerIds: selected, limit: Math.min(input.limit ?? 100, 100), ...(input.offset === undefined ? {} : { offset: input.offset }), ...(input.type ? { type: input.type } : {}) }, { signal: controller.signal, timeoutMs });
+      if (this.getProwlarrMcpCapability(token) !== cap) throw new Error('capability-expired');
+      return this.storeCandidates(cap.searchId, upstreamRows.filter(row => selected.includes(row.indexerId)), [cap.settings.integrations.prowlarr.apiKey, cap.settings.integrations.prowlarr.url]);
+    } catch (error) { this.recordProwlarrFailure(error); throw error instanceof Error && ['no-healthy-indexers','provider-cooldown','unauthorized'].includes(error.message) ? error : new Error('Prowlarr search failed'); }
+    finally { controller.abort(); clearTimeout(timer); cap.controller.signal.removeEventListener('abort', abort); requestSignal?.removeEventListener('abort', abortRequest); }
+  }
+  private storeCandidates(searchId: string, releases: Release[], secrets: string[]) {
+    const byKey = new Map<string, { candidateId: string; observations: ReturnType<typeof safeReleaseObservation>[] }>();
+    for (const release of releases) {
+      const key = physicalRelease(release);
+      let entry = byKey.get(key);
+      if (!entry) {
+        const prior = this.store.listCandidates(searchId, this.clock()).find(row => (this.store.getCandidate(searchId, row.candidateId, this.clock())?.privateData as { physicalKey?: string } | undefined)?.physicalKey === key);
+        entry = prior ? prior.safe as { candidateId: string; observations: ReturnType<typeof safeReleaseObservation>[] } : { candidateId: randomUUID(), observations: [] };
+      }
+      if (!entry) throw new Error('candidate registration failed');
+      const safe = safeReleaseObservation(release, secrets, true);
+      if (!entry.observations.some(o => JSON.stringify(o) === JSON.stringify(safe))) entry.observations.push(safe);
+      byKey.set(key, entry);
+      const record = { searchId, candidateId: entry.candidateId, safe: entry, privateData: { release, physicalKey: key }, expiresAt: this.clock() + 1_800_000 };
+      if (this.store.getCandidate(searchId, entry.candidateId, this.clock())) this.store.updateCandidate(record); else this.store.addCandidate(record);
+    }
+    return [...byKey.values()];
+  }
+  private recordProwlarrFailure(error: unknown) {
+    if (error instanceof ApiError && error.status === 429) this.store.setProviderDeadline('prowlarr', this.clock() + (error.retryAfter ?? 60) * 1000);
+  }
+  private trackMcpOperation<T>(operation: Promise<T>): Promise<T> {
+    this.mcpOperations.add(operation);
+    void operation.then(() => this.mcpOperations.delete(operation), () => this.mcpOperations.delete(operation));
+    return operation;
   }
   missingSettings(settings = this.getSettings()): string[] { return missingSettings(settings); }
   saveSettings(value: unknown): { ok: true; settings: Settings } | { ok: false; issues: Array<{ path: PropertyKey[]; message: string; code: string }> } {
@@ -199,9 +337,14 @@ export class SearchRuntime {
   }
 
   async drain(): Promise<void> {
-    while (this.jobs.size || this.pollJob) {
-      await Promise.allSettled([...this.jobs.values(), ...(this.pollJob ? [this.pollJob.then(() => undefined)] : [])]);
-      if (this.jobs.size || this.pollJob) await new Promise(resolve => setTimeout(resolve, 25));
+    while (this.jobs.size || this.pollJob || this.mcpOperations.size || this.mcpSessionCloseJobs.size) {
+      await Promise.allSettled([
+        ...this.jobs.values(),
+        ...(this.pollJob ? [this.pollJob.then(() => undefined)] : []),
+        ...this.mcpOperations,
+        ...this.mcpSessionCloseJobs,
+      ]);
+      if (this.jobs.size || this.pollJob || this.mcpOperations.size || this.mcpSessionCloseJobs.size) await new Promise(resolve => setTimeout(resolve, 25));
     }
   }
   async close(): Promise<void> {
@@ -218,6 +361,7 @@ export class SearchRuntime {
     if (this.closed || this.closing) return;
     this.closing = true;
     this.passController?.abort();
+    for (const token of [...this.prowlarrCapabilities.keys()]) this.revokeProwlarrMcpCapability(token);
   }
 
   async startArrSearch(targetId: string): Promise<{ searchId: string; status: 'queued' }> {
@@ -299,6 +443,7 @@ export class SearchRuntime {
     };
   }
   private maintain(): void {
+    for (const [token, capability] of this.prowlarrCapabilities) if (capability.expiresAt <= this.clock()) this.revokeProwlarrMcpCapability(token);
     this.store.recoverExpiredSearchWork(this.clock());
     for (const search of this.store.activeSearches()) {
       if (search.status === 'queued') continue;

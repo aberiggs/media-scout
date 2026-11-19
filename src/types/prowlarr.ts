@@ -74,6 +74,10 @@ export const indexerSchema = z.object({
   id: z.number().int(),
   name: z.string(),
   enable: z.boolean().catch(false),
+  supportsSearch: z.boolean().optional(),
+  supportsRss: z.boolean().optional(),
+  categories: z.array(releaseCategorySchema).optional(),
+  capabilities: z.object({ categories: z.array(releaseCategorySchema).optional() }).optional(),
 });
 export type Indexer = z.infer<typeof indexerSchema>;
 export const indexerListSchema = z.array(indexerSchema);

@@ -198,8 +198,29 @@ model-timeout message rather than a generic invalid-output error.
   decisions, 117 physical candidates, about 366 seconds overall. Rank one uses
   an Anime Time S1+S2 pack, Judas S3 and Judas S4, assigning 1–50, 51–66 and
   67–85 respectively. Its final model decision took about 309 seconds; each
-  indexer query took about four seconds. A repeat with the cleaned-up request
-  remains pending.
+  indexer query took about four seconds.
+- **Re:Zero, realistic full-workload repeat:** matched after two queries and
+  three decisions, 260 physical candidates, about 525 seconds overall. Rank one
+  assigns 1–50 to a Tenrai S1+S2 pack, 51–66 to Judas S3 and 67–85 to Judas S4.
+  All 85 targets are assigned once, and no context-only reference is assigned.
+  The final model decision took about 503 seconds; indexer searches took about
+  ten and four seconds. Candidate observations include HR-DR S02E14 `{39}` and
+  S02E23 `{48}`, ToonsHub S03E16, and Chinese S4 titles stating total episodes
+  67–85 and season episode 19 / total 85. These substantively support the
+  numbering inference; they do not inspect the selected packs' contents.
+- **Real model with fixture indexers, Kaiju:** matched all 23 targets using the
+  two ordinary season packs, excluding recap/manga/out-of-range distractors;
+  three queries, four decisions, about 318 seconds. Its explanation nevertheless
+  invented a 12+12 cour structure and identified context-only future episode 24
+  as S2E12. The selected requested coverage was the plausible 12+11 split, but
+  those extra assertions were unsupported.
+- **Real model with fixture indexers, Re:Zero:** failed after three searches and
+  four model decisions, seven physical candidates, about 609 seconds overall.
+  The first three decisions took about 1.7, 1.6 and 5.6 seconds; the final
+  decision hit the full 600-second model timeout and produced no selectable
+  plan. Mock indexer calls took milliseconds. This is an unresolved model
+  finalization/latency failure, not a Prowlarr timeout or a successful evaluation.
+  No further timeout increase or claim of consistent reliability follows from it.
 - **Harness correction:** the initial request unnecessarily instructed the model
   not to assume factual mappings and supplied fabricated episode titles. Kaiju
   returned unexplained `needs-input` despite plausible packs. The corrected
@@ -216,11 +237,27 @@ All live probes made zero download submissions. Actual import behavior,
 automatic batch submission, and one-hour acquisition grace remain unimplemented
 or unverified; the batch submission guard is still enabled.
 
+Independent inspection of the completed real-indexer artifacts found no blocking
+best-plan selection issue. It also identified explanatory overclaims: Re:Zero's
+unnamed context specials were identified as specific OVAs, and future absolute 86
+as S4E20 without sufficient supplied evidence. Neither changed requested coverage.
+Language/track composition and every file's presence remain inferred. This
+supports a useful pragmatic search-only direction, not perfect semantic matching.
+In particular, the 503-second model decision does **not** pass the unchanged
+60-second production model timeout; production timeout tuning is deliberately
+deferred at the user's request. Do not enable automatic batch execution based on
+these evaluation-only successes. Both realistic real-indexer workloads succeeded,
+but the controlled Re:Zero failure leaves sparse-evidence robustness open. A
+future evaluation should compare model choice and evidence enrichment rather
+than assume more turns or a still-longer timeout necessarily solves this case.
+
 ### Checks for this increment
 
 - Backend: 480 tests passing, TypeScript and diff checks passing.
 - Harness: standalone strict TypeScript check passing.
-- Web: 33 tests, TypeScript and production build passing. The only newly delivered
+- Published web snapshot: 31 tests, TypeScript and production build passing.
+  The local worktree also passes 33 tests, including two uncommitted batch-UI tests.
+  The only newly delivered
   UI change is the settings-cap display; pre-existing batch UI work remains
   uncommitted and excluded from publication.
 - Settings caps rendered at 1440×1000 and 390×844 with mock API boundaries:

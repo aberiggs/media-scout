@@ -1,7 +1,7 @@
 import { OpenRouter } from '@openrouter/sdk';
 import Database from 'better-sqlite3';
 import { createHash } from 'node:crypto';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { z } from 'zod';
@@ -101,7 +101,7 @@ function main() {
     { ...x, model:settings.ai.model }, { ...x, model:cli.comparator },
   ]);
   const report:any={runId,models:[settings.ai.model,cli.comparator],protocol:{id:'one-plan-production-text-bounds-v1',responseCodec:'production stripFences then JSON/schema validation',purpose:'evaluation-only finalization; no tools; same frozen user and system input; append identical finalization instruction',reasoningParameters:'provider defaults; unspecified',outputTokens:OUTPUT_TOKENS,timeoutMs:DEADLINE_MS,maxConcurrency:2,retries:0,textBounds:TEXT_BOUNDS},inputs:cases.map(c=>({artifact:c.path,sha256:inputHash(c.input),system:c.input.system+FINALIZATION_INSTRUCTION,user:c.input.user,jsonSchema:wireSchema})),attempts:[],complete:false};
-  const persist=()=>writeFileSync(path,JSON.stringify(report,null,2)+'\n',{mode:0o600});
+  const persist=()=>{ const temporaryPath=`${path}.${process.pid}.tmp`; writeFileSync(temporaryPath,JSON.stringify(report,null,2)+'\n',{mode:0o600}); renameSync(temporaryPath,path); };
   persist();
   const client=new OpenRouter({apiKey:settings.ai.apiKey,serverURL:settings.ai.baseUrl});
   const controller=new AbortController(); let cancelled=false, blocked=false;

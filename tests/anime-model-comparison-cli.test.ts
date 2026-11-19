@@ -57,7 +57,7 @@ function reportIn(out:string) {
 
 describe('comparison CLI against the real SDK and local HTTP boundary',()=>{
   it('runs four bounded requests with frozen protocol, telemetry, and incremental report persistence',async()=>{
-    const f=prepare(), requests:any[]=[],paths:string[]=[], perModel=new Map<string,number>(), pending=new Set<ServerResponse>();
+    const f=prepare(), requests:any[]=[],paths:string[]=[], perModel=new Map<string,number>(), pending=new Set<ServerResponse>(), manifestReadFailures:string[]=[];
     let inFlight=0,maxInFlight=0,maxPerModel=0,firstPairReleased=false;
     let releasePair!:()=>void;const firstPair=new Promise<void>(resolvePair=>releasePair=resolvePair);
     let serverInfo:{server:Server;url:string}|undefined;
@@ -68,7 +68,9 @@ describe('comparison CLI against the real SDK and local HTTP boundary',()=>{
         const body=await bodyOf(req);requests.push(body);
         const model=String(body.model);const count=(perModel.get(model)??0)+1;perModel.set(model,count);
         inFlight++;maxInFlight=Math.max(maxInFlight,inFlight);maxPerModel=Math.max(maxPerModel,count);
-        const current=reportIn(f.out);
+        let current:ReturnType<typeof reportIn>;
+        try { current=reportIn(f.out); }
+        catch (error) { manifestReadFailures.push(error instanceof Error ? error.message : String(error)); throw error; }
         expect(current.value.inputs).toHaveLength(1);
         expect(current.value.inputs[0]).toMatchObject({system:expect.stringContaining('Use observed evidence.'),user:f.user});
         expect(current.value.inputs[0].jsonSchema.required).toContain('options');
@@ -94,7 +96,10 @@ describe('comparison CLI against the real SDK and local HTTP boundary',()=>{
       const artifact=reportIn(f.out);
       expect(artifact.value.complete).toBe(true);expect(artifact.value.attempts).toHaveLength(4);
       expect(artifact.value.protocol).toMatchObject({id:'one-plan-production-text-bounds-v1',responseCodec:'production stripFences then JSON/schema validation',outputTokens:16_384,timeoutMs:600_000,textBounds:{releaseCoverageReason:1000,releaseUncertainty:1000,planReason:2000,planUncertainty:2000,message:2000}});
-      expect(artifact.value.attempts.every((a:any)=>a.outcome==='success'&&a.usage.promptTokens===12&&a.usage.completionTokens===8&&a.usage.reasoningTokens===2&&a.usage.cachedTokens===3&&a.usage.cost===0.001)).toBe(true);
+      expect(manifestReadFailures, 'the server must never observe a partially-written persisted report').toEqual([]);
+      for(const [index,attempt] of artifact.value.attempts.entries()) {
+        expect(attempt,`attempt ${index+1} telemetry and outcome`).toMatchObject({outcome:'success',usage:{promptTokens:12,completionTokens:8,reasoningTokens:2,cachedTokens:3,cost:0.001}});
+      }
       expect(statSync(artifact.path).mode&0o777).toBe(0o600);
     } finally {if(serverInfo)await closeServer(serverInfo.server);}
   });

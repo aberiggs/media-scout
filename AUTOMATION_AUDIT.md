@@ -1,5 +1,9 @@
 # Automation product audit
 
+The original audit sections below describe the initial audit against the
+pre-batch runtime. Follow-up sections record subsequent work; historical gaps
+are not assertions that every later search scope still has those behaviors.
+
 ## Scope and acceptance
 
 Trace requests **after Seerr has populated Sonarr/Radarr**, through observation,
@@ -119,3 +123,111 @@ burst, native Arr search races, actual Re:Zero metadata equivalence, torrent fil
 contents, real download-client routing, and successful Arr imports. Those are
 separate integration acceptance scenarios; no-download authorization precludes
 proving the last two here.
+
+## Offline characterization follow-up (November 2026)
+
+Added an offline, synthetic episode-set probe in
+`tests/search-episode-set-service.test.ts`. It follows the real
+`ArrObserver -> buildEpisodeSetRequest -> SearchService -> SQLite` path with
+fake Arr/Prowlarr and a scripted LLM. It models a collapsed metadata season with
+synthetic season-label ranges for both reported shapes (four release seasons vs
+collapsed S1 for Re:Zero; two vs one for Kaiju No.  8), broad then refined
+alias/season queries, and partial plans including one where a release pack is
+missing. A queue-covered related episode is context-only. A separate negative probe
+characterizes rejection of an explicit unrelated TVDB ID and a related/future
+episode reference used as requested coverage. A real `SubmissionService` is
+invoked against the stored match and remains blocked; fake grab is not called.
+
+These probes demonstrate pipeline/schema/validation/persistence contracts, not
+real LLM reasoning, public metadata equivalence, or actual episode correspondence
+for Re:Zero or Kaiju No. 8. The range fixtures are invented test data. No live
+search was run by this increment; authorized read-only live evaluation remains
+pending separately. No production code, live API, model, download, or web files
+were changed. The older findings above describe historical audit observations,
+not universal claims about current live behavior or those shows' factual mappings.
+
+## Search-only workflow tuning (November 2026)
+
+The user authorized real model/indexer evaluation, but no download requests.
+`scripts/evaluate-anime-search.ts` reads existing SQLite settings read-only, runs
+the real search service with an in-memory store, and exposes only indexer/status/
+search reads. It has no submission service or grab dependency. Its synthetic
+collapsed-S1 inventories contain 85 Re:Zero or 23 Kaiju No. 8 targets; these are
+test workloads, not reads or verified representations of the user's Sonarr/TMDB
+library. Owned/queued specials and a future episode are context-only.
+
+Prompt version `episode-set-2` encourages broad discovery and gap refinement,
+reasonable numbering inference, useful packs with incidental extras, and partial
+progress. It distinguishes main-story content from specials/print results and
+does not infer all-season completeness from a bare title/year. One strong plan
+is sufficient; five alternatives are not a quota. Semantic coverage still
+depends on the model, not a deterministic episode-mapping proof.
+
+Workflow changes retain distinct/conflicting observations while deduplicating
+identical evidence. Repeated queries with the same effective healthy indexer and
+category scope are not resent. Query results report new candidate/observation
+counts. Configured constructor budgets now actually apply above the old default
+ceiling: an offline reproduction previously stopped at 12 searches despite a
+configured allowance of 30. New defaults are 40 decisions / 30 searches; settings
+accept 80 / 60. Saved lower values remain unchanged and honored.
+
+### Timeout evidence and evaluation policy
+
+Initial real runs with `z-ai/glm-5.3-flash` hit the model client's 60-second
+deadline: Re:Zero before its first query, Kaiju after one query. Model-only
+replays completed at 109 seconds for Re:Zero's first query and 69 seconds for
+Kaiju's next decision. A prompt-append probe completed Re:Zero's first query in
+48 seconds but Kaiju timed out at 180 seconds. These do not establish a provider
+root cause or a reliable latency improvement from prompting.
+
+At the user's request the evaluation harness allows ten minutes per model and
+Prowlarr call, with a thirty-minute overall deadline and a forty-five-minute
+claimed worker lease. Boundary timings separate model time from indexer time.
+Production model/Prowlarr timeouts and saved settings were not changed. The model
+client supports bounded per-call timeout overrides and reports a safe actionable
+model-timeout message rather than a generic invalid-output error.
+
+### Live results
+
+- **Kaiju, realistic full-workload request:** matched after one broad query,
+  two model decisions, 297 physical candidates, about 90 seconds overall.
+  The single ranked plan assigns targets 1–12 to a SubsPlease S1 pack and 13–23
+  to an Anime Time S2 pack, with inferred coverage and incidental NC extras.
+  Prowlarr search took about 4.9 seconds; model decisions about 41 and 44 seconds.
+- **Re:Zero, initial full-workload pilot:** matched after four queries and five
+  decisions, 117 physical candidates, about 366 seconds overall. Rank one uses
+  an Anime Time S1+S2 pack, Judas S3 and Judas S4, assigning 1–50, 51–66 and
+  67–85 respectively. Its final model decision took about 309 seconds; each
+  indexer query took about four seconds. A repeat with the cleaned-up request
+  remains pending.
+- **Harness correction:** the initial request unnecessarily instructed the model
+  not to assume factual mappings and supplied fabricated episode titles. Kaiju
+  returned unexplained `needs-input` despite plausible packs. The corrected
+  request is ordinary acquisition intent permitting reasonable inference; the
+  synthetic-data caveat stays in the report. This is a changed-input evaluation,
+  not a controlled claim that prompt tuning alone caused success.
+
+These plans have plausible release-title coverage, not inspected contents.
+Official references corroborate seasonal/absolute numbering as useful evidence:
+https://kaiju-no8.net/en/ lists episodes through 23 and seasons 1/2;
+https://kadokawa-anime.com/titles/entry-224.html labels Re:Zero season 4 and
+episodes starting at 67. Neither proves the user's metadata or torrent contents.
+All live probes made zero download submissions. Actual import behavior,
+automatic batch submission, and one-hour acquisition grace remain unimplemented
+or unverified; the batch submission guard is still enabled.
+
+### Checks for this increment
+
+- Backend: 480 tests passing, TypeScript and diff checks passing.
+- Harness: standalone strict TypeScript check passing.
+- Web: 33 tests, TypeScript and production build passing. The only newly delivered
+  UI change is the settings-cap display; pre-existing batch UI work remains
+  uncommitted and excluded from publication.
+- Settings caps rendered at 1440×1000 and 390×844 with mock API boundaries:
+  80/60 values saved, a simulated 503 preserved drafts, retry succeeded.
+  No application exceptions or unexpected console errors; the injected 503
+  produced the expected browser resource error. This does not validate the
+  unfinished batch UI or real settings writes.
+
+Jev evaluation is tracked separately in issue #50:
+https://github.com/aberiggs/media-scout/issues/50.

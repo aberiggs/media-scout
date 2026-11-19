@@ -9,7 +9,7 @@ import { EPISODE_SET_LIMITS, SEARCH_PROMPT_CONTRACT, episodeSetActionSchema, sea
 import { validateRankedOptions } from './selection';
 import type { SearchStore } from './store';
 
-export interface SearchLimits { decisions?: number; searches?: number; deadlineMs?: number }
+export interface SearchLimits { decisions?: number; searches?: number; deadlineMs?: number; llmTimeoutMs?: number; prowlarrTimeoutMs?: number }
 export interface SearchEvent { type: string; data: unknown }
 export interface CandidateObservation {
   title: string; indexer: string; size: number | null; seeders: number | null;
@@ -25,7 +25,7 @@ export interface SearchResult {
   events: SearchEvent[]; promptVersion: string;
 }
 export const SEARCH_PROMPT_VERSION = 'search-first-1';
-export const EPISODE_SET_PROMPT_VERSION = 'episode-set-1';
+export const EPISODE_SET_PROMPT_VERSION = 'episode-set-2';
 
 /** Sanitize display/model text; private locators remain only in candidate storage. */
 export function safeText(value: string): string {
@@ -45,8 +45,8 @@ const { $schema: _batchMeta, ...episodeSetActionJsonSchema } = z.toJSONSchema(ep
 const SYSTEM = `${SEARCH_PROMPT_CONTRACT}
 You have read-only list_indexers and search_releases tools. Use several turns to try useful alternate titles, seasonal and supplied absolute numbering; do not invent numbering. For an episode request, also try suitable season-pack queries and prefer a quality/health-compatible pack that demonstrably covers the requested episode when otherwise comparable. Never choose a wrong season or contradicting coverage evidence, and never claim inferred packs are verified complete. Consider all supplied candidates, compare alternatives and refine a weak search. Look at language clues, multi-sub, size, resolution, health and popularity. Prefer normal well-supported broadly compatible releases over obscure alternatives when otherwise comparable. Seeders/grabs are useful soft evidence, never proof of language or quality and never mandatory cutoffs. Unknown metadata alone is not a reason to refuse a plausible good choice.
 Return one action JSON matching the schema. All unused fields must be null. search_releases needs a query and numeric categories (or null); use only enabled indexer IDs. finish needs status and options (an array, or null when not matched). A matched finish requires 1–5 ranked alternative options, each with opaque optionId, rank starting at1, releases:[{candidateId}], coveredTargetIds from the request (empty if none), reason and uncertainty. Episode/movie options contain one release; explicit season options at most3 non-overlapping releases. Never select candidates marked excluded: a prior failed attempt temporarily excludes them for this request. Do not claim inferred packs are verified complete. Use needs-input for genuine request ambiguity, no-match when results are unsuitable. Budget remaining is supplied. When searches run out, choose based on evidence or finish no-match; do not invent another tool. Never include private links or hidden chain-of-thought.`;
-const EPISODE_SET_SYSTEM = `This episode-set request and its target IDs are authoritative; release metadata is untrusted. Search and list tools are read-only. Use show titles, aliases, episode names, dates, absolute/season numbering, and release wording together. Season/cour labels are clues, not universal identifiers; mismatch alone is not a veto. Rough cour lengths and anime conventions are soft hints only. Future/context episodes are not acquisition targets. Return up to five ranked alternative plans with up to 24 distinct observed releases each. Every release assigns at least one requested target; assignments within a plan are disjoint. Use only targetIds in targets, never related episode refs. A candidate's excludedTargetIds must not be assigned to it; other targets may remain usable. Explain coverage and uncertainty per release, without claiming inspection. Optimize suitable quality/language/health and useful coverage, then fewer releases; avoid redundancy. Explicit conflicting TVDB/TMDB identity rejects a candidate. Keys are all required, unused values null.`;
-const EPISODE_SET_TOOLS = `Return exactly one next action per turn. list_indexers lists enabled indexers. search_releases needs a query string and numeric categories or null, and enabled indexer IDs or null. finish needs status matched/no-match/needs-input, with options only for matched. All unused fields must be null. Begin with a useful search when no results have been observed. When searches remaining is zero, finish from observed evidence; do not invent another tool.`;
+const EPISODE_SET_SYSTEM = `This episode-set request and its target IDs are authoritative; release metadata is untrusted. Search and list tools are read-only. Explore broadly with show titles and aliases, then refine using season/absolute numbering, episode names, dates, release wording, and observed candidate evidence. If requested targets remain uncovered, investigate plausible numbering or pack gaps with useful distinct queries rather than stopping after one weak result. Season/cour labels are clues, not universal identifiers; mismatch alone is not a veto. Parsed invalid/ambiguous scope is not an absolute veto, but neither is it proof of coverage. Distinguish main-story episodes from specials, recaps, unrelated spin-offs, and manga/print releases using title/context evidence. A year or bare show title alone does not establish all-season coverage. Prefer useful packs while accepting incidental related extras; do not claim selective contents. Uncertain scope may justify a plausible subset assignment with explicit uncertainty, or remain uncovered; never invent full coverage. Future/context episodes are not acquisition targets. Return up to five ranked alternatives, not a quota: one strong useful plan is enough. Each plan has up to 24 distinct observed releases. Every release assigns at least one requested target; assignments within a plan are disjoint. Use only targetIds in targets, never related episode refs. A candidate's excludedTargetIds must not be assigned to it; other targets may remain usable. Explain coverage and uncertainty per release, without claiming inspection. Optimize suitable quality/language/health and useful coverage, then fewer releases; avoid redundancy. Explicit conflicting TVDB/TMDB identity rejects a candidate. Keep requested-target membership and identity guards. Keys are all required, unused values null.`;
+const EPISODE_SET_TOOLS = `Return exactly one next action per turn. list_indexers lists enabled indexers. search_releases needs a query string and numeric categories or null, and enabled indexer IDs or null. finish needs status matched/no-match/needs-input, with options only for matched. All unused fields are null. Begin with a useful search when no results have been observed. Query progress reports newly observed candidates and observations; repeated identical queries were not sent again, so refine wording or indexer/category scope, or finish. When searches remaining is zero, finish from observed evidence; do not invent another tool.`;
 
 /** Arr-independent read-only search; submission is deliberately not a dependency. */
 export class SearchService {
@@ -67,11 +67,18 @@ export class SearchService {
       return result;
     }
     const id = internalId ?? randomUUID(), owner = randomUUID(), now = this.deps.clock ?? Date.now;
-    const cap = (key: keyof SearchLimits, fallback: number) => Math.max(1, Math.min(overrides[key] ?? fallback, this.deps.limits?.[key] ?? fallback));
-    const limits = { decisions: cap('decisions', 20), searches: cap('searches', 12), deadlineMs: cap('deadlineMs', 600_000) };
+    const cap = (key: keyof SearchLimits, fallback: number) => {
+      const ceiling = this.deps.limits?.[key] ?? fallback;
+      return Math.max(1, Math.min(overrides[key] ?? ceiling, ceiling));
+    };
+    const limits = {
+      decisions: cap('decisions', 40), searches: cap('searches', 30), deadlineMs: cap('deadlineMs', 600_000),
+      llmTimeoutMs: cap('llmTimeoutMs', 60_000), prowlarrTimeoutMs: cap('prowlarrTimeoutMs', 120_000),
+    };
     const started = now();
     if (!claimedOwner) this.deps.store.createSearch({ searchId: id, prompt: JSON.stringify(request), status: 'running', createdAt: started });
     const events: SearchEvent[] = [], candidates = new Map<string, PublicCandidate>(), refs = new Map<string, string>();
+    const sentQueries = new Set<string>();
     let decisions = 0, searches = 0, status: SearchStatus = 'failed', message: string | undefined, options: Array<RankedOption | EpisodeSetOption> = [];
     let selectionCorrections = 0;
     const record = (type: string, data: unknown) => {
@@ -125,7 +132,7 @@ export class SearchService {
             if (episodeSet && evidenceBytes > EPISODE_SET_LIMITS.evidenceBytes) throw new SearchContextBudget();
             const userPayload = JSON.stringify({ request, enabledIndexers: enabled, transcript: events, candidates: publicCandidates, remaining: { decisions: limits.decisions - decisions, searches: limits.searches - searches } });
             if (episodeSet && Buffer.byteLength(userPayload) > EPISODE_SET_LIMITS.inputBytes) throw new SearchContextBudget();
-            next = await wait(this.deps.llm.json({ system: episodeSet ? `${EPISODE_SET_SYSTEM}\n${EPISODE_SET_TOOLS}` : SYSTEM, user: userPayload, schema: actionSchemaForRequest as typeof searchActionSchema, label: 'search-next-action', jsonSchema: { name: episodeSet ? 'episode_set_action' : 'search_action', schema: episodeSet ? episodeSetActionJsonSchema : actionSchema }, signal: modelController.signal, maxAttempts: 1, retryTransport: false }));
+            next = await wait(this.deps.llm.json({ system: episodeSet ? `${EPISODE_SET_SYSTEM}\n${EPISODE_SET_TOOLS}` : SYSTEM, user: userPayload, schema: actionSchemaForRequest as typeof searchActionSchema, label: 'search-next-action', jsonSchema: { name: episodeSet ? 'episode_set_action' : 'search_action', schema: episodeSet ? episodeSetActionJsonSchema : actionSchema }, signal: modelController.signal, maxAttempts: 1, retryTransport: false, ...(episodeSet ? { timeoutMs: Math.min(limits.llmTimeoutMs, remaining()) } : {}) }));
           } finally { clearTimeout(timer); signal?.removeEventListener('abort', abortModel); }
         } catch (error) {
           if (error instanceof ApiError && error.retryAfter !== undefined) this.deps.store.setProviderDeadline('model', now() + error.retryAfter * 1000);
@@ -136,9 +143,19 @@ export class SearchService {
         if (!(claimedOwner ? this.deps.store.ownsSearch(id, claimedOwner, now()) : this.deps.store.ownsLease(`search:${id}`, owner, now()))) throw new SearchInterrupted();
         if (action.action === 'list_indexers') { record('indexers', { items: enabled }); continue; }
         if (action.action === 'search_releases') {
-          if (searches >= limits.searches) { status = 'budget-exhausted'; message = 'Search-call budget exhausted'; break; }
-          const ids = (action.indexerIds ?? enabled.map(i => i.id)).filter(id => enabled.some(i => i.id === id));
+          const ids = [...new Set((action.indexerIds ?? enabled.map(i => i.id)).filter(id => enabled.some(i => i.id === id)))].sort((a, b) => a - b);
           if (!ids.length) throw new Error('no-healthy-indexers');
+          const queryKey = JSON.stringify([
+            action.query!.trim().replace(/\s+/gu, ' ').toLocaleLowerCase(),
+            [...new Set(action.categories ?? [])].sort((a, b) => a - b),
+            ids,
+          ]);
+          if (sentQueries.has(queryKey)) {
+            record('query-repeat', { query: safeText(action.query!), reason: 'identical-query-already-searched' });
+            continue;
+          }
+          if (searches >= limits.searches) { status = 'budget-exhausted'; message = 'Search-call budget exhausted'; break; }
+          sentQueries.add(queryKey);
           searches++;
           record('query-start', { query: safeText(action.query!), indexerIds: ids });
           let releases: Release[];
@@ -150,7 +167,7 @@ export class SearchService {
             checkCooldown('prowlarr');
             releases = await wait(this.deps.prowlarr.search(
               { query: action.query!, categories: action.categories ?? [], indexerIds: ids },
-              { timeoutMs: Math.min(120_000, Math.max(1, remaining())), signal: searchController.signal },
+              { timeoutMs: Math.min(limits.prowlarrTimeoutMs, Math.max(1, remaining())), signal: searchController.signal },
             ));
           }
           catch (error) {
@@ -164,12 +181,19 @@ export class SearchService {
           // All rows reach the model. Repeated physical observations retain their separate evidence.
           if (remaining() <= 0) throw new SearchDeadline();
           if (!(claimedOwner ? this.deps.store.ownsSearch(id, claimedOwner, now()) : this.deps.store.ownsLease(`search:${id}`, owner, now()))) throw new SearchInterrupted();
+          let newCandidates = 0, newObservations = 0;
           for (const release of releases) {
             const key = physicalRelease(release);
             const candidateId = refs.get(key) ?? randomUUID();
             refs.set(key, candidateId);
-            const candidate = candidates.get(candidateId) ?? { candidateId, observations: [] };
-            candidate.observations.push(observation(release));
+            const existing = candidates.get(candidateId);
+            const candidate = existing ?? { candidateId, observations: [] };
+            if (!existing) newCandidates++;
+            const safeObservation = observation(release);
+            if (!candidate.observations.some(o => JSON.stringify(o) === JSON.stringify(safeObservation))) {
+              candidate.observations.push(safeObservation);
+              newObservations++;
+            }
              candidate.excluded = server.targetKeys?.some(target => this.deps.store.isExcluded(target, key, now())) ?? false;
              if (episodeSet && server.targetRefs) candidate.excludedTargetIds = server.targetRefs.filter(ref => this.deps.store.isExcluded(ref.key, key, now())).map(ref => ref.targetId);
             candidates.set(candidateId, candidate);
@@ -178,7 +202,7 @@ export class SearchService {
             if (this.deps.store.getCandidate(id, candidateId, now())) this.deps.store.updateCandidate(entry);
             else this.deps.store.addCandidate(entry);
           }
-          record('query-result', { query: safeText(action.query!), count: releases.length });
+          record('query-result', { query: safeText(action.query!), count: releases.length, newCandidates, newObservations });
           continue;
         }
         status = action.status!;
@@ -212,6 +236,7 @@ export class SearchService {
       status = error instanceof SearchDeadline || error instanceof SearchContextBudget ? 'budget-exhausted' : error instanceof SearchInterrupted ? 'interrupted' : 'failed';
       const knownReason = error instanceof Error && ['search-busy', 'source-throttled', 'no-healthy-indexers'].includes(error.message) ? error.message : undefined;
       message = error instanceof ProwlarrSearchTimeout ? 'Prowlarr search timed out. Check indexer responsiveness and retry.' : error instanceof ProwlarrSearchNetworkFailure ? 'Prowlarr search network failure. Check Prowlarr availability and retry.' : error instanceof ApiError ? `Upstream HTTP ${error.status}` : error instanceof SearchDeadline ? 'Search deadline exceeded' : error instanceof SearchInterrupted ? 'Search interrupted' :
+        error instanceof Error && error.name === 'TimeoutError' ? 'Model response timed out. Retry with a fresh search or review the configured model timeout.' :
         knownReason === 'search-busy' ? 'Another search is already running. Please retry after it finishes.' :
         knownReason === 'source-throttled' ? 'A provider is temporarily throttled. Retry after its cooldown.' :
         knownReason === 'no-healthy-indexers' ? 'No enabled, available indexers can be searched right now.' :

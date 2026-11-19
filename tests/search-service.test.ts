@@ -232,10 +232,120 @@ describe('bounded neutral search', () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(store.getSearch(result.searchId)?.status).toBe('budget-exhausted');
   });
+  it('keeps the standard model deadline unless an episode-set evaluation explicitly overrides it', async () => {
+    const store = openSearchStore(':memory:'); stores.push(store);
+    const observed: Array<number | undefined> = [];
+    const llm = { json: async (args: any) => { observed.push(args.timeoutMs); return action({ status: 'no-match' }); } } as LLMClient;
+    const prowlarr = { getIndexers: async () => [{ id: 1, name: 'Index', enable: true }], getIndexerStatuses: async () => [], search: async () => [] };
+    const defaultService = new SearchService({ llm, prowlarr: prowlarr as any, store });
+    const evalService = new SearchService({ llm, prowlarr: prowlarr as any, store, limits: { decisions: 40, searches: 30, deadlineMs: 1_800_000, llmTimeoutMs: 600_000 } });
+    await defaultService.run({ prompt: 'Find ordinary item' });
+    await defaultService.run({ prompt: 'Plan episodes', context: { scope: { type: 'episode-set' }, targets: [{ targetId: 'a' }] } });
+    await evalService.run({ prompt: 'Plan episodes', context: { scope: { type: 'episode-set' }, targets: [{ targetId: 'a' }] } });
+    expect(observed).toEqual([undefined, 60_000, 600_000]);
+  });
+  it('reports model timeout safely and protects secrets in the result', async () => {
+    const { service } = setup(() => action({ status: 'no-match' }));
+    (service as any).deps.llm.json = async () => { const error = new Error('https://private.test/?key=secret'); error.name = 'TimeoutError'; throw error; };
+    const result = await service.run({ prompt: 'Plan', context: { scope: { type: 'episode-set' }, targets: [{ targetId: 'a' }] } });
+    expect(result.status).toBe('failed');
+    expect(result.message).toMatch(/model response timed out/i);
+    expect(JSON.stringify(result)).not.toMatch(/private\.test|secret/);
+  });
+  it('still aborts a generously configured batch model call at the overall search deadline', async () => {
+    vi.useFakeTimers();
+    let argsSeen: any;
+    let resolveModel!: (value: unknown) => void;
+    const { service } = setup(() => action({ status: 'no-match' }), undefined, { decisions: 40, searches: 30, deadlineMs: 10, llmTimeoutMs: 600_000 });
+    (service as any).deps.llm.json = (args: any) => { argsSeen = args; return new Promise(resolve => { resolveModel = resolve; }); };
+    const pending = service.run({ prompt: 'Plan', context: { scope: { type: 'episode-set' }, targets: [{ targetId: 'a' }] } });
+    await vi.advanceTimersByTimeAsync(11);
+    expect((await pending).status).toBe('budget-exhausted');
+    expect(argsSeen.timeoutMs).toBeLessThanOrEqual(10);
+    expect(argsSeen.signal.aborted).toBe(true);
+    resolveModel(action({ status: 'matched' }));
+  });
+  it('allows configured exploration above old defaults while preserving lower per-run limits', async () => {
+    const queries: string[] = [];
+    const { service } = setup(() => action({ action: 'search_releases', query: `Different query ${queries.length}` }),
+      async (args: any) => { queries.push(args.query); return []; }, { decisions: 40, searches: 30, deadlineMs: 600_000 });
+    const request = { prompt: 'Plan', context: { scope: { type: 'episode-set' as const }, targets: [{ targetId: 'a' }] } };
+    const aboveOldCap = await service.run(request);
+    expect(aboveOldCap.counts.searches).toBe(30);
+    const lowLimits = setup(() => action({ action: 'search_releases', query: `Different query ${queries.length}` }),
+      async (args: any) => { queries.push(args.query); return []; }, { decisions: 40, searches: 30, deadlineMs: 600_000 });
+    const reduced = await lowLimits.service.run(request, { searches: 3, decisions: 8 });
+    expect(reduced.counts.searches).toBe(3);
+    expect(reduced.counts.decisions).toBe(4);
+    const aboveCeiling = await service.run(request, { searches: 50, decisions: 80 });
+    expect(aboveCeiling.counts.searches).toBe(30);
+  });
+  it('deduplicates queries by the effective healthy indexer scope', async () => {
+    let calls = 0;
+    const { service, searches } = setup(() => {
+      calls++;
+      if (calls <= 2) return action({ action: 'search_releases', query: 'Example', categories: [5000], indexerIds: calls === 1 ? [2, 1, 1] : [1] });
+      return action({ status: 'no-match' });
+    });
+    const result = await service.run({ prompt: 'Find example' });
+    expect(result.status).toBe('no-match');
+    expect(searches).toHaveLength(1);
+    expect(searches[0].indexerIds).toEqual([1]);
+    expect(result.counts.searches).toBe(1);
+  });
   it('retains conflicting observations for the same physical release', async () => {
     const { service, inputs } = setup(input => !input.candidates.length ? action({ action: 'search_releases', query: 'Show' }) : action({ status: 'no-match' }), async () => [{ ...release(1, 'Show S01E01'), infoHash: 'same' }, { ...release(2, 'Show S02E01'), infoHash: 'same' }]);
     await service.run({ prompt: 'Find' });
     expect(inputs[1].candidates).toHaveLength(1);
     expect(inputs[1].candidates[0].observations).toHaveLength(2);
+  });
+  it('does not resend an identical normalized query and tells the model to refine it', async () => {
+    let calls = 0;
+    const { service, searches, inputs } = setup(() => {
+      calls++;
+      if (calls === 1) return action({ action: 'search_releases', query: '  Example   S01 ', categories: [5000], indexerIds: [1] });
+      if (calls === 2) return action({ action: 'search_releases', query: 'example s01', categories: [5000], indexerIds: [1] });
+      return action({ status: 'no-match', message: 'No suitable results' });
+    });
+    const result = await service.run({ prompt: 'Find example' });
+    expect(result.status).toBe('no-match');
+    expect(searches).toHaveLength(1);
+    expect(inputs[2].transcript).toContainEqual(expect.objectContaining({
+      type: 'query-repeat', data: expect.objectContaining({ reason: 'identical-query-already-searched' }),
+    }));
+  });
+  it('keeps the same text searchable under a different category or indexer scope', async () => {
+    let decision = 0;
+    const { service, searches, prowlarr } = setup(() => {
+      decision++;
+      const variants = [
+        { categories: [5000], indexerIds: [1] }, { categories: [5001], indexerIds: [1] },
+        { categories: [5000], indexerIds: [2] },
+      ];
+      return decision <= variants.length
+        ? action({ action: 'search_releases', query: 'Example season', ...variants[decision - 1] })
+        : action({ status: 'no-match' });
+    }, async () => []);
+    prowlarr.getIndexers = async () => [{ id: 1, name: 'Index', enable: true }, { id: 2, name: 'Second', enable: true }];
+    await service.run({ prompt: 'Find example' });
+    expect(searches).toHaveLength(3);
+  });
+  it('deduplicates identical observations across distinct queries but preserves conflicting evidence and new results', async () => {
+    let call = 0;
+    const sharedA = { ...release(1, 'Example S01E01'), infoHash: 'physical-shared' };
+    const sharedB = { ...release(2, 'Example S01E01'), infoHash: 'physical-shared' };
+    const resultC = { ...release(3, 'Example S02E01'), infoHash: 'physical-new' };
+    const { service, inputs } = setup(input => {
+      if (!input.candidates.length || call++ === 0) return action({ action: 'search_releases', query: call === 0 ? 'Example broad' : 'Example refined' });
+      return action({ status: 'no-match' });
+    }, async (args: any) => args.query.includes('broad') ? [sharedA] : [sharedA, sharedB, resultC]);
+    const result = await service.run({ prompt: 'Find Example' });
+    expect(result.counts.candidates).toBe(2);
+    expect(inputs[2].candidates[0].observations).toHaveLength(2);
+    expect(inputs[2].candidates[1].observations).toHaveLength(1);
+    expect(result.events.filter(e => e.type === 'query-result').map(e => e.data)).toEqual([
+      expect.objectContaining({ newCandidates: 1, newObservations: 1 }),
+      expect.objectContaining({ newCandidates: 1, newObservations: 2 }),
+    ]);
   });
 });

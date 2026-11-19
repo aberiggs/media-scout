@@ -36,8 +36,8 @@ function failure(headers: Record<string, string>): Response {
   });
 }
 
-function call(llm: OpenRouterLLM) {
-  return llm.json({ system: 'sys', user: 'user', schema, label: 'verdict' });
+function call(llm: OpenRouterLLM, timeoutMs?: number) {
+  return llm.json({ system: 'sys', user: 'user', schema, label: 'verdict', ...(timeoutMs === undefined ? {} : { timeoutMs }) });
 }
 
 afterEach(() => {
@@ -70,6 +70,25 @@ describe('OpenRouterLLM.json deadline', () => {
     const outcome = await result;
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.error).toMatchObject({ name: 'TimeoutError' });
+  });
+
+  it('allows an explicit longer deadline while leaving omitted calls at 60 seconds', async () => {
+    vi.useFakeTimers();
+    let requestSignal: AbortSignal | undefined;
+    const llm = build((input) => {
+      requestSignal = (input as Request).signal;
+      return new Promise<Response>((_resolve, reject) => {
+        requestSignal!.addEventListener('abort', () => reject(requestSignal!.reason), { once: true });
+      });
+    });
+    let settled = false;
+    const result = call(llm, 90_000).catch(e => e).finally(() => { settled = true; });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(settled).toBe(true);
+    expect(requestSignal?.aborted).toBe(true);
+    await result;
   });
 
   it('cancels a response whose body stalls after headers arrive', async () => {

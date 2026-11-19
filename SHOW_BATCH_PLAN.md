@@ -2,6 +2,9 @@
 
 **Status: approved; implementation in progress.** Torrent inspection and CRW
 remain out of scope. Validation must not send live download-client requests.
+Offline characterization is not live search evaluation. Search-only live probes
+now include full collapsed-season anime workloads; results and limitations are
+recorded in `AUTOMATION_AUDIT.md`. No download trial is included here.
 
 Delivery checklist:
 - [ ] Shared batch contracts, workload/context builder, bounded search and selection.
@@ -73,8 +76,19 @@ show synopsis/profile on every episode. Extend `ArrObserver` to retain show-leve
 context and queue/eligibility reasons while keeping current eligibility timing.
 An incomplete episode read is unknown, not an empty show.
 
-Typical shows get all due requested episodes in one workload. Retain existing
-search-call/decision/deadline budgets. Proposed initial batch ceilings: 200
+Typical shows get all due requested episodes in one workload. Search direction
+is agent-directed generous exploration: distinct broad/alias/season/absolute
+numbering queries and evidence-driven refinement, rather than rigid tiny
+search/decision budgets. The search-only implementation now reports new candidate
+and observation counts, deduplicates identical evidence and repeated effective
+queries, and fixes configured budgets being silently limited by old defaults.
+Defaults are 40 decisions / 30 searches; settings accept up to 80 / 60 while
+preserving saved lower budgets. Existing provider cooldowns, cancellation, context
+and overall deadline bounds remain. This is not unlimited execution or a semantic
+proof of search exhaustion; broader long-running exploration remains to evaluate.
+The opt-in anime harness uses ten-minute model/indexer call limits, a thirty-minute
+overall deadline and an appropriately longer claimed lease, without changing
+production timeouts or saved settings. Initial batch ceilings are 200
 acquisition targets and 24 selected releases per plan, not the current three.
 Oversized backlogs use deterministic oldest-due slices, retain compact whole-show
 context, and explicitly report deferred counts. Context rendering also needs a
@@ -223,14 +237,16 @@ MCP shares the schemas: extend `ma_search_v2`/status/submit and add
 fields; it still cannot grab. Version the prompt/result interpretation so existing
 stored searches remain readable and old options are not reinterpreted as batches.
 
-Expose an explicit recovery action for the rare ambiguous send:
-`POST /api/v2/submissions/:id/releases/:candidateId/allow-retry`, requiring an
-acknowledgment of possible duplicate downloading. It clears that child's retry
-quarantine with an audit event; it does not change the historical outcome or
-submit anything. Normal automatic operation does not require confirmations per
-release. Reject this action while that child still has an active execution lease,
-and never clear another child's holds. Share this operation with MCP if exposed
-there, marked as a mutation.
+After a completed, failed, or ambiguous acquisition attempt, apply a one-hour
+whole-show grace. Then require a fresh complete Sonarr observation before retrying
+targets that remain missing and not queued. Agent-assigned coverage is predictive,
+not ground truth; Arr's fresh state determines whether target need remains.
+Ambiguous sends may be retried after this grace, accepting possible duplicate
+downloads. Do not require indefinite physical-release quarantine or an operator
+allow-retry workflow. Do not add qBittorrent introspection in this increment.
+Search-only/no-match retries remain governed by ordinary target search retry and
+provider cooldowns; they do not start acquisition grace. A related hold must not
+outlive acquisition grace indefinitely.
 
 ## 4. Agent reasoning and validation
 
@@ -270,9 +286,11 @@ Hard validation stays deliberately small:
 `SearchService` currently marks a candidate excluded if *any* target excludes it.
 Batch candidates instead need `excludedTargetIds`, validated against that release's
 coverage; retain legacy semantics for old search scopes.
-Keep ordinary target/release-pair failures scoped to those pairs. Explicitly
-release-wide barriers (for example an unresolved ambiguous POST) apply to that
-physical release across all target sets and new idempotency keys.
+Keep ordinary target/release-pair failures scoped to those pairs. Any release-
+wide barrier after an ambiguous POST is bounded: acquisition grace is at most
+one hour, after which a fresh complete Arr observation showing missing and
+not-queued targets permits retry. Do not impose indefinite physical-release
+quarantine across new target sets or idempotency keys.
 
 This intentionally delegates semantic matching to the agent. Bookkeeping prevents
 duplicate/unauthorized work; it does not promise the agent will never misidentify
@@ -321,22 +339,22 @@ Flow:
    renewal failure; the current fixed 15-minute lease is not a promise a plan
    will finish safely before expiry. Lease loss/abort during an in-flight POST
    does not prove upstream cancellation: keep a sending child ambiguous unless
-   a definitive outcome is durably recorded, preserve quarantine, and stop all
-   subsequent POSTs.
+   a definitive outcome is durably recorded, stop all subsequent POSTs, and
+   apply the one-hour acquisition grace followed by a complete fresh Arr read;
+   do not retain indefinite quarantine.
 4. On definite failure or an uncertain POST, stop the remaining plan. Do not
    automatically submit another ranked alternative or roll back successful grabs.
    Unsent releases are explicit `not-attempted`, not inferred failures.
-5. Keep target/physical queue-appearance holds for submitted or uncertain releases;
-   release unused reservations for skipped/unsent/rejected work. Cleanup is
-   child/owner-scoped and cannot delete holds justified by a sent/ambiguous child.
-   Derive each hold from that release's send/completion time, not the original
-   search time.
+5. Apply one-hour whole-show acquisition grace after a completed, failed, or
+   ambiguous attempt; then use a fresh complete observation to retry only targets
+   still missing and not queued. Release unused reservations for skipped/unsent/
+   rejected work. Do not let related holds outlive that grace.
 6. Reconcile submitted, uncertain, and recovered-sending children against their
    own assigned/residual targets. File/queue changes can satisfy targets
    independently; do not require every episode in the batch to import before
    resolving successful work. A file arriving from an unrelated download resolves
-   target need, not the uncertain physical-send history. Clear a physical-send
-   quarantine only from a reliable correlation or explicit recovery acknowledgment.
+   target need, not certainty about prior physical sends. Retry after grace accepts
+   duplicate risk; reliable correlation may improve diagnostics but is not required.
 
 Return per-release outcomes plus aggregate `submitted|partial|uncertain|...`.
 Any ambiguous child makes the aggregate `uncertain`, even if earlier releases
@@ -348,18 +366,15 @@ new additive outcomes understood by activity, HTTP, MCP, and UI, not new search
 statuses. Expose counts and child outcomes so the summary does not hide success.
 A replay of the parent key returns the durable receipt without sending again.
 After process death, `sending` is uncertain until reconciled; prepared/unsent work
-is not automatically resumed. A later fresh plan may address remaining need,
-but cannot bypass unresolved per-release holds.
+is not automatically resumed. A later fresh plan may address remaining need only
+after the one-hour acquisition grace and a complete fresh Arr observation.
 
-For a hard-killed POST, expired queue grace alone does not establish rejection.
-Do not blindly replay that same physical release; retain an unresolved submission
-barrier until Arr evidence resolves it or an explicit operator action does.
-The physical-release quarantine is durable across new searches and keys. Target
-appearance holds are bounded: after grace and a complete fresh Arr read showing
-the target missing and not queued, a later fresh plan may choose a *different*
-release. Surface the possible overlap risk; do not pretend absence proves the
-first send failed. No immediate fallback inside the original execution. This is
-a deliberate practical recovery policy rather than indefinitely blocking a show.
+Apply one-hour whole-show acquisition grace after completed/failed/ambiguous
+attempts. After grace, a fresh complete Arr observation showing a target missing
+and not queued permits a new plan; that does not prove a prior ambiguous POST
+failed, and duplicates are an accepted risk. There is no mandatory indefinite
+physical quarantine or operator allow-retry workflow. Search-only/no-match does
+not enter acquisition grace. No immediate fallback inside the original execution.
 
 Correct content may still fail Sonarr's filename/import mapping. This work does
 not rename files or rewrite Sonarr numbering: expose stalled/import-pending work
@@ -383,7 +398,7 @@ Arr has observed anything.
 | Five-minute per-show search cooldown | Remove for new show-batch automation; ignore old show-cooldown settings |
 | `intervalMinutes` (default five minutes) | Keep as idle observation cadence, not a per-release wait |
 | Delay between releases in a selected plan | None intentionally; POST sequentially with fresh checks |
-| Queue-appearance grace (default 30 minutes) | Keep, per release and its assigned targets; protects the observation gap |
+| Acquisition grace (one hour) | Whole-show grace after completed/failed/ambiguous attempt; then fresh complete Arr read |
 | Target search retry (default 30 minutes) | Keep for searched-but-uncovered/no-match targets and dry-run searches |
 | Failure backoff / provider Retry-After | Keep; operational failures still need pacing |
 | Live queue/import-pending suppression | Keep while observed active; not a timed five-minute assumption |
@@ -399,7 +414,7 @@ Scheduler algorithm:
    from its due targets, with other episodes as context.
 3. Run one bounded search; automation chooses rank one and executes that plan only
    when enabled and not dry-run. Search-only/manual callers never auto-submit.
-4. Update attempts per target: submitted/uncertain -> release-specific hold;
+4. Update attempts per target: submitted/uncertain -> whole-show acquisition grace;
    uncovered/no-match -> ordinary retry; operational failure -> backoff; unchanged
    unsent targets get appropriate failure retry without being marked downloaded.
    Targets not in this bounded search are not charged a search attempt.
@@ -466,9 +481,9 @@ CRW and magnet swarm metadata retrieval remain separate follow-ups.
   they were submitted, and do not exclude every release against every target.
 - Source/config change, pause/dry-run, lease loss, expired candidate -> no subsequent
   POST; same idempotency key returns the same durable execution.
-- Ambiguous POST -> new keys do not bypass physical-release quarantine; different-
-  release recovery after target grace is explicit, and operator allow-retry only
-  clears quarantine with acknowledgment, never sends directly.
+- Ambiguous POST -> whole-show acquisition grace delays retry; after grace a
+  fresh complete missing/not-queued observation permits retry, with duplicate
+  risk accepted. Search-only/no-match uses ordinary target retry instead.
 - Upgrade -> old searches/receipts/settings remain readable and safe; movie and
   single-episode APIs and explicit approval boundaries remain intact.
 

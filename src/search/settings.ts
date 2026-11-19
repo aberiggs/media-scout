@@ -17,7 +17,7 @@ export const settingsSchema = z.object({
     enabled: z.boolean(), intervalMinutes: z.number().int().min(1).max(35_791), searchRetryMinutes: z.number().int().min(1).max(525_600),
     failureBackoffMinMinutes: z.number().int().min(1).max(35_791), failureBackoffMaxMinutes: z.number().int().min(1).max(35_791), queueGraceMinutes: z.number().int().min(1).max(1440),
   }).strict().refine((value) => value.failureBackoffMaxMinutes >= value.failureBackoffMinMinutes, { path: ['failureBackoffMaxMinutes'], message: 'must be at least failureBackoffMinMinutes' }),
-  search: z.object({ maxDecisions: z.number().int().min(1).max(20), maxSearches: z.number().int().min(1).max(12), deadlineMinutes: z.number().int().min(1).max(10) }).strict(),
+  search: z.object({ maxDecisions: z.number().int().min(1).max(80), maxSearches: z.number().int().min(1).max(60), deadlineMinutes: z.number().int().min(1).max(10) }).strict(),
   safety: z.object({ dryRun: z.boolean() }).strict(),
 }).strict();
 
@@ -27,7 +27,7 @@ export const defaultSettings: Settings = {
   integrations: { prowlarr: { url: '', apiKey: '', tvClient: '', movieClient: '' }, sonarr: { url: '', apiKey: '' }, radarr: { url: '', apiKey: '' } },
   ai: { apiKey: '', model: 'z-ai/glm-5.3-flash', baseUrl: 'https://openrouter.ai/api/v1', preferences: '' },
   monitoring: { enabled: false, intervalMinutes: 5, searchRetryMinutes: 30, failureBackoffMinMinutes: 5, failureBackoffMaxMinutes: 60, queueGraceMinutes: 30 },
-  search: { maxDecisions: 20, maxSearches: 12, deadlineMinutes: 10 }, safety: { dryRun: true },
+  search: { maxDecisions: 40, maxSearches: 30, deadlineMinutes: 10 }, safety: { dryRun: true },
 };
 
 export function migrateSettings(value: unknown): { migrated: boolean; settings: Settings } {

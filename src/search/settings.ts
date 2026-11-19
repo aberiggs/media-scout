@@ -25,7 +25,7 @@ export type Settings = z.infer<typeof settingsSchema>;
 export const defaultSettings: Settings = {
   version: 3,
   integrations: { prowlarr: { url: '', apiKey: '', tvClient: '', movieClient: '' }, sonarr: { url: '', apiKey: '' }, radarr: { url: '', apiKey: '' } },
-  ai: { apiKey: '', model: 'z-ai/glm-5.3-flash', baseUrl: 'https://openrouter.ai/api/v1', preferences: '' },
+  ai: { apiKey: '', model: 'openai/gpt-6.1-sol', baseUrl: 'https://openrouter.ai/api/v1', preferences: '' },
   monitoring: { enabled: false, intervalMinutes: 5, searchRetryMinutes: 30, failureBackoffMinMinutes: 5, failureBackoffMaxMinutes: 60, queueGraceMinutes: 30 },
   search: { maxDecisions: 40, maxSearches: 30, deadlineMinutes: 10 }, safety: { dryRun: true },
 };

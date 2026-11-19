@@ -36,7 +36,7 @@ export interface LLMClient {
  * completion (opening fence but no closing ```) is NOT salvaged: returning the
  * content unchanged makes JSON.parse fail so the existing retry fires.
  */
-function stripFences(content: string): string {
+export function stripFences(content: string): string {
   // Unfenced valid JSON passes through untouched: a picker reason can contain
   // ```code``` markup, and a first-open/last-close slice would corrupt it. A
   // real fenced payload starts with a backtick, so extraction still runs for it.

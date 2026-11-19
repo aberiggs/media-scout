@@ -5,6 +5,11 @@ import { openSearchStore } from '../src/search/store';
 describe('search-first settings', () => {
   it('defaults to disabled monitoring and no downloads', () => {
     expect(settingsSchema.parse(defaultSettings)).toMatchObject({ version: 3, safety: { dryRun: true }, monitoring: { enabled: false, searchRetryMinutes: 30 }, search: { maxDecisions: 40, maxSearches: 30, deadlineMinutes: 10 } });
+    expect(defaultSettings.ai.model).toBe('openai/gpt-6.1-sol');
+  });
+  it('does not migrate a previously saved model when the new-install default changes', () => {
+    const saved = { ...defaultSettings, ai: { ...defaultSettings.ai, model: 'z-ai/glm-5.3-flash' } };
+    expect(migrateSettings(saved)).toEqual({ migrated: false, settings: saved });
   });
   it('requires only search connections for standalone readiness', () => {
     const settings = structuredClone(defaultSettings);

@@ -268,3 +268,77 @@ than assume more turns or a still-longer timeout necessarily solves this case.
 
 Jev evaluation is tracked separately in issue #50:
 https://github.com/aberiggs/media-scout/issues/50.
+
+## Frozen-input model comparison — execution plan
+
+Compare configured `z-ai/glm-5.3-flash` with catalog-listed
+`openai/gpt-6.1-sol` using the four saved final-decision inputs from the realistic
+and fixture-indexer Kaiju/Re:Zero runs above. Use the exact same input, prompt
+and constrained schema for both models: one best plan with concise explanations.
+Run two repetitions per model/input (16 calls), with a ten-minute per-call
+deadline and a 16,384-token output allowance. No Prowlarr requests, download
+submissions, saved-setting changes, or production behavior changes are included.
+
+Capture input hashes, final structured outputs, elapsed time, finish reason,
+and provider-reported token counts/cost where available, but never private
+reasoning text, credentials, or raw provider responses. Validate actions and
+coverage references with the real selection validator, then independently inspect
+selected releases and explanations; structural completeness alone is not quality.
+Record timeouts/truncation/invalid output as failures and missing usage as unknown,
+not zero. This is a small finalization comparison, not an end-to-end search-agent
+benchmark or a causal comparison against the earlier unconstrained prompts.
+Implementation is in `scripts/compare-anime-models.ts`; SDK/MCP integration
+remains follow-up work (issue #51).
+
+The primary protocol is `one-plan-production-text-bounds-v1`. It uses production
+text bounds (1,000 characters per release field; 2,000 per plan field/message),
+preserves optional empty uncertainty strings, and uses the production fenced-JSON
+parser. Concision is prompt guidance, not a new 200-character hard limit.
+
+An initial diagnostic used tighter text limits and is retained separately.
+Several comparator outputs hit the exact 200-character uncertainty cap, ended
+mid-sentence, and omitted later releases; one had an empty plan reason. Two
+same-input comparator controls with only the text limits restored produced
+complete 23-target Kaiju plans in 13.3 and 14.5 seconds. This is evidence of a
+schema interaction worth controlling, not proof of causation from two repeats.
+The diagnostic ultimately recorded all 16 responses (its cancellation flag was
+set near final completion). Its results and two controls are not pooled with
+the corrected 16-call primary comparison below. All calls remain search-only/model-only.
+
+### Corrected primary run
+
+The 16-call corrected run used four frozen inputs with two repeats per model
+(eight calls per model). All 16 responses were parseable and schema-valid;
+seven GLM plans and all eight Sol plans passed the real selection validator.
+The one GLM validation failure was on real Re:Zero input `a83f3173`: the
+response referenced an invented candidate and assigned S3 targets 51–75.
+Mean response time was 27.200875s for GLM and 17.6785s for Sol. Observed
+response times ranged 14.685–42.546s for GLM and 11.848–23.737s for Sol.
+Reported costs summed to $0.01967056 for GLM and $0.1129986 for Sol;
+provider-reported cost is not a quality metric.
+
+By input hash:
+
+- `564f7510` (real Kaiju): GLM coverage was 12/23 then 23/23; both Sol plans
+  covered 23/23.
+- `a83f3173` (real Re:Zero): GLM returned the invalid plan described above,
+  then a validator-passing 85/85 plan. Both Sol plans covered 85/85.
+- `affd7eeb` (fixture Kaiju): both GLM plans structurally covered 23/23 but
+  assigned all targets to the S01 pack, collapsing the fixture's season
+  mapping; both Sol plans used two packs and covered 23/23.
+- `70fab867` (fixture Re:Zero): both Sol plans covered 74/85, leaving 67–77
+  uncovered. Both GLM plans claimed 85/85 but used inconsistent season
+  boundaries: 51–64 / 65–77 in one run and 51–63 / 64–77 in the other.
+
+These are structural and candidate-reference observations, not a general
+quality ranking. A validator-approved target count does not establish pack
+contents, boundaries, audio/subtitle suitability, or quality. Independent
+artifact review found Sol's conservative partial plan useful rather than
+erroneous, though a plausible S04 assignment might improve coverage.
+The new-install default is Sol as separately user-approved; existing saved
+settings remain unchanged. No raw response artifact is included here.
+
+Close-out checks: 493 backend tests passed, backend TypeScript and standalone
+strict comparator TypeScript checks passed. The comparison makes no claim
+about end-to-end tool use or downloaded/imported contents. Production model
+timeouts and automatic episode-set submission behavior remain unchanged.

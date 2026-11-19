@@ -40,6 +40,12 @@ export class SubmissionService {
     if ((this.deps.store.getProviderDeadline('prowlarr') ?? 0) > now()) return { searchId: request.searchId, optionId: request.optionId, outcome: 'deferred', candidateIds: [], outcomes: [] };
     if (policy.enabled === false || !policy.dryRun && server.available?.() === false) return { searchId: request.searchId, optionId: request.optionId, outcome: 'failed', candidateIds: [], outcomes: [] };
     const search = this.deps.store.getSearch(request.searchId);
+    // Batch plans have no release-level journal/reservation semantics yet.
+    // Never let the legacy Cartesian submission path execute one.
+    try {
+      if ((JSON.parse(search?.prompt ?? 'null') as { context?: { scope?: { type?: string } } } | null)?.context?.scope?.type === 'episode-set')
+        return { searchId: request.searchId, optionId: request.optionId, outcome: 'rejected', message: 'Episode-set submission is not enabled yet.', candidateIds: [], outcomes: [] };
+    } catch { /* malformed legacy prompt continues through the existing validation path */ }
     const options = (search?.result as any)?.options as Array<any> | undefined;
     const option = search?.status === 'matched' ? options?.find(o => o.optionId === request.optionId) : undefined;
     if (!option) return { searchId: request.searchId, optionId: request.optionId, outcome: 'rejected', candidateIds: [], outcomes: [] };

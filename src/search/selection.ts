@@ -1,14 +1,44 @@
-import { rankedOptionSchema, type RankedOption } from './contracts';
+import { episodeSetWireOptionSchema, rankedOptionSchema, type EpisodeSetOption, type RankedOption } from './contracts';
+
+function conflictingIdentity(expected: string | number | undefined, observed: number | null): boolean {
+  const requested = Number(expected);
+  // Arr/Prowlarr use zero as an unknown-ID sentinel, not another show's identity.
+  return Number.isFinite(requested) && requested > 0 && observed !== null && observed > 0 && requested !== observed;
+}
 
 export function validateRankedOptions(
-  input: unknown[], candidates: Set<string>, targets: Set<string>, scope: { type: string; seasonNumber?: number; episodeNumber?: number; absoluteEpisodeNumber?: number; candidateSeasons?: Record<string, number[]>; candidateScopes?: Record<string, import('../core/parser').ParsedReleaseCoverage[]> },
-): { valid: boolean; options: RankedOption[]; error?: string } {
-  const parsed = input.map(value => rankedOptionSchema.safeParse(value));
+  input: unknown[], candidates: Set<string>, targets: Set<string>, scope: { type: string; seasonNumber?: number; episodeNumber?: number; absoluteEpisodeNumber?: number; candidateSeasons?: Record<string, number[]>; candidateScopes?: Record<string, import('../core/parser').ParsedReleaseCoverage[]>; expectedIds?: Record<string, string | number>; candidateIds?: Record<string, Array<{tvdb:number|null;tmdb:number|null}>> },
+): { valid: boolean; options: Array<RankedOption | EpisodeSetOption>; error?: string } {
+  const batch = scope.type === 'episode-set';
+  const parsed = input.map(value => batch ? episodeSetWireOptionSchema.safeParse(value) : rankedOptionSchema.safeParse(value));
   if (parsed.some(x => !x.success)) return { valid: false, options: [], error: 'invalid option schema' };
   const options = parsed.map(x => (x as { success: true; data: RankedOption }).data);
   if (!options.length || options.length > 5) return { valid: false, options: [], error: 'invalid option count' };
   if (new Set(options.map(o => o.optionId)).size !== options.length || options.some((o, index) => o.rank !== index + 1)) return { valid: false, options: [], error: 'invalid option ranks' };
   for (const option of options) {
+    if (batch) {
+      const raw = option as unknown as { optionId: string; rank: number; releases: Array<{candidateId:string;coveredTargetIds:string[];coverageReason:string;uncertainty:string}>; reason: string; uncertainty: string };
+      const assigned = new Set<string>();
+      for (const release of raw.releases) {
+        if (!candidates.has(release.candidateId)) return { valid: false, options: [], error: 'unobserved candidate reference' };
+        for (const observation of scope.candidateIds?.[release.candidateId] ?? []) {
+          const tvdb = Object.entries(scope.expectedIds ?? {}).find(([k]) => k.toLowerCase() === 'tvdb')?.[1];
+          const tmdb = Object.entries(scope.expectedIds ?? {}).find(([k]) => k.toLowerCase() === 'tmdb')?.[1];
+          if (conflictingIdentity(tvdb, observation.tvdb) || conflictingIdentity(tmdb, observation.tmdb))
+            return { valid: false, options: [], error: 'conflicting show identity' };
+        }
+        if (release.coveredTargetIds.some(id => !targets.has(id))) return { valid: false, options: [], error: 'invalid target reference' };
+        for (const id of release.coveredTargetIds) {
+          if (assigned.has(id)) return { valid: false, options: [], error: 'duplicate target assignment' };
+          assigned.add(id);
+        }
+      }
+      const union = [...assigned].sort();
+      const uncovered = [...targets].filter(id => !assigned.has(id)).sort();
+      if (raw.releases.length > 24 || !assigned.size || new Set(raw.releases.map(r => r.candidateId)).size !== raw.releases.length) return { valid: false, options: [], error: 'invalid episode-set plan' };
+      Object.assign(raw, { coveredTargetIds: union, uncoveredTargetIds: uncovered, coverage: uncovered.length ? 'partial' : 'complete' });
+      continue;
+    }
     if (option.releases.some(r => !candidates.has(r.candidateId))) return { valid: false, options: [], error: 'unobserved candidate reference' };
     if (new Set(option.releases.map(r => r.candidateId)).size !== option.releases.length) return { valid: false, options: [], error: 'duplicate physical release' };
     if (option.coveredTargetIds.some(id => !targets.has(id)) || new Set(option.coveredTargetIds).size !== option.coveredTargetIds.length) return { valid: false, options: [], error: 'invalid target reference' };

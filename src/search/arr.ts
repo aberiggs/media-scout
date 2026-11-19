@@ -12,7 +12,8 @@ export type ArrProvider = 'sonarr' | 'radarr';
 export interface ArrTarget {
   key: string; provider: ArrProvider; sourceFingerprint: string; serviceId: number; externalId: number;
   episodeId?: number; movieId?: number; monitored: boolean; hasFile: boolean; eligible: boolean;
-  available: boolean; airAt?: number; context: Record<string, unknown>;
+  available: boolean; airAt?: number; queued?: boolean; queueReason?: string; context: Record<string, unknown>;
+  showContext?: Record<string, unknown>; episodeContext?: Record<string, unknown>;
 }
 export interface SafeQueueRecord { serviceId?: number; itemId?: number; seasonNumber?: number; status?: string; trackedStatus?: string; trackedState?: string }
 export interface ProviderObservation {
@@ -112,8 +113,10 @@ export class ArrObserver {
           const eligible = series.monitored && episode.monitored && !episode.hasFile && available && !queueCovered;
           const key = targetKey('sonarr', fp, series.id, series.tvdbId, episode.id);
           const profile = profiles?.find(p => p.id === series.qualityProfileId);
-          targets.push({ key, provider: 'sonarr', sourceFingerprint: fp, serviceId: series.id, externalId: series.tvdbId, episodeId: episode.id, monitored: series.monitored && episode.monitored, hasFile: episode.hasFile, available, eligible,
-            ...(airing === undefined ? {} : { airAt: airing }), context: safeContext({ title: series.title, titles: [series.title, ...series.alternateTitles.map(t => t.title)], seasonNumber: episode.seasonNumber, episodeNumber: episode.episodeNumber, absoluteEpisodeNumber: episode.absoluteEpisodeNumber, episodeTitle: episode.title, overview: episode.overview ?? series.overview ?? undefined, originalLanguage: languageName(series.originalLanguage), seriesType: series.seriesType, profileContext: summarizeProfile(client.getQualityProfiles ? profile : series.qualityProfile), externalIds: { tvdb: series.tvdbId } }) });
+          const showContext = safeContext({ title: series.title, titles: [series.title, ...series.alternateTitles.map(t => t.title)], overview: series.overview ?? undefined, originalLanguage: languageName(series.originalLanguage), seriesType: series.seriesType, profileContext: summarizeProfile(client.getQualityProfiles ? profile : series.qualityProfile), externalIds: { tvdb: series.tvdbId } });
+          const episodeContext = safeContext({ seasonNumber: episode.seasonNumber, episodeNumber: episode.episodeNumber, absoluteEpisodeNumber: episode.absoluteEpisodeNumber, episodeTitle: episode.title, episodeOverview: episode.overview ?? undefined });
+          targets.push({ key, provider: 'sonarr', sourceFingerprint: fp, serviceId: series.id, externalId: series.tvdbId, episodeId: episode.id, monitored: series.monitored && episode.monitored, hasFile: episode.hasFile, available, queued: queueCovered, ...(queueCovered ? { queueReason: 'observed-in-queue' } : {}), eligible,
+            ...(airing === undefined ? {} : { airAt: airing }), showContext, episodeContext, context: safeContext({ ...showContext, ...episodeContext, overview: episode.overview ?? series.overview ?? undefined }) });
         }
       }
       if (this.sourceFingerprint('sonarr') !== fp) return unknown(at, 'source-changed');

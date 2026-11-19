@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { searchRequestSchema, searchActionSchema, searchStatusSchema, rankedOptionSchema, submissionRequestSchema } from '../src/search/contracts';
+import { searchRequestSchema, searchActionSchema, episodeSetActionSchema, searchStatusSchema, rankedOptionSchema, submissionRequestSchema } from '../src/search/contracts';
 
 describe('neutral search contracts', () => {
   it('accepts prompt-only requests and keeps preferences descriptive', () => {
@@ -23,5 +23,24 @@ describe('neutral search contracts', () => {
   it('requires explicit submission references and idempotency key', () => {
     expect(submissionRequestSchema.safeParse({ searchId: 's1', optionId: 'o1', idempotencyKey: 'k1' }).success).toBe(true);
     expect(submissionRequestSchema.safeParse({ searchId: 's1', optionId: 'o1', url: 'magnet:?x' }).success).toBe(false);
+  });
+  it('accepts bounded episode-set context and rejects wire fields that are absent or oversized', () => {
+    const episodeSet = { prompt: 'Plan the aired episodes', context: { kind: 'tv', scope: { type: 'episode-set' }, targets: [{ targetId: 'a', seasonNumber: 1, episodeNumber: 2, title: 'Ep', airDateUtc: null }] } };
+    expect(searchRequestSchema.safeParse(episodeSet).success).toBe(true);
+    expect(searchRequestSchema.safeParse({ ...episodeSet, context: { ...episodeSet.context, targets: Array.from({ length: 201 }, (_, i) => ({ targetId: `e${i}` })) } }).success).toBe(false);
+  });
+  it('requires distinct acquisition targets for a batch without changing legacy target limits', () => {
+    const batch = (targets?: Array<{ targetId: string }>) => ({ prompt: 'Plan episodes', context: { scope: { type: 'episode-set' }, targets } });
+    expect(searchRequestSchema.safeParse(batch()).success).toBe(false);
+    expect(searchRequestSchema.safeParse(batch([])).success).toBe(false);
+    expect(searchRequestSchema.safeParse(batch([{ targetId: 'a' }, { targetId: 'a' }])).success).toBe(false);
+    expect(searchRequestSchema.safeParse({ prompt: 'Find season', context: { scope: { type: 'season' }, targets: Array.from({ length: 201 }, (_, i) => ({ targetId: `e${i}` })) } }).success).toBe(true);
+  });
+  it('keeps batch action wire shape strict and nullable without model-computed aggregate fields', () => {
+    const release = { candidateId: 'c', coveredTargetIds: ['t'], coverageReason: 'title and numbering align', uncertainty: 'inferred' };
+    const action = { action: 'finish', query: null, categories: null, indexerIds: null, status: 'matched', options: [{ optionId: 'p', rank: 1, releases: [release], reason: 'good plan', uncertainty: '' }], message: null };
+    expect(episodeSetActionSchema.safeParse(action).success).toBe(true);
+    expect(episodeSetActionSchema.safeParse({ ...action, options: [{ ...action.options[0], coverage: 'complete' }] }).success).toBe(false);
+    expect(episodeSetActionSchema.safeParse({ ...action, message: undefined }).success).toBe(false);
   });
 });

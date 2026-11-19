@@ -10,8 +10,185 @@ import pino from 'pino';
 import { createMCPTools } from '@openrouter/agent/mcp';
 import { ApiError } from '../src/http';
 import { releaseSchema } from '../src/types/prowlarr';
+import { OpenRouter } from '@openrouter/sdk';
+import { runAgentSearch } from '../src/search/agent';
 
 describe('internal Prowlarr Streamable HTTP MCP', () => {
+  it('never accepts natural-language or empty output as a plan, nor runs a finalizer after lease loss or exhausted budget', async () => {
+    const scenarios = [
+      { name: 'empty completion', output: [], maxSteps: 4, ownsSearch: true },
+      { name: 'natural-language completion', output: [{ id: 'message', type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: 'The search looks complete.', annotations: [] }] }], maxSteps: 4, ownsSearch: true },
+      { name: 'lease lost before finalizer', output: [{ id: 'final', type: 'function_call', call_id: 'final', name: 'finalize_release_set', arguments: JSON.stringify({ status: 'no-match', selections: [], gaps: [], deferred: [], broadCoverage: 'none' }), status: 'completed' }], maxSteps: 4, ownsSearch: false },
+      { name: 'finalizer at exhausted step budget', output: [{ id: 'final', type: 'function_call', call_id: 'final', name: 'finalize_release_set', arguments: JSON.stringify({ status: 'no-match', selections: [], gaps: [], deferred: [], broadCoverage: 'none' }), status: 'completed' }], maxSteps: 1, ownsSearch: true },
+    ];
+    for (const scenario of scenarios) {
+      const responses = createServer(async (request, response) => {
+        for await (const _chunk of request) { /* consume */ }
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({
+          id: scenario.name, object: 'response', created_at: 1, completed_at: 1, status: 'completed',
+          error: null, incomplete_details: null, instructions: null, model: 'fixture/model',
+          output: scenario.output, parallel_tool_calls: false, tool_choice: 'auto', tools: [], usage: null, metadata: null,
+          frequency_penalty: null, presence_penalty: null, temperature: null, top_p: null,
+        }));
+      });
+      await new Promise<void>(resolve => responses.listen(0, '127.0.0.1', resolve));
+      const responseAddress = responses.address();
+      if (!responseAddress || typeof responseAddress === 'string') throw new Error('No Responses listener');
+      const runtime = new SearchRuntime({ initialSettings: defaultSettings, store: openSearchStore(':memory:'), clients: () => ({ prowlarr: { getIndexers: async () => [], getIndexerStatuses: async () => [], search: async () => [], getDownloadClients: async () => [], grab: async () => {} } }) });
+      const app = await buildApp({ runtime, logger: pino({ level: 'silent' }) } as unknown as Stack, { webRoot: '/missing' });
+      try {
+        await app.listen({ host: '127.0.0.1', port: 0 });
+        const address = app.server.address();
+        if (!address || typeof address === 'string') throw new Error('No daemon listener');
+        const searchId = `terminal-${scenario.name.replaceAll(' ', '-')}`;
+        runtime.store.createSearch({ searchId, prompt: '{}', status: 'running', createdAt: Date.now() });
+        const { token } = runtime.createProwlarrMcpCapability(searchId);
+        let staged = 0;
+        const result = runAgentSearch({
+          client: new OpenRouter({ apiKey: 'fixture', serverURL: `http://127.0.0.1:${responseAddress.port}`, retryConfig: { strategy: 'none' } }),
+          model: 'fixture/model', input: 'test', mcpUrl: `http://127.0.0.1:${address.port}/internal/mcp/prowlarr`,
+          capability: token, signal: new AbortController().signal, maxSteps: scenario.maxSteps, requestTimeoutMs: 5_000,
+          ledger: () => ({ searchId, targets: [], candidates: [] }), ownsSearch: () => scenario.ownsSearch,
+          onFinalize: () => { staged++; },
+        });
+        const outcome = await result.then(() => 'resolved', () => 'rejected');
+        expect(outcome, scenario.name).toBe('rejected');
+        expect(staged, scenario.name).toBe(0);
+      } finally {
+        await app.close();
+        await runtime.close();
+        await new Promise<void>(resolve => responses.close(() => resolve()));
+      }
+    }
+  }, 30_000);
+
+  it('cancels an active Responses request when the runner signal aborts', async () => {
+    let modelRequestSeen!: () => void, modelRequestClosed!: () => void;
+    const seen = new Promise<void>(resolve => { modelRequestSeen = resolve; });
+    const closed = new Promise<void>(resolve => { modelRequestClosed = resolve; });
+    const responses = createServer((request) => {
+      request.resume();
+      modelRequestSeen();
+      request.once('close', modelRequestClosed);
+    });
+    await new Promise<void>(resolve => responses.listen(0, '127.0.0.1', resolve));
+    const responseAddress = responses.address();
+    if (!responseAddress || typeof responseAddress === 'string') throw new Error('No Responses listener');
+    const runtime = new SearchRuntime({ initialSettings: defaultSettings, store: openSearchStore(':memory:'), clients: () => ({ prowlarr: { getIndexers: async () => [], getIndexerStatuses: async () => [], search: async () => [], getDownloadClients: async () => [], grab: async () => {} } }) });
+    const app = await buildApp({ runtime, logger: pino({ level: 'silent' }) } as unknown as Stack, { webRoot: '/missing' });
+    const abort = new AbortController();
+    try {
+      await app.listen({ host: '127.0.0.1', port: 0 });
+      const address = app.server.address();
+      if (!address || typeof address === 'string') throw new Error('No daemon listener');
+      runtime.store.createSearch({ searchId: 'cancel-runner', prompt: '{}', status: 'running', createdAt: Date.now() });
+      const { token } = runtime.createProwlarrMcpCapability('cancel-runner');
+      const runner = runAgentSearch({
+        client: new OpenRouter({ apiKey: 'fixture', serverURL: `http://127.0.0.1:${responseAddress.port}`, retryConfig: { strategy: 'none' } }),
+        model: 'fixture/model', input: 'test', mcpUrl: `http://127.0.0.1:${address.port}/internal/mcp/prowlarr`,
+        capability: token, signal: abort.signal, maxSteps: 5, requestTimeoutMs: 30_000,
+        ledger: () => ({ searchId: 'cancel-runner', targets: [], candidates: [] }), ownsSearch: () => true, onFinalize: () => {},
+      });
+      await seen;
+      abort.abort(new Error('cancel-test'));
+      await expect(runner).rejects.toThrow();
+      await closed;
+      expect(runtime.hasProwlarrMcpCapability(token)).toBe(true);
+    } finally {
+      await app.close();
+      await runtime.close();
+      await new Promise<void>(resolve => responses.close(() => resolve()));
+    }
+  }, 15_000);
+
+  it('accepts only one concurrent finalizer and stages once', async () => {
+    const responses = createServer(async (request, response) => {
+      for await (const _chunk of request) { /* consume request */ }
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        id: 'parallel-finalizers', object: 'response', created_at: 1, completed_at: 1, status: 'completed',
+        error: null, incomplete_details: null, instructions: null, model: 'fixture/model',
+        output: [1, 2].map(index => ({ id: `tool-${index}`, type: 'function_call', call_id: `call-${index}`, name: 'finalize_release_set',
+          arguments: JSON.stringify({ status: 'no-match', selections: [], gaps: [], deferred: [], broadCoverage: 'none' }), status: 'completed' })),
+        parallel_tool_calls: true, tool_choice: 'auto', tools: [], usage: null, metadata: null,
+        frequency_penalty: null, presence_penalty: null, temperature: null, top_p: null,
+      }));
+    });
+    await new Promise<void>(resolve => responses.listen(0, '127.0.0.1', resolve));
+    const responseAddress = responses.address();
+    if (!responseAddress || typeof responseAddress === 'string') throw new Error('No Responses listener');
+    const runtime = new SearchRuntime({ initialSettings: defaultSettings, store: openSearchStore(':memory:'), clients: () => ({ prowlarr: { getIndexers: async () => [], getIndexerStatuses: async () => [], search: async () => [], getDownloadClients: async () => [], grab: async () => {} } }) });
+    const app = await buildApp({ runtime, logger: pino({ level: 'silent' }) } as unknown as Stack, { webRoot: '/missing' });
+    try {
+      await app.listen({ host: '127.0.0.1', port: 0 });
+      const address = app.server.address();
+      if (!address || typeof address === 'string') throw new Error('No daemon listener');
+      runtime.store.createSearch({ searchId: 'parallel-finalize', prompt: '{}', status: 'running', createdAt: Date.now() });
+      const { token } = runtime.createProwlarrMcpCapability('parallel-finalize');
+      let staged = 0;
+      const plan = await runAgentSearch({
+        client: new OpenRouter({ apiKey: 'fixture', serverURL: `http://127.0.0.1:${responseAddress.port}`, retryConfig: { strategy: 'none' } }),
+        model: 'fixture/model', input: 'test', mcpUrl: `http://127.0.0.1:${address.port}/internal/mcp/prowlarr`,
+        capability: token, signal: new AbortController().signal, maxSteps: 5, requestTimeoutMs: 5_000,
+        ledger: () => ({ searchId: 'parallel-finalize', targets: [], candidates: [] }), ownsSearch: () => true,
+        onFinalize: async () => { staged++; await new Promise(resolve => setTimeout(resolve, 30)); },
+      });
+      expect(plan.status).toBe('no-match');
+      expect(staged).toBe(1);
+    } finally {
+      await app.close();
+      await runtime.close();
+      await new Promise<void>(resolve => responses.close(() => resolve()));
+    }
+  }, 15_000);
+
+  it('allows a valid finalization retry after an invalid candidate reference', async () => {
+    let calls = 0;
+    const responses = createServer(async (request, response) => {
+      for await (const _chunk of request) { /* consume */ }
+      calls++;
+      const arguments_ = calls === 1
+        ? { status: 'matched', selections: [{ candidateId: 'fabricated', targetIds: [], reason: 'fake', uncertainty: '' }], gaps: [], deferred: [] }
+        : { status: 'no-match', selections: [], gaps: [], deferred: [], broadCoverage: 'none' };
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        id: `retry-${calls}`, object: 'response', created_at: 1, completed_at: 1, status: 'completed',
+        error: null, incomplete_details: null, instructions: null, model: 'fixture/model',
+        output: [{ id: `call-${calls}`, type: 'function_call', call_id: `call-${calls}`, name: 'finalize_release_set', arguments: JSON.stringify(arguments_), status: 'completed' }],
+        parallel_tool_calls: false, tool_choice: 'auto', tools: [], usage: null, metadata: null,
+        frequency_penalty: null, presence_penalty: null, temperature: null, top_p: null,
+      }));
+    });
+    await new Promise<void>(resolve => responses.listen(0, '127.0.0.1', resolve));
+    const responseAddress = responses.address();
+    if (!responseAddress || typeof responseAddress === 'string') throw new Error('No Responses listener');
+    const runtime = new SearchRuntime({ initialSettings: defaultSettings, store: openSearchStore(':memory:'), clients: () => ({ prowlarr: { getIndexers: async () => [], getIndexerStatuses: async () => [], search: async () => [], getDownloadClients: async () => [], grab: async () => {} } }) });
+    const app = await buildApp({ runtime, logger: pino({ level: 'silent' }) } as unknown as Stack, { webRoot: '/missing' });
+    try {
+      await app.listen({ host: '127.0.0.1', port: 0 });
+      const address = app.server.address();
+      if (!address || typeof address === 'string') throw new Error('No daemon listener');
+      runtime.store.createSearch({ searchId: 'retry-finalize', prompt: '{}', status: 'running', createdAt: Date.now() });
+      const { token } = runtime.createProwlarrMcpCapability('retry-finalize');
+      let staged = 0;
+      const plan = await runAgentSearch({
+        client: new OpenRouter({ apiKey: 'fixture', serverURL: `http://127.0.0.1:${responseAddress.port}`, retryConfig: { strategy: 'none' } }),
+        model: 'fixture/model', input: 'test', mcpUrl: `http://127.0.0.1:${address.port}/internal/mcp/prowlarr`,
+        capability: token, signal: new AbortController().signal, maxSteps: 5, requestTimeoutMs: 5_000,
+        ledger: () => ({ searchId: 'retry-finalize', targets: [], candidates: [] }), ownsSearch: () => true,
+        onFinalize: () => { staged++; },
+      });
+      expect(plan.status).toBe('no-match');
+      expect(staged).toBe(1);
+      expect(calls).toBe(2);
+    } finally {
+      await app.close();
+      await runtime.close();
+      await new Promise<void>(resolve => responses.close(() => resolve()));
+    }
+  }, 15_000);
+
   it.each(['discovery', 'search'])('aborts sibling discovery reads when %s fails early', async operation => {
     const settings = structuredClone(defaultSettings);
     settings.integrations.prowlarr = { url: 'http://fixture.test', apiKey: 'fixture-key', tvClient: '', movieClient: '' };
@@ -93,14 +270,58 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
       expect(grabs).toBe(0);
       const candidates = JSON.parse((found.content as Array<{ text: string }>)[0]!.text) as Array<{ candidateId: string; observations: unknown[] }>;
       expect(candidates).toHaveLength(1);
-      expect(candidates[0]!.observations).toHaveLength(2);
-      expect(runtime.store.getCandidate('owner-search', candidates[0]!.candidateId)?.privateData).toMatchObject({ physicalKey: expect.any(String), release: { guid: 'private-guid' } });
-      expect(runtime.store.getCandidate('different-owner', candidates[0]!.candidateId)).toBeNull();
-      runtime.store.finishSearch('owner-search', 'matched', {
+       expect(candidates[0]!.observations).toHaveLength(2);
+       expect(runtime.store.getCandidate('owner-search', candidates[0]!.candidateId)?.privateData).toMatchObject({ physicalKey: expect.any(String), release: { guid: 'private-guid' } });
+       expect(runtime.store.getCandidate('different-owner', candidates[0]!.candidateId)).toBeNull();
+       const responseRequests: Array<Record<string, unknown>> = [];
+       const scriptedToolNames: Array<string | undefined> = [];
+       const responses = createServer(async (request, response) => {
+         const chunks: Buffer[] = [];
+         for await (const chunk of request) chunks.push(Buffer.from(chunk));
+         const body = JSON.parse(Buffer.concat(chunks).toString()) as { tools?: Array<{ name?: string }> };
+         responseRequests.push(body as Record<string, unknown>);
+         const toolName = responseRequests.length === 1
+           ? body.tools?.find(tool => tool.name?.includes('prowlarr_search'))?.name
+           : 'finalize_release_set';
+         scriptedToolNames.push(toolName);
+         response.writeHead(200, { 'content-type': 'application/json' });
+         response.end(JSON.stringify({
+           id: `response-${responseRequests.length}`, object: 'response', created_at: 1, completed_at: 1,
+           status: 'completed', error: null, incomplete_details: null, instructions: null, model: 'z-ai/glm-5.3-flash',
+           output: [{ id: `call-${responseRequests.length}`, type: 'function_call', call_id: `call-${responseRequests.length}`,
+             name: toolName, arguments: responseRequests.length === 1 ? JSON.stringify({ query: 'Runner probe' })
+               : JSON.stringify({ status: 'no-match', selections: [], gaps: [], deferred: [], broadCoverage: 'none' }), status: 'completed' }],
+           parallel_tool_calls: false, tool_choice: 'auto', tools: [], usage: null, metadata: null,
+           frequency_penalty: null, presence_penalty: null, temperature: null, top_p: null,
+         }));
+       });
+       await new Promise<void>(resolve => responses.listen(0, '127.0.0.1', resolve));
+       const responseAddress = responses.address();
+       if (!responseAddress || typeof responseAddress === 'string') throw new Error('No scripted Responses listener');
+       try {
+         const { token: agentToken } = runtime.createProwlarrMcpCapability('owner-search');
+         const result = await runAgentSearch({
+           client: new OpenRouter({ apiKey: 'fixture-key', serverURL: `http://127.0.0.1:${responseAddress.port}`, retryConfig: { strategy: 'none' } }),
+           model: 'z-ai/glm-5.3-flash', input: 'Search and finalize only from observations.',
+           mcpUrl: `http://127.0.0.1:${address.port}/internal/mcp/prowlarr`, capability: agentToken,
+           signal: new AbortController().signal, maxSteps: 5, requestTimeoutMs: 2_000,
+           ledger: () => ({ searchId: 'owner-search', targets: [], candidates: runtime.store.listCandidates('owner-search').map(item => {
+             const value = runtime.store.getCandidate('owner-search', item.candidateId);
+             return { id: item.candidateId, physicalId: String((value?.privateData as { physicalKey?: string } | undefined)?.physicalKey ?? ''), targets: [] };
+           }) }),
+           ownsSearch: () => true, onFinalize: () => undefined,
+         });
+         expect(result.status).toBe('no-match');
+          expect(responseRequests).toHaveLength(2);
+         expect(scriptedToolNames).toContain('finalize_release_set');
+         expect(scriptedToolNames.some(name => name?.includes('prowlarr_search'))).toBe(true);
+         expect((responseRequests[0]!.tools as Array<{ name: string }>).some(tool => tool.name.includes('prowlarr_search'))).toBe(true);
+       } finally { await new Promise<void>((resolve, reject) => responses.close(error => error ? reject(error) : resolve())); }
+       runtime.store.finishSearch('owner-search', 'matched', {
         options: [{ optionId: 'selected', rank: 1, releases: [{ candidateId: candidates[0]!.candidateId }], coveredTargetIds: [], reason: 'Observed candidate', uncertainty: '' }],
       }, Date.now());
-      await expect(runtime.submit({ searchId: 'owner-search', optionId: 'selected', idempotencyKey: 'internal-mcp-candidate', downloadClientId: 1 })).resolves.toMatchObject({
-        outcome: 'dry-run', candidateIds: [candidates[0]!.candidateId],
+       await expect(runtime.submit({ searchId: 'owner-search', optionId: 'selected', idempotencyKey: 'internal-mcp-candidate', downloadClientId: 1 })).resolves.toMatchObject({
+         outcome: 'deferred', candidateIds: [],
       });
       const unauthorized = await app.inject({ method: 'POST', url: '/internal/mcp/prowlarr', payload: { jsonrpc: '2.0', id: 1, method: 'tools/list' } });
       expect(unauthorized.statusCode).toBe(401);

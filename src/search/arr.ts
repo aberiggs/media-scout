@@ -4,7 +4,7 @@ import type { RadarrClient } from '../clients/radarr';
 import { episodeEligibilityTime } from '../core/episode-timing';
 import type { Episode, SonarrQueueRecord } from '../types/sonarr';
 import type { Movie } from '../types/radarr';
-import { safeText } from './service';
+import { safeText } from './release-observation';
 import type { SearchStore } from './store';
 import { summarizeProfile } from '../types/quality-profile';
 

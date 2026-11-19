@@ -31,7 +31,7 @@ const parse = <T>(s: string): T => JSON.parse(s) as T;
 const hash = (v: unknown): string => json(v);
 
 export interface SearchRecord { searchId: string; prompt: string; status: SearchStatus; createdAt: number; finishedAt?: number; result?: unknown }
-export interface SearchWork { searchId: string; prompt: string; source: 'manual' | 'automation'; context: unknown; owner: string }
+export interface SearchWork { searchId: string; prompt: string; source: 'manual' | 'automation' | 'arr'; context: unknown; owner: string }
 export interface CandidateRecord { searchId: string; candidateId: string; safe: unknown; privateData: unknown; expiresAt: number }
 export interface SubmissionReceipt { idempotencyKey: string; payload: unknown; outcome: string; createdAt: number }
 export type BeginSubmission = { kind: 'created' } | { kind: 'replay'; receipt: SubmissionReceipt } | { kind: 'conflict' };
@@ -69,29 +69,14 @@ export class SearchStore {
       this.db.prepare("DELETE FROM leases WHERE resource='search-worker'").run();
     }).immediate();
   }
-  enqueueSearch(input: { searchId: string; prompt: string; now: number; source?: 'manual' | 'automation'; context?: unknown }): void {
+  enqueueSearch(input: { searchId: string; prompt: string; now: number; source?: 'manual' | 'automation' | 'arr'; context?: unknown }): void {
     this.db.transaction(() => {
       this.db.prepare("INSERT INTO searches(id,prompt,status,created_at) VALUES(?,?,'queued',?)").run(input.searchId,input.prompt,input.now);
       this.db.prepare('INSERT INTO search_work(search_id,sequence,source,context_json) VALUES(?,?,?,?)').run(input.searchId, Number((this.db.prepare('SELECT COALESCE(MAX(sequence),0)+1 AS n FROM search_work').get() as {n:number}).n), input.source ?? 'manual', json(input.context ?? {}));
       this.db.prepare("INSERT INTO search_events(search_id,event_json,created_at) VALUES(?,?,?)").run(input.searchId,json({type:'queued',data:{source:input.source ?? 'manual'}}),input.now);
       this.setSetting(`search-source:${input.searchId}`, input.source ?? 'manual');
-      for(const binding of (input.context as {targetBindings?:Array<{key?:string}>}|undefined)?.targetBindings ?? []) if(binding.key) this.setSetting(`search-arr:${input.searchId}`,binding);
-    }).immediate();
-  }
-  startAutomationSearch(input:{searchId:string;prompt:string;owner:string;now:number;ttl:number;maxActive:number;context:unknown}):SearchWork|null {
-    return this.db.transaction(():SearchWork|null=>{
-      this.recoverExpiredSearchWork(input.now);
-      if(this.db.prepare("SELECT 1 FROM searches s JOIN search_work w ON w.search_id=s.id WHERE s.status='queued' AND w.source='manual' LIMIT 1").get()) return null;
-      const active=(this.db.prepare('SELECT COUNT(*) AS n FROM search_work WHERE owner IS NOT NULL AND lease_expires_at>?').get(input.now) as {n:number}).n;
-      if(active>=input.maxActive) return null;
-      const context=parse<unknown>(json(input.context));
-      const sequence=Number((this.db.prepare('SELECT COALESCE(MAX(sequence),0)+1 AS n FROM search_work').get() as {n:number}).n);
-      this.db.prepare("INSERT INTO searches(id,prompt,status,created_at) VALUES(?,?,'running',?)").run(input.searchId,input.prompt,input.now);
-      this.db.prepare('INSERT INTO search_work(search_id,sequence,source,context_json,owner,lease_expires_at,started_at) VALUES(?,?,\'automation\',?,?,?,?)').run(input.searchId,sequence,json(context),input.owner,input.now+input.ttl,input.now);
-      this.setSetting(`search-source:${input.searchId}`,'automation');
-      this.db.prepare("INSERT INTO search_events(search_id,event_json,created_at) VALUES(?,?,?)").run(input.searchId,json({type:'started',data:{source:'automation'}}),input.now);
-      for(const binding of (input.context as {targetBindings?:Array<{key?:string}>}).targetBindings ?? []) if(binding.key) this.setSetting(`search-arr:${input.searchId}`,binding);
-      return {searchId:input.searchId,prompt:input.prompt,source:'automation',context,owner:input.owner};
+       const bindings = (input.context as {targetBindings?:Array<unknown>}|undefined)?.targetBindings;
+       if (bindings?.length) this.setSetting(`search-arr-bindings-v1:${input.searchId}`, bindings);
     }).immediate();
   }
   claimNextSearch(owner: string, now: number, ttl: number, maxActive = 3): SearchWork | null {
@@ -99,7 +84,7 @@ export class SearchStore {
       this.recoverExpiredSearchWork(now);
       const active = (this.db.prepare("SELECT COUNT(*) AS n FROM search_work WHERE owner IS NOT NULL AND lease_expires_at>?").get(now) as {n:number}).n;
       if (active >= maxActive) return null;
-      const row = this.db.prepare("SELECT w.search_id,w.source,w.context_json,s.prompt FROM search_work w JOIN searches s ON s.id=w.search_id WHERE s.status='queued' AND w.owner IS NULL ORDER BY CASE w.source WHEN 'manual' THEN 0 ELSE 1 END,w.sequence LIMIT 1").get() as {search_id:string;source:'manual'|'automation';context_json:string;prompt:string}|undefined;
+       const row = this.db.prepare("SELECT w.search_id,w.source,w.context_json,s.prompt FROM search_work w JOIN searches s ON s.id=w.search_id WHERE s.status='queued' AND w.owner IS NULL ORDER BY CASE w.source WHEN 'manual' THEN 0 ELSE 1 END,w.sequence LIMIT 1").get() as {search_id:string;source:'manual'|'automation'|'arr';context_json:string;prompt:string}|undefined;
       if (!row) return null;
       const changed = this.db.prepare("UPDATE searches SET status='running' WHERE id=? AND status='queued'").run(row.search_id).changes;
       if (!changed) return null;
@@ -109,11 +94,12 @@ export class SearchStore {
     }).immediate();
   }
   queuePosition(searchId: string): number | null {
-    const row = this.db.prepare("SELECT sequence,source FROM search_work WHERE search_id=? AND owner IS NULL AND (SELECT status FROM searches WHERE id=search_id)='queued'").get(searchId) as {sequence:number;source:'manual'|'automation'}|undefined;
+    const row = this.db.prepare("SELECT sequence,source FROM search_work WHERE search_id=? AND owner IS NULL AND (SELECT status FROM searches WHERE id=search_id)='queued'").get(searchId) as {sequence:number;source:'manual'|'automation'|'arr'}|undefined;
     return row ? (this.db.prepare("SELECT COUNT(*) AS n FROM search_work w JOIN searches s ON s.id=w.search_id WHERE s.status='queued' AND (CASE w.source WHEN 'manual' THEN 0 ELSE 1 END < CASE ? WHEN 'manual' THEN 0 ELSE 1 END OR (w.source=? AND w.sequence<=?))").get(row.source,row.source,row.sequence) as {n:number}).n : null;
   }
   activeSearchCount(now:number): number { return (this.db.prepare('SELECT COUNT(*) AS n FROM search_work WHERE owner IS NOT NULL AND lease_expires_at>?').get(now) as {n:number}).n; }
   ownsSearch(searchId:string,owner:string,now:number):boolean { return !!this.db.prepare('SELECT 1 FROM search_work WHERE search_id=? AND owner=? AND lease_expires_at>?').get(searchId,owner,now); }
+  renewSearchWork(searchId:string,owner:string,now:number,ttl:number):boolean { return this.db.prepare('UPDATE search_work SET lease_expires_at=? WHERE search_id=? AND owner=? AND lease_expires_at>?').run(now+ttl,searchId,owner,now).changes===1; }
   renewLease(resource:string,owner:string,now:number,ttl:number):boolean { return this.db.prepare('UPDATE leases SET expires_at=? WHERE resource=? AND owner=? AND expires_at>?').run(now+ttl,resource,owner,now).changes===1; }
   recoverExpiredSearchWork(now:number):number {
     return this.db.transaction(() => {
@@ -236,14 +222,14 @@ export class SearchStore {
   maintain(now: number): void {
     this.db.transaction(() => {
       this.db.prepare('DELETE FROM candidates WHERE expires_at<=?').run(now);
-      const records = this.db.prepare("SELECT id,created_at FROM searches WHERE status NOT IN ('queued','running') ORDER BY created_at DESC,rowid DESC").all() as Array<{id:string;created_at:number}>;
+         const records = this.db.prepare("SELECT id,created_at FROM searches WHERE status NOT IN ('queued','running') ORDER BY created_at DESC,rowid DESC").all() as Array<{id:string;created_at:number}>;
       const remove = records.filter((row, index) => index >= 10_000 || row.created_at < now - 30 * 86_400_000);
       for (const row of remove) {
         this.db.prepare('DELETE FROM candidates WHERE search_id=?').run(row.id);
         this.db.prepare('DELETE FROM search_events WHERE search_id=?').run(row.id);
         this.db.prepare('DELETE FROM search_work WHERE search_id=?').run(row.id);
         this.db.prepare('DELETE FROM searches WHERE id=?').run(row.id);
-        for (const prefix of ['search-source:', 'search-owner:', 'search-arr:']) this.db.prepare('DELETE FROM settings WHERE key=?').run(`${prefix}${row.id}`);
+         for (const prefix of ['search-source:', 'search-owner:', 'search-arr:', 'search-arr-bindings-v1:']) this.db.prepare('DELETE FROM settings WHERE key=?').run(`${prefix}${row.id}`);
       }
     })();
   }

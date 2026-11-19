@@ -4,6 +4,13 @@ The original audit sections below describe the initial audit against the
 pre-batch runtime. Follow-up sections record subsequent work; historical gaps
 are not assertions that every later search scope still has those behaviors.
 
+> **Superseded implementation references (November 2026):** this is a historical
+> audit of the retired handwritten planner, Arr acquisition automation, and
+> model-evaluation scripts. Those engines/scripts and their implementation tests
+> were removed in the Agent SDK cutover. Do not use this document as current
+> runtime instructions or claims about current timeout/default behavior. Current
+> backend behavior is documented in `src/search/README.md` and `README.md`.
+
 ## Scope and acceptance
 
 Trace requests **after Seerr has populated Sonarr/Radarr**, through observation,

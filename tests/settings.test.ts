@@ -4,7 +4,7 @@ import { SearchRuntime } from '../src/search/runtime';
 import { openSearchStore } from '../src/search/store';
 describe('search-first settings', () => {
   it('defaults to disabled monitoring and no downloads', () => {
-    expect(settingsSchema.parse(defaultSettings)).toMatchObject({ version: 3, safety: { dryRun: true }, monitoring: { enabled: false, searchRetryMinutes: 30 }, search: { maxDecisions: 40, maxSearches: 30, deadlineMinutes: 10 } });
+    expect(settingsSchema.parse(defaultSettings)).toMatchObject({ version: 3, safety: { dryRun: true }, monitoring: { enabled: false, searchRetryMinutes: 30 }, search: { maxDecisions: 100, maxSearches: 100, deadlineMinutes: 30 } });
     expect(defaultSettings.ai.model).toBe('openai/gpt-6.1-sol');
   });
   it('does not migrate a previously saved model when the new-install default changes', () => {
@@ -20,8 +20,8 @@ describe('search-first settings', () => {
   it('rejects legacy settings, unsafe URLs and invalid budget/rate bounds', () => {
     expect(settingsSchema.safeParse({ ...defaultSettings, version: 1 }).success).toBe(false);
     expect(settingsSchema.safeParse({ ...defaultSettings, search: { ...defaultSettings.search, maxSearches: 999 } }).success).toBe(false);
-    expect(settingsSchema.safeParse({ ...defaultSettings, search: { ...defaultSettings.search, maxDecisions: 81 } }).success).toBe(false);
-    expect(settingsSchema.parse({ ...defaultSettings, search: { maxDecisions: 80, maxSearches: 60, deadlineMinutes: 10 } }).search).toEqual({ maxDecisions: 80, maxSearches: 60, deadlineMinutes: 10 });
+    expect(settingsSchema.safeParse({ ...defaultSettings, search: { ...defaultSettings.search, maxDecisions: 101 } }).success).toBe(false);
+    expect(settingsSchema.parse({ ...defaultSettings, search: { maxDecisions: 100, maxSearches: 100, deadlineMinutes: 30 } }).search).toEqual({ maxDecisions: 100, maxSearches: 100, deadlineMinutes: 30 });
     expect(settingsSchema.safeParse({ ...defaultSettings, ai: { ...defaultSettings.ai, baseUrl: 'https://user:password@example.test' } }).success).toBe(false);
   });
   it('round-trips existing lower search budgets without rewriting them', () => {
@@ -32,7 +32,7 @@ describe('search-first settings', () => {
     const store = openSearchStore(':memory:');
     const runtime = new SearchRuntime({ store });
     try {
-      const larger = { ...defaultSettings, search: { maxDecisions: 80, maxSearches: 60, deadlineMinutes: 10 } };
+      const larger = { ...defaultSettings, search: { maxDecisions: 100, maxSearches: 100, deadlineMinutes: 30 } };
       expect(runtime.saveSettings(larger)).toMatchObject({ ok: true, settings: { search: larger.search } });
       expect(runtime.getSettings().search).toEqual(larger.search);
       const old = { ...defaultSettings, search: { maxDecisions: 20, maxSearches: 12, deadlineMinutes: 10 } };

@@ -596,7 +596,6 @@ h1 { color: #f0f2ef; font-family: var(--display); font-size: clamp(1.875rem, 3vw
 .search-result-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .search-result-heading h2 { font: 700 var(--type-title) var(--display); }
 .search-result-heading p, .ranked-option > p { margin-top: 5px; color: var(--muted); font-size: var(--type-small); line-height: 1.5; }
-.ranked-options { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 12px; }
 .ranked-option { display: grid; align-content: start; gap: 12px; padding: 16px; border: 1px solid #303832; border-radius: 8px; background: #171a18; }
 .ranked-option:first-child { border-color: #48644f; background: linear-gradient(120deg,rgba(126,212,166,.06),transparent 65%),#171a18; }
 .option-title { display: flex; align-items: baseline; justify-content: space-between; gap: 9px; }
@@ -638,7 +637,7 @@ h1 { color: #f0f2ef; font-family: var(--display); font-size: clamp(1.875rem, 3vw
  .search-layout { grid-template-columns: minmax(0,1fr); }
  .search-rail { position: static; grid-template-columns: 1fr; }
  .search-composer { padding: 14px; }
- .search-optional,.ranked-options { grid-template-columns: 1fr; }
+ .search-optional { grid-template-columns: 1fr; }
  .search-form-actions { align-items: stretch; flex-direction: column; }
  .search-form-actions .button { width: 100%; }
  .search-result-heading { flex-direction: column; }
@@ -649,7 +648,7 @@ h1 { color: #f0f2ef; font-family: var(--display); font-size: clamp(1.875rem, 3vw
 /* Whole-plan review and durable receipt, using the existing operations palette. */
 .release-set { display: grid; gap: 13px; min-width: 0; }
 .release-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.release-section-heading h3,.execution-receipt h3,.legacy-inspection h3 { color: #e4e8e4; font: 700 var(--type-lead) var(--display); }
+.release-section-heading h3,.execution-receipt h3 { color: #e4e8e4; font: 700 var(--type-lead) var(--display); }
 .release-section-heading p { margin-top: 3px; color: var(--muted); font-size: var(--type-small); }
 .release-set > .ranked-option { gap: 7px; }
 .release-set .ranked-option h4 { color: #e1e7e2; font: 650 var(--type-body) var(--display); overflow-wrap: anywhere; }
@@ -669,11 +668,6 @@ h1 { color: #f0f2ef; font-family: var(--display); font-size: clamp(1.875rem, 3vw
 .receipt-children li { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 6px 10px; padding: 10px 0; border-top: 1px solid #2c322e; }
 .receipt-children li > strong { min-width: 0; color: #d9e1da; font-size: var(--type-small); overflow-wrap: anywhere; }
 .receipt-children li > small { grid-column: 1/-1; color: #9ca79e; line-height: 1.45; overflow-wrap: anywhere; }
-.legacy-inspection { display: grid; gap: 10px; min-width: 0; padding: 14px; border: 1px solid #303832; border-radius: 7px; background: #141815; }
-.legacy-inspection > p { color: #a4afa6; font-size: var(--type-small); line-height: 1.5; }
-.legacy-inspection details { min-width: 0; }
-.legacy-inspection summary { min-height: 36px; color: #b8dec2; cursor: pointer; }
-.legacy-inspection pre { max-width: 100%; max-height: 360px; overflow: auto; padding: 11px; border: 1px solid #303832; border-radius: 5px; background: #101311; color: #bac7bd; font: .75rem/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
 .ops-execution-dialog { width: min(100%,590px); }
 .confirmation-facts { display: grid; gap: 8px; }
 .confirmation-facts p { display: grid; gap: 3px; color: #bdc8bf; font-size: var(--type-small); overflow-wrap: anywhere; }

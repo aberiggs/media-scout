@@ -11,6 +11,7 @@ import { loadConfig } from './config';
 import { searchRequestSchema, activityStatusSchema } from './search/contracts';
 import { missingSettings, type Settings } from './settings';
 import { createProwlarrMcpServer } from './search/prowlarr-mcp';
+import { LEGACY_DATABASE_ERROR } from './search/store';
 
 declare module 'fastify' { interface FastifyInstance { refreshScheduler?: () => void } }
 const identifier = z.string().trim().min(1).max(200);
@@ -158,13 +159,7 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
     const receipt=runtime.executionReceipt(identifier.parse((request.params as {id:string}).id));
     return receipt ?? reply.code(404).send({error:'Execution receipt not found',code:'receipt-not-found'});
   });
-  app.post('/api/v2/submissions', async (_request, reply) => reply.code(410).send({ error: 'Release execution is deferred', code: 'execution-deferred' }));
-  app.get('/api/v2/submissions/:id', async (request, reply) => {
-    const receipt = runtime.store.getSubmission(identifier.parse((request.params as { id: string }).id));
-    if (!receipt) return reply.code(404).send({ error: 'Submission not found' });
-    const payload = receipt.payload as { request?: { searchId: string; optionId: string }; result?: unknown };
-    return payload.result ?? { searchId: payload.request?.searchId, optionId: payload.request?.optionId, outcome: receipt.outcome === 'submitting' ? 'uncertain' : receipt.outcome };
-  });
+  app.post('/api/v2/submissions', async (_request, reply) => reply.code(410).send({ error: 'This endpoint was retired; use release-set execution', code: 'submission-route-retired' }));
   app.get('/api/v2/automation', async () => runtime.automationStatus());
   app.post('/api/v2/automation/poll', async () => runtime.poll());
   app.post('/api/v2/automation/search', async (request, reply) => {
@@ -226,4 +221,10 @@ export function createShutdown(deps: { stopTimer(): void; quiesce?(): void; awai
   let draining = false;
   return () => { if (draining) return; draining = true; deps.stopTimer(); deps.quiesce?.(); void (async () => { await deps.awaitSettled(); await deps.close(); deps.exit(0); })(); };
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) startDaemon(buildStack({ config: loadConfig() })).catch(() => { console.error('Media Scout startup failed; check configuration and use a fresh database path.'); process.exitCode = 1; });
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  void Promise.resolve().then(() => startDaemon(buildStack({ config: loadConfig() }))).catch((error: unknown) => {
+    console.error(error instanceof Error && error.message === LEGACY_DATABASE_ERROR
+      ? error.message : 'Media Scout startup failed; check configuration and DB_PATH.');
+    process.exitCode = 1;
+  });
+}

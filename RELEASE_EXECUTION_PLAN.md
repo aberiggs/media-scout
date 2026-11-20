@@ -1,5 +1,9 @@
 # Release-set execution and confirmation — #56 / #58
 
+> Historical delivery plan. The parity follow-up requires a fresh database and
+> removes old plan and receipt compatibility. Current release-set receipts still
+> protect against duplicate sends and survive restart.
+
 Base: PR #61 at e94b11c; branch feat/56-58-release-set-execution.
 Draft PR targets feat/52-55-agent-release-set, not main.
 

@@ -15,12 +15,12 @@ describe('execution journal', () => {
       store.setAutomationAttempt('episode-1',{lastAttempt:now,failCount:1,deadline:now+120*60_000,graceUntil:0});
       expect(store.updateExecutionChild('auto-exec','owner',now,0,'sending',undefined,grace)).toBe(true);
       store.close();store=openSearchStore(path);
-      expect(store.getGrace('media','sonarr:show',now)).toBe(grace.graceUntil);
+      expect(store.getMediaGrace('sonarr:show',now)).toBe(grace.graceUntil);
       expect(store.updateExecutionChild('auto-exec','owner',now+1,0,'rejected',undefined,grace)).toBe(true);
       store.close();store=openSearchStore(path);
       expect(store.recoverExecutions(now+30_000)).toBe(1);
       expect(store.execution('auto-exec')?.outcome).toBe('rejected');
-      expect(store.getGrace('media','sonarr:show',now+30_000)).toBeNull();
+      expect(store.getMediaGrace('sonarr:show',now+30_000)).toBeNull();
       expect(store.getAutomationAttempt('episode-1')).toMatchObject({deadline:now+1+2*60_000,failCount:2});
     } finally {store.close();rmSync(dir,{recursive:true,force:true});}
   });
@@ -34,7 +34,7 @@ describe('execution journal', () => {
       store.close();store=openSearchStore(path);
       expect(store.recoverExecutions(201)).toBe(1);
       expect(store.execution('auto-crash')?.children[0]?.state).toBe('uncertain');
-      expect(store.getGrace('media','radarr:movie:7',201)).toBe(180_000);
+      expect(store.getMediaGrace('radarr:movie:7',201)).toBe(180_000);
       expect(store.getAutomationAttempt('movie-7')?.deadline).toBe(180_000);
     } finally {store.close();rmSync(dir,{recursive:true,force:true});}
   });
@@ -77,6 +77,15 @@ describe('execution journal', () => {
       expect(store.createExecution({id:'two',key:'two-key',hash:'two-hash',searchId:'s',planId:'p',version:2,payload:{},children:[{candidateId:'b',physicalKey:'same',state:'prepared'}],owner:'owner-b',now:11,leaseUntil:21})).toBe('busy');
       expect(store.updateExecutionChild('one','owner-a',21,0,'sending')).toBe(false);
       expect(store.renewExecution('one','owner-a',21,30)).toBe(false);
+    } finally {store.close();}
+  });
+  it('checks expiry at claim time rather than the earlier execution timestamp',()=>{
+    const store=openSearchStore(':memory:');
+    try {
+      store.saveExecutionPreparation('confirmation','s',100,{});
+      const outcome=store.createExecution({id:'op',key:'key',hash:'hash',searchId:'s',planId:'p',version:2,payload:{confirmationId:'confirmation'},children:[{candidateId:'c',physicalKey:'p',state:'prepared'}],owner:'owner',now:99,leaseUntil:30_099},()=>100);
+      expect(outcome).toBe('confirmation-expired');
+      expect(store.executionByKey('key')).toBeNull();
     } finally {store.close();}
   });
 });

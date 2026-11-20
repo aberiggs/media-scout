@@ -13,7 +13,7 @@ const { default: App } = await import('./App')
 const originalFetch = globalThis.fetch
 const originalCrypto = globalThis.crypto
 const env = { settings: defaults, status: { ready: false, missing: [], monitoringEnabled: false, cycleRunning: false } }
-const matched = { searchId: 's1', status: 'matched', createdAt: '2026-11-15T00:00:00Z', prompt: 'Find Example', plan: { version: 1, planId: 'p1', status: 'matched', selections: [{ candidateId: 'c1', targetIds: ['target-1'], reason: 'Best evidence', uncertainty: 'Audio not verified' }], coverage: { covered: ['target-1'], gaps: [], deferred: [], broad: { status: 'complete', gaps: [] } }, warnings: [] }, candidates: [{ candidateId: 'c1', observations: [{ title: 'Example 1080p', indexer: 'Index', seeders: 20 }] }], events: [], counts: { decisions: 2, searches: 1, candidates: 1 } }
+const matched = { searchId: 's1', status: 'matched', createdAt: '2026-11-15T00:00:00Z', prompt: 'Find Example', plan: { version: 2, planId: 'p1', status: 'matched', selections: [{ candidateId: 'c1', coverage: 'Season one', reason: 'Best evidence', uncertainty: 'Audio not verified' }], coverage: { covered: ['Season one'], gaps: [], deferred: [], broad: { status: 'complete', gaps: [] } }, warnings: [] }, candidates: [{ candidateId: 'c1', observations: [{ title: 'Example 1080p', indexer: 'Index', seeders: 20 }] }], events: [], counts: { decisions: 2, searches: 1, candidates: 1 } }
 
 afterEach(() => { cleanup(); window.history.replaceState(null, '', '/'); sessionStorage.clear(); globalThis.fetch = originalFetch; Object.defineProperty(globalThis, 'crypto', { configurable: true, value: originalCrypto }) })
 
@@ -147,21 +147,6 @@ it('rejects an incomplete successful preparation without opening a broken dialog
   assert.equal(Boolean(screen.queryByRole('dialog')), false)
 })
 
-for (const durable of [true, false]) it(`preserves ${durable ? 'durable' : 'event-only'} submission inspection for retired-format search results`, async () => {
-  lifecycleFetch(url => url === '/api/v2/searches/life' ? Response.json({
-    ...semanticSearch, plan: undefined, legacyResult: { options: [{ title: 'Retired result' }] },
-    legacyReceipts: durable ? [{ searchId: 'life', outcome: 'uncertain', candidateIds: [], outcomes: [] }] : [],
-    events: [{ type: 'submission', data: { outcome: durable ? 'EVENT MUST NOT OVERRIDE' : 'submitted' } }],
-  }) : Response.json({}))
-  const { SearchPage } = await import('./Search')
-  render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
-  assert.ok(await screen.findByRole('heading', { name: 'Legacy search record' }))
-  assert.ok(screen.getByRole('heading', { name: 'Historical submission receipts' }))
-  const history = screen.getByRole('heading', { name: 'Historical submission receipts' }).parentElement!
-  assert.ok(within(history).getByText(durable ? 'uncertain' : /submitted/))
-  assert.equal(Boolean(screen.queryByText(/EVENT MUST NOT OVERRIDE/)), false)
-})
-
 it('clears only a definitive stale-confirmation rejection and allows fresh preparation', async () => {
   let preparations = 0
   lifecycleFetch(url => {
@@ -289,13 +274,13 @@ it('keeps the whole-set dialog open while a commit request is pending', async ()
   assert.ok(await screen.findByRole('heading', { name: 'Execution receipt' }))
 })
 
-it('starts with Search, submits a prompt without downloading, and displays ranked evidence', async () => {
+it('starts with Search, submits a prompt without downloading, and displays selected release evidence', async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = []
   globalThis.fetch = async (input, init) => {
     const url = String(input); calls.push({ url, init })
     if (url === '/api/settings') return Response.json(env)
     if (url === '/api/v2/searches' && init?.method === 'POST') return Response.json({ searchId: 's1', status: 'running' }, { status: 202 })
-    if (url === '/api/v2/searches/s1') return Response.json({ searchId: 's1', status: 'matched', createdAt: '2026-11-15T00:00:00Z', prompt: 'Find North Shore', plan: { version: 1, planId: 'p1', status: 'matched', selections: [{ candidateId: 'c1', targetIds: ['target-1'], reason: 'Best evidence', uncertainty: 'Audio not verified' }], coverage: { covered: ['target-1'], gaps: [], deferred: [], broad: { status: 'complete', gaps: [] } }, warnings: [] }, candidates: [{ candidateId: 'c1', observations: [{ title: 'North Shore 1080p', indexer: 'Example', size: 1000, seeders: 20, leechers: 2 }] }], events: [{ type: 'query-result', data: { query: 'North Shore', count: 4 } }], counts: { decisions: 2, searches: 1, candidates: 4 } })
+    if (url === '/api/v2/searches/s1') return Response.json({ ...matched, prompt: 'Find North Shore', candidates: [{ candidateId: 'c1', observations: [{ title: 'North Shore 1080p', indexer: 'Example', size: 1000, seeders: 20, leechers: 2 }] }] })
     return Response.json({ items: [] })
   }
   render(<App />)
@@ -546,14 +531,14 @@ it('filters Activity by media and inclusive local dates and offers every submiss
     assert.equal(query.get('offset'), '0')
   })
   const statuses = within(screen.getByLabelText('Status'))
-  for (const name of ['queued', 'rejected', 'partial', 'not-attempted', 'deferred', 'expired']) assert.ok(statuses.queryByRole('option', { name }), `${name} is filterable`)
+  for (const name of ['queued', 'rejected', 'partial', 'not-attempted', 'deferred']) assert.ok(statuses.queryByRole('option', { name }), `${name} is filterable`)
 })
 
-it('renders all durable receipt children and suppresses unsafe event fallback when legacy receipts exist', async () => {
+it('renders all durable receipt children without incidental event data', async () => {
   const result = { ...semanticSearch, receipts: [
     { executionId: 'exec-partial', searchId: 'life', outcome: 'partial', dryRun: false, updatedAt: '2026-11-19T12:00:00.000Z', client: { name: 'Client A', defaultCategory: 'tv' }, children: [{ candidateId: 'c1', outcome: 'submitted', categoryRouting: 'default', categoryNote: 'Client default: tv' }, { candidateId: 'c2', outcome: 'not-attempted', message: 'Stopped after prior rejection.' }] },
     { executionId: 'exec-rejected', searchId: 'life', outcome: 'rejected', dryRun: false, updatedAt: '2026-11-19T12:01:00.000Z', children: [{ candidateId: 'c1', outcome: 'rejected', categoryRouting: 'configured-mapping' }] },
-  ], legacyReceipts: [{ searchId: 'life', optionId: 'legacy-option', outcome: 'uncertain', candidateIds: ['c1'], outcomes: [{ candidateId: 'c1', outcome: 'submitted' }] }], events: [{ type: 'submission', data: { secret: 'SHOULD-NOT-RENDER' } }] }
+  ], source: 'automation', events: [{ type: 'submission', data: { secret: 'SHOULD-NOT-RENDER' } }] }
   lifecycleFetch(url => url === '/api/v2/searches/life' ? Response.json(result) : Response.json({}))
   const { SearchPage } = await import('./Search')
   render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
@@ -562,7 +547,7 @@ it('renders all durable receipt children and suppresses unsafe event fallback wh
   assert.ok(screen.getByText('not-attempted'))
   assert.ok(screen.getByText(/Prowlarr client default/))
   assert.ok(screen.getByText(/Configured category mapping/))
-  assert.ok(screen.getByRole('heading', { name: 'Historical submission receipts' }))
+  assert.equal(screen.queryByRole('heading', { name: 'Automatic submission' }), null)
   assert.equal(screen.queryByText('SHOULD-NOT-RENDER'), null)
 })
 
@@ -648,25 +633,15 @@ it('hides stale Activity rows and disables pagination when a filtered request fa
 it('renders a nested read-only plan without acquisition controls or submission requests', async () => {
   window.history.replaceState(null, '', '/#activity')
   const requests: string[] = []
-  globalThis.fetch = async input => { const url = String(input); requests.push(url); if (url === '/api/settings') return Response.json(env); if (url.startsWith('/api/v2/activity')) return Response.json({ items: [{ searchId: 's1', prompt: 'Saved request', status: 'matched', source: 'manual', createdAt: matched.createdAt }], total: 1 }); return Response.json(matched) }
+  globalThis.fetch = async input => { const url = String(input); requests.push(url); if (url === '/api/settings') return Response.json(env); if (url.startsWith('/api/v2/activity')) return Response.json({ items: [{ searchId: 's1', prompt: 'Saved request', status: 'matched', source: 'automation', createdAt: matched.createdAt }], total: 1 }); return Response.json({ ...matched, source: 'automation', manualExecutionEligible: false }) }
   render(<App />)
   fireEvent.click(await screen.findByRole('button', { name: 'View search details' }))
   assert.ok(await screen.findByText('Best evidence'))
-  assert.ok(screen.getByText('target-1'))
+  assert.ok(screen.getAllByText('Season one').length > 0)
   assert.ok(screen.getAllByText(/Audio not verified/).length > 0)
-  assert.ok(screen.getAllByText(/execution is unavailable/i)[0])
+  assert.ok(screen.getByText(/cannot be manually submitted/i))
   assert.equal(screen.queryByRole('button', { name: /^(run dry-run|confirm and submit set|prepare confirmation|choose prowlarr client)$/i }), null)
   assert.equal(requests.some(url => /submissions|download-clients/.test(url)), false)
-})
-
-it('keeps historical submission receipts inspectable without offering execution', async () => {
-  window.history.replaceState(null, '', '/#activity')
-  globalThis.fetch = async input => String(input) === '/api/settings' ? Response.json(env) : String(input).startsWith('/api/v2/activity') ? Response.json({ items: [{ searchId: 's1', prompt: 'Saved request', status: 'matched', source: 'manual', createdAt: matched.createdAt }], total: 1 }) : Response.json({ ...matched, events: [{ type: 'submission', data: { outcome: 'uncertain', outcomes: [{ candidateId: 'c1', outcome: 'submitted' }] } }] })
-  render(<App />)
-  fireEvent.click(await screen.findByRole('button', { name: 'View search details' }))
-  assert.ok(await screen.findByRole('heading', { name: 'Historical submission receipts' }))
-  assert.ok(screen.getAllByText(/uncertain/).length > 0)
-  assert.equal(screen.queryByRole('button', { name: /^(run dry-run|confirm and submit set|prepare confirmation|choose prowlarr client)$/i }), null)
 })
 
 it('keeps search available in dry-run and distinguishes a saved refresh from a live poll', async () => {
@@ -734,8 +709,8 @@ it('places automation defaults and client choices in Automation and saves downlo
       const settings = JSON.parse(String(init.body)); saved.push(settings)
       return Response.json({ settings, status: env.status })
     }
-    if (String(input) === '/api/settings') return Response.json({ ...env, settings: { ...defaults, version: 4, monitoring: { ...defaults.monitoring, allowDownloads: false }, integrations: { ...defaults.integrations, prowlarr: { ...defaults.integrations.prowlarr, tvClient: 'old-client' } } } })
-    if (String(input) === '/api/v2/download-clients') return Response.json({ items: [{ id: 8, name: 'qBittorrent', protocol: 'torrent' }] })
+    if (String(input) === '/api/settings') return Response.json({ ...env, settings: { ...defaults, integrations: { ...defaults.integrations, prowlarr: { ...defaults.integrations.prowlarr, tvClientId: 99 } } } })
+    if (String(input) === '/api/v2/download-clients') return Response.json({ items: [{ id: 7, name: 'qBittorrent', protocol: 'torrent' }, { id: 12, name: '7', protocol: 'torrent' }] })
     return Response.json({ items: [] })
   }
   render(<App />)
@@ -744,12 +719,15 @@ it('places automation defaults and client choices in Automation and saves downlo
   assert.equal(screen.getByRole('textbox', { name: 'Automation media preferences' }).closest('section')?.querySelector('h2')?.textContent, 'Automation and retries')
   assert.equal(permission.getAttribute('aria-checked'), 'false')
   assert.ok(screen.getByRole('textbox', { name: 'Automation media preferences' }))
-  assert.ok(screen.getByRole('combobox', { name: /TV download client/ }).textContent?.includes('old-client'))
+  const tvClient = screen.getByRole('combobox', { name: /TV download client/ })
+  assert.ok(tvClient.textContent?.includes('Saved client #99'))
+  fireEvent.change(tvClient, { target: { value: '12' } })
   fireEvent.click(permission)
   assert.equal(saved.length, 0)
   fireEvent.click(screen.getByRole('button', { name: 'Save changes' }))
   await waitFor(() => assert.equal(saved.at(-1)?.monitoring.allowDownloads, true))
   assert.equal(saved.at(-1)?.monitoring.enabled, false)
+  assert.equal(saved.at(-1)?.integrations.prowlarr.tvClientId, 12)
 })
 
 it('shows gated automation state and links to recent automation receipts without enabling execution controls', async () => {
@@ -757,7 +735,7 @@ it('shows gated automation state and links to recent automation receipts without
   let activityUrl = ''
   globalThis.fetch = async input => {
     const url = String(input)
-    if (url === '/api/settings') return Response.json({ ...env, settings: { ...defaults, version: 4, monitoring: { ...defaults.monitoring, allowDownloads: false } } })
+    if (url === '/api/settings') return Response.json({ ...env, settings: defaults })
     if (url === '/api/v2/automation') return Response.json({ enabled: true, allowDownloads: false, dryRun: true, running: false, executionBlocked: true, executionBlockedReason: 'downloads-not-activated', providers: [], items: [] })
     if (url.startsWith('/api/v2/activity')) { activityUrl = url; return Response.json({ items: [{ searchId: 'auto-1', prompt: 'Automated search', status: 'matched', source: 'automation', createdAt: matched.createdAt }], total: 1 }) }
     if (url === '/api/v2/searches/auto-1') return Response.json({ ...semanticSearch, searchId: 'auto-1', source: 'automation', manualExecutionEligible: false })
@@ -816,7 +794,7 @@ it('uses committed safety settings across navigation while preserving drafts and
   fireEvent.click(screen.getByRole('link', { name: 'Activity' }))
   assert.ok(await screen.findByText(/unsaved settings/i))
   fireEvent.click(await screen.findByRole('button', { name: 'View search details' }))
-  assert.ok(await screen.findAllByText(/execution is unavailable/i).then(items => items[0]!))
+  await screen.findByRole('heading', { name: 'Selected release set' })
   assert.ok(screen.getAllByText(/Dry-run saved preference: off/)[0])
   fireEvent.click(screen.getByRole('link', { name: 'Settings' }))
   assert.equal((await screen.findByRole('switch', { name: 'Dry-run mode' })).getAttribute('aria-checked'), 'true')
@@ -824,7 +802,7 @@ it('uses committed safety settings across navigation while preserving drafts and
   await screen.findByRole('alert')
   assert.ok(screen.getByText(/unsaved settings/i))
   fireEvent.click(screen.getByRole('link', { name: 'Search' }))
-  assert.ok(await screen.findAllByText(/execution is unavailable/i).then(items => items[0]!))
+  assert.ok(await screen.findByText('Saved dry-run preference: off'))
 })
 
 it('blocks operational search when committed settings cannot be loaded and allows retry', async () => {
@@ -859,12 +837,13 @@ it('uses committed dry-run after a draft turns it off, and save success commits 
   fireEvent.click(await screen.findByRole('switch', { name: 'Dry-run mode' }))
   fireEvent.click(screen.getByRole('link', { name: 'Activity' }))
   fireEvent.click(await screen.findByRole('button', { name: 'View search details' }))
-  assert.ok(await screen.findAllByText(/execution is unavailable/i).then(items => items[0]!))
+  await screen.findByRole('heading', { name: 'Selected release set' })
+  assert.ok(screen.getByText('Saved dry-run preference: on'))
   fireEvent.click(screen.getByRole('link', { name: 'Settings' }))
   fireEvent.click(await screen.findByRole('button', { name: 'Save changes' }))
   await screen.findByText('Settings saved.')
   fireEvent.click(screen.getByRole('link', { name: 'Search' }))
-  assert.ok(await screen.findAllByText(/execution is unavailable/i).then(items => items[0]!))
+  assert.ok(await screen.findByText('Saved dry-run preference: off'))
 })
 
 it('keeps a cleared numeric field blank instead of silently turning it into zero', async () => {

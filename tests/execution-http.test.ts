@@ -25,8 +25,16 @@ async function fixture(postMode:'accept'|'reject'|'timeout'|'hang'|'second-rejec
   const postSeen=new Promise<void>(resolve=>signalPost=resolve);
   let runtime:SearchRuntime;
   let changeSourceOnNextClientList=false;
+  let holdNextClientList: ((send:()=>void)=>void)|undefined;
   const upstream:Server=createServer((req,res)=>{
-    if(req.method==='GET'&&req.url==='/api/v1/downloadclient') {if(changeSourceOnNextClientList){changeSourceOnNextClientList=false;runtime.saveSettings({...runtime.getSettings(),integrations:{...runtime.getSettings().integrations,prowlarr:{...runtime.getSettings().integrations.prowlarr,url:'http://127.0.0.1:1'}}});}res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify([{id:7,name:clientName,enable:true,protocol:'torrent',supportsCategories:true,categories:categoryMappings,fields:[{name:'category',value:defaultCategory},{name:'host',value:'private-host-canary'}]}]));return;}
+    if(req.method==='GET'&&req.url==='/api/v1/downloadclient') {
+      if(changeSourceOnNextClientList){changeSourceOnNextClientList=false;runtime.saveSettings({...runtime.getSettings(),integrations:{...runtime.getSettings().integrations,prowlarr:{...runtime.getSettings().integrations.prowlarr,url:'http://127.0.0.1:1'}}});}
+      const send=()=>{res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify([{id:7,name:clientName,enable:true,protocol:'torrent',supportsCategories:true,categories:categoryMappings,fields:[{name:'category',value:defaultCategory},{name:'host',value:'private-host-canary'}]}]));};
+      const hold=holdNextClientList;
+      holdNextClientList=undefined;
+      if(hold) hold(send); else send();
+      return;
+    }
     if(req.method==='GET'&&req.url==='/api/v1/indexer'){res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify([{id:5,name:'Indexer',enable:true,supportsSearch:true}]));return;}
     if(req.method==='GET'&&req.url==='/api/v1/indexerstatus'){res.writeHead(200,{'content-type':'application/json'});res.end('[]');return;}
     if(req.method==='GET'&&req.url?.startsWith('/api/v1/search?')){res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify([releaseSchema.parse({guid:'research-guid',indexerId:5,indexer:'Indexer',title:'Research result',publishDate:'2026-01-01T00:00:00Z',protocol:'torrent',downloadUrl:'https://private.invalid/research'})]));return;}
@@ -51,7 +59,7 @@ async function fixture(postMode:'accept'|'reject'|'timeout'|'hang'|'second-rejec
     const release=releaseSchema.parse({guid:`guid-${index}`,indexerId:5,indexer:'Indexer',title:`Title ${index} guid-${index}`,publishDate:'2026-01-01T00:00:00Z',protocol:'torrent',downloadUrl:`https://private.invalid/${index}`,size:1000,age:0,categories:[{id:index===0?5000:5999,name:index===0?'TV':'Anime'}]});
     runtime.store.addCandidate({searchId,candidateId,safe:{candidateId,observations:[]},privateData:{release,physicalKey:physicalRelease(release),sourceFingerprint:source},expiresAt:Date.now()+300_000});
   });
-  return {app,runtime,posts,searchId,candidateIds,setClientName:(name:string)=>{clientName=name;},setDefaultCategory:(category:string)=>{defaultCategory=category;},setCategoryMappings:(mappings:typeof categoryMappings)=>{categoryMappings=mappings;},changeSourceOnNextClientList:()=>{changeSourceOnNextClientList=true;},postSeen,releaseDelayedPost:()=>releaseDelayedPost?.(),advance:(ms:number)=>{currentTime+=ms;},now:()=>currentTime};
+  return {app,runtime,posts,searchId,candidateIds,setClientName:(name:string)=>{clientName=name;},setDefaultCategory:(category:string)=>{defaultCategory=category;},setCategoryMappings:(mappings:typeof categoryMappings)=>{categoryMappings=mappings;},changeSourceOnNextClientList:()=>{changeSourceOnNextClientList=true;},holdNextClientList:()=>new Promise<()=>void>(resolve=>{holdNextClientList=resolve;}),postSeen,releaseDelayedPost:()=>releaseDelayedPost?.(),advance:(ms:number)=>{currentTime+=ms;},now:()=>currentTime};
 }
 
 describe('execution API through real Prowlarr HTTP adapter',()=>{
@@ -214,6 +222,39 @@ describe('execution API through real Prowlarr HTTP adapter',()=>{
     const conflict=await f.app.inject({method:'POST',url:'/api/v2/executions/commit',payload:body(second.confirmationId)});
     expect(conflict.statusCode).toBe(409);
     expect(f.posts).toHaveLength(2);
+  });
+
+  it('does not reuse a confirmation under another key after the first execution releases its holds',async()=>{
+    const f=await fixture('reject');
+    const c=await f.runtime.prepareExecution({searchId:f.searchId,planId:'plan-one',version:2,candidateIds:f.candidateIds,downloadClientId:7});
+    const commit=(idempotencyKey:string)=>f.app.inject({method:'POST',url:'/api/v2/executions/commit',payload:{confirmationId:c.confirmationId,searchId:f.searchId,planId:'plan-one',version:2,idempotencyKey}});
+    const held=f.holdNextClientList();
+    const delayed=commit('delayed-key');
+    const release=await held;
+    try {
+      expect((await commit('winning-key')).json()).toMatchObject({outcome:'rejected'});
+    } finally { release(); }
+    const loser=await delayed;
+    expect(loser.statusCode).toBe(409);
+    expect(loser.json()).toMatchObject({code:'confirmation-expired'});
+    expect(f.posts).toHaveLength(1);
+  });
+
+  it('does not send if the confirmation expires during commit-time client discovery',async()=>{
+    const f=await fixture();
+    const c=await f.runtime.prepareExecution({searchId:f.searchId,planId:'plan-one',version:2,candidateIds:f.candidateIds,downloadClientId:7});
+    const untilExpiry=Date.parse(c.expiresAt)-f.now();
+    f.runtime.store.expireCandidatesAt(f.searchId,f.now()+untilExpiry+60_000);
+    f.advance(untilExpiry-1);
+    const held=f.holdNextClientList();
+    const response=f.app.inject({method:'POST',url:'/api/v2/executions/commit',payload:{confirmationId:c.confirmationId,searchId:f.searchId,planId:'plan-one',version:2,idempotencyKey:'expires-during-discovery'}});
+    const release=await held;
+    f.advance(1);
+    release();
+    const expired=await response;
+    expect(expired.statusCode).toBe(409);
+    expect(expired.json()).toMatchObject({code:'confirmation-expired'});
+    expect(f.posts).toHaveLength(0);
   });
 
   it('treats accepted-but-timeout as uncertain and makes dry-run zero POSTs',async()=>{

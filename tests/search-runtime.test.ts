@@ -11,14 +11,14 @@ const stores: ReturnType<typeof openSearchStore>[] = [];
 afterEach(() => { for (const store of stores.splice(0)) store.close(); });
 function setup() {
   const store = openSearchStore(':memory:'); stores.push(store);
-  const settings = { version: 4, integrations: { prowlarr: { url: 'http://localhost:9696', apiKey: 'private', tvClient: '', movieClient: '' }, sonarr: { url: '', apiKey: '' }, radarr: { url: '', apiKey: '' } }, ai: { apiKey: 'private-ai', model: 'test/model', baseUrl: 'https://example.test/v1', preferences: '' }, monitoring: { enabled: false, allowDownloads: false, intervalMinutes: 5, searchRetryMinutes: 30, failureBackoffMinMinutes: 5, failureBackoffMaxMinutes: 60, queueGraceMinutes: 30 }, search: { maxDecisions: 20, maxSearches: 12, deadlineMinutes: 10 }, safety: { dryRun: true } } satisfies Settings;
+  const settings = { ...defaultSettings, integrations: { ...defaultSettings.integrations, prowlarr: { ...defaultSettings.integrations.prowlarr, url: 'http://localhost:9696', apiKey: 'private' } }, ai: { apiKey: 'private-ai', model: 'test/model', baseUrl: 'https://example.test/v1', preferences: '' }, search: { maxDecisions: 20, maxSearches: 12, deadlineMinutes: 10 } } satisfies Settings;
   let indexerReads = 0;
   let now = 1_800_000_000_000;
   const runtime = new SearchRuntime({ store, now: () => now, clients: () => ({ prowlarr: { getIndexers: async () => { indexerReads++; return [{ id: 1, name: 'Test', enable: true }]; }, getIndexerStatuses: async () => [], search: async () => [], getDownloadClients: async () => [{ id: 7, name: 'TV', enable: true, protocol: 'torrent', supportsCategories: false, categories: [] }], grab: async () => {} } }), initialSettings: settings });
   return { runtime, store, settings, reads: () => indexerReads, get now() { return now; }, set now(value: number) { now = value; } };
 }
 function matched(f: ReturnType<typeof setup>, expires: number) {
-  f.store.createSearch({ searchId: 'matched', prompt: '{"prompt":"Find Example"}', status: 'matched', createdAt: f.now, finishedAt: f.now, result: { options: [{ optionId: 'option', releases: [{ candidateId: 'candidate' }], rank: 1, reason: 'Fit', uncertainty: '', coveredTargetIds: [] }] } });
+  f.store.createSearch({ searchId: 'matched', prompt: '{"request":{"prompt":"Find Example"}}', status: 'matched', createdAt: f.now, finishedAt: f.now, result: { version: 1, plan: { version: 2 } } });
   f.store.addCandidate({ searchId: 'matched', candidateId: 'candidate', safe: {}, privateData: { release: releaseSchema.parse({ guid: 'private-locator', indexerId: 1, indexer: 'Test', title: 'Example', publishDate: '', protocol: 'torrent' }), physicalKey: 'physical' }, expiresAt: expires });
 }
 
@@ -120,38 +120,20 @@ describe('search runtime', () => {
     expect(f.store.ownsSearch('heartbeat', 'owner', f.now + 10_001)).toBe(true);
     expect(f.store.renewSearchWork('heartbeat', 'owner', f.now + 30_002, 20_000)).toBe(false);
   });
-  it('preserves live peer-owned searches and queued requests during another runtime startup', () => {
-    const f = setup();
-    f.store.enqueueSearch({searchId:'live-peer',prompt:'{}',now:f.now});
-    f.store.enqueueSearch({searchId:'still-queued',prompt:'{}',now:f.now+1});
-    f.store.claimNextSearch('peer-owner',f.now,90_000);
-    f.store.migrateLegacySearchWork(f.now+2);
-    expect(f.store.getSearch('live-peer')?.status).toBe('running');
-    expect(f.store.getSearch('still-queued')?.status).toBe('queued');
-    expect(f.store.queuePosition('still-queued')).toBe(1);
-  });
-  it('migrates saved v2 settings and shortens only legacy search-only deadlines once', async () => {
-    const store = openSearchStore(':memory:'); stores.push(store);
-    const now = 1_800_000_000_000, longDeadline = now + 6 * 60 * 60_000;
-    const legacy = { ...defaultSettings, version: 2, monitoring: { ...defaultSettings.monitoring, minRetryHours: 6 } };
-    store.setSetting('application-settings', legacy);
-    for (const target of ['search', 'grab']) {
-      store.setAutomationAttempt(target, { lastAttempt: now - 5 * 60_000, failCount: 0, deadline: longDeadline, graceUntil: 0 });
-      store.setDeadline(target, longDeadline);
-    }
-    store.createSearch({ searchId: 'legacy-search', prompt: 'Find', status: 'matched', createdAt: now });
-    store.setSetting('search-arr:legacy-search', { key: 'search' });
-    store.setSetting('search-source:legacy-search', 'automation');
-    store.createSearch({ searchId: 'legacy-grab', prompt: 'Find', status: 'matched', createdAt: now });
-    store.setSetting('search-arr:legacy-grab', { key: 'grab' });
-    store.setSetting('search-source:legacy-grab', 'automation');
-    store.recordSubmission({ idempotencyKey: 'receipt', payload: { targets: ['grab'] }, outcome: 'submitted', createdAt: now });
-    const runtime = new SearchRuntime({ store, now: () => now, initialSettings: legacy as Settings });
-    expect(runtime.getSettings()).toMatchObject({ version: 4, monitoring: { searchRetryMinutes: 30, allowDownloads: false } });
-    expect(store.getAutomationAttempt('search')?.deadline).toBe(now + 25 * 60_000);
-    expect(store.getDeadline('search')).toBe(now + 25 * 60_000);
-    expect(store.getAutomationAttempt('grab')?.deadline).toBe(longDeadline);
-    await runtime.close();
+  it('preserves live peer-owned searches and queued requests during another runtime startup', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'media-scout-peer-')), path = join(dir, 'search.db');
+    const first = openSearchStore(path);
+    const now = Date.now();
+    let peer: SearchRuntime | undefined;
+    try {
+      first.enqueueSearch({searchId:'live-peer',prompt:'{}',now});
+      first.enqueueSearch({searchId:'still-queued',prompt:'{}',now:now+1});
+      first.claimNextSearch('peer-owner',now,90_000);
+      peer = new SearchRuntime({ databasePath: path, now: () => now + 2 });
+      expect(first.getSearch('live-peer')?.status).toBe('running');
+      expect(first.getSearch('still-queued')?.status).toBe('queued');
+      expect(first.queuePosition('still-queued')).toBe(1);
+    } finally { await peer?.close(); first.close(); rmSync(dir,{recursive:true,force:true}); }
   });
   it('filters Activity by persisted media context and inclusive creation-time bounds', () => {
     const f = setup();
@@ -161,37 +143,15 @@ describe('search runtime', () => {
     expect(f.runtime.activity({ kind: 'tv', createdAtFrom: new Date(f.now).toISOString(), createdAtTo: new Date(f.now + 1).toISOString() }).items.map(x => x.searchId)).toEqual(['tv']);
     expect(f.runtime.activity({ kind: 'other' }).items.map(x => x.searchId)).toEqual(['contextless']);
   });
-  it('projects durable receipt evidence even if a crash prevented the Activity event', () => {
-    const f = setup(); matched(f, f.now + 1000);
-    f.store.appendEvent('matched', { type: 'submission', data: { outcome: 'dry-run', outcomes: [] } }, f.now - 1);
-    f.store.beginSubmission({ idempotencyKey: 'crash', payload: { request: { searchId: 'matched', optionId: 'option' }, candidateIds: ['candidate'] }, createdAt: f.now });
-    expect(f.runtime.activity({ status: 'uncertain' }).items[0]?.submission).toMatchObject({ outcome: 'uncertain' });
-    f.store.updateSubmissionResult('crash', 'submitted', { outcomes: [{ candidateId: 'candidate', outcome: 'submitted' }] });
-    expect(f.runtime.activity({ status: 'submitted' }).items[0]?.submission).toMatchObject({ outcome: 'submitted', outcomes: [{ candidateId: 'candidate', outcome: 'submitted' }] });
-  });
-  it('keeps durable legacy receipts authoritative over newer incidental events and exposes only safe receipt fields', async () => {
+  it('omits retired results from Activity and direct detail without disturbing current results', async () => {
     const f = setup();
     matched(f, f.now + 1000);
-    f.store.beginSubmission({
-      idempotencyKey: 'durable-legacy',
-      payload: { request: { searchId: 'matched', optionId: 'option-1' }, candidateIds: ['candidate'] },
-      createdAt: f.now,
-    });
-    f.store.updateSubmissionResult('durable-legacy', 'submitted', {
-      outcomes: [{ candidateId: 'candidate', outcome: 'submitted' }],
-      privateLocator: 'PRIVATE-LOCATOR-CANARY',
-    });
-    f.store.appendEvent('matched', { type: 'submission', data: { outcome: 'rejected', outcomes: [] } }, f.now + 100);
-
-    expect(f.runtime.activity().items.find(item => item.searchId === 'matched')?.submission).toMatchObject({
-      outcome: 'submitted', outcomes: [{ candidateId: 'candidate', outcome: 'submitted' }],
-    });
-    const detail=await f.runtime.getSearch('matched');
-    expect(detail?.legacyReceipts).toMatchObject([{
-      searchId: 'matched', optionId: 'option-1', outcome: 'submitted',
-      candidateIds: ['candidate'], outcomes: [{ candidateId: 'candidate', outcome: 'submitted' }],
-    }]);
-    expect(JSON.stringify(detail?.legacyReceipts)).not.toContain('PRIVATE-LOCATOR-CANARY');
+    for (const [searchId, result] of [['old-options', { options: [] }], ['old-plan', { version: 1, plan: { version: 1 } }]] as const) {
+      f.store.createSearch({ searchId, prompt: '{}', status: 'matched', createdAt: f.now, result });
+      expect(await f.runtime.getSearch(searchId)).toBeNull();
+    }
+    expect(f.runtime.activity()).toMatchObject({ total: 1, items: [{ searchId: 'matched' }] });
+    expect((await f.runtime.getSearch('matched'))?.plan?.version).toBe(2);
   });
   it('does not cache mixed-source observations when configuration changes during a read', async () => {
     const store = openSearchStore(':memory:'); stores.push(store);
@@ -225,44 +185,26 @@ describe('search runtime', () => {
     f.store.saveObservation('sonarr', { observedAt: f.now, complete: true, payload: { observedAt: f.now, targets, queue: [], diagnostics: { unidentifiedQueueRows: 0 } } });
     f.store.saveObservation('radarr', { observedAt: f.now, complete: true, payload: { observedAt: f.now, targets: [], queue: [], diagnostics: { unidentifiedQueueRows: 0 } } });
     f.store.setAutomationAttempt('cooldown', { lastAttempt: f.now, failCount: 0, deadline: f.now + 60_000, graceUntil: 0 });
-    f.store.setDeadline('cooldown', f.now + 60_000);
 
     const items = f.runtime.automationStatus().items;
     expect(items.map(item => item.title).sort()).toEqual(['available', 'cooldown', 'queued']);
     expect(items.find(item => item.title === 'queued')?.status).toBe('downloading');
     expect(items.find(item => item.title === 'cooldown')?.status).toBe('cooldown');
   });
-  it('interrupts legacy abandoned jobs instead of trusting the obsolete global worker lease', async () => {
-    const f = setup();
-    f.store.createSearch({ searchId: 'abandoned', prompt: '{"prompt":"Find"}', status: 'running', createdAt: f.now });
-    f.store.setSetting('search-owner:abandoned', 'old-process');
-    f.store.acquireLease('search-worker', 'old-process', f.now, 900_000);
-    expect((await f.runtime.getSearch('abandoned'))?.status).toBe('interrupted');
-    f.now += 900_001;
-    expect((await f.runtime.getSearch('abandoned'))?.status).toBe('interrupted');
-  });
-  it('actually removes expired private material and old history while preserving receipts', () => {
+  it('actually removes expired private material and old history', () => {
     const f = setup(); matched(f, f.now - 1);
     f.store.createSearch({ searchId: 'old', prompt: 'old', status: 'no-match', createdAt: f.now - 31 * 86_400_000 });
     f.store.setSetting('search-source:old', 'manual');
-    f.store.beginSubmission({ idempotencyKey: 'retained', payload: { searchId: 'old' }, createdAt: f.now - 31 * 86_400_000 });
     f.runtime.activity();
     expect(f.store.getSearch('old')).toBeNull();
     expect(f.store.getSetting('search-source:old')).toBeNull();
     expect(f.store.getCandidate('matched', 'candidate', 0)).toBeNull();
-    expect(f.store.getSubmission('retained')).not.toBeNull();
   });
   it('rejects extreme retry intervals instead of accepting settings that break ISO projections', () => {
     const f = setup();
     expect(f.runtime.saveSettings({ ...f.settings, monitoring: { ...f.settings.monitoring, searchRetryMinutes: 1_000_000_000_000_000 } }).ok).toBe(false);
   });
-  it('blocks execution regardless of saved dry-run policy', async () => {
-    const f = setup(); matched(f, f.now - 1);
-    f.runtime.saveSettings({ ...f.settings, safety: { dryRun: false } });
-    expect((await f.runtime.submit({ searchId: 'matched', optionId: 'option', idempotencyKey: 'blocked', downloadClientId: 7 })).outcome).toBe('deferred');
-    expect(f.runtime.getSettings().safety.dryRun).toBe(false);
-  });
-  it('uses strict version 4 settings and requires only standalone search integrations', async () => {
+  it('uses strict current settings and requires only standalone search integrations', async () => {
     const { runtime, settings } = setup();
     expect(runtime.getSettings()).toEqual(settings);
     expect(runtime.missingSettings()).toEqual([]);

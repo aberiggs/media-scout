@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { searchRequestSchema, searchStatusSchema, submissionRequestSchema } from '../src/search/contracts';
+import { searchRequestSchema, searchStatusSchema } from '../src/search/contracts';
 
 describe('search request contract', () => {
   it('accepts prompt-only and descriptive preference requests', () => {
@@ -18,10 +18,8 @@ describe('search request contract', () => {
     expect(searchRequestSchema.safeParse(request).success).toBe(true);
     expect(searchRequestSchema.safeParse({ ...request, context: { ...request.context, targets: Array.from({ length: 201 }, (_, i) => ({ targetId: `e${i}` })) } }).success).toBe(false);
   });
-  it('retains status and submission receipt request contracts', () => {
+  it('distinguishes search status from downstream import', () => {
     expect(searchStatusSchema.safeParse('needs-input').success).toBe(true);
     expect(searchStatusSchema.safeParse('imported').success).toBe(false);
-    expect(submissionRequestSchema.safeParse({ searchId: 's1', optionId: 'o1', idempotencyKey: 'k1' }).success).toBe(true);
-    expect(submissionRequestSchema.safeParse({ searchId: 's1', optionId: 'o1', url: 'magnet:?x' }).success).toBe(false);
   });
 });

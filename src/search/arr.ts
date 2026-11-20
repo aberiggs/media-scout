@@ -87,6 +87,28 @@ export class ArrObserver {
     return provider === 'sonarr' ? this.readSonarr(now, serviceId, ignoreQueue) : this.readRadarr(now, serviceId, ignoreQueue);
   }
 
+  /** Read the queue again after routing validation, without rereading the library. */
+  async queueStillClear(provider: ArrProvider, serviceId: number, targets: ArrTarget[], ignoreQueue: (row: QueueIdentity) => boolean): Promise<boolean> {
+    const fingerprint = this.sourceFingerprint(provider), now = (this.deps.clock ?? Date.now)();
+    if (!fingerprint || (this.deps.store?.getProviderDeadline(provider) ?? 0) > now) return false;
+    try {
+      if (provider === 'sonarr') {
+        if (!this.deps.sonarr) return false;
+        const rows = await this.deps.sonarr.getQueue();
+        return this.sourceFingerprint(provider) === fingerprint && !rows.some(row =>
+          row.seriesId === serviceId && !isTerminal(row) && !ignoreQueue(row) && (
+            row.episodeId != null ? targets.some(target => target.episodeId === row.episodeId)
+              : row.seasonNumber == null || targets.some(target => target.context.seasonNumber === row.seasonNumber)));
+      }
+      if (!this.deps.radarr) return false;
+      const rows = await this.deps.radarr.getQueue();
+      return this.sourceFingerprint(provider) === fingerprint && !rows.some(row => row.movieId === serviceId && !isTerminal(row) && !ignoreQueue(row));
+    } catch (error) {
+      this.reportRetry(provider, error);
+      return false;
+    }
+  }
+
   async fingerprintFor(target: ArrTarget): Promise<string | null> {
     const snapshot = await this.observe();
     return snapshot.targets.find(current => current.key === target.key)?.sourceFingerprint ?? null;

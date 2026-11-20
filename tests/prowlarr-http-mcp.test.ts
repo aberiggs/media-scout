@@ -48,7 +48,7 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
           client: new OpenRouter({ apiKey: 'fixture', serverURL: `http://127.0.0.1:${responseAddress.port}`, retryConfig: { strategy: 'none' } }),
           model: 'fixture/model', input: 'test', mcpUrl: `http://127.0.0.1:${address.port}/internal/mcp/prowlarr`,
           capability: token, signal: new AbortController().signal, maxSteps: scenario.maxSteps, requestTimeoutMs: 5_000,
-          ledger: () => ({ searchId, targets: [], candidates: [] }), ownsSearch: () => scenario.ownsSearch,
+          ledger: () => ({ searchId, candidates: [] }), ownsSearch: () => scenario.ownsSearch,
           onFinalize: () => { staged++; },
         });
         const outcome = await result.then(() => 'resolved', () => 'rejected');
@@ -98,7 +98,7 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
         client: new OpenRouter({ apiKey: 'fixture', serverURL: `http://127.0.0.1:${responseAddress.port}`, retryConfig: { strategy: 'none' } }),
         model: 'fixture/model', input: 'test', mcpUrl: `http://127.0.0.1:${address.port}/internal/mcp/prowlarr`,
         capability: token, signal: new AbortController().signal, maxSteps, requestTimeoutMs: 5_000,
-        ledger: () => ({ searchId: 'last-turn', targets: [], candidates: [] }), ownsSearch: () => true, onFinalize: () => { staged++; },
+        ledger: () => ({ searchId: 'last-turn', candidates: [] }), ownsSearch: () => true, onFinalize: () => { staged++; },
       });
       if (accepted) await expect(result).resolves.toMatchObject({ status: 'no-match' });
       else await expect(result).rejects.toThrow(/budget exhausted/i);
@@ -157,7 +157,7 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
         client: new OpenRouter({ apiKey: 'fixture', serverURL: `http://127.0.0.1:${responseAddress.port}`, retryConfig: { strategy: 'none' } }),
         model: 'fixture/model', input: 'test', mcpUrl: `http://127.0.0.1:${address.port}/internal/mcp/prowlarr`,
         capability: token, signal: abort.signal, maxSteps: 5, requestTimeoutMs: 30_000,
-        ledger: () => ({ searchId: 'cancel-runner', targets: [], candidates: [] }), ownsSearch: () => true, onFinalize: () => {},
+        ledger: () => ({ searchId: 'cancel-runner', candidates: [] }), ownsSearch: () => true, onFinalize: () => {},
       });
       await seen;
       abort.abort(new Error('cancel-test'));
@@ -200,7 +200,7 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
         client: new OpenRouter({ apiKey: 'fixture', serverURL: `http://127.0.0.1:${responseAddress.port}`, retryConfig: { strategy: 'none' } }),
         model: 'fixture/model', input: 'test', mcpUrl: `http://127.0.0.1:${address.port}/internal/mcp/prowlarr`,
         capability: token, signal: new AbortController().signal, maxSteps: 5, requestTimeoutMs: 5_000,
-        ledger: () => ({ searchId: 'parallel-finalize', targets: [], candidates: [] }), ownsSearch: () => true,
+        ledger: () => ({ searchId: 'parallel-finalize', candidates: [] }), ownsSearch: () => true,
         onFinalize: async () => { staged++; await new Promise(resolve => setTimeout(resolve, 30)); },
       });
       expect(plan.status).toBe('no-match');
@@ -245,7 +245,7 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
         client: new OpenRouter({ apiKey: 'fixture', serverURL: `http://127.0.0.1:${responseAddress.port}`, retryConfig: { strategy: 'none' } }),
         model: 'fixture/model', input: 'test', mcpUrl: `http://127.0.0.1:${address.port}/internal/mcp/prowlarr`,
         capability: token, signal: new AbortController().signal, maxSteps: 5, requestTimeoutMs: 5_000,
-        ledger: () => ({ searchId: 'retry-finalize', targets: [], candidates: [] }), ownsSearch: () => true,
+        ledger: () => ({ searchId: 'retry-finalize', candidates: [] }), ownsSearch: () => true,
         onFinalize: () => { staged++; },
       });
       expect(plan.status).toBe('no-match');
@@ -260,7 +260,7 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
 
   it.each(['discovery', 'search'])('aborts sibling discovery reads when %s fails early', async operation => {
     const settings = structuredClone(defaultSettings);
-    settings.integrations.prowlarr = { url: 'http://fixture.test', apiKey: 'fixture-key', tvClient: '', movieClient: '' };
+    settings.integrations.prowlarr = { ...settings.integrations.prowlarr, url: 'http://fixture.test', apiKey: 'fixture-key' };
     let siblingSignal: AbortSignal | undefined;
     const runtime = new SearchRuntime({
       initialSettings: settings, store: openSearchStore(':memory:'),
@@ -283,7 +283,7 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
 
   it('serves real SDK discovery and safe search through a scoped bearer capability', async () => {
     const settings = structuredClone(defaultSettings);
-    settings.integrations.prowlarr = { url: 'http://prowlarr.test', apiKey: 'SECRET-KEY', tvClient: '', movieClient: '' };
+    settings.integrations.prowlarr = { ...settings.integrations.prowlarr, url: 'http://prowlarr.test', apiKey: 'SECRET-KEY' };
     let grabs = 0;
     const runtime = new SearchRuntime({
       initialSettings: settings, store: openSearchStore(':memory:'),
@@ -374,9 +374,9 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
            model: 'z-ai/glm-5.3-flash', input: 'Search and finalize only from observations.',
            mcpUrl: `http://127.0.0.1:${address.port}/internal/mcp/prowlarr`, capability: agentToken,
            signal: new AbortController().signal, maxSteps: 5, requestTimeoutMs: 2_000,
-           ledger: () => ({ searchId: 'owner-search', targets: [], candidates: runtime.store.listCandidates('owner-search').map(item => {
+           ledger: () => ({ searchId: 'owner-search', candidates: runtime.store.listCandidates('owner-search').map(item => {
              const value = runtime.store.getCandidate('owner-search', item.candidateId);
-             return { id: item.candidateId, physicalId: String((value?.privateData as { physicalKey?: string } | undefined)?.physicalKey ?? ''), targets: [] };
+             return { id: item.candidateId, physicalId: String((value?.privateData as { physicalKey?: string } | undefined)?.physicalKey ?? '') };
            }) }),
            ownsSearch: () => true, onFinalize: () => undefined,
          });
@@ -386,12 +386,6 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
          expect(scriptedToolNames.some(name => name?.includes('prowlarr_search'))).toBe(true);
          expect((responseRequests[0]!.tools as Array<{ name: string }>).some(tool => tool.name.includes('prowlarr_search'))).toBe(true);
        } finally { await new Promise<void>((resolve, reject) => responses.close(error => error ? reject(error) : resolve())); }
-       runtime.store.finishSearch('owner-search', 'matched', {
-        options: [{ optionId: 'selected', rank: 1, releases: [{ candidateId: candidates[0]!.candidateId }], coveredTargetIds: [], reason: 'Observed candidate', uncertainty: '' }],
-      }, Date.now());
-       await expect(runtime.submit({ searchId: 'owner-search', optionId: 'selected', idempotencyKey: 'internal-mcp-candidate', downloadClientId: 1 })).resolves.toMatchObject({
-         outcome: 'deferred', candidateIds: [],
-      });
       const unauthorized = await app.inject({ method: 'POST', url: '/internal/mcp/prowlarr', payload: { jsonrpc: '2.0', id: 1, method: 'tools/list' } });
       expect(unauthorized.statusCode).toBe(401);
       const wrongToken = `${created.token[0] === '0' ? '1' : '0'}${created.token.slice(1)}`;
@@ -411,7 +405,7 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
 
   it('honors per-job snapshots, healthy selection, cooldown and sanitized upstream errors', async () => {
     const settings = structuredClone(defaultSettings);
-    settings.integrations.prowlarr = { url: 'http://original.test', apiKey: 'old-secret', tvClient: '', movieClient: '' };
+    settings.integrations.prowlarr = { ...settings.integrations.prowlarr, url: 'http://original.test', apiKey: 'old-secret' };
     let clientUrl = '', searchCalls = 0;
     const runtime = new SearchRuntime({
       initialSettings: settings, store: openSearchStore(':memory:'),
@@ -467,7 +461,7 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
     let now = 10_000, searches = 0, grabs = 0, observedSignal: AbortSignal | undefined, shutdownStarted!: () => void;
     const shutdownUpstreamStarted = new Promise<void>(resolve => { shutdownStarted = resolve; });
     const settings = structuredClone(defaultSettings);
-    settings.integrations.prowlarr = { url: 'http://prowlarr.test', apiKey: 'test-key', tvClient: '', movieClient: '' };
+    settings.integrations.prowlarr = { ...settings.integrations.prowlarr, url: 'http://prowlarr.test', apiKey: 'test-key' };
     const release = {
       guid: 'private-guid', age: 1, size: 42, files: null, grabs: null, indexerId: 1, indexer: 'Indexer', subGroup: null,
       title: 'Series S01E01 1080p', tvdbId: null, tmdbId: null, publishDate: '', downloadUrl: null,
@@ -529,7 +523,7 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
 
   it('forwards a real served SDK cancellation to its active upstream Prowlarr request', async () => {
     const settings = structuredClone(defaultSettings);
-    settings.integrations.prowlarr = { url: 'http://prowlarr.test', apiKey: 'test-key', tvClient: '', movieClient: '' };
+    settings.integrations.prowlarr = { ...settings.integrations.prowlarr, url: 'http://prowlarr.test', apiKey: 'test-key' };
     let searchSignal: AbortSignal | undefined, started!: () => void;
     const upstreamStarted = new Promise<void>(resolve => { started = resolve; });
     const runtime = new SearchRuntime({
@@ -576,7 +570,7 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
 
   it('binds independent served MCP sessions and candidate ledgers to their bearer capabilities', async () => {
     const settings = structuredClone(defaultSettings);
-    settings.integrations.prowlarr = { url: 'http://source-a.test', apiKey: 'same-key', tvClient: '', movieClient: '' };
+    settings.integrations.prowlarr = { ...settings.integrations.prowlarr, url: 'http://source-a.test', apiKey: 'same-key' };
     let grabs = 0;
     const runtime = new SearchRuntime({
       initialSettings: settings, store: openSearchStore(':memory:'),
@@ -684,7 +678,7 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
     const upstreamAddress = upstream.address();
     if (!upstreamAddress || typeof upstreamAddress === 'string') throw new Error('No upstream listener');
     const settings = structuredClone(defaultSettings);
-    settings.integrations.prowlarr = { url: `http://127.0.0.1:${upstreamAddress.port}`, apiKey: 'fixture-key', tvClient: '', movieClient: '' };
+    settings.integrations.prowlarr = { ...settings.integrations.prowlarr, url: `http://127.0.0.1:${upstreamAddress.port}`, apiKey: 'fixture-key' };
     let clockOffset = 0;
     const runtime = new SearchRuntime({ initialSettings: settings, store: openSearchStore(':memory:'), now: () => Date.now() + clockOffset });
     const app = await buildApp({ runtime, logger: pino({ level: 'silent' }) } as unknown as Stack, { webRoot: '/missing' });

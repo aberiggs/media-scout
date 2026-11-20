@@ -31,4 +31,16 @@ describe('fresh search database boundary', () => {
       expect(new Database(path, { readonly: true }).prepare('SELECT work_key FROM work_items').get()).toEqual({ work_key: 'legacy' });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
+  it('refuses the previous search database generation without modifying it', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'search-db-'));
+    const path = join(dir, 'old-search.sqlite');
+    try {
+      const db = new Database(path);
+      db.exec('CREATE TABLE search_meta (version INTEGER NOT NULL); INSERT INTO search_meta VALUES (1)');
+      db.close();
+      const before = readFileSync(path);
+      expect(() => openSearchStore(path)).toThrow(LEGACY_DATABASE_ERROR);
+      expect(readFileSync(path)).toEqual(before);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
 });

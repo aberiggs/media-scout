@@ -13,7 +13,7 @@ import { ProwlarrClient } from '../src/clients/prowlarr';
 const host = '0.0.0.0';
 const port = Number(process.env.PREVIEW_SEARCH_PORT ?? process.env.PORT ?? 4787);
 const settings = structuredClone(defaultSettings);
-settings.integrations.prowlarr = { url: 'http://synthetic.invalid', apiKey: 'fixture-only', tvClient: 'Synthetic torrent client', movieClient: 'Synthetic torrent client' };
+settings.integrations.prowlarr = { url: 'http://synthetic.invalid', apiKey: 'fixture-only', tvClientId: null, movieClientId: null };
 settings.ai.apiKey = 'fixture-only'; settings.ai.model = 'fixture-no-provider-calls';
 settings.safety.dryRun = true;
 
@@ -136,25 +136,6 @@ const stalePlan = { ...seasonPlan, planId: 'fixture-plan-stale', selections: [{ 
 const staleItem = seedSearch('fixture-stale-confirmation', 'Stale Signal Harbor plan', baseRequest, stalePlan, []);
 const expiredPlan = { ...moviePlan, planId: 'fixture-plan-expired', selections: [{ candidateId: 'expired-movie', coverage: 'Complete feature film', reason: 'Expired candidate sample', uncertainty: '' }] };
 const expiredItem = seedSearch('fixture-expired-candidate', 'Expired Glass Orchard candidate', movieRequest, expiredPlan, [{ id: 'expired-movie', title: 'Glass Orchard (2024) old candidate', expiresAt: now - 1 }]);
-const longLegacyPlan = {
-  version: 1, planId: 'fixture-plan-legacy', status: 'matched',
-  selections: [{ candidateId: 'legacy-candidate', targetIds: ['series:legacy:season:2'], reason: 'Historical saved recommendation', uncertainty: 'Legacy coverage is not reinterpreted.' }],
-  coverage: { covered: ['Season 2 episodes 1–4'], gaps: [], deferred: [], broad: { status: 'complete', gaps: [] } },
-  warnings: ['This plan is inspection-only.'], historicalPayload: 'Synthetic legacy detail '.repeat(1600),
-};
-const legacyRequest = { ...baseRequest, prompt: 'Legacy Signal Harbor season two' };
-const legacyItem = seedSearch('fixture-legacy-long-json', legacyRequest.prompt, legacyRequest, longLegacyPlan, [{ id: 'legacy-candidate', title: 'Legacy Signal Harbor pack' }]);
-stack.runtime.store.createSearch({
-  searchId: 'fixture-retired-receipt', prompt: 'Retired result with historical receipt',
-  status: 'matched', createdAt: now,
-  result: { status: 'matched', options: [{ title: 'Retired option', reason: 'Saved legacy evidence' }], detail: 'Long retired detail '.repeat(1600) },
-});
-stack.runtime.store.recordSubmission({
-  idempotencyKey: 'fixture-legacy-receipt', createdAt: now,
-  payload: { request: { searchId: 'fixture-retired-receipt', optionId: 'legacy-option' }, result: { outcomes: [{ candidateId: 'legacy-candidate', outcome: 'uncertain' }] } },
-  outcome: 'uncertain',
-});
-stack.runtime.store.appendEvent('fixture-retired-receipt', { type: 'submission', data: { outcome: 'event-must-not-override' } });
 const noMatchPlan = {
   version: 2, planId: 'fixture-plan-no-match', status: 'no-match', selections: [],
   covered: [], gaps: ['No suitable release observed'], deferred: [], scopeGaps: [],
@@ -172,7 +153,7 @@ function localOnly(request: { ip: string }) {
 }
 app.get('/__fixture', async request => {
   localOnly(request);
-  return { scenarios: [seasonItem, movieItem, staleItem, expiredItem, legacyItem, uncertainItem, recoveryItem], upstreamMode: mode, upstreamRequests, accepted, requestBodies };
+  return { scenarios: [seasonItem, movieItem, staleItem, expiredItem, uncertainItem, recoveryItem], upstreamMode: mode, upstreamRequests, accepted, requestBodies };
 });
 app.post('/__fixture', async (request, reply) => {
   localOnly(request);
@@ -192,7 +173,7 @@ app.post('/__fixture', async (request, reply) => {
 
 await app.listen({ port, host });
 console.log(`Synthetic UI fixture: http://127.0.0.1:${port}/#search`);
-console.log(`Scenarios: ${[seasonItem, movieItem, staleItem, expiredItem, legacyItem].map(item => item.searchId).join(', ')}`);
+console.log(`Scenarios: ${[seasonItem, movieItem, staleItem, expiredItem].map(item => item.searchId).join(', ')}`);
 console.log(`Synthetic modes via POST /__fixture: success, reject-after-first, accepted-timeout (dryRun reset defaults to true).`);
 const stop = async () => { await app.close(); await upstream.close(); await stack.runtime.close(); };
 process.on('SIGINT', () => { void stop(); });

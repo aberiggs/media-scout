@@ -6,9 +6,9 @@ const serviceUrl = z.string().refine((value) => value === '' || (() => {
 })(), 'must be an http(s) URL without embedded credentials or empty');
 const text = z.string();
 export const settingsSchema = z.object({
-  version: z.literal(4),
+  version: z.literal(5),
   integrations: z.object({
-    prowlarr: z.object({ url: serviceUrl, apiKey: text, tvClient: text, movieClient: text }).strict(),
+    prowlarr: z.object({ url: serviceUrl, apiKey: text, tvClientId: z.number().int().positive().nullable(), movieClientId: z.number().int().positive().nullable() }).strict(),
     sonarr: z.object({ url: serviceUrl, apiKey: text }).strict(),
     radarr: z.object({ url: serviceUrl, apiKey: text }).strict(),
   }).strict(),
@@ -23,27 +23,12 @@ export const settingsSchema = z.object({
 
 export type Settings = z.infer<typeof settingsSchema>;
 export const defaultSettings: Settings = {
-  version: 4,
-  integrations: { prowlarr: { url: '', apiKey: '', tvClient: '', movieClient: '' }, sonarr: { url: '', apiKey: '' }, radarr: { url: '', apiKey: '' } },
+  version: 5,
+  integrations: { prowlarr: { url: '', apiKey: '', tvClientId: null, movieClientId: null }, sonarr: { url: '', apiKey: '' }, radarr: { url: '', apiKey: '' } },
   ai: { apiKey: '', model: 'openai/gpt-6.1-sol', baseUrl: 'https://openrouter.ai/api/v1', preferences: '' },
   monitoring: { enabled: false, allowDownloads: false, intervalMinutes: 5, searchRetryMinutes: 30, failureBackoffMinMinutes: 5, failureBackoffMaxMinutes: 60, queueGraceMinutes: 30 },
   search: { maxDecisions: 100, maxSearches: 100, deadlineMinutes: 30 }, safety: { dryRun: true },
 };
-
-export function migrateSettings(value: unknown): { migrated: boolean; settings: Settings } {
-  const current = settingsSchema.safeParse(value);
-  if (current.success) return { migrated: false, settings: current.data };
-  if (!value || typeof value !== 'object' || ![2, 3].includes((value as { version?: number }).version ?? -1)) {
-    throw new Error('Saved application settings are invalid');
-  }
-  const legacy = value as Record<string, any>;
-  const hours = legacy.monitoring?.minRetryHours;
-  const searchRetryMinutes = legacy.version === 2 ? hours === 6 ? 30 : typeof hours === 'number' ? hours * 60 : 30 : legacy.monitoring?.searchRetryMinutes ?? 30;
-  const { minRetryHours: _legacyRetry, ...monitoring } = legacy.monitoring ?? {};
-  const migrated = settingsSchema.safeParse({ ...legacy, version: 4, monitoring: { ...monitoring, allowDownloads: false, searchRetryMinutes } });
-  if (!migrated.success) throw new Error('Saved application settings are invalid');
-  return { migrated: true, settings: migrated.data };
-}
 
 export function missingSettings(settings: Settings): string[] {
   const required: Array<[string, string]> = [

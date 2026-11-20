@@ -30,10 +30,11 @@ A completed result has one `plan`, not `options`. New plans are version 2:
 V2 finalization requires plain-language per-release coverage, overall covered/gaps/
 deferred descriptions, and a consistent broad-coverage status. It has no `targetIds`
 field and never maps releases to episodes or Arr entities. Coverage, gaps, extras,
-and useful overlap are semantic descriptions; reasonable extras are valid. V1 plans
-remain safely typed for read-only history and are not reinterpreted.
+and useful overlap are semantic descriptions; reasonable extras are valid. Earlier
+plan formats are not shown in history.
 An empty **validated** set is
-`no-match`; failed/interrupted/budget-exhausted research has no executable plan.
+`no-match`; a Prowlarr failure with no successful search is not a clean miss.
+Failed/interrupted/budget-exhausted research has no executable plan.
 Safe candidate evidence is retained with history independently of private locator
 expiry. Consumers resolve selected IDs through the owning backend ledger, never
 through client-supplied magnets or tracker URLs. Inferred coverage does not establish
@@ -80,7 +81,11 @@ API or release-to-episode assignment is involved. The explicit poll endpoint onl
 refreshes observations and returns promptly when another pass owns the lease.
 
 Execution revalidates the Arr title, configured source/destination, durable selected
-set and current authorization before each release. Queue records identifiable as
+set and current authorization before each release. The final routing read is followed
+by a fresh Arr queue check; a slow verification window stops the set rather than
+sending from stale observations. These reads cannot atomically lock either service.
+Changing the saved Prowlarr connection clears automatic client selections; choose the
+IDs again from the new connection. Queue records identifiable as
 earlier grabs in the same set do not veto later releases; unidentified new queue
 coverage can stop the tail. A submitted or possibly submitted request applies
 persisted media-level grace to the show or movie, including newly due episodes.
@@ -126,7 +131,7 @@ Results are JSON text MCP content; the search result count describes that respon
 
 The daemon registers its actual bound loopback origin before dispatching work. The job passes its backend-minted capability to the canonical `createMCPTools` import and always closes/revokes it. The caller—not tool arguments—owns the search and lifetime. The public stdio server reuses the daemon architecture and reports unavailable when no HTTP origin is present; it never spawns a second engine/listener. Do not give the token to model prompts, events, public responses, or logs.
 
-Legacy history remains inspectable via the explicit `legacyResult` projection and is never converted to release-set plans. Legacy submission receipts are separately returned as a safe `legacyReceipts` projection and take precedence over incidental Activity events. The retired `/api/v2/submissions` mutation route remains blocked; new execution uses `/api/v2/executions/*`. External research MCP settings remain out of scope.
+This release requires a fresh `DB_PATH`; it does not migrate old settings, searches or receipts. The retired `/api/v2/submissions` mutation route returns `410`; release-set execution uses `/api/v2/executions/*`. Configured external research MCPs (#54) are deferred as an optional capability, not required for parity with the Prowlarr-based setup.
 
 The public Media Scout stdio adapter remains available and uses SDK v2. It is separate from this read-only internal server and does not expose recursive agent tools.
 
@@ -140,7 +145,6 @@ Implementation map:
 
 - `agent.ts`, `agent-contracts.ts`: SDK orchestration and ledger-validated finalization.
 - `contracts.ts`, `arr.ts`, `automation.ts`: request contracts, Arr observation, and the retained cooldown-key helper; no acquisition automation engine remains.
-- `submission.ts`: safe legacy receipt projection types.
 - `store.ts`, `settings.ts`: SQLite persistence.
 - `runtime.ts`, `mcp.ts`, `prowlarr-mcp.ts`: runtime wiring and MCP adapters/capabilities.
 

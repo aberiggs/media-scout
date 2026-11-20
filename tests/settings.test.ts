@@ -1,27 +1,45 @@
 import { describe, expect, it } from 'vitest';
-import { defaultSettings, migrateSettings, settingsSchema, missingSettings } from '../src/settings';
+import { defaultSettings, settingsSchema, missingSettings } from '../src/settings';
 import { SearchRuntime } from '../src/search/runtime';
 import { openSearchStore } from '../src/search/store';
 describe('search-first settings', () => {
   it('defaults to disabled monitoring and no downloads', () => {
-    expect(settingsSchema.parse(defaultSettings)).toMatchObject({ version: 4, safety: { dryRun: true }, monitoring: { enabled: false, allowDownloads: false, searchRetryMinutes: 30 }, search: { maxDecisions: 100, maxSearches: 100, deadlineMinutes: 30 } });
+    expect(settingsSchema.parse(defaultSettings)).toMatchObject({ version: 5, safety: { dryRun: true }, monitoring: { enabled: false, allowDownloads: false, searchRetryMinutes: 30 }, search: { maxDecisions: 100, maxSearches: 100, deadlineMinutes: 30 } });
     expect(defaultSettings.ai.model).toBe('openai/gpt-6.1-sol');
   });
-  it('migrates saved v3 settings to require explicit download activation without changing dry-run', () => {
-    const old = structuredClone(defaultSettings) as any;
-    old.version = 3;
-    delete old.monitoring.allowDownloads;
-    old.monitoring.enabled = true;
-    old.safety.dryRun = false;
-    expect(migrateSettings(old)).toMatchObject({ migrated: true, settings: { monitoring: { enabled: true, allowDownloads: false }, safety: { dryRun: false } } });
+  it('only accepts explicit numeric client IDs or no selection', () => {
+    const settings = structuredClone(defaultSettings);
+    const withId = (tvClientId: unknown) => ({ ...settings, integrations: { ...settings.integrations, prowlarr: { ...settings.integrations.prowlarr, tvClientId } } });
+    expect(settingsSchema.parse(withId(12)).integrations.prowlarr).toMatchObject({ tvClientId: 12, movieClientId: null });
+    expect(settingsSchema.safeParse(withId('7')).success).toBe(false);
+    expect(settingsSchema.safeParse(withId(0)).success).toBe(false);
+    expect(settingsSchema.safeParse({ ...settings, version: 4 }).success).toBe(false);
+  });
+  it('requires a new client selection when switching Prowlarr instances with the same ID', async () => {
+    const settings = structuredClone(defaultSettings);
+    settings.integrations.prowlarr = { url: 'http://old.fixture', apiKey: 'fixture', tvClientId: 7, movieClientId: 7 };
+    settings.monitoring.allowDownloads = true;
+    const runtime = new SearchRuntime({ store: openSearchStore(':memory:'), initialSettings: settings, clients: current => ({
+      prowlarr: { getIndexers: async () => [], getIndexerStatuses: async () => [], search: async () => [],
+        getDownloadClients: async () => [{ id: 7, name: current.integrations.prowlarr.url.includes('old') ? 'Old client' : 'Different client', enable: true, protocol: 'torrent', supportsCategories: false, categories: [] }] },
+    }) });
+    try {
+      expect(await runtime.downloadClients()).toMatchObject([{ id: 7, name: 'Old client' }]);
+      const switched = structuredClone(settings);
+      switched.integrations.prowlarr.url = 'http://new.fixture';
+      expect(runtime.saveSettings(switched)).toMatchObject({ ok: true });
+      expect(runtime.getSettings()).toMatchObject({ integrations: { prowlarr: { tvClientId: null, movieClientId: null } }, monitoring: { allowDownloads: true } });
+      expect(await runtime.downloadClients()).toMatchObject([{ id: 7, name: 'Different client' }]);
+      expect(runtime.saveSettings(switched)).toMatchObject({ ok: true, settings: { integrations: { prowlarr: { tvClientId: 7 } } } });
+    } finally { await runtime.close(); }
   });
   it('does not migrate a previously saved model when the new-install default changes', () => {
     const saved = { ...defaultSettings, ai: { ...defaultSettings.ai, model: 'z-ai/glm-5.3-flash' } };
-    expect(migrateSettings(saved)).toEqual({ migrated: false, settings: saved });
+    expect(settingsSchema.parse(saved)).toEqual(saved);
   });
   it('requires only search connections for standalone readiness', () => {
     const settings = structuredClone(defaultSettings);
-    settings.integrations.prowlarr = { url: 'http://indexer.test', apiKey: 'fake', tvClient: '', movieClient: '' };
+    settings.integrations.prowlarr = { ...settings.integrations.prowlarr, url: 'http://indexer.test', apiKey: 'fake' };
     settings.ai.apiKey = 'fake';
     expect(missingSettings(settings)).toEqual([]);
   });
@@ -34,7 +52,7 @@ describe('search-first settings', () => {
   });
   it('round-trips existing lower search budgets without rewriting them', () => {
     const existing = { ...defaultSettings, search: { maxDecisions: 20, maxSearches: 12, deadlineMinutes: 10 } };
-    expect(migrateSettings(existing)).toEqual({ migrated: false, settings: existing });
+    expect(settingsSchema.parse(existing)).toEqual(existing);
   });
   it('saves larger accepted budgets and reads them back without mutating existing saved values', async () => {
     const store = openSearchStore(':memory:');
@@ -48,16 +66,5 @@ describe('search-first settings', () => {
       expect(runtime.getSettings().search).toEqual(old.search);
       expect(store.getSetting('application-settings')).toEqual(old);
     } finally { await runtime.close(); }
-  });
-  it('migrates the old default retry and preserves customized hour values in minutes', () => {
-    const legacy = { ...defaultSettings, version: 2 as const, monitoring: { ...defaultSettings.monitoring, minRetryHours: 6 } } as any;
-    const migrated = migrateSettings(legacy);
-    expect(migrated).toMatchObject({ migrated: true, settings: { version: 4, monitoring: { searchRetryMinutes: 30, allowDownloads: false } } });
-    expect('minRetryHours' in (migrated.settings as any).monitoring).toBe(false);
-
-    const customized = migrateSettings({ ...legacy, monitoring: { ...legacy.monitoring, minRetryHours: 2 } });
-    expect(customized).toMatchObject({ migrated: true, settings: { monitoring: { searchRetryMinutes: 120 } } });
-    const maximum = migrateSettings({ ...legacy, monitoring: { ...legacy.monitoring, minRetryHours: 8760 } });
-    expect(maximum.settings.monitoring.searchRetryMinutes).toBe(525_600);
   });
 });

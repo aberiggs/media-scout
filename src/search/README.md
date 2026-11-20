@@ -1,12 +1,15 @@
 # Search subsystem
 
-HTTP and public MCP adapters share one asynchronous search domain. The OpenRouter Agent SDK owns tool orchestration; the backend validates a single versioned release-set against the owning-search ledger. Search is read-only and never grabs. Release execution (#56) and automation acquisition (#57) are disabled; saved preferences and observer data remain intact.
+HTTP and public MCP adapters share one asynchronous search domain. The OpenRouter Agent SDK owns tool orchestration; the backend validates a single versioned release-set against the owning-search ledger. Search itself is read-only; explicit release execution is a separate confirmation-and-commit API. Automation acquisition remains disabled; saved preferences and observer data remain intact.
 
 ## Canonical request and result
 
 `POST /api/v2/searches` and public MCP `ma_search_v2` accept the same request.
 Creation returns HTTP 202 / `{searchId,status:"queued"}`; read the persisted result
 with `GET /api/v2/searches/:id` or `ma_search_status_v2`.
+An optional positive integer `preferredDownloadClientId` is retained in durable
+search metadata and returned by search status. It is not sent to the research model
+and does not validate or select a client during search.
 
 ```json
 {"prompt":"Find seasons 1-4 of Example; useful partial sets are welcome","context":{"kind":"tv","titles":["Example"],"scope":{"type":"unspecified"}}}
@@ -18,20 +21,53 @@ references with numbering evidence. For Arr-backed acquisition intent, supply
 and validates them, then persists immutable canonical bindings. Generic target IDs
 never grant Arr authority, even if they happen to equal an Arr reference.
 
-A completed result has one `plan`, not `options`. Abbreviated example:
+A completed result has one `plan`, not `options`. New plans are version 2:
 
 ```json
-{"searchId":"backend-id","status":"matched","plan":{"version":1,"planId":"backend-id","status":"matched","selections":[{"candidateId":"observed-id","targetIds":[],"reason":"Observed pack covers seasons 1-3","uncertainty":"Inferred from title; contents not inspected"}],"gaps":[],"deferred":[],"broadCoverage":"partial","scopeGaps":["Season 4 not found"],"coverage":{"covered":[],"gaps":[],"deferred":[],"broad":{"status":"partial","gaps":["Season 4 not found"]}}}}
+{"searchId":"backend-id","status":"matched","plan":{"version":2,"planId":"backend-id","status":"matched","selections":[{"candidateId":"observed-id","coverage":"Seasons 1-3","reason":"Observed pack covers the first three requested seasons","uncertainty":"Season listing inferred from the release title"}],"covered":["Seasons 1-3"],"gaps":[],"deferred":[],"broadCoverage":"partial","scopeGaps":["Season 4 not found"],"extras":["Pack also includes specials"],"usefulOverlap":[],"coverage":{"covered":["Seasons 1-3"],"gaps":[],"deferred":[],"broad":{"status":"partial","gaps":["Season 4 not found"]}}}}
 ```
 
-`targetIds` refer only to explicit requested targets; broad free-text requests use
-descriptive scope coverage/gaps. Atomic target coverage is the backend-computed
-union across selections, so useful overlap is valid. An empty **validated** set is
+V2 finalization requires plain-language per-release coverage, overall covered/gaps/
+deferred descriptions, and a consistent broad-coverage status. It has no `targetIds`
+field and never maps releases to episodes or Arr entities. Coverage, gaps, extras,
+and useful overlap are semantic descriptions; reasonable extras are valid. V1 plans
+remain safely typed for read-only history and are not reinterpreted.
+An empty **validated** set is
 `no-match`; failed/interrupted/budget-exhausted research has no executable plan.
 Safe candidate evidence is retained with history independently of private locator
 expiry. Consumers resolve selected IDs through the owning backend ledger, never
-through client-supplied magnets or tracker URLs. Download execution is not available
-until #56; inferred coverage does not establish download or import completion.
+through client-supplied magnets or tracker URLs. Inferred coverage does not establish
+download or import completion.
+
+## Explicit release execution
+
+`GET /api/v2/download-clients` lists enabled clients with only safe routing metadata.
+`POST /api/v2/executions/prepare` confirms the complete selected set and an explicit
+`downloadClientId`; `POST /api/v2/executions/commit` sends it only after rechecking
+the plan, source settings, safety mode, client configuration, and candidate validity.
+`GET /api/v2/executions/:id` and search detail expose durable receipts. A repeated
+idempotency key with the same confirmation replays its receipt; reuse with a
+different confirmation conflicts. Physical releases are held against overlapping
+executions. Partial and uncertain outcomes are retained; uncertain sends are never
+automatically retried. Terminal execution receipts are retained for 30 days, capped
+at 10,000 records; expired receipts leave idempotency tombstones for a further
+30 days.
+
+Prowlarr category mappings are shown as inferred routing metadata, not as a
+category override sent by Media Scout. A direct Newznab category mapping can be
+reported as inferred; if Prowlarr has mappings but no direct match, parent-category
+fallback may apply and the final category is unknown. For a client with no category
+mappings, the allowlisted `fields[].name == "category"` value is exposed as
+`defaultCategory` (including null/empty values); other client fields are discarded.
+For qBittorrent, this is its configured fallback category. A change to that value
+requires fresh confirmation.
+
+Search requests may include a positive `preferredDownloadClientId`. It is persisted
+as search metadata and returned in status but is not sent to the model, does not
+validate the client during search, and never triggers automatic execution.
+Automation polling remains observation-only; automation acquisition is not enabled.
+Activity filters accept search statuses and submission/execution outcomes, including
+`partial` and `not-attempted`.
 
 Fresh defaults are 100 SDK steps, 100 indexer searches and a 30-minute job deadline;
 model requests have a 10-minute ceiling. Existing saved lower limits are preserved.
@@ -69,7 +105,7 @@ Results are JSON text MCP content; the search result count describes that respon
 
 The daemon registers its actual bound loopback origin before dispatching work. The job passes its backend-minted capability to the canonical `createMCPTools` import and always closes/revokes it. The caller—not tool arguments—owns the search and lifetime. The public stdio server reuses the daemon architecture and reports unavailable when no HTTP origin is present; it never spawns a second engine/listener. Do not give the token to model prompts, events, public responses, or logs.
 
-Legacy history remains inspectable via the explicit `legacyResult` projection and is never converted to release-set plans. Submission routes are blocked with `execution-deferred`; automation polling remains observation-only and reports the same block reason. External research MCP settings (#54) and per-release execution (#56) are out of scope.
+Legacy history remains inspectable via the explicit `legacyResult` projection and is never converted to release-set plans. Legacy submission receipts are separately returned as a safe `legacyReceipts` projection and take precedence over incidental Activity events. The retired `/api/v2/submissions` mutation route remains blocked; new execution uses `/api/v2/executions/*`. External research MCP settings remain out of scope.
 
 The public Media Scout stdio adapter remains available and uses SDK v2. It is separate from this read-only internal server and does not expose recursive agent tools.
 
@@ -83,7 +119,7 @@ Implementation map:
 
 - `agent.ts`, `agent-contracts.ts`: SDK orchestration and ledger-validated finalization.
 - `contracts.ts`, `arr.ts`, `automation.ts`: request contracts, Arr observation, and the retained cooldown-key helper; no acquisition automation engine remains.
-- `submission.ts`: safe receipt projection types only; the release execution service is retired.
+- `submission.ts`: safe legacy receipt projection types.
 - `store.ts`, `settings.ts`: SQLite persistence.
 - `runtime.ts`, `mcp.ts`, `prowlarr-mcp.ts`: runtime wiring and MCP adapters/capabilities.
 

@@ -31,7 +31,7 @@ export function ActivityPage({ onOpenSearch }: { onOpenSearch(id: string): void 
     return () => controller.abort()
   }, [q, source, status, kind, createdAtFrom, createdAtTo, offset, retryVersion])
   return <>
-    <Heading title="Activity" intro="A record of searches, recommendations, and submission outcomes." eyebrow="SEARCH RECORD" icon={<ActivityIcon size={15}/>}/>
+     <Heading title="Activity" intro="A record of searches, recommendations, and per-release submission outcomes." eyebrow="SEARCH RECORD" icon={<ActivityIcon size={15}/>}/>
     <div className="activity-layout"><div className="ops-page"><div className="ops-list-card">
       <div className="ops-controls activity-filters">
         <label className="field">Filter searches<input value={q} onChange={event => { setQ(event.target.value); setOffset(0) }} placeholder="Search request"/></label>
@@ -39,7 +39,7 @@ export function ActivityPage({ onOpenSearch }: { onOpenSearch(id: string): void 
         <label className="field">Media<select value={kind} onChange={event => { setKind(event.target.value); setOffset(0) }}><option value="">All media</option><option value="tv">TV</option><option value="movie">Movie</option><option value="other">Other / no context</option></select></label>
         <label className="field">Created from<input type="date" value={createdAtFrom} onChange={event => { setCreatedAtFrom(event.target.value); setOffset(0) }}/></label>
         <label className="field">Created through<input type="date" value={createdAtTo} onChange={event => { setCreatedAtTo(event.target.value); setOffset(0) }}/></label>
-        <label className="field">Status<select value={status} onChange={event => { setStatus(event.target.value); setOffset(0) }}><option value="">All statuses</option>{['queued', 'running', 'matched', 'no-match', 'needs-input', 'budget-exhausted', 'failed', 'interrupted', 'dry-run', 'submitted', 'rejected', 'uncertain', 'deferred', 'expired'].map(value => <option key={value}>{value}</option>)}</select></label>
+         <label className="field">Status<select value={status} onChange={event => { setStatus(event.target.value); setOffset(0) }}><option value="">All statuses</option>{['queued', 'running', 'matched', 'no-match', 'needs-input', 'budget-exhausted', 'failed', 'interrupted', 'dry-run', 'submitted', 'partial', 'rejected', 'uncertain', 'not-attempted', 'deferred', 'expired'].map(value => <option key={value}>{value}</option>)}</select></label>
       </div>
       {error && <div role="alert" className="notice notice-error"><span>{error}</span><button className="text-button activity-open" type="button" onClick={() => setRetryVersion(version => version + 1)}>Retry</button></div>}
       {loading ? <p role="status" className="ops-state-panel">Loading activity…</p> : error ? null : !items.length ? <div className="ops-state-panel ops-empty"><span className="ops-empty-mark"><SearchIcon size={19}/></span><h2>No matching activity</h2><p>Search attempts will appear here, including unsuccessful searches.</p></div> : <div className="ops-activity-list">{items.map(item => <article className="ops-activity-row" key={item.searchId}>
@@ -51,7 +51,7 @@ export function ActivityPage({ onOpenSearch }: { onOpenSearch(id: string): void 
     </div></div><aside className="right-rail activity-rail" aria-label="Activity information">
       <div className="rail-card"><div className="rail-overline">SEARCH HISTORY</div><div className="activity-total"><strong>{total === null ? '—' : total.toLocaleString()}</strong><span>{total === null ? 'Count unavailable' : 'recorded searches'}</span></div><div className="rail-rule"/><p>History is kept for up to {retention.days} days or {retention.maxEntries.toLocaleString()} entries.</p></div>
       <div className="rail-card activity-key"><div className="rail-icon"><ShieldCheck size={17}/></div><strong>Private by design</strong><p>Search terms can reveal what you watch. This history stays on your Media Scout instance.</p></div>
-      <div className="rail-card activity-key"><div className="rail-icon"><RefreshCw size={17}/></div><strong>Need the full result?</strong><p>Open any search to review its recommendations, evidence, and submission record.</p></div>
+       <div className="rail-card activity-key"><div className="rail-icon"><RefreshCw size={17}/></div><strong>Need the full result?</strong><p>Open any search to review its saved request, recommendations, and every durable release outcome—including partial and not attempted.</p></div>
     </aside></div>
   </>
 }

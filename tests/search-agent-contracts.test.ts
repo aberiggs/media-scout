@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { finalizeReleaseSet, normalizeAgentRequest } from '../src/search/agent-contracts';
+import { finalizeReleaseSet, finalizeReleaseSetInputSchema, normalizeAgentRequest, releaseSetSchema } from '../src/search/agent-contracts';
+import { searchRequestSchema } from '../src/search/contracts';
 
 describe('agent release-set contract', () => {
   it('requires explicit missing scope for partial broad coverage and forbids complete coverage with gaps', () => {
     const ledger = { searchId: 'broad', targets: [], candidates: [{ id: 'a', physicalId: 'p', targets: [] }] };
-    const selected = { status: 'matched', selections: [{ candidateId: 'a', targetIds: [], reason: 'Observed pack', uncertainty: '' }], gaps: [], deferred: [] };
-    expect(() => finalizeReleaseSet({ ...selected, broadCoverage: 'partial', scopeGaps: [] }, ledger)).toThrow('Partial coverage requires explicit gaps');
-    expect(() => finalizeReleaseSet({ ...selected, broadCoverage: 'complete', scopeGaps: ['Season 4'] }, ledger)).toThrow(/requested-scope gaps/i);
+    const selected = { status: 'matched', selections: [{ candidateId: 'a', coverage: 'Seasons 1–3', reason: 'Observed pack', uncertainty: '' }], covered: ['Seasons 1–3'], gaps: [], deferred: [], scopeGaps: [] };
+    expect(() => finalizeReleaseSet({ ...selected, broadCoverage: 'partial', scopeGaps: [] }, ledger)).toThrow(/partial broad coverage requires explicit gaps/i);
+    expect(() => finalizeReleaseSet({ ...selected, broadCoverage: 'complete', scopeGaps: ['Season 4'] }, ledger)).toThrow(/complete broad coverage cannot contain gaps/i);
   });
   it('normalizes legacy requests without conflating owned context with acquisition targets', () => {
     const request = normalizeAgentRequest({
@@ -27,6 +28,14 @@ describe('agent release-set contract', () => {
     const request = normalizeAgentRequest({ prompt: 'Find Arrival', context: { kind: 'movie', titles: ['Arrival'], year: 2016, scope: { type: 'movie' } } });
     expect(request.intents).toEqual([{ id: 'movie:arrival:2016', type: 'movie' }]);
     expect(request.scope).toBe('movie');
+  });
+
+  it('accepts a positive preferred client in search requests but excludes it from model input', () => {
+    const request=searchRequestSchema.parse({prompt:'Find a film',preferredDownloadClientId:987654});
+    expect(request.preferredDownloadClientId).toBe(987654);
+    expect(normalizeAgentRequest(request)).not.toHaveProperty('preferredDownloadClientId');
+    expect(searchRequestSchema.safeParse({prompt:'Find a film',preferredDownloadClientId:0}).success).toBe(false);
+    expect(searchRequestSchema.safeParse({prompt:'Find a film',preferredDownloadClientId:1.5}).success).toBe(false);
   });
 
   it('preserves ordinary episode/season numbering and search preferences', () => {
@@ -65,36 +74,78 @@ describe('agent release-set contract', () => {
     } })).toThrow(/conflict/i);
   });
 
-  it('accepts overlapping observed releases, partial union and no-match with no selection', () => {
+  it('accepts semantic release coverage and useful overlap without Arr target mapping', () => {
     const candidates = [
       { id: 'a', physicalId: 'physical-a', targets: ['t1', 't2'] },
       { id: 'b', physicalId: 'physical-b', targets: ['t2'] },
     ];
-    expect(finalizeReleaseSet({ status: 'matched', selections: [{ candidateId: 'a', targetIds: ['t1', 't2'], reason: 'pack coverage', uncertainty: '' }, { candidateId: 'b', targetIds: ['t2'], reason: 'overlap', uncertainty: '' }], gaps: [], deferred: [] }, {
+    expect(finalizeReleaseSet({ status: 'matched', selections: [
+      { candidateId: 'a', coverage: 'Seasons 1–2', reason: 'Useful two-season pack', uncertainty: '' },
+      { candidateId: 'b', coverage: 'Episodes 8–10', reason: 'Adds remaining episodes', uncertainty: 'Some overlap with the first pack' },
+    ], covered: ['Seasons 1–2', 'Episodes 8–10'], gaps: [], deferred: [], broadCoverage: 'complete', scopeGaps: [], usefulOverlap: ['The second pack repeats episode 8'] }, {
       searchId: 's', targets: ['t1', 't2'], candidates,
-    }).coverage).toEqual({ covered: ['t1', 't2'], gaps: [], deferred: [], broad: { status: 'unknown', gaps: [] } });
-    expect(finalizeReleaseSet({ status: 'no-match', selections: [], gaps: ['t1'], deferred: [] }, {
+    })).toMatchObject({ version: 2, coverage: { covered: ['Seasons 1–2', 'Episodes 8–10'], gaps: [], deferred: [], broad: { status: 'complete', gaps: [] } }, usefulOverlap: ['The second pack repeats episode 8'] });
+    expect(finalizeReleaseSet({ status: 'no-match', selections: [], covered: [], gaps: [], deferred: [], broadCoverage: 'none', scopeGaps: [] }, {
       searchId: 's', targets: ['t1'], candidates: [],
     }).status).toBe('no-match');
   });
 
-  it('rejects foreign targets, duplicate physical releases and explicit identity conflicts', () => {
+  it('accepts descriptive release coverage independent of Arr target IDs', () => {
+    const plan = finalizeReleaseSet({ status: 'matched', selections: [
+      { candidateId: 'pack-a', coverage: 'Seasons 1–3', reason: 'Useful season pack', uncertainty: '' },
+      { candidateId: 'pack-b', coverage: 'Remaining episodes in season 3', reason: 'Adds several episodes', uncertainty: 'Episode listing inferred from title' },
+    ], covered: ['Seasons 1–3'], gaps: [], deferred: [], broadCoverage: 'partial', scopeGaps: ['Season 4 not observed'], extras: ['Pack B also includes specials'], usefulOverlap: ['Some season 3 episodes overlap'] }, {
+      searchId: 's', targets: ['t1', 't2'], candidates: [
+        { id: 'pack-a', physicalId: 'p1', targets: [] }, { id: 'pack-b', physicalId: 'p2', targets: [] },
+      ],
+    });
+    expect(plan.version).toBe(2);
+    expect(plan.selections.map(x => x.candidateId)).toEqual(['pack-a', 'pack-b']);
+    expect(plan.coverage.covered).toEqual(['Seasons 1–3']);
+    expect(plan.extras).toEqual(['Pack B also includes specials']);
+    expect(plan.usefulOverlap).toEqual(['Some season 3 episodes overlap']);
+    expect(plan.coverage.covered).not.toContain('t1');
+  });
+
+  it('does not expose target assignments in the finalizer schema and rejects contradictory broad coverage', () => {
+    const ledger = { searchId: 's', targets: ['opaque-arr-id'], candidates: [{ id: 'a', physicalId: 'p', targets: ['opaque-arr-id'] }] };
+    const semantic = { status: 'matched', selections: [{ candidateId: 'a', coverage: 'The requested film', reason: 'Matches title and year', uncertainty: '' }], covered: ['The requested film'], gaps: [], deferred: [], broadCoverage: 'complete', scopeGaps: [] };
+    expect(finalizeReleaseSetInputSchema.safeParse({ ...semantic, selections: [{ ...semantic.selections[0], targetIds: ['opaque-arr-id'] }] }).success).toBe(false);
+    expect(() => finalizeReleaseSet({ ...semantic, covered: [] }, ledger)).toThrow(/plain-language coverage/i);
+    expect(() => finalizeReleaseSet({ ...semantic, gaps: ['The requested film is missing'] }, ledger)).toThrow(/complete.*gap/i);
+    expect(() => finalizeReleaseSet({ ...semantic, deferred: ['The requested film'] }, ledger)).toThrow(/complete.*gap|deferred/i);
+    expect(() => finalizeReleaseSet({ ...semantic, status: 'no-match', selections: [], covered: [], broadCoverage: 'complete' }, ledger)).toThrow(/complete.*matched/i);
+  });
+
+  it('rejects foreign candidates, duplicate physical releases and explicit identity conflicts', () => {
     const ctx = { searchId: 's', targets: ['t1'], candidates: [
       { id: 'a', physicalId: 'same', targets: ['t1'], identityConflict: false },
       { id: 'b', physicalId: 'same', targets: ['t1'], identityConflict: false },
       { id: 'c', physicalId: 'other', targets: ['t1'], identityConflict: true },
     ] };
-    for (const selection of [
-      [{ candidateId: 'a', targetIds: ['foreign'], reason: 'x', uncertainty: '' }],
-      [{ candidateId: 'a', targetIds: ['t1'], reason: 'x', uncertainty: '' }, { candidateId: 'b', targetIds: ['t1'], reason: 'x', uncertainty: '' }],
-      [{ candidateId: 'c', targetIds: ['t1'], reason: 'x', uncertainty: '' }],
-    ]) expect(() => finalizeReleaseSet({ status: 'matched', selections: selection, gaps: [], deferred: [] }, ctx)).toThrow();
+    const common = { status: 'matched', covered: ['Requested season'], gaps: [], deferred: [], broadCoverage: 'complete', scopeGaps: [] };
+    expect(() => finalizeReleaseSet({ ...common, selections: [{ candidateId: 'not-owned', coverage: 'Requested season', reason: 'x', uncertainty: '' }] }, ctx)).toThrow(/owning search/i);
+    expect(() => finalizeReleaseSet({ ...common, selections: [
+      { candidateId: 'a', coverage: 'Requested season', reason: 'x', uncertainty: '' },
+      { candidateId: 'b', coverage: 'Requested season', reason: 'x', uncertainty: '' },
+    ] }, ctx)).toThrow(/physical release/i);
+    expect(() => finalizeReleaseSet({ ...common, selections: [{ candidateId: 'c', coverage: 'Requested season', reason: 'x', uncertainty: '' }] }, ctx)).toThrow(/identity conflict/i);
+  });
+
+  it('keeps historical v1 target assignment plans readable without accepting them as v2 finalizer input', () => {
+    const legacy = {
+      version: 1, planId: 'old-plan', status: 'matched',
+      selections: [{ candidateId: 'old-candidate', targetIds: ['old-arr-target'], reason: 'legacy', uncertainty: '' }],
+      gaps: [], deferred: [], coverage: { covered: ['old-arr-target'], gaps: [], deferred: [], broad: { status: 'complete', gaps: [] } },
+    };
+    expect(releaseSetSchema.parse(legacy)).toMatchObject({ version: 1, selections: [{ targetIds: ['old-arr-target'] }] });
+    expect(finalizeReleaseSetInputSchema.safeParse(legacy).success).toBe(false);
   });
 
   it('does not infer full broad-scope coverage from a selected release', () => {
     const result = finalizeReleaseSet({
-      status: 'matched', selections: [{ candidateId: 'a', targetIds: [], reason: 'covers three seasons', uncertainty: 'season four unknown' }],
-      gaps: [], deferred: [], broadCoverage: 'partial', scopeGaps: ['Season 4 remains unresolved'],
+      status: 'matched', selections: [{ candidateId: 'a', coverage: 'Seasons 1–3', reason: 'Covers three seasons', uncertainty: 'Season four unknown' }],
+      covered: ['Seasons 1–3'], gaps: [], deferred: [], broadCoverage: 'partial', scopeGaps: ['Season 4 remains unresolved'],
     }, { searchId: 'broad', targets: [], candidates: [{ id: 'a', physicalId: 'p', targets: [] }] });
     expect(result.coverage.broad).toEqual({ status: 'partial', gaps: ['Season 4 remains unresolved'] });
     expect(result.planId).toBeTruthy();
@@ -102,14 +153,14 @@ describe('agent release-set contract', () => {
 
   it('treats incidental broad pack overcoverage as a warning, not an unmet scope gap', () => {
     const result = finalizeReleaseSet({
-      status: 'matched', selections: [{ candidateId: 'pack', targetIds: [], reason: 'Requested seasons covered', uncertainty: '' }],
-      gaps: [], deferred: [], broadCoverage: 'complete', scopeGaps: [], warnings: ['Pack also includes seasons 1–3'],
+      status: 'matched', selections: [{ candidateId: 'pack', coverage: 'Requested seasons', reason: 'Requested seasons covered', uncertainty: '' }],
+      covered: ['Requested seasons'], gaps: [], deferred: [], broadCoverage: 'complete', scopeGaps: [], warnings: ['Pack also includes seasons 1–3'],
     }, { searchId: 'broad', targets: [], candidates: [{ id: 'pack', physicalId: 'p', targets: [] }] });
     expect(result.coverage.broad).toEqual({ status: 'complete', gaps: [] });
     expect(result.warnings).toEqual(['Pack also includes seasons 1–3']);
     expect(() => finalizeReleaseSet({
-      status: 'matched', selections: [{ candidateId: 'pack', targetIds: [], reason: 'pack', uncertainty: '' }],
-      gaps: [], deferred: [], broadCoverage: 'complete', scopeGaps: ['Extra season in pack'],
-    }, { searchId: 'broad', targets: [], candidates: [{ id: 'pack', physicalId: 'p', targets: [] }] })).toThrow(/requested-scope gaps/i);
+      status: 'matched', selections: [{ candidateId: 'pack', coverage: 'Some seasons', reason: 'pack', uncertainty: '' }],
+      covered: ['Some seasons'], gaps: [], deferred: [], broadCoverage: 'complete', scopeGaps: ['Extra season in pack'],
+    }, { searchId: 'broad', targets: [], candidates: [{ id: 'pack', physicalId: 'p', targets: [] }] })).toThrow(/complete broad coverage cannot contain gaps/i);
   });
 });

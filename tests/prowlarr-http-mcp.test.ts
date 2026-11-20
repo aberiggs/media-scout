@@ -18,7 +18,7 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
     const scenarios = [
       { name: 'empty completion', output: [], maxSteps: 4, ownsSearch: true },
       { name: 'natural-language completion', output: [{ id: 'message', type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: 'The search looks complete.', annotations: [] }] }], maxSteps: 4, ownsSearch: true },
-      { name: 'lease lost before finalizer', output: [{ id: 'final', type: 'function_call', call_id: 'final', name: 'finalize_release_set', arguments: JSON.stringify({ status: 'no-match', selections: [], gaps: [], deferred: [], broadCoverage: 'none' }), status: 'completed' }], maxSteps: 4, ownsSearch: false },
+      { name: 'lease lost before finalizer', output: [{ id: 'final', type: 'function_call', call_id: 'final', name: 'finalize_release_set', arguments: JSON.stringify({ status: 'no-match', selections: [], covered: [], gaps: [], deferred: [], broadCoverage: 'none', scopeGaps: [] }), status: 'completed' }], maxSteps: 4, ownsSearch: false },
     ];
     for (const scenario of scenarios) {
       const responses = createServer(async (request, response) => {
@@ -77,7 +77,7 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
         error: null, incomplete_details: null, instructions: null, model: 'fixture/model',
         output: [{ id: `call-${requests}`, type: 'function_call', call_id: `call-${requests}`,
           name: requests >= finalizeAt ? 'finalize_release_set' : 'prowlarr_indexers',
-          arguments: JSON.stringify(requests >= finalizeAt ? { status: 'no-match', selections: [], gaps: [], deferred: [], broadCoverage: 'none' } : {}), status: 'completed' }],
+          arguments: JSON.stringify(requests >= finalizeAt ? { status: 'no-match', selections: [], covered: [], gaps: [], deferred: [], broadCoverage: 'none', scopeGaps: [] } : {}), status: 'completed' }],
         parallel_tool_calls: false, tool_choice: 'auto', tools: [], usage: null, metadata: null,
         frequency_penalty: null, presence_penalty: null, temperature: null, top_p: null,
       }));
@@ -179,7 +179,7 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
         id: 'parallel-finalizers', object: 'response', created_at: 1, completed_at: 1, status: 'completed',
         error: null, incomplete_details: null, instructions: null, model: 'fixture/model',
         output: [1, 2].map(index => ({ id: `tool-${index}`, type: 'function_call', call_id: `call-${index}`, name: 'finalize_release_set',
-          arguments: JSON.stringify({ status: 'no-match', selections: [], gaps: [], deferred: [], broadCoverage: 'none' }), status: 'completed' })),
+          arguments: JSON.stringify({ status: 'no-match', selections: [], covered: [], gaps: [], deferred: [], broadCoverage: 'none', scopeGaps: [] }), status: 'completed' })),
         parallel_tool_calls: true, tool_choice: 'auto', tools: [], usage: null, metadata: null,
         frequency_penalty: null, presence_penalty: null, temperature: null, top_p: null,
       }));
@@ -218,8 +218,8 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
       for await (const _chunk of request) { /* consume */ }
       calls++;
       const arguments_ = calls === 1
-        ? { status: 'matched', selections: [{ candidateId: 'fabricated', targetIds: [], reason: 'fake', uncertainty: '' }], gaps: [], deferred: [] }
-        : { status: 'no-match', selections: [], gaps: [], deferred: [], broadCoverage: 'none' };
+        ? { status: 'matched', selections: [{ candidateId: 'fabricated', coverage: 'film', reason: 'fake', uncertainty: '' }], covered: ['film'], gaps: [], deferred: [], broadCoverage: 'complete', scopeGaps: [] }
+        : { status: 'no-match', selections: [], covered: [], gaps: [], deferred: [], broadCoverage: 'none', scopeGaps: [] };
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(JSON.stringify({
         id: `retry-${calls}`, object: 'response', created_at: 1, completed_at: 1, status: 'completed',
@@ -359,7 +359,7 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
            status: 'completed', error: null, incomplete_details: null, instructions: null, model: 'z-ai/glm-5.3-flash',
            output: [{ id: `call-${responseRequests.length}`, type: 'function_call', call_id: `call-${responseRequests.length}`,
              name: toolName, arguments: responseRequests.length === 1 ? JSON.stringify({ query: 'Runner probe' })
-               : JSON.stringify({ status: 'no-match', selections: [], gaps: [], deferred: [], broadCoverage: 'none' }), status: 'completed' }],
+               : JSON.stringify({ status: 'no-match', selections: [], covered: [], gaps: [], deferred: [], broadCoverage: 'none', scopeGaps: [] }), status: 'completed' }],
            parallel_tool_calls: false, tool_choice: 'auto', tools: [], usage: null, metadata: null,
            frequency_penalty: null, presence_penalty: null, temperature: null, top_p: null,
          }));

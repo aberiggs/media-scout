@@ -104,29 +104,79 @@ export function normalizeAgentRequest(raw: SearchRequest): AgentRequest {
   });
 }
 
+const broadStatus = z.enum(['complete', 'partial', 'none', 'unknown']);
+const semanticCoverage = z.object({
+  covered: z.array(nonempty),
+  gaps: z.array(nonempty),
+  deferred: z.array(nonempty),
+  broad: z.object({ status: broadStatus, gaps: z.array(nonempty) }).strict(),
+}).strict();
+
 export const finalizeReleaseSetInputSchema = z.object({
   status: z.enum(['matched', 'no-match', 'needs-input']),
   selections: z.array(z.object({
     candidateId: nonempty,
-    targetIds: z.array(nonempty),
+    coverage: nonempty.max(2000),
     reason: nonempty.max(2000),
     uncertainty: z.string().max(2000),
   }).strict()),
+  covered: z.array(nonempty),
   gaps: z.array(nonempty),
   deferred: z.array(nonempty),
-  broadCoverage: z.enum(['complete', 'partial', 'none', 'unknown']).optional(),
-  scopeGaps: z.array(nonempty).optional(),
+  broadCoverage: broadStatus,
+  scopeGaps: z.array(nonempty),
+  extras: z.array(nonempty).optional(),
+  usefulOverlap: z.array(nonempty).optional(),
   warnings: z.array(nonempty).optional(),
   message: z.string().max(2000).optional(),
-}).strict();
-export const releaseSetSchema = finalizeReleaseSetInputSchema.extend({
+}).strict().superRefine((output, ctx) => {
+  if (output.status === 'matched' && output.selections.length === 0)
+    ctx.addIssue({ code: 'custom', path: ['selections'], message: 'Matched release set requires a selection' });
+  if (output.status === 'matched' && output.covered.length === 0)
+    ctx.addIssue({ code: 'custom', path: ['covered'], message: 'Matched release set requires a plain-language coverage description' });
+  if (output.status !== 'matched' && output.selections.length > 0)
+    ctx.addIssue({ code: 'custom', path: ['selections'], message: 'Only matched plans may select releases' });
+  const hasUncoveredScope = output.gaps.length > 0 || output.deferred.length > 0 || output.scopeGaps.length > 0;
+  if (output.broadCoverage === 'complete' && output.status !== 'matched')
+    ctx.addIssue({ code: 'custom', path: ['broadCoverage'], message: 'Complete broad coverage requires a matched release set' });
+  if (output.broadCoverage === 'complete' && hasUncoveredScope)
+    ctx.addIssue({ code: 'custom', path: ['broadCoverage'], message: 'Complete broad coverage cannot contain gaps or deferred scope' });
+  if (output.broadCoverage === 'partial' && !hasUncoveredScope)
+    ctx.addIssue({ code: 'custom', path: ['broadCoverage'], message: 'Partial broad coverage requires explicit gaps or deferred scope' });
+  if (output.status === 'no-match' && output.broadCoverage !== 'none')
+    ctx.addIssue({ code: 'custom', path: ['broadCoverage'], message: 'No-match must report no broad coverage' });
+  if (output.broadCoverage === 'none' && output.status === 'matched')
+    ctx.addIssue({ code: 'custom', path: ['broadCoverage'], message: 'Matched release set cannot report no broad coverage' });
+});
+
+const legacyV1Schema = z.object({
   version: z.literal(1),
   planId: nonempty,
+  status: z.enum(['matched', 'no-match', 'needs-input']),
+  selections: z.array(z.object({
+    candidateId: nonempty, targetIds: z.array(nonempty).optional(), reason: nonempty,
+    uncertainty: z.string().optional(),
+  }).passthrough()),
+  gaps: z.array(nonempty),
+  deferred: z.array(nonempty),
+  broadCoverage: broadStatus.optional(),
+  scopeGaps: z.array(nonempty).optional(),
+  warnings: z.array(nonempty).optional(),
+  extras: z.array(nonempty).optional(),
+  message: z.string().optional(),
   coverage: z.object({
     covered: z.array(nonempty), gaps: z.array(nonempty), deferred: z.array(nonempty),
-    broad: z.object({ status: z.enum(['complete', 'partial', 'none', 'unknown']), gaps: z.array(nonempty) }).strict(),
-  }).strict(),
+    broad: z.object({ status: broadStatus, gaps: z.array(nonempty).optional() }).passthrough(),
+  }).passthrough(),
+}).passthrough();
+
+const semanticV2Schema = finalizeReleaseSetInputSchema.extend({
+  version: z.literal(2),
+  planId: nonempty,
+  coverage: semanticCoverage,
 });
+/** Read-only compatibility for stored v1 plans; only semantic v2 is accepted from the model. */
+export const releaseSetSchema = z.union([legacyV1Schema, semanticV2Schema]);
 export type ReleaseSet = z.infer<typeof releaseSetSchema>;
 
 export interface LedgerCandidate {
@@ -147,45 +197,26 @@ export interface FinalizationLedger {
 export function finalizeReleaseSet(raw: unknown, ledger: FinalizationLedger): ReleaseSet {
   if (!ledger.searchId.trim()) throw new Error('Invalid owning search');
   const input = finalizeReleaseSetInputSchema.parse(raw);
-  const output = input;
-  const targetSet = new Set(ledger.targets), candidates = new Map(ledger.candidates.map(c => [c.id, c]));
-  if (targetSet.size !== ledger.targets.length || candidates.size !== ledger.candidates.length) throw new Error('Invalid ledger membership');
-    const selectedPhysical = new Set<string>();
-  const selectedTargets = new Set<string>();
-  for (const selection of output.selections) {
+  const candidates = new Map(ledger.candidates.map(candidate => [candidate.id, candidate]));
+  if (candidates.size !== ledger.candidates.length) throw new Error('Invalid ledger membership');
+  const selectedPhysical = new Set<string>();
+  for (const selection of input.selections) {
     const candidate = candidates.get(selection.candidateId);
     if (!candidate) throw new Error('Candidate does not belong to owning search');
     if (candidate.identityConflict) throw new Error('Candidate has explicit identity conflict');
     if (selectedPhysical.has(candidate.physicalId)) throw new Error('Duplicate physical release');
     selectedPhysical.add(candidate.physicalId);
-    if ((targetSet.size > 0 && !selection.targetIds.length) || new Set(selection.targetIds).size !== selection.targetIds.length) throw new Error('Invalid selected target set');
-    for (const id of selection.targetIds) {
-      if (!targetSet.has(id) || !candidate.targets.includes(id)) throw new Error('Foreign or unsupported target');
-      selectedTargets.add(id);
-    }
   }
-  if (output.status === 'matched' && output.selections.length === 0) throw new Error('Matched release set requires a selection');
-  if (output.status !== 'matched' && output.selections.length) throw new Error('Only matched plans may select releases');
-  if (new Set(output.gaps).size !== output.gaps.length || new Set(output.deferred).size !== output.deferred.length) throw new Error('Duplicate gap/deferred target');
-  const accounted = new Set(selectedTargets);
-  for (const id of [...output.gaps, ...output.deferred]) {
-    if (!targetSet.has(id) || selectedTargets.has(id) || accounted.has(id)) throw new Error('Invalid gap/deferred target');
-    accounted.add(id);
-  }
-  if (targetSet.size && accounted.size !== targetSet.size) throw new Error('Every requested target must be covered, a gap, or deferred');
-  if (!targetSet.size && !output.broadCoverage) throw new Error('Broad scope coverage must be explicit');
-  const broadCoverage = output.broadCoverage ?? 'unknown';
-  const scopeGaps = output.scopeGaps ?? [];
-  if (broadCoverage === 'partial' && !scopeGaps.length && !output.gaps.length && !output.deferred.length)
-    throw new Error('Partial coverage requires explicit gaps');
-  if (broadCoverage === 'complete' && output.status !== 'matched') throw new Error('Complete broad coverage requires a matched release set');
-  if (broadCoverage === 'none' && output.status === 'matched') throw new Error('A matched broad request cannot report no coverage');
-  if (broadCoverage === 'complete' && scopeGaps.length) throw new Error('Complete broad coverage cannot contain requested-scope gaps');
   const planId = ledger.planId ?? createHash('sha256').update(ledger.searchId).digest('hex');
   return {
-    ...output,
-    version: 1,
+    ...input,
+    version: 2,
     planId,
-    coverage: { covered: [...selectedTargets].sort(), gaps: output.gaps, deferred: output.deferred, broad: { status: broadCoverage, gaps: scopeGaps } },
+    coverage: {
+      covered: input.covered,
+      gaps: input.gaps,
+      deferred: input.deferred,
+      broad: { status: input.broadCoverage, gaps: input.scopeGaps },
+    },
   };
 }

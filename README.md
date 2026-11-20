@@ -1,6 +1,6 @@
 # Media Scout
 
-Media Scout turns a natural-language request into bounded Prowlarr searches and a versioned release-set plan. Search is read-only; download execution and acquisition automation are currently deferred.
+Media Scout turns a natural-language request into bounded Prowlarr searches and a versioned release-set plan. Search is read-only. Review and explicitly confirm the whole set to submit downloads; acquisition automation remains deferred.
 
 Prowlarr provides indexer search and routed submissions. Sonarr/Radarr supply library and queue observations for optional automation.
 
@@ -26,10 +26,16 @@ For a fixed image, replace `ghcr.io/aberiggs/media-scout:latest` in both command
 ## Setup and safety
 
 - Prowlarr with configured indexers and an LLM API endpoint are needed for searching. Sonarr/Radarr are optional context providers.
-- Settings, including integration credentials, are stored in SQLite in the data volume; protect that volume and its backups as secrets. Monitoring starts disabled. Submission APIs return execution-deferred while #56 is pending; searches can still incur indexer and LLM costs.
+- Settings, including integration credentials, are stored in SQLite in the data volume; protect that volume and its backups as secrets. Monitoring starts disabled. Dry-run records receipts without submitting downloads; searches can still incur indexer and LLM costs.
 - The web interface and API have no authentication. The quickstart binds to loopback; expose it only on trusted networks.
 
 Configure Prowlarr, LLM, and optional Arr connection details in the web UI. Arr polling remains read-only; saved monitoring preferences are retained but cannot trigger acquisition.
+
+Manual confirmation uses an explicit Prowlarr download client, its configured
+category routing, and the saved dry-run setting. Expired candidates require a new
+search. Durable receipts distinguish accepted submissions, partial failure,
+uncertain sends and releases not attempted; accepted does not mean downloaded or
+imported. Interrupted/uncertain sets are never automatically replayed.
 
 ## Search execution
 

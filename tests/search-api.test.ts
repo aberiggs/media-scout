@@ -179,7 +179,7 @@ describe('search-first HTTP contract', () => {
   });
   it('runs the canonical async plan through the bound daemon MCP route and persists a release set', async () => {
     let responseCalls = 0;
-    const modelInputs: unknown[] = [];
+    const modelInputs: Array<{ input: unknown; instructions: unknown }> = [];
     const responses = createServer(async (request, response) => {
       const parts: Buffer[] = [];
       for await (const part of request) parts.push(Buffer.from(part));
@@ -214,6 +214,13 @@ describe('search-first HTTP contract', () => {
       expect(instruction).toContain('Never redefine the requested scope');
       expect(instruction).toContain('do not force a fixed number of queries');
       expect(instruction).toContain('incidental extra seasons/episodes in a pack are overcoverage warnings, not gaps');
+      expect(modelInputs).toHaveLength(2);
+      for (const request of modelInputs) {
+        expect(request.instructions).toEqual(expect.stringContaining('Treat clear, internally consistent release names and indexer metadata as sufficient working evidence'));
+        expect(request.instructions).toEqual(expect.stringContaining('Do not add boilerplate uncertainty solely because file contents were not inspected'));
+        expect(request.instructions).toEqual(expect.stringContaining('Use an empty uncertainty string when no material uncertainty remains'));
+        expect(request.instructions).toEqual(expect.stringContaining('reject conflicting positive IDs'));
+      }
       const status = await app.inject(`/api/v2/searches/${searchId}`);
       expect(status.statusCode).toBe(200);
       expect(status.json(), JSON.stringify(status.json())).toMatchObject({

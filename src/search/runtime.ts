@@ -521,9 +521,10 @@ export class SearchRuntime {
     const payload={confirmationId:input.confirmationId,searchId:input.searchId,planId:input.planId,version:input.version,sourceFingerprint:bound.snapshot.source,client:bound.snapshot.client,clientName:safeText(bound.snapshot.client.name,secrets),defaultCategory:bound.snapshot.client.defaultCategory==null?null:safeText(bound.snapshot.client.defaultCategory,secrets),configuredCategories:this.publicCategoryMap(bound.snapshot.client,secrets),dryRun:bound.snapshot.dryRun,candidateIds:bound.candidates.map(c=>c.candidateId),...(automation?{automationMediaKey:automation.mediaKey}:{})};
     const hash=requestHash;
     const owner=randomUUID(), id=randomUUID(), now=this.clock(), children=bound.candidates.map(c=>({candidateId:c.candidateId,physicalKey:c.physicalKey,state:'prepared' as const,effectiveCategory:c.effectiveCategory,categoryRouting:c.categoryRouting,categoryNote:c.categoryNote,releaseCategoryIds:c.releaseCategoryIds}));
-    const begin=this.store.createExecution({id,key:input.idempotencyKey,hash,searchId:input.searchId,planId:input.planId,version:input.version,payload:{...payload,boundReleases:bound.candidates.map(c=>c.release)},children,owner,now,leaseUntil:now+30_000});
+    const begin=this.store.createExecution({id,key:input.idempotencyKey,hash,searchId:input.searchId,planId:input.planId,version:input.version,payload:{...payload,boundReleases:bound.candidates.map(c=>c.release)},children,owner,now,leaseUntil:now+30_000},this.clock);
     if(begin==='conflict') throw new Error('idempotency-conflict');
     if(begin==='busy') throw new Error('physical-release-busy');
+    if(begin==='confirmation-expired') throw new Error(begin);
      if(begin==='replay') { const prior=this.store.executionByKey(input.idempotencyKey)!; return (prior.receipt as ExecutionReceipt|null)??this.publicExecution(prior); }
     const op=this.store.execution(id)!;
     if(settings.safety.dryRun) {

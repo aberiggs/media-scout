@@ -79,4 +79,13 @@ describe('execution journal', () => {
       expect(store.renewExecution('one','owner-a',21,30)).toBe(false);
     } finally {store.close();}
   });
+  it('checks expiry at claim time rather than the earlier execution timestamp',()=>{
+    const store=openSearchStore(':memory:');
+    try {
+      store.saveExecutionPreparation('confirmation','s',100,{});
+      const outcome=store.createExecution({id:'op',key:'key',hash:'hash',searchId:'s',planId:'p',version:2,payload:{confirmationId:'confirmation'},children:[{candidateId:'c',physicalKey:'p',state:'prepared'}],owner:'owner',now:99,leaseUntil:30_099},()=>100);
+      expect(outcome).toBe('confirmation-expired');
+      expect(store.executionByKey('key')).toBeNull();
+    } finally {store.close();}
+  });
 });

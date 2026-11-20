@@ -59,7 +59,7 @@ export class SearchStore {
   constructor(private readonly db: Database.Database) {}
   saveExecutionPreparation(id:string,searchId:string,expiresAt:number,payload:unknown):void { this.db.prepare('INSERT INTO execution_preparations VALUES(?,?,?,?)').run(id,searchId,expiresAt,json(payload)); }
   getExecutionPreparation(id:string):{searchId:string;expiresAt:number;payload:any}|null { const r=this.db.prepare('SELECT * FROM execution_preparations WHERE id=?').get(id) as any; return r?{searchId:r.search_id,expiresAt:r.expires_at,payload:parse(r.payload_json)}:null; }
-  createExecution(input:{id:string;key:string;hash:string;searchId:string;planId:string;version:number;payload:any;children:ExecutionChild[];owner:string;now:number;leaseUntil:number}):'created'|'replay'|'busy'|'conflict' {
+  createExecution(input:{id:string;key:string;hash:string;searchId:string;planId:string;version:number;payload:any;children:ExecutionChild[];owner:string;now:number;leaseUntil:number}, claimTime:()=>number=()=>input.now):'created'|'replay'|'busy'|'conflict'|'confirmation-expired' {
     return this.db.transaction(() => {
       const prior=this.executionByKey(input.key);
       if(prior) return prior.hash===input.hash?'replay':'conflict';
@@ -68,10 +68,12 @@ export class SearchStore {
       if(physical.length!==input.children.length) return 'conflict';
       this.db.prepare('DELETE FROM execution_holds WHERE expires_at<=?').run(input.now);
       if(physical.some(key=>this.db.prepare('SELECT 1 FROM execution_holds WHERE physical_key=?').get(key))) return 'busy';
+      // A preparation can expire during discovery or while waiting for the write lock.
+      const confirmationId=(input.payload as {confirmationId?:string}).confirmationId;
+      if(confirmationId && this.db.prepare('DELETE FROM execution_preparations WHERE id=? AND search_id=? AND expires_at>?').run(confirmationId,input.searchId,claimTime()).changes!==1)
+        return 'confirmation-expired';
       const record:ExecutionRecord={id:input.id,key:input.key,hash:input.hash,searchId:input.searchId,planId:input.planId,version:input.version,outcome:'running',owner:input.owner,leaseUntil:input.leaseUntil,children:input.children,receipt:null,payload:input.payload,updatedAt:input.now};
       this.db.prepare('INSERT INTO executions VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(input.id,input.key,input.hash,input.searchId,'running',input.owner,input.leaseUntil,json(physical),json(record),input.now,input.now);
-      const confirmationId=(input.payload as {confirmationId?:string}).confirmationId;
-      if(confirmationId) this.db.prepare('DELETE FROM execution_preparations WHERE id=?').run(confirmationId);
       const hold=this.db.prepare('INSERT INTO execution_holds VALUES(?,?,?)'); for(const key of physical) hold.run(key,input.id,input.now+3_600_000);
       return 'created';
     }).immediate();

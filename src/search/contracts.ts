@@ -43,8 +43,4 @@ export type SearchRequest = z.infer<typeof searchRequestSchema>;
 
 export const searchStatusSchema = z.enum(['queued', 'running', 'matched', 'no-match', 'needs-input', 'budget-exhausted', 'failed', 'interrupted']);
 export type SearchStatus = z.infer<typeof searchStatusSchema>;
-export const submissionRequestSchema = z.object({ searchId: nonempty, optionId: nonempty, idempotencyKey: nonempty.max(200), downloadClientId: z.number().int().positive().optional() }).strict();
-export type SubmissionRequest = z.infer<typeof submissionRequestSchema>;
-export const submissionOutcomeSchema = z.enum(['submitting', 'submitted', 'rejected', 'uncertain', 'deferred', 'conflict', 'failed', 'dry-run', 'expired']);
-export type SubmissionOutcome = z.infer<typeof submissionOutcomeSchema>;
-export const activityStatusSchema = z.union([searchStatusSchema, submissionOutcomeSchema, z.enum(['partial', 'not-attempted'])]);
+export const activityStatusSchema = z.union([searchStatusSchema, z.enum(['submitted', 'rejected', 'uncertain', 'deferred', 'dry-run', 'partial', 'not-attempted'])]);

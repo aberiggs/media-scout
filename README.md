@@ -23,13 +23,17 @@ With Docker installed, these commands pull and run the published image—no clon
 
 For a fixed image, replace `ghcr.io/aberiggs/media-scout:latest` in both commands with `ghcr.io/aberiggs/media-scout:sha-<full-commit-sha>` or an image digest. There are no semver release tags.
 
+### Moving from the old database
+
+This release requires a fresh database. Set `DB_PATH=data/media-scout-agent.db` in your Compose `.env` (or add `-e DB_PATH=data/media-scout-agent.db` when recreating the Docker container). The path is inside the existing data mount. The app refuses older database formats without modifying them; do not copy the old database to the new path. Re-enter your integrations and preferences in Settings. Old search history, receipts, and pending work are not carried over. Check your existing downloads in Arr and your download client before opting back into automation.
+
 ## Setup and safety
 
 - Prowlarr with configured indexers and an LLM API endpoint are needed for searching. Sonarr/Radarr are optional context providers.
 - Settings, including integration credentials, are stored in SQLite in the data volume; protect that volume and its backups as secrets. Monitoring starts disabled. Dry-run records receipts without submitting downloads; searches can still incur indexer and LLM costs.
 - The web interface and API have no authentication. The quickstart binds to loopback; expose it only on trusted networks.
 
-Configure Prowlarr, LLM, and optional Arr connections in the web UI. In **Settings → Automation and retries**, choose the TV and/or movie download client and set any preferences for scheduled searches. Enable monitoring for scheduled searches. Automatic downloads additionally require **Allow automatic downloads** and dry-run off. On upgrade, existing monitoring and dry-run values are kept, but permission to download starts off. **Refresh Arr observations** never starts a search or download.
+Configure Prowlarr, LLM, and optional Arr connections in the web UI. In **Settings → Automation and retries**, choose the TV and/or movie download client and set any preferences for scheduled searches. Enable monitoring for scheduled searches. Automatic downloads additionally require **Allow automatic downloads** and dry-run off. A fresh database starts with dry-run on and both monitoring and automatic downloads off. **Refresh Arr observations** never starts a search or download.
 
 Each scheduled search covers a show's currently actionable episodes across seasons, or one movie. After a submitted or possibly submitted download, Scout waits for Arr to see it before researching that title again (30 minutes by default). Scout does not inspect or repair qBittorrent downloads or Arr imports.
 

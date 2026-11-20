@@ -149,47 +149,21 @@ export const finalizeReleaseSetInputSchema = z.object({
     ctx.addIssue({ code: 'custom', path: ['broadCoverage'], message: 'Matched release set cannot report no broad coverage' });
 });
 
-const legacyV1Schema = z.object({
-  version: z.literal(1),
-  planId: nonempty,
-  status: z.enum(['matched', 'no-match', 'needs-input']),
-  selections: z.array(z.object({
-    candidateId: nonempty, targetIds: z.array(nonempty).optional(), reason: nonempty,
-    uncertainty: z.string().optional(),
-  }).passthrough()),
-  gaps: z.array(nonempty),
-  deferred: z.array(nonempty),
-  broadCoverage: broadStatus.optional(),
-  scopeGaps: z.array(nonempty).optional(),
-  warnings: z.array(nonempty).optional(),
-  extras: z.array(nonempty).optional(),
-  message: z.string().optional(),
-  coverage: z.object({
-    covered: z.array(nonempty), gaps: z.array(nonempty), deferred: z.array(nonempty),
-    broad: z.object({ status: broadStatus, gaps: z.array(nonempty).optional() }).passthrough(),
-  }).passthrough(),
-}).passthrough();
-
-const semanticV2Schema = finalizeReleaseSetInputSchema.extend({
+export const releaseSetSchema = finalizeReleaseSetInputSchema.extend({
   version: z.literal(2),
   planId: nonempty,
   coverage: semanticCoverage,
 });
-/** Read-only compatibility for stored v1 plans; only semantic v2 is accepted from the model. */
-export const releaseSetSchema = z.union([legacyV1Schema, semanticV2Schema]);
 export type ReleaseSet = z.infer<typeof releaseSetSchema>;
 
 export interface LedgerCandidate {
   id: string;
   physicalId: string;
-  /** Eligibility/exclusion membership only; never deterministic scope evidence. */
-  targets: string[];
   identityConflict?: boolean;
 }
 export interface FinalizationLedger {
   searchId: string;
   planId?: string;
-  targets: string[];
   candidates: LedgerCandidate[];
 }
 

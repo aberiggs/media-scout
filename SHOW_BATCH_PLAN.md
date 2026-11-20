@@ -4,8 +4,9 @@
 > backend uses one asynchronous search request and a single overlap-tolerant
 > release-set result. Do not implement this document's separate batch API,
 > ranked alternatives, disjoint per-release target assignment, or acquisition
-> flow. The current backend is read-only; execution and whole-show automation
-> remain deferred. Retain this document as historical design context only.
+> flow. Whole-show scheduling and guarded release-set execution now use the
+> unified runtime described in [Search subsystem](src/search/README.md).
+> Retain this document as historical design context only.
 
 **Status: approved; implementation in progress.** Torrent inspection and CRW
 remain out of scope. Validation must not send live download-client requests.

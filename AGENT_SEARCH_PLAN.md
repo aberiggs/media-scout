@@ -1,5 +1,10 @@
 # Agent release-set search — #52 + #55
 
+> **Current parity scope:** #54 (optional remote research MCPs) is deferred.
+> Existing Prowlarr-backed search, manual confirmation, and Arr automation are the
+> parity target. Earlier compatibility and rollout notes below describe the
+> original cutover; the parity follow-up requires a fresh DB.
+
 Approved scope: second PR based on #60 (`ef68938`), targeting
 `feat/53-prowlarr-http-mcp`. Publish as a draft; owner will register the GitHub stack.
 

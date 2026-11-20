@@ -6,13 +6,17 @@ import { ActivityPage, AutomationPage } from './Activity'
 
 type Page = 'search' | 'activity' | 'automation' | 'settings'
 function pageFromHash(): Page { const value = location.hash.slice(1); return ['activity', 'automation', 'settings'].includes(value) ? value as Page : 'search' }
+const differentProwlarrSource = (a: Settings, b: Settings) =>
+  a.integrations.prowlarr.url !== b.integrations.prowlarr.url || a.integrations.prowlarr.apiKey !== b.integrations.prowlarr.apiKey
 
 export default function App() {
   const [page, setPage] = useState<Page>(pageFromHash), [selectedSearch, setSelectedSearch] = useState<{ id?: string; revision: number }>({ revision: 0 })
   const selectionRevision = useRef(0)
   const [settings, setSettings] = useState<Settings>(defaults), [committed, setCommitted] = useState<Settings | null>(null), [status, setStatus] = useState<SettingsEnvelope['status'] | null>(null)
   const [loading, setLoading] = useState(true), [saving, setSaving] = useState(false), [message, setMessage] = useState(''), [messageIsError, setMessageIsError] = useState(false), [saved, setSaved] = useState('')
+  const [clientListRevision, setClientListRevision] = useState(0)
   const dirty = useMemo(() => JSON.stringify(settings) !== saved, [settings, saved])
+  const unsavedProwlarr = !committed || differentProwlarrSource(settings, committed)
   const accept = (envelope: SettingsEnvelope) => { const next = mergeSettings(envelope.settings); setSettings(next); setCommitted(next); setStatus(envelope.status); setSaved(JSON.stringify(next)) }
   const load = useCallback(async () => {
     setLoading(true)
@@ -36,6 +40,7 @@ export default function App() {
     }
     const envelope = await response.json() as SettingsEnvelope
     const savedSettings = mergeSettings(envelope.settings)
+    if (committed && differentProwlarrSource(savedSettings, committed)) setClientListRevision(value => value + 1)
     setCommitted(savedSettings)
     setSettings(draft => preserveDraft ? { ...draft, monitoring: { ...draft.monitoring, enabled: draft.monitoring.enabled === committed?.monitoring.enabled ? savedSettings.monitoring.enabled : draft.monitoring.enabled } } : savedSettings)
     setStatus(envelope.status); setSaved(JSON.stringify(savedSettings))
@@ -95,9 +100,9 @@ export default function App() {
                <Toggle label="Allow automatic downloads" description="Explicit permission for automated searches to submit downloads. Off by default; dry-run still prevents submission." checked={settings.monitoring.allowDownloads} onChange={allowDownloads => setSettings(s => ({ ...s, monitoring: { ...s.monitoring, allowDownloads } }))}/>
                <Field label="Automation media preferences" value={settings.ai.preferences} multiline onChange={value => setSettings(s => ({ ...s, ai: { ...s.ai, preferences: value } }))}/>
                <p className="field-hint">Used by automated searches as a default. Manual searches can set their own preferences.</p>
-               <DownloadClientField label="TV download client" value={settings.integrations.prowlarr.tvClient} onChange={value => setSettings(s => ({ ...s, integrations: { ...s.integrations, prowlarr: { ...s.integrations.prowlarr, tvClient: value } } }))}/>
-               <DownloadClientField label="Movie download client" value={settings.integrations.prowlarr.movieClient} onChange={value => setSettings(s => ({ ...s, integrations: { ...s.integrations, prowlarr: { ...s.integrations.prowlarr, movieClient: value } } }))}/>
-               <p className="field-hint">These are automation defaults; manual searches still choose a client explicitly before confirmation.</p>
+               <DownloadClientField key={`tv:${clientListRevision}`} disabled={unsavedProwlarr} label="TV download client" value={settings.integrations.prowlarr.tvClientId} onChange={value => setSettings(s => ({ ...s, integrations: { ...s.integrations, prowlarr: { ...s.integrations.prowlarr, tvClientId: value } } }))}/>
+               <DownloadClientField key={`movie:${clientListRevision}`} disabled={unsavedProwlarr} label="Movie download client" value={settings.integrations.prowlarr.movieClientId} onChange={value => setSettings(s => ({ ...s, integrations: { ...s.integrations, prowlarr: { ...s.integrations.prowlarr, movieClientId: value } } }))}/>
+               <p className="field-hint">{unsavedProwlarr ? 'Save the Prowlarr connection first, then select its download clients.' : 'These are automation defaults; manual searches still choose a client explicitly before confirmation.'}</p>
               <Toggle label="Dry-run mode" description="Search and compare, but never submit a download. Live searches still use model/indexer calls." checked={settings.safety.dryRun} onChange={dryRun => setSettings(s => ({ ...s, safety: { dryRun } }))}/>
                <div className="field-grid">{([['Check interval (minutes)', 'intervalMinutes', 35791], ['Search-only retry (minutes)', 'searchRetryMinutes', 525600], ['Initial failure backoff (minutes)', 'failureBackoffMinMinutes', 35791], ['Maximum failure backoff (minutes)', 'failureBackoffMaxMinutes', 35791], ['Queue appearance grace (minutes)', 'queueGraceMinutes', 1440]] as const).map(([label, key, max]) => <label className="field number-field" key={key}>{label}<input type="number" min="1" max={max} step="1" required value={Number.isNaN(settings.monitoring[key]) ? '' : settings.monitoring[key]} onChange={event => setSettings(s => ({ ...s, monitoring: { ...s.monitoring, [key]: numericValue(event.target.value) } }))}/><span className="field-hint">1–{max.toLocaleString()}</span></label>)}</div>
               <p className="field-hint">After finite appearance grace, unmatched downloads may be retried. Scout does not inspect or cancel qBittorrent jobs.</p>
@@ -147,7 +152,7 @@ function Field({ label, value, onChange, multiline = false }: { label: string; v
 }
 const settingsFieldLabels: Record<string, string> = {
   'integrations.prowlarr.url': 'Prowlarr URL', 'integrations.prowlarr.apiKey': 'Prowlarr API key',
-  'integrations.prowlarr.tvClient': 'TV download client', 'integrations.prowlarr.movieClient': 'Movie download client',
+  'integrations.prowlarr.tvClientId': 'TV download client', 'integrations.prowlarr.movieClientId': 'Movie download client',
   'integrations.sonarr.url': 'Sonarr URL', 'integrations.sonarr.apiKey': 'Sonarr API key',
   'integrations.radarr.url': 'Radarr URL', 'integrations.radarr.apiKey': 'Radarr API key',
   'ai.apiKey': 'AI API key', 'ai.model': 'Model', 'ai.baseUrl': 'AI API base URL',
@@ -160,7 +165,7 @@ const numericValue = (value: string): number => value.trim() === '' ? Number.NaN
 function Group({ title, fields, update }: { title: string; fields: Array<[string, string, string]>; update(key: string, value: string): void }) { const Icon = title === 'Prowlarr' ? Waves : title === 'Sonarr' ? Tv : title === 'Radarr' ? Film : Bot; return <div className="service-block"><div className="service-heading"><span className={`service-symbol ${title.toLowerCase()}-symbol`}><Icon size={17}/></span><div><h3>{title}</h3><p>{title === 'Prowlarr' ? 'Indexer manager and download routes' : title === 'Sonarr' ? 'Optional TV library' : title === 'Radarr' ? 'Optional movie library' : 'Ranking and search decisions'}</p></div><span className={`service-badge ${fields.every(([, value]) => value.trim()) ? 'configured' : ''}`}><span/>{fields.every(([, value]) => value.trim()) ? 'Configured' : 'Needs setup'}</span></div><div className="field-grid">{fields.map(([label, value, key]) => <Field key={key} label={label} value={value} onChange={value => update(key, value)}/>)}</div></div> }
 function StatusRow({ label, done, optional = false }: { label: string; done: boolean; optional?: boolean }) { return <div className="check-row"><span className={`check-status ${done ? 'done' : ''}`}>{done ? <Check size={11}/> : <span/>}</span><span>{label}</span><span className={`check-label ${done ? 'complete' : ''}`}>{done ? 'Added' : optional ? 'Optional' : 'Needed'}</span></div> }
 function Toggle({ label, description, checked, onChange }: { label: string; description: string; checked: boolean; onChange(value: boolean): void }) { return <div className="toggle-row"><div className="toggle-copy"><strong>{label}</strong><p>{description}</p></div><button className={`switch ${checked ? 'switch-on' : ''}`} role="switch" aria-label={label} aria-checked={checked} type="button" onClick={() => onChange(!checked)}><span/></button></div> }
-function DownloadClientField({ label, value, onChange }: { label: string; value: string; onChange(value: string): void }) {
+function DownloadClientField({ label, value, disabled, onChange }: { label: string; value: number | null; disabled: boolean; onChange(value: number | null): void }) {
   const [clients, setClients] = useState<Array<{ id: number; name: string; protocol: string }>>([]), [loading, setLoading] = useState(true), [error, setError] = useState('')
   const hintId = label === 'TV download client' ? 'tv-client-hint' : 'movie-client-hint'
   const load = useCallback(async () => {
@@ -170,12 +175,10 @@ function DownloadClientField({ label, value, onChange }: { label: string; value:
     finally { setLoading(false) }
   }, [])
   useEffect(() => { void load() }, [load])
-  const named = clients.filter(client => client.name.trim().toLowerCase() === value.trim().toLowerCase())
-  const matching = /^(?:[1-9]\d*)$/.test(value.trim()) ? clients.find(client => String(client.id) === value.trim()) : named.length === 1 ? named[0] : undefined
-  const savedOption = value && !clients.some(client => String(client.id) === value)
-  return <label className="field">{label}<select value={value} onChange={event => onChange(event.target.value)} aria-describedby={hintId}>
+  const savedOption = value !== null && !clients.some(client => client.id === value)
+  return <label className="field">{label}<select disabled={disabled || loading} value={value ?? ''} onChange={event => onChange(event.target.value === '' ? null : Number(event.target.value))} aria-describedby={hintId}>
     <option value="">No default client</option>
-    {savedOption && <option value={value}>{matching ? `Saved: ${matching.name} · ${matching.protocol}` : loading || error ? `Saved: ${value}` : `Saved value (not found): ${value}`}</option>}
+    {savedOption && <option value={value}>{`Saved client #${value}${loading || error ? '' : ' (unavailable)'}`}</option>}
     {clients.map(client => <option key={client.id} value={String(client.id)}>{client.name} · {client.protocol}</option>)}
   </select><span id={hintId} className="field-hint" role={error ? 'alert' : 'status'}>{loading ? 'Loading download clients…' : error ? <>{error} <button type="button" className="text-button" onClick={() => void load()}>Retry</button></> : clients.length ? 'Choose an automation default. An unresolved saved value is preserved until changed.' : 'No download clients are available. Check Prowlarr; saved value is unchanged.'}</span></label>
 }

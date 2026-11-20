@@ -1,6 +1,6 @@
 # Media Scout
 
-Media Scout turns a natural-language request into bounded Prowlarr searches and a versioned release-set plan. Search is read-only. Review and explicitly confirm the whole set to submit downloads; acquisition automation remains deferred.
+Media Scout turns a natural-language request into bounded Prowlarr searches and a versioned release-set plan. Manual search is read-only until you confirm the set. Optional Sonarr/Radarr automation can search and submit a stored set under your saved settings.
 
 Prowlarr provides indexer search and routed submissions. Sonarr/Radarr supply library and queue observations for optional automation.
 
@@ -29,7 +29,9 @@ For a fixed image, replace `ghcr.io/aberiggs/media-scout:latest` in both command
 - Settings, including integration credentials, are stored in SQLite in the data volume; protect that volume and its backups as secrets. Monitoring starts disabled. Dry-run records receipts without submitting downloads; searches can still incur indexer and LLM costs.
 - The web interface and API have no authentication. The quickstart binds to loopback; expose it only on trusted networks.
 
-Configure Prowlarr, LLM, and optional Arr connection details in the web UI. Arr polling remains read-only; saved monitoring preferences are retained but cannot trigger acquisition.
+Configure Prowlarr, LLM, and optional Arr connections in the web UI. In **Settings → Automation and retries**, choose the TV and/or movie download client and set any preferences for scheduled searches. Enable monitoring for scheduled searches. Automatic downloads additionally require **Allow automatic downloads** and dry-run off. On upgrade, existing monitoring and dry-run values are kept, but permission to download starts off. **Refresh Arr observations** never starts a search or download.
+
+Each scheduled search covers a show's currently actionable episodes across seasons, or one movie. After a submitted or possibly submitted download, Scout waits for Arr to see it before researching that title again (30 minutes by default). Scout does not inspect or repair qBittorrent downloads or Arr imports.
 
 Manual confirmation uses an explicit Prowlarr download client, its configured
 category routing, and the saved dry-run setting. Expired candidates require a new

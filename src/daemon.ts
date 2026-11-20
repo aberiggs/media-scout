@@ -187,7 +187,7 @@ export async function startDaemon(stack: Stack): Promise<void> {
   const app = await buildApp(stack);
   await app.listen({ host: stack.config.HTTP_HOST, port: stack.config.HTTP_PORT });
   const scheduler = createMonitorScheduler(() => stack.runtime.getSettings(), async () => {
-    try { return await stack.runtime.poll(); } catch { stack.logger.warn({ code: 'poll-unavailable' }, 'scheduled poll failed'); return undefined; }
+    try { return await stack.runtime.runAutomation(); } catch { stack.logger.warn({ code: 'poll-unavailable' }, 'scheduled automation pass failed'); return undefined; }
   });
   app.refreshScheduler = scheduler.refresh;
   scheduler.refresh();
@@ -208,7 +208,7 @@ export function createMonitorScheduler(getSettings: () => Settings, run: () => P
         if (!stopped && getSettings().monitoring.enabled) {
           const interval = getSettings().monitoring.intervalMinutes * 60_000;
           const untilDue = result?.nextAttemptAt === undefined ? interval : result.nextAttemptAt - Date.now();
-          schedule(result?.ran ? 0 : Math.max(1, Math.min(interval, untilDue)));
+          schedule(Math.max(1, Math.min(interval, untilDue)));
         }
       });
     }, delay);

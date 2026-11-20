@@ -65,7 +65,7 @@ html { min-width: 320px; scroll-behavior: smooth; }
 body { margin: 0; min-width: 320px; min-height: 100vh; background: var(--bg); font-size: var(--type-body); }
 button, input, textarea { font: inherit; }
 button { color: inherit; }
-button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible { outline: 2px solid var(--mint); outline-offset: 3px; }
+button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid var(--mint); outline-offset: 3px; }
 ::selection { background: rgba(126, 212, 166, .28); color: #f1fff7; }
 
 .app-shell { min-height: 100vh; }
@@ -142,6 +142,8 @@ h1 { color: #f0f2ef; font-family: var(--display); font-size: clamp(1.875rem, 3vw
 .field > label { color: #c1c9c2; font-size: var(--type-label); font-weight: 600; }
 .field input, .field textarea { display: block; width: 100%; min-width: 0; border: 1px solid #333a35; border-radius: 5px; outline: none; background: #111412; color: #dce3dc; font-size: var(--type-body); transition: border-color .16s ease, box-shadow .16s ease, background .16s ease; }
 .field input { height: 44px; padding: 0 12px; }
+.field select { display: block; width: 100%; min-width: 0; height: 44px; padding: 0 12px; border: 1px solid #333a35; border-radius: 5px; background: #111412; color: #dce3dc; color-scheme: dark; font: inherit; }
+.field select:hover { border-color: #475149; }
 .field textarea { min-height: 112px; padding: 12px; resize: vertical; line-height: 1.55; }
 .field input::placeholder, .field textarea::placeholder { color: #77827a; }
 .field input:hover, .field textarea:hover { border-color: #475149; }

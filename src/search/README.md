@@ -1,6 +1,6 @@
 # Search subsystem
 
-HTTP and public MCP adapters share one asynchronous search domain. The OpenRouter Agent SDK owns tool orchestration; the backend validates a single versioned release-set against the owning-search ledger. Search itself is read-only; explicit release execution is a separate confirmation-and-commit API. Automation acquisition remains disabled; saved preferences and observer data remain intact.
+HTTP, public MCP, and scheduled Arr automation share one search domain. The OpenRouter Agent SDK owns tool orchestration; the backend validates a single versioned release set against the owning-search ledger. Search itself is read-only. Manual execution requires explicit confirmation; scheduled execution requires saved authorization.
 
 ## Canonical request and result
 
@@ -65,9 +65,30 @@ requires fresh confirmation.
 Search requests may include a positive `preferredDownloadClientId`. It is persisted
 as search metadata and returned in status but is not sent to the model, does not
 validate the client during search, and never triggers automatic execution.
-Automation polling remains observation-only; automation acquisition is not enabled.
+Manual execution endpoints do not accept automation-owned plans. The scheduler may execute only the selected set from its own search, and only under saved monitoring, explicit automatic-download permission, and dry-run off.
 Activity filters accept search statuses and submission/execution outcomes, including
 `partial` and `not-attempted`.
+
+## Scheduled Arr automation
+
+The scheduler uses one lease and selects one fair title per pass. Sonarr workloads
+group all due missing episodes across seasons; Radarr workloads describe one
+movie. Unknown inventories are not empty. Context-only episodes, bounded-workload
+deferrals and omitted related detail are kept distinct from searched targets.
+Oversized workloads rotate by last attempt, not season alone. No additional batch
+API or release-to-episode assignment is involved. The explicit poll endpoint only
+refreshes observations and returns promptly when another pass owns the lease.
+
+Execution revalidates the Arr title, configured source/destination, durable selected
+set and current authorization before each release. Queue records identifiable as
+earlier grabs in the same set do not veto later releases; unidentified new queue
+coverage can stop the tail. A submitted or possibly submitted request applies
+persisted media-level grace to the show or movie, including newly due episodes.
+The default is 30 minutes (`queueGraceMinutes`); reopening work requires fresh Arr
+observations. Definite rejection without an earlier send applies failure backoff;
+search-only outcomes use the ordinary target retry deadline. Recovery never
+replays the previous POST or its unsent tail. Retrying later against fresh Arr
+state still carries some duplicate risk. A submitted receipt is not verified import.
 
 Fresh defaults are 100 SDK steps, 100 indexer searches and a 30-minute job deadline;
 model requests have a 10-minute ceiling. Existing saved lower limits are preserved.

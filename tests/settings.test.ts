@@ -4,8 +4,16 @@ import { SearchRuntime } from '../src/search/runtime';
 import { openSearchStore } from '../src/search/store';
 describe('search-first settings', () => {
   it('defaults to disabled monitoring and no downloads', () => {
-    expect(settingsSchema.parse(defaultSettings)).toMatchObject({ version: 3, safety: { dryRun: true }, monitoring: { enabled: false, searchRetryMinutes: 30 }, search: { maxDecisions: 100, maxSearches: 100, deadlineMinutes: 30 } });
+    expect(settingsSchema.parse(defaultSettings)).toMatchObject({ version: 4, safety: { dryRun: true }, monitoring: { enabled: false, allowDownloads: false, searchRetryMinutes: 30 }, search: { maxDecisions: 100, maxSearches: 100, deadlineMinutes: 30 } });
     expect(defaultSettings.ai.model).toBe('openai/gpt-6.1-sol');
+  });
+  it('migrates saved v3 settings to require explicit download activation without changing dry-run', () => {
+    const old = structuredClone(defaultSettings) as any;
+    old.version = 3;
+    delete old.monitoring.allowDownloads;
+    old.monitoring.enabled = true;
+    old.safety.dryRun = false;
+    expect(migrateSettings(old)).toMatchObject({ migrated: true, settings: { monitoring: { enabled: true, allowDownloads: false }, safety: { dryRun: false } } });
   });
   it('does not migrate a previously saved model when the new-install default changes', () => {
     const saved = { ...defaultSettings, ai: { ...defaultSettings.ai, model: 'z-ai/glm-5.3-flash' } };
@@ -44,7 +52,7 @@ describe('search-first settings', () => {
   it('migrates the old default retry and preserves customized hour values in minutes', () => {
     const legacy = { ...defaultSettings, version: 2 as const, monitoring: { ...defaultSettings.monitoring, minRetryHours: 6 } } as any;
     const migrated = migrateSettings(legacy);
-    expect(migrated).toMatchObject({ migrated: true, settings: { version: 3, monitoring: { searchRetryMinutes: 30 } } });
+    expect(migrated).toMatchObject({ migrated: true, settings: { version: 4, monitoring: { searchRetryMinutes: 30, allowDownloads: false } } });
     expect('minRetryHours' in (migrated.settings as any).monitoring).toBe(false);
 
     const customized = migrateSettings({ ...legacy, monitoring: { ...legacy.monitoring, minRetryHours: 2 } });

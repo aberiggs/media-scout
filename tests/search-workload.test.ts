@@ -66,4 +66,16 @@ describe('episode-set workload', () => {
     const targetOnlyBytes = Buffer.byteLength(JSON.stringify(buildEpisodeSetRequest(base).request));
     expect(() => buildEpisodeSetRequest({ ...base, related: [target(2, 2)], maxContextBytes: targetOnlyBytes })).toThrow(/context budget/);
   });
+  it('rotates oversize targets and marks byte-deferred episodes as unsearched context', () => {
+    const targets=[target(1,1,{episodeTitle:'A'.repeat(700)}),target(2,2,{episodeTitle:'B'.repeat(700)}),target(3,3)];
+    const setup={targets,related:targets,observedAt:40,maxContextBytes:1_000,allowByteDeferral:true,contextReason:()=> 'deferred-unsearched'};
+    const first=buildEpisodeSetRequest(setup);
+    expect(first.targetRefs.map(t=>t.key)).toEqual([targets[0]!.key]);
+    expect(first.deferredTargets).toBe(2);
+    const next=buildEpisodeSetRequest({...setup,maxContextBytes:1_200,prioritize:(a,b)=>Number(a.episodeId===1)-Number(b.episodeId===1)});
+    expect(next.targetRefs.map(t=>t.key)).toEqual([targets[1]!.key,targets[2]!.key]);
+    expect(next.deferredTargets).toBe(1);
+    expect(Buffer.byteLength(JSON.stringify(next.request))).toBeLessThanOrEqual(1_200);
+    expect((next.request.context?.relatedEpisodes?.length??0)+next.omittedRelatedEpisodes).toBe(1);
+  });
 });

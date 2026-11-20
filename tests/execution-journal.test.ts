@@ -5,6 +5,39 @@ import { join } from 'node:path';
 import { openSearchStore } from '../src/search/store';
 
 describe('execution journal', () => {
+  it('writes automation grace atomically with sending and clears its own grace on rejection', () => {
+    const dir=mkdtempSync(join(tmpdir(),'execution-grace-')),path=join(dir,'search.db');
+    let store = openSearchStore(path);
+    try {
+      const now=1_800_000_000_000;
+      store.createExecution({id:'auto-exec',key:'auto-key',hash:'hash',searchId:'auto-search',planId:'plan',version:2,payload:{},children:[{candidateId:'candidate',physicalKey:'physical',state:'prepared'}],owner:'owner',now,leaseUntil:now+30_000});
+      const grace={mediaKey:'sonarr:show',graceUntil:now+30*60_000,attempt:{startedAt:now,targetKeys:['episode-1'],failureBackoffMinMs:60_000,failureBackoffMaxMs:10*60_000}};
+      store.setAutomationAttempt('episode-1',{lastAttempt:now,failCount:1,deadline:now+120*60_000,graceUntil:0});
+      expect(store.updateExecutionChild('auto-exec','owner',now,0,'sending',undefined,grace)).toBe(true);
+      store.close();store=openSearchStore(path);
+      expect(store.getGrace('media','sonarr:show',now)).toBe(grace.graceUntil);
+      expect(store.updateExecutionChild('auto-exec','owner',now+1,0,'rejected',undefined,grace)).toBe(true);
+      store.close();store=openSearchStore(path);
+      expect(store.recoverExecutions(now+30_000)).toBe(1);
+      expect(store.execution('auto-exec')?.outcome).toBe('rejected');
+      expect(store.getGrace('media','sonarr:show',now+30_000)).toBeNull();
+      expect(store.getAutomationAttempt('episode-1')).toMatchObject({deadline:now+1+2*60_000,failCount:2});
+    } finally {store.close();rmSync(dir,{recursive:true,force:true});}
+  });
+  it('retains grace for a possibly accepted send recovered after process restart', () => {
+    const dir=mkdtempSync(join(tmpdir(),'execution-recovery-grace-')),path=join(dir,'search.db');
+    let store=openSearchStore(path);
+    try {
+      store.createExecution({id:'auto-crash',key:'crash-key',hash:'hash',searchId:'auto-search',planId:'plan',version:2,payload:{},children:[{candidateId:'candidate',physicalKey:'physical',state:'prepared'}],owner:'owner',now:100,leaseUntil:200});
+      store.setAutomationAttempt('movie-7',{lastAttempt:100,failCount:0,deadline:720_000,graceUntil:0});
+      store.updateExecutionChild('auto-crash','owner',101,0,'sending',undefined,{mediaKey:'radarr:movie:7',graceUntil:180_000,attempt:{startedAt:100,targetKeys:['movie-7'],failureBackoffMinMs:60_000,failureBackoffMaxMs:600_000}});
+      store.close();store=openSearchStore(path);
+      expect(store.recoverExecutions(201)).toBe(1);
+      expect(store.execution('auto-crash')?.children[0]?.state).toBe('uncertain');
+      expect(store.getGrace('media','radarr:movie:7',201)).toBe(180_000);
+      expect(store.getAutomationAttempt('movie-7')?.deadline).toBe(180_000);
+    } finally {store.close();rmSync(dir,{recursive:true,force:true});}
+  });
   it('recovers only expired operation ownership and never replays sending children', () => {
     const dir=mkdtempSync(join(tmpdir(),'execution-journal-')),path=join(dir,'search.db');
     let store = openSearchStore(path);

@@ -726,6 +726,52 @@ it('keeps Settings sections scannable and distinguishes required from optional s
   assert.ok(screen.getByRole('spinbutton', { name: /Search-only retry \(minutes\)/ }))
 })
 
+it('places automation defaults and client choices in Automation and saves download permission only on explicit save', async () => {
+  window.history.replaceState(null, '', '/#settings')
+  const saved: any[] = []
+  globalThis.fetch = async (input, init) => {
+    if (String(input) === '/api/settings' && init?.method === 'PUT') {
+      const settings = JSON.parse(String(init.body)); saved.push(settings)
+      return Response.json({ settings, status: env.status })
+    }
+    if (String(input) === '/api/settings') return Response.json({ ...env, settings: { ...defaults, version: 4, monitoring: { ...defaults.monitoring, allowDownloads: false }, integrations: { ...defaults.integrations, prowlarr: { ...defaults.integrations.prowlarr, tvClient: 'old-client' } } } })
+    if (String(input) === '/api/v2/download-clients') return Response.json({ items: [{ id: 8, name: 'qBittorrent', protocol: 'torrent' }] })
+    return Response.json({ items: [] })
+  }
+  render(<App />)
+  await screen.findByRole('heading', { name: 'Search services' })
+  const permission = await screen.findByRole('switch', { name: 'Allow automatic downloads' })
+  assert.equal(screen.getByRole('textbox', { name: 'Automation media preferences' }).closest('section')?.querySelector('h2')?.textContent, 'Automation and retries')
+  assert.equal(permission.getAttribute('aria-checked'), 'false')
+  assert.ok(screen.getByRole('textbox', { name: 'Automation media preferences' }))
+  assert.ok(screen.getByRole('combobox', { name: /TV download client/ }).textContent?.includes('old-client'))
+  fireEvent.click(permission)
+  assert.equal(saved.length, 0)
+  fireEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+  await waitFor(() => assert.equal(saved.at(-1)?.monitoring.allowDownloads, true))
+  assert.equal(saved.at(-1)?.monitoring.enabled, false)
+})
+
+it('shows gated automation state and links to recent automation receipts without enabling execution controls', async () => {
+  window.history.replaceState(null, '', '/#automation')
+  let activityUrl = ''
+  globalThis.fetch = async input => {
+    const url = String(input)
+    if (url === '/api/settings') return Response.json({ ...env, settings: { ...defaults, version: 4, monitoring: { ...defaults.monitoring, allowDownloads: false } } })
+    if (url === '/api/v2/automation') return Response.json({ enabled: true, allowDownloads: false, dryRun: true, running: false, executionBlocked: true, executionBlockedReason: 'downloads-not-activated', providers: [], items: [] })
+    if (url.startsWith('/api/v2/activity')) { activityUrl = url; return Response.json({ items: [{ searchId: 'auto-1', prompt: 'Automated search', status: 'matched', source: 'automation', createdAt: matched.createdAt }], total: 1 }) }
+    if (url === '/api/v2/searches/auto-1') return Response.json({ ...semanticSearch, searchId: 'auto-1', source: 'automation', manualExecutionEligible: false })
+    return Response.json({})
+  }
+  render(<App />)
+  assert.ok(await screen.findByText(/Monitoring: on/))
+  assert.ok(screen.getAllByText(/automatic downloads are not allowed/i).length)
+  fireEvent.click(screen.getByRole('button', { name: 'View search details' }))
+  await screen.findByText('Search plan')
+  assert.match(activityUrl, /source=automation/)
+  assert.equal(screen.queryByRole('button', { name: /prepare confirmation|search this item|confirm and submit/i }), null)
+})
+
 it('shows server validation details as an error and preserves the rejected form values', async () => {
   window.history.replaceState(null, '', '/#settings')
   let submitted: Record<string, any> | undefined
@@ -859,6 +905,5 @@ it('explains when secure clipboard access is unavailable instead of silently ign
   render(<App />)
   await screen.findByLabelText('Prowlarr API key')
   fireEvent.click(screen.getByRole('button', { name: 'Copy Prowlarr API key' }))
-  assert.ok(await screen.findByRole('status'))
-  assert.match(screen.getByRole('status').textContent ?? '', /clipboard.*unavailable.*copy it manually/i)
+  assert.ok(await screen.findByText('Clipboard is unavailable. Reveal the key and copy it manually.'))
 })

@@ -24,6 +24,7 @@ export interface ArrSnapshot {
   observedAt: number; sonarr: ProviderObservation; radarr: ProviderObservation;
   targets: ArrTarget[];
 }
+export interface QueueIdentity { downloadId?: string | null; title?: string | null }
 export interface ArrObserverDeps {
   sonarr?: Pick<SonarrClient, 'getSeries' | 'getEpisodes' | 'getQueue'> & Partial<Pick<SonarrClient, 'getQualityProfiles'>>;
   radarr?: Pick<RadarrClient, 'getMovies' | 'getQueue'> & Partial<Pick<RadarrClient, 'getQualityProfiles'>>;
@@ -69,15 +70,21 @@ export class ArrObserver {
     return sources[provider] ? fingerprint(provider, sources[provider]!) : null;
   }
 
-  async observe(): Promise<ArrSnapshot> {
+  async observe(signal?: AbortSignal): Promise<ArrSnapshot> {
     const now = (this.deps.clock ?? Date.now)();
-    const [sonarr, radarr] = await Promise.all([this.readSonarr(now), this.readRadarr(now)]);
+    const [sonarr, radarr] = await Promise.all([this.readSonarr(now, undefined, undefined, signal), this.readRadarr(now)]);
     const snapshot = { observedAt: now, sonarr, radarr, targets: [...sonarr.targets, ...radarr.targets] };
     for (const [source, observation] of [['sonarr', sonarr], ['radarr', radarr]] as const) {
       // Cache is private. Public projections explicitly omit keys/fingerprints and use opaque IDs.
-      this.deps.store?.saveObservation(source, { observedAt: now, complete: observation.known, payload: observation });
+      if (!signal?.aborted) this.deps.store?.saveObservation(source, { observedAt: now, complete: observation.known, payload: observation });
     }
     return snapshot;
+  }
+
+  /** Focused, uncached revalidation; prior same-execution downloads can be identified without episode mappings. */
+  observeMedia(provider: ArrProvider, serviceId: number, ignoreQueue?: (row: QueueIdentity) => boolean): Promise<ProviderObservation> {
+    const now = (this.deps.clock ?? Date.now)();
+    return provider === 'sonarr' ? this.readSonarr(now, serviceId, ignoreQueue) : this.readRadarr(now, serviceId, ignoreQueue);
   }
 
   async fingerprintFor(target: ArrTarget): Promise<string | null> {
@@ -91,19 +98,29 @@ export class ArrObserver {
     return snapshot.targets.some(current => current.key === target.key && current.eligible && current.available && current.monitored && !current.hasFile);
   }
 
-  private async readSonarr(at: number): Promise<ProviderObservation> {
+  private async readSonarr(at: number, serviceId?: number, ignoreQueue?: (row: QueueIdentity) => boolean, signal?: AbortSignal): Promise<ProviderObservation> {
     const client = this.deps.sonarr, sources = typeof this.deps.source === 'function' ? this.deps.source() : this.deps.source, src = sources.sonarr;
     if (!client || !src) return unknown(at, 'not-configured');
     if (Math.max(this.throttledUntil.sonarr ?? 0, this.deps.store?.getProviderDeadline('sonarr') ?? 0) > at) return unknown(at, 'source-throttled');
     const fp = fingerprint('sonarr', src);
     try {
-      const [seriesList, queue] = await Promise.all([client.getSeries(), client.getQueue()]);
-      const profiles = client.getQualityProfiles ? await client.getQualityProfiles().catch(error => { this.reportRetry('sonarr', error); return null; }) : null;
+      const seriesList = await client.getSeries();
+      if (signal?.aborted) return unknown(at, 'observation-interrupted');
+      const profiles = serviceId === undefined && client.getQualityProfiles ? await client.getQualityProfiles().catch(error => { this.reportRetry('sonarr', error); return null; }) : null;
       const targets: ArrTarget[] = [], unknownSeriesIds: number[] = [];
+      const inventories: Array<{series:Awaited<ReturnType<SonarrClient['getSeries']>>[number];episodes:Episode[]}> = [];
       for (const series of seriesList) {
+        if (signal?.aborted) return unknown(at, 'observation-interrupted');
+        if (serviceId !== undefined && series.id !== serviceId) continue;
         if ((this.throttledUntil.sonarr ?? 0) > at) { unknownSeriesIds.push(series.id); continue; }
         let episodes: Episode[];
         try { episodes = await client.getEpisodes(series.id); } catch (error) { this.reportRetry('sonarr', error); unknownSeriesIds.push(series.id); continue; }
+        inventories.push({series,episodes});
+      }
+      if (signal?.aborted) return unknown(at, 'observation-interrupted');
+      const rows = await client.getQueue();
+      const queue = ignoreQueue ? rows.filter(row => !ignoreQueue(row)) : rows;
+      for (const {series,episodes} of inventories) {
         const episodeIds = queuedEpisodeIds(queue, series.id, -1);
         for (const episode of episodes) {
           const airing = episodeEligibilityTime(episode)?.getTime();
@@ -124,19 +141,21 @@ export class ArrObserver {
     } catch (error) { this.reportRetry('sonarr', error); return unknown(at); }
   }
 
-  private async readRadarr(at: number): Promise<ProviderObservation> {
+  private async readRadarr(at: number, serviceId?: number, ignoreQueue?: (row: QueueIdentity) => boolean): Promise<ProviderObservation> {
     const client = this.deps.radarr, sources = typeof this.deps.source === 'function' ? this.deps.source() : this.deps.source, src = sources.radarr;
     if (!client || !src) return unknown(at, 'not-configured');
     if (Math.max(this.throttledUntil.radarr ?? 0, this.deps.store?.getProviderDeadline('radarr') ?? 0) > at) return unknown(at, 'source-throttled');
     const fp = fingerprint('radarr', src);
     try {
-      const [movies, queue] = await Promise.all([client.getMovies(), client.getQueue()]);
-      const profiles = client.getQualityProfiles ? await client.getQualityProfiles().catch(error => { this.reportRetry('radarr', error); return null; }) : null;
-      const targets = movies.map((movie: Movie): ArrTarget => {
+      const movies = await client.getMovies();
+      const profiles = serviceId === undefined && client.getQualityProfiles ? await client.getQualityProfiles().catch(error => { this.reportRetry('radarr', error); return null; }) : null;
+      const rows = await client.getQueue();
+      const queue = ignoreQueue ? rows.filter(row => !ignoreQueue(row)) : rows;
+      const targets = movies.filter(movie => serviceId === undefined || movie.id === serviceId).map((movie: Movie): ArrTarget => {
         const covered = queue.some(row => row.movieId === movie.id && !isTerminal(row));
         const available = movie.isAvailable;
         const key = targetKey('radarr', fp, movie.id, movie.tmdbId, movie.id);
-        return { key, provider: 'radarr', sourceFingerprint: fp, serviceId: movie.id, externalId: movie.tmdbId, movieId: movie.id, monitored: movie.monitored, hasFile: movie.hasFile, available, eligible: movie.monitored && !movie.hasFile && available && !covered,
+        return { key, provider: 'radarr', sourceFingerprint: fp, serviceId: movie.id, externalId: movie.tmdbId, movieId: movie.id, monitored: movie.monitored, hasFile: movie.hasFile, available, queued: covered, eligible: movie.monitored && !movie.hasFile && available && !covered,
           context: safeContext({ title: movie.title, titles: [movie.title], year: movie.year, overview: movie.overview ?? undefined, originalLanguage: languageName(movie.originalLanguage), profileContext: summarizeProfile(client.getQualityProfiles ? profiles?.find(p => p.id === movie.qualityProfileId) : movie.qualityProfile), externalIds: { tmdb: movie.tmdbId } }) };
       });
       if (this.sourceFingerprint('radarr') !== fp) return unknown(at, 'source-changed');

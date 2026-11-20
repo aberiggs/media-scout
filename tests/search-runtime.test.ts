@@ -4,7 +4,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openSearchStore } from '../src/search/store';
 import { SearchRuntime } from '../src/search/runtime';
-import { showCooldownSettingKey } from '../src/search/automation';
 import { defaultSettings, type Settings } from '../src/search/settings';
 import { releaseSchema } from '../src/types/prowlarr';
 
@@ -12,7 +11,7 @@ const stores: ReturnType<typeof openSearchStore>[] = [];
 afterEach(() => { for (const store of stores.splice(0)) store.close(); });
 function setup() {
   const store = openSearchStore(':memory:'); stores.push(store);
-  const settings = { version: 3, integrations: { prowlarr: { url: 'http://localhost:9696', apiKey: 'private', tvClient: '', movieClient: '' }, sonarr: { url: '', apiKey: '' }, radarr: { url: '', apiKey: '' } }, ai: { apiKey: 'private-ai', model: 'test/model', baseUrl: 'https://example.test/v1', preferences: '' }, monitoring: { enabled: false, intervalMinutes: 5, searchRetryMinutes: 30, failureBackoffMinMinutes: 5, failureBackoffMaxMinutes: 60, queueGraceMinutes: 30 }, search: { maxDecisions: 20, maxSearches: 12, deadlineMinutes: 10 }, safety: { dryRun: true } } satisfies Settings;
+  const settings = { version: 4, integrations: { prowlarr: { url: 'http://localhost:9696', apiKey: 'private', tvClient: '', movieClient: '' }, sonarr: { url: '', apiKey: '' }, radarr: { url: '', apiKey: '' } }, ai: { apiKey: 'private-ai', model: 'test/model', baseUrl: 'https://example.test/v1', preferences: '' }, monitoring: { enabled: false, allowDownloads: false, intervalMinutes: 5, searchRetryMinutes: 30, failureBackoffMinMinutes: 5, failureBackoffMaxMinutes: 60, queueGraceMinutes: 30 }, search: { maxDecisions: 20, maxSearches: 12, deadlineMinutes: 10 }, safety: { dryRun: true } } satisfies Settings;
   let indexerReads = 0;
   let now = 1_800_000_000_000;
   const runtime = new SearchRuntime({ store, now: () => now, clients: () => ({ prowlarr: { getIndexers: async () => { indexerReads++; return [{ id: 1, name: 'Test', enable: true }]; }, getIndexerStatuses: async () => [], search: async () => [], getDownloadClients: async () => [{ id: 7, name: 'TV', enable: true, protocol: 'torrent', supportsCategories: false, categories: [] }], grab: async () => {} } }), initialSettings: settings });
@@ -37,12 +36,12 @@ describe('search runtime', () => {
     expect(f.store.listCandidates('staggered', f.now)).toHaveLength(1);
     expect((await f.runtime.getSearch('staggered'))!.candidates).toEqual(evidence);
   });
-  it('projects a source-scoped show cooldown in automation status', () => {
+  it('does not apply the retired show-wide cooldown to an individual actionable target', () => {
     const f = setup();
     const deadline = f.now + 120_000, target = { key: 'sonarr:fp:7:20:2', provider: 'sonarr', sourceFingerprint: 'fp', serviceId: 7, externalId: 20, episodeId: 2, monitored: true, hasFile: false, available: true, eligible: true, context: { title: 'Show', seasonNumber: 3, episodeNumber: 2 } };
     f.store.saveObservation('sonarr', { observedAt: f.now, complete: true, payload: { targets: [target] } });
-    f.store.setSetting(showCooldownSettingKey('fp', 7), deadline);
-    expect(f.runtime.automationStatus().items[0]).toMatchObject({ status: 'cooldown', eligible: false, nextAttemptAt: new Date(deadline).toISOString() });
+    f.store.setSetting(`automation:show-cooldown:fp:7`, deadline);
+    expect(f.runtime.automationStatus().items[0]).toMatchObject({ status: 'missing', eligible: true });
   });
   it('rejects per-request preference notes longer than 4000 characters', async () => {
     const f = setup();
@@ -77,6 +76,20 @@ describe('search runtime', () => {
     f.store.enqueueSearch({searchId:'manual-second',prompt:'{}',now:f.now+1});
     expect(f.store.queuePosition('manual-second')).toBe(1);
     expect(f.store.queuePosition('automation-first')).toBe(2);
+  });
+  it('never lets the general dispatcher claim automation work', () => {
+    const { store, now } = setup();
+    store.enqueueSearch({ searchId: 'auto', prompt: '{}', now, source: 'automation' });
+    store.enqueueSearch({ searchId: 'manual', prompt: '{}', now: now + 1, source: 'manual' });
+    expect(store.claimNextSearch('worker', now, 1000)?.searchId).toBe('manual');
+    expect(store.claimAutomationSearchById('auto', 'auto-worker', now, 1000)?.searchId).toBe('auto');
+  });
+  it('interrupts queued automation rows rather than replaying them after restart', () => {
+    const { store, now } = setup();
+    store.enqueueSearch({ searchId: 'stranded-auto', prompt: '{}', now, source: 'automation' });
+    store.interruptQueuedAutomation(now + 1);
+    expect(store.getSearch('stranded-auto')?.status).toBe('interrupted');
+    expect(store.claimAutomationSearchById('stranded-auto', 'worker', now + 2, 1000)).toBeNull();
   });
   it('never shortens a provider cooldown when concurrent responses arrive out of order', () => {
     const f = setup();
@@ -134,7 +147,7 @@ describe('search runtime', () => {
     store.setSetting('search-source:legacy-grab', 'automation');
     store.recordSubmission({ idempotencyKey: 'receipt', payload: { targets: ['grab'] }, outcome: 'submitted', createdAt: now });
     const runtime = new SearchRuntime({ store, now: () => now, initialSettings: legacy as Settings });
-    expect(runtime.getSettings()).toMatchObject({ version: 3, monitoring: { searchRetryMinutes: 30 } });
+    expect(runtime.getSettings()).toMatchObject({ version: 4, monitoring: { searchRetryMinutes: 30, allowDownloads: false } });
     expect(store.getAutomationAttempt('search')?.deadline).toBe(now + 25 * 60_000);
     expect(store.getDeadline('search')).toBe(now + 25 * 60_000);
     expect(store.getAutomationAttempt('grab')?.deadline).toBe(longDeadline);
@@ -249,7 +262,7 @@ describe('search runtime', () => {
     expect((await f.runtime.submit({ searchId: 'matched', optionId: 'option', idempotencyKey: 'blocked', downloadClientId: 7 })).outcome).toBe('deferred');
     expect(f.runtime.getSettings().safety.dryRun).toBe(false);
   });
-  it('uses strict version 3 settings and requires only standalone search integrations', async () => {
+  it('uses strict version 4 settings and requires only standalone search integrations', async () => {
     const { runtime, settings } = setup();
     expect(runtime.getSettings()).toEqual(settings);
     expect(runtime.missingSettings()).toEqual([]);

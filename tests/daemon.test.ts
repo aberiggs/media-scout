@@ -10,7 +10,7 @@ it('does not schedule when disabled and stops scheduling on shutdown', async () 
   scheduler.stop(); await vi.advanceTimersByTimeAsync(600_000); expect(run).toHaveBeenCalledTimes(1);
   vi.useRealTimers();
 });
-it('continues promptly only after a completed attempt and never overlaps refresh with an in-flight pass', async () => {
+it('uses the configured cadence after a completed pass and never overlaps refresh with an in-flight pass', async () => {
   vi.useFakeTimers();
   const settings = structuredClone(defaultSettings); settings.monitoring.enabled = true;
   let finish!: (value: { ran: boolean }) => void;
@@ -24,6 +24,8 @@ it('continues promptly only after a completed attempt and never overlaps refresh
   expect(run).toHaveBeenCalledTimes(1);
   finish({ ran: true });
   await vi.advanceTimersByTimeAsync(0);
+  expect(run).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(settings.monitoring.intervalMinutes * 60_000);
   expect(run).toHaveBeenCalledTimes(2);
   finish({ ran: false });
   await vi.advanceTimersByTimeAsync(1);

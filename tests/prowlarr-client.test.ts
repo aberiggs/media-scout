@@ -125,6 +125,37 @@ describe('ProwlarrClient.getDownloadClients', () => {
     expect(clients[0]!.categories[0]!.clientCategory).toBe('tv-sonarr');
     expect(clients[1]!.categories[0]!.clientCategory).toBe('radarr');
   });
+
+  it('extracts only the configured category field and never retains other client fields', async () => {
+    const raw=[
+      {
+        id:4,name:'qBit-TV',enable:true,protocol:'torrent',supportsCategories:true,categories:[],
+        fields:[
+          {name:'category',value:'tv'},
+          {name:'host',value:'HOST-CANARY'},
+          {name:'password',value:'PASSWORD-CANARY'},
+          {name:'apiKey',value:'APIKEY-CANARY'},
+        ],
+      },
+      {id:5,name:'Empty default',enable:true,protocol:'torrent',supportsCategories:true,categories:[],fields:[{name:'category',value:''}]},
+      {id:6,name:'Missing default',enable:true,protocol:'torrent',supportsCategories:true,categories:[]},
+    ];
+    nock(BASE).get('/api/v1/downloadclient').reply(200,raw);
+    const clients=await makeClient().getDownloadClients();
+    expect(clients[0]).toMatchObject({id:4,defaultCategory:'tv',categories:[]});
+    expect(clients.slice(1).map(client=>client.defaultCategory)).toEqual(['',null]);
+    expect(JSON.stringify(clients)).not.toMatch(/HOST-CANARY|PASSWORD-CANARY|APIKEY-CANARY|fields/);
+  });
+
+  it('tolerates unrelated Prowlarr fields whose value is omitted and retains only category', async () => {
+    nock(BASE).get('/api/v1/downloadclient').reply(200, [{
+      id: 7, name: 'Minimal client', enable: true, protocol: 'torrent', supportsCategories: true, categories: [],
+      fields: [{ name: 'category', value: 'tv' }, { name: 'username' }, { name: 'password' }],
+    }]);
+    const clients = await makeClient().getDownloadClients();
+    expect(clients[0]).toMatchObject({ id: 7, defaultCategory: 'tv' });
+    expect(JSON.stringify(clients)).not.toMatch(/username|password|fields/);
+  });
 });
 
 describe('ProwlarrClient.grab', () => {

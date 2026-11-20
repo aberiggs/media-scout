@@ -20,6 +20,10 @@ CREATE TABLE IF NOT EXISTS grace (kind TEXT NOT NULL, identity TEXT NOT NULL, su
 CREATE TABLE IF NOT EXISTS exclusions (target TEXT NOT NULL, release TEXT NOT NULL, expires_at INTEGER NOT NULL, reason TEXT NOT NULL, PRIMARY KEY(target,release));
 CREATE TABLE IF NOT EXISTS observations (source TEXT PRIMARY KEY, observed_at INTEGER NOT NULL, complete INTEGER NOT NULL, payload_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS automation_attempts (target TEXT PRIMARY KEY, last_attempt INTEGER NOT NULL, fail_count INTEGER NOT NULL DEFAULT 0, deadline INTEGER NOT NULL DEFAULT 0, grace_until INTEGER NOT NULL DEFAULT 0, physical_key TEXT);
+CREATE TABLE IF NOT EXISTS execution_preparations (id TEXT PRIMARY KEY, search_id TEXT NOT NULL, expires_at INTEGER NOT NULL, payload_json TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS executions (id TEXT PRIMARY KEY, idem_key TEXT NOT NULL UNIQUE, payload_hash TEXT NOT NULL, search_id TEXT NOT NULL, outcome TEXT NOT NULL, owner TEXT NOT NULL, lease_until INTEGER NOT NULL, physical_json TEXT NOT NULL, payload_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS execution_holds (physical_key TEXT PRIMARY KEY, execution_id TEXT NOT NULL, expires_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS execution_idempotency (idem_key TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, expires_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS search_events_by_search ON search_events(search_id,id);
 CREATE INDEX IF NOT EXISTS searches_by_time ON searches(created_at);
 CREATE INDEX IF NOT EXISTS candidates_by_expiry ON candidates(expires_at);
@@ -36,6 +40,8 @@ export interface CandidateRecord { searchId: string; candidateId: string; safe: 
 export interface SubmissionReceipt { idempotencyKey: string; payload: unknown; outcome: string; createdAt: number }
 export type BeginSubmission = { kind: 'created' } | { kind: 'replay'; receipt: SubmissionReceipt } | { kind: 'conflict' };
 export type Reservation = { kind: 'reserved' } | { kind: 'deferred'; reason: 'target' | 'physical-release' } | { kind: 'replay'; receipt: SubmissionReceipt } | { kind: 'conflict' };
+export interface ExecutionChild { candidateId: string; physicalKey: string; state: 'prepared'|'sending'|'submitted'|'rejected'|'uncertain'|'not-attempted'|'dry-run'; effectiveCategory?:string|null; categoryRouting?:'direct'|'configured-mapping'|'default-category'; categoryNote?:string; releaseCategoryIds?:number[]; message?: string }
+export interface ExecutionRecord { id:string; key:string; hash:string; searchId:string; planId:string; version:number; outcome:string; owner:string; leaseUntil:number; children:ExecutionChild[]; receipt:unknown; payload:unknown; updatedAt:number }
 
 export function openSearchStore(path: string): SearchStore {
   if (path !== ':memory:' && existsSync(path)) {
@@ -54,6 +60,54 @@ export function openSearchStore(path: string): SearchStore {
 
 export class SearchStore {
   constructor(private readonly db: Database.Database) {}
+  saveExecutionPreparation(id:string,searchId:string,expiresAt:number,payload:unknown):void { this.db.prepare('INSERT INTO execution_preparations VALUES(?,?,?,?)').run(id,searchId,expiresAt,json(payload)); }
+  getExecutionPreparation(id:string):{searchId:string;expiresAt:number;payload:any}|null { const r=this.db.prepare('SELECT * FROM execution_preparations WHERE id=?').get(id) as any; return r?{searchId:r.search_id,expiresAt:r.expires_at,payload:parse(r.payload_json)}:null; }
+  createExecution(input:{id:string;key:string;hash:string;searchId:string;planId:string;version:number;payload:any;children:ExecutionChild[];owner:string;now:number;leaseUntil:number}):'created'|'replay'|'busy'|'conflict' {
+    return this.db.transaction(() => {
+      const prior=this.executionByKey(input.key);
+      if(prior) return prior.hash===input.hash?'replay':'conflict';
+      if(this.db.prepare('SELECT 1 FROM execution_idempotency WHERE idem_key=?').get(input.key)) return 'conflict';
+      const physical=[...new Set(input.children.map(c=>c.physicalKey))];
+      if(physical.length!==input.children.length) return 'conflict';
+      this.db.prepare('DELETE FROM execution_holds WHERE expires_at<=?').run(input.now);
+      if(physical.some(key=>this.db.prepare('SELECT 1 FROM execution_holds WHERE physical_key=?').get(key))) return 'busy';
+      const record:ExecutionRecord={id:input.id,key:input.key,hash:input.hash,searchId:input.searchId,planId:input.planId,version:input.version,outcome:'running',owner:input.owner,leaseUntil:input.leaseUntil,children:input.children,receipt:null,payload:input.payload,updatedAt:input.now};
+      this.db.prepare('INSERT INTO executions VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(input.id,input.key,input.hash,input.searchId,'running',input.owner,input.leaseUntil,json(physical),json(record),input.now,input.now);
+      const confirmationId=(input.payload as {confirmationId?:string}).confirmationId;
+      if(confirmationId) this.db.prepare('DELETE FROM execution_preparations WHERE id=?').run(confirmationId);
+      const hold=this.db.prepare('INSERT INTO execution_holds VALUES(?,?,?)'); for(const key of physical) hold.run(key,input.id,input.now+3_600_000);
+      return 'created';
+    }).immediate();
+  }
+  execution(id:string):ExecutionRecord|null { const r=this.db.prepare('SELECT payload_json FROM executions WHERE id=?').get(id) as {payload_json:string}|undefined; return r?parse(r.payload_json):null; }
+  executionByKey(key:string):ExecutionRecord|null { const r=this.db.prepare('SELECT payload_json FROM executions WHERE idem_key=?').get(key) as {payload_json:string}|undefined; return r?parse(r.payload_json):null; }
+  executionsForSearch(searchId:string):ExecutionRecord[] { return (this.db.prepare('SELECT payload_json FROM executions WHERE search_id=? ORDER BY created_at,rowid').all(searchId) as Array<{payload_json:string}>).map(r=>parse(r.payload_json)); }
+  ownsExecution(id:string,owner:string,now:number):boolean { const row=this.execution(id);return !!row&&row.owner===owner&&row.leaseUntil>now&&row.outcome==='running'; }
+  updateExecution(id:string,owner:string,now:number,change:(r:ExecutionRecord)=>ExecutionRecord):boolean { return this.db.transaction(()=>{const prior=this.execution(id); if(!prior || prior.owner!==owner || prior.leaseUntil<=now) return false; const next=change(prior); this.db.prepare('UPDATE executions SET outcome=?,lease_until=?,payload_json=?,updated_at=? WHERE id=?').run(next.outcome,next.leaseUntil,json(next),now,id); return true; }).immediate(); }
+  renewExecution(id:string,owner:string,now:number,ttl:number):boolean { return this.db.transaction(()=>{const prior=this.execution(id); if(!prior||prior.owner!==owner||prior.leaseUntil<=now)return false; prior.leaseUntil=now+ttl; prior.updatedAt=now; this.db.prepare('UPDATE executions SET lease_until=?,payload_json=?,updated_at=? WHERE id=?').run(prior.leaseUntil,json(prior),now,id); this.db.prepare('UPDATE execution_holds SET expires_at=? WHERE execution_id=?').run(now+3_600_000,id); return true; }).immediate(); }
+  updateExecutionChild(id:string,owner:string,now:number,index:number,state:ExecutionChild['state'],message?:string):boolean { return this.db.transaction(()=>{const prior=this.execution(id); if(!prior||prior.owner!==owner||prior.leaseUntil<=now||!prior.children[index])return false; const old=prior.children[index]!.state; const legal=(old==='prepared'&&(state==='sending'||state==='not-attempted'||state==='dry-run'))||(old==='sending'&&['submitted','rejected','uncertain'].includes(state)); if(!legal)return false; prior.children[index]={...prior.children[index]!,state,...(message?{message}: {})}; prior.updatedAt=now; this.db.prepare('UPDATE executions SET payload_json=?,updated_at=? WHERE id=?').run(json(prior),now,id); if(['rejected','not-attempted','dry-run'].includes(state)) this.db.prepare('DELETE FROM execution_holds WHERE execution_id=? AND physical_key=?').run(id,prior.children[index]!.physicalKey); if(state==='submitted'||state==='uncertain') this.db.prepare('UPDATE execution_holds SET expires_at=? WHERE execution_id=? AND physical_key=?').run(now+3_600_000,id,prior.children[index]!.physicalKey); return true; }).immediate(); }
+  finishExecution(id:string,owner:string,now:number,outcome:string,receipt:unknown):boolean { return this.db.transaction(()=>{const prior=this.execution(id); if(!prior||prior.owner!==owner||prior.leaseUntil<=now)return false; prior.outcome=outcome; prior.receipt=receipt; prior.updatedAt=now; const payload=prior.payload as Record<string,unknown>; delete payload.boundReleases; prior.payload=payload; if(typeof payload.confirmationId==='string')this.db.prepare('DELETE FROM execution_preparations WHERE id=?').run(payload.confirmationId); this.db.prepare('UPDATE executions SET outcome=?,payload_json=?,updated_at=? WHERE id=?').run(outcome,json(prior),now,id); return true; }).immediate(); }
+  recoverExecutions(now:number):number {
+    return this.db.transaction(()=>{
+      const rows=this.db.prepare("SELECT id,payload_json FROM executions WHERE outcome='running' AND lease_until<=?").all(now) as Array<{id:string;payload_json:string}>;
+      for(const row of rows) {
+        const r=parse<ExecutionRecord>(row.payload_json);
+        const uncertain=r.children.some(c=>c.state==='sending'||c.state==='uncertain');
+        r.children=r.children.map(c=>c.state==='sending'?{...c,state:'uncertain'}:c.state==='prepared'?{...c,state:'not-attempted'}:c);
+        const submitted=r.children.some(c=>c.state==='submitted'), rejected=r.children.some(c=>c.state==='rejected');
+        r.outcome=uncertain?'uncertain':r.children.every(c=>c.state==='dry-run')?'dry-run':submitted?(rejected||r.children.some(c=>c.state==='not-attempted')?'partial':'submitted'):rejected?'rejected':'not-attempted';
+        r.owner='recovered';r.leaseUntil=now;r.updatedAt=now;
+        const payload=r.payload as {boundReleases?:unknown;client?:{id?:number;protocol?:string};clientName?:string;defaultCategory?:string|null;configuredCategories?:unknown;dryRun?:boolean};
+        delete payload.boundReleases;r.payload=payload;
+        if(typeof (payload as {confirmationId?:unknown}).confirmationId==='string') this.db.prepare('DELETE FROM execution_preparations WHERE id=?').run((payload as {confirmationId:string}).confirmationId);
+        r.receipt={executionId:r.id,searchId:r.searchId,planId:r.planId,version:r.version,outcome:r.outcome,updatedAt:new Date(now).toISOString(),...(payload.client?{client:{id:payload.client.id,name:payload.clientName??'Download client',protocol:payload.client.protocol,defaultCategory:payload.defaultCategory??null,configuredCategories:payload.configuredCategories}}:{}),dryRun:payload.dryRun??true,children:r.children.map(c=>({candidateId:c.candidateId,outcome:c.state,...(c.effectiveCategory!==undefined?{effectiveCategory:c.effectiveCategory}:{}),...(c.categoryRouting?{categoryRouting:c.categoryRouting}:{}),...(c.categoryNote?{categoryNote:c.categoryNote}:{}),...(c.releaseCategoryIds?{releaseCategoryIds:c.releaseCategoryIds}:{})}))};
+        this.db.prepare('UPDATE executions SET outcome=?,owner=?,lease_until=?,payload_json=?,updated_at=? WHERE id=?').run(r.outcome,r.owner,now,json(r),now,row.id);
+        this.db.prepare("DELETE FROM execution_holds WHERE execution_id=? AND physical_key IN (SELECT value FROM json_each(?))").run(row.id,json(r.children.filter(c=>['not-attempted','rejected','dry-run'].includes(c.state)).map(c=>c.physicalKey)));
+        this.db.prepare('UPDATE execution_holds SET expires_at=? WHERE execution_id=?').run(now+3_600_000,row.id);
+      }
+      return rows.length;
+    }).immediate();
+  }
   close(): void { this.db.close(); }
   migrateLegacySearchWork(now:number): void {
     this.db.transaction(() => {
@@ -124,6 +178,7 @@ export class SearchStore {
   }
   createSearch(r: SearchRecord): void { this.db.prepare('INSERT INTO searches(id,prompt,status,created_at,finished_at,result_json) VALUES(?,?,?,?,?,?)').run(r.searchId,r.prompt,r.status,r.createdAt,r.finishedAt ?? null,r.result === undefined ? null : json(r.result)); }
   getSearch(id: string): SearchRecord | null { const r = this.db.prepare('SELECT * FROM searches WHERE id=?').get(id) as {id:string;prompt:string;status:SearchStatus;created_at:number;finished_at:number|null;result_json:string|null}|undefined; return r ? {searchId:r.id,prompt:r.prompt,status:r.status,createdAt:r.created_at,...(r.finished_at === null ? {} : {finishedAt:r.finished_at}),...(r.result_json === null ? {} : {result:parse(r.result_json)})} : null; }
+  searchWorkContext(id:string):unknown { const row=this.db.prepare('SELECT context_json FROM search_work WHERE search_id=?').get(id) as {context_json:string}|undefined;return row?parse(row.context_json):undefined; }
   listSearches(limit=100, full=true): SearchRecord[] {
     if (full) return (this.db.prepare('SELECT id FROM searches ORDER BY created_at DESC LIMIT ?').all(Math.max(0,limit)) as Array<{id:string}>).map(r=>this.getSearch(r.id)!).filter(Boolean);
     const rows = this.db.prepare("SELECT id,prompt,status,created_at,finished_at,json_extract(result_json,'$.counts') AS counts FROM searches ORDER BY created_at DESC LIMIT ?").all(Math.max(0,limit)) as Array<{id:string;prompt:string;status:SearchStatus;created_at:number;finished_at:number|null;counts:string|null}>;
@@ -197,6 +252,7 @@ export class SearchStore {
   }
   getSubmission(key:string):SubmissionReceipt|null { const r=this.db.prepare('SELECT * FROM submissions WHERE key=?').get(key) as any; return r?{idempotencyKey:r.key,payload:parse(r.payload_json),outcome:r.outcome,createdAt:r.created_at}:null; }
   latestSubmission(searchId: string): SubmissionReceipt | null { const row = this.db.prepare("SELECT key FROM submissions WHERE json_extract(payload_json,'$.request.searchId')=? ORDER BY created_at DESC,rowid DESC LIMIT 1").get(searchId) as {key:string}|undefined; return row ? this.getSubmission(row.key) : null; }
+  submissionsForSearch(searchId:string):SubmissionReceipt[] { const rows=this.db.prepare("SELECT key FROM submissions WHERE json_extract(payload_json,'$.request.searchId')=? ORDER BY created_at DESC,rowid DESC").all(searchId) as Array<{key:string}>;return rows.map(row=>this.getSubmission(row.key)!).filter(Boolean); }
   updateSubmissionOutcome(key:string,outcome:string):void { this.db.prepare('UPDATE submissions SET outcome=? WHERE key=?').run(outcome,key); }
   updateSubmissionResult(key:string,outcome:string,result:unknown, claim?: { owner: string; now: number }):void { this.db.transaction(()=>{ if(claim && !this.ownsLease(`submission:${key}`,claim.owner,claim.now)) throw new Error('stale lease owner'); const prior=this.getSubmission(key); if(!prior) throw new Error('submission receipt missing'); const payload={...(prior.payload as Record<string,unknown>),result}; this.db.prepare('UPDATE submissions SET outcome=?,payload_json=? WHERE key=?').run(outcome,json(payload),key); })(); }
   reserveSubmission(input:{idempotencyKey:string;payload:unknown;owner:string;targets:string[];physicalReleases:string[];now:number;graceMs:number}):Reservation {
@@ -221,6 +277,17 @@ export class SearchStore {
   pruneSearches(before:number,limit:number):number { return this.db.transaction(()=>{ const ids=(this.db.prepare('SELECT id FROM searches WHERE created_at<? ORDER BY created_at ASC LIMIT ?').all(before,Math.max(0,limit)) as Array<{id:string}>).map(r=>r.id); const del=this.db.prepare('DELETE FROM searches WHERE id=?'); const cd=this.db.prepare('DELETE FROM candidates WHERE search_id=?'); const ed=this.db.prepare('DELETE FROM search_events WHERE search_id=?'); const wd=this.db.prepare('DELETE FROM search_work WHERE search_id=?'); for(const id of ids){cd.run(id);ed.run(id);wd.run(id);del.run(id);} return ids.length; })(); }
   maintain(now: number): void {
     this.db.transaction(() => {
+      this.db.prepare('DELETE FROM execution_preparations WHERE expires_at<=?').run(now);
+      this.db.prepare('DELETE FROM execution_holds WHERE expires_at<=?').run(now);
+      this.db.prepare('DELETE FROM execution_idempotency WHERE expires_at<=?').run(now);
+      const oldExecutions=this.db.prepare("SELECT id,idem_key,payload_hash FROM executions WHERE outcome!='running' ORDER BY created_at DESC,rowid DESC").all() as Array<{id:string;idem_key:string;payload_hash:string}>;
+      const prunable=oldExecutions.slice(10_000);
+      const archiveKey=this.db.prepare('INSERT OR REPLACE INTO execution_idempotency VALUES(?,?,?)');
+      const deleteHolds=this.db.prepare('DELETE FROM execution_holds WHERE execution_id=?');
+      const deleteExecution=this.db.prepare('DELETE FROM executions WHERE id=?');
+      for(const row of prunable){archiveKey.run(row.idem_key,row.payload_hash,now+30*86_400_000);deleteHolds.run(row.id);deleteExecution.run(row.id);}
+      const expiredExecutions=this.db.prepare("SELECT id,idem_key,payload_hash FROM executions WHERE outcome!='running' AND created_at<?").all(now-30*86_400_000) as Array<{id:string;idem_key:string;payload_hash:string}>;
+      for(const row of expiredExecutions){archiveKey.run(row.idem_key,row.payload_hash,now+30*86_400_000);deleteHolds.run(row.id);deleteExecution.run(row.id);}
       this.db.prepare('DELETE FROM candidates WHERE expires_at<=?').run(now);
          const records = this.db.prepare("SELECT id,created_at FROM searches WHERE status NOT IN ('queued','running') ORDER BY created_at DESC,rowid DESC").all() as Array<{id:string;created_at:number}>;
       const remove = records.filter((row, index) => index >= 10_000 || row.created_at < now - 30 * 86_400_000);

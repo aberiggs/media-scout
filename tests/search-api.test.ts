@@ -179,12 +179,12 @@ describe('search-first HTTP contract', () => {
   });
   it('runs the canonical async plan through the bound daemon MCP route and persists a release set', async () => {
     let responseCalls = 0;
-    const modelInputs: Array<{ input: unknown; instructions: unknown }> = [];
+    const modelInputs: Array<{ input: unknown; instructions: unknown; tools: unknown }> = [];
     const responses = createServer(async (request, response) => {
       const parts: Buffer[] = [];
       for await (const part of request) parts.push(Buffer.from(part));
       const body = JSON.parse(Buffer.concat(parts).toString()) as { tools?: Array<{ name?: string }>; input?: unknown; instructions?: unknown };
-      modelInputs.push({ input: body.input, instructions: body.instructions });
+      modelInputs.push({ input: body.input, instructions: body.instructions, tools: body.tools });
       responseCalls++;
       const name = (responseCalls === 1 ? body.tools?.find(tool => tool.name?.includes('prowlarr_search'))?.name : undefined) ?? 'finalize_release_set';
       response.writeHead(200, { 'content-type': 'application/json' });
@@ -193,7 +193,7 @@ describe('search-first HTTP contract', () => {
         error: null, incomplete_details: null, instructions: null, model: 'z-ai/glm-5.3-flash',
         output: [{ id: `call-${Date.now()}`, type: 'function_call', call_id: `call-${Date.now()}`, name,
           arguments: name?.includes('prowlarr_search') ? JSON.stringify({ query: 'Find a film' })
-            : JSON.stringify({ status: 'no-match', selections: [], gaps: [], deferred: [], broadCoverage: 'none' }), status: 'completed' }],
+            : JSON.stringify({ status: 'no-match', selections: [], covered: [], gaps: [], deferred: [], broadCoverage: 'none', scopeGaps: [] }), status: 'completed' }],
         parallel_tool_calls: false, tool_choice: 'auto', tools: [], usage: { input_tokens: 120, input_tokens_details: { cached_tokens: 20 }, output_tokens: 30, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 150, cost: 0.004 }, metadata: null,
         frequency_penalty: null, presence_penalty: null, temperature: null, top_p: null,
       }));
@@ -205,15 +205,19 @@ describe('search-first HTTP contract', () => {
     try {
       runtime.saveSettings({ ...runtime.getSettings(), ai: { ...runtime.getSettings().ai, baseUrl: `http://127.0.0.1:${upstream.port}` } });
       await app.listen({ host: '127.0.0.1', port: 0 });
-      const start = await app.inject({ method: 'POST', url: '/api/v2/searches', payload: { prompt: 'Find a film', context: { kind: 'movie', titles: ['Arrival'], year: 2016, scope: { type: 'movie' } } } });
+      const start = await app.inject({ method: 'POST', url: '/api/v2/searches', payload: { prompt: 'Find a film', preferredDownloadClientId: 987654, context: { kind: 'movie', titles: ['Arrival'], year: 2016, scope: { type: 'movie' } } } });
       expect(start.statusCode).toBe(202);
       const { searchId } = start.json() as { searchId: string };
+      expect(runtime.store.searchWorkContext(searchId)).toMatchObject({preferredDownloadClientId:987654});
       await runtime.drain();
       const instruction = JSON.stringify(modelInputs);
       expect(instruction).toContain('typed finalize_release_set');
       expect(instruction).toContain('Never redefine the requested scope');
       expect(instruction).toContain('do not force a fixed number of queries');
       expect(instruction).toContain('incidental extra seasons/episodes in a pack are overcoverage warnings, not gaps');
+      expect(instruction).toContain('Do not output targetIds');
+      expect(instruction).toContain('plain language, not IDs');
+      expect(JSON.stringify(modelInputs.flatMap(request => request.tools)).match(/targetIds/g)).toBeNull();
       expect(modelInputs).toHaveLength(2);
       for (const request of modelInputs) {
         expect(request.instructions).toEqual(expect.stringContaining('Treat clear, internally consistent release names and indexer metadata as sufficient working evidence'));
@@ -226,9 +230,11 @@ describe('search-first HTTP contract', () => {
       expect(status.json(), JSON.stringify(status.json())).toMatchObject({
         searchId, status: 'no-match', diagnostics: { modelTurns: 2, stopReason: 'release-set-finalized', elapsedMs: expect.any(Number), usage: { inputTokens: 120, outputTokens: 30, totalTokens: 150, cost: 0.004 } },
         counts: { decisions: 2, searches: 1 },
-        plan: { version: 1, status: 'no-match', selections: [], coverage: { broad: { status: 'none' } } },
+        preferredDownloadClientId: 987654,
+        plan: { version: 2, status: 'no-match', selections: [], coverage: { broad: { status: 'none' } } },
       });
       expect(status.body).not.toContain('private-model');
+      expect(JSON.stringify(modelInputs)).not.toContain('987654');
       expect(grabs()).toBe(0);
     } finally {
       await app.close();
@@ -258,7 +264,7 @@ describe('search-first HTTP contract', () => {
       if (responseCalls <= 2) { searchCall++; args = { query: `identity-${searchCall}` }; }
       else {
         const candidateId = runtimeRef!.store.listCandidates(runtimeRef!.activity().items[0]!.searchId)[0]?.candidateId;
-        args = { status: 'matched', selections: [{ candidateId, targetIds: ['opaque-target'], reason: 'Observed candidate', uncertainty: '' }], gaps: [], deferred: [] };
+        args = { status: 'matched', selections: [{ candidateId, coverage: 'The requested film', reason: 'private-model observed candidate', uncertainty: '' }], covered: ['The requested film'], gaps: [], deferred: [], broadCoverage: 'complete', scopeGaps: [] };
       }
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(JSON.stringify({
@@ -300,6 +306,7 @@ describe('search-first HTTP contract', () => {
       if (expected === 'failed') expect(result?.message).toBe('Search provider request failed (HTTP 500)');
       expect(result?.counts.decisions).toBeGreaterThan(0);
       if (expected === 'matched') {
+        expect(JSON.stringify(result?.plan)).not.toContain('private-model');
         runtime.store.expireCandidatesAt(searchId, Date.now() - 1);
         expect(runtime.store.listCandidates(searchId)).toHaveLength(0);
         const historical = await runtime.getSearch(searchId);
@@ -385,14 +392,20 @@ describe('search-first HTTP contract', () => {
   it('validates bounded Activity media/time filters and rejects reversed ranges', async () => {
     const { app, runtime } = await fixture(), now = Date.now();
     runtime.store.createSearch({ searchId: 'tv', prompt: '{"prompt":"Example","context":{"kind":"tv"}}', status: 'no-match', createdAt: now });
+    runtime.store.createSearch({ searchId: 'movie', prompt: '{"prompt":"Example","context":{"kind":"movie"}}', status: 'no-match', createdAt: now + 1 });
+    runtime.store.appendEvent('tv', { type: 'submission', data: { outcome: 'partial' } });
+    runtime.store.appendEvent('movie', { type: 'submission', data: { outcome: 'not-attempted' } });
     expect((await app.inject(`/api/v2/activity?kind=tv&createdAtFrom=${encodeURIComponent(new Date(now).toISOString())}&createdAtTo=${encodeURIComponent(new Date(now).toISOString())}`)).json()).toMatchObject({ total: 1, items: [{ kind: 'tv' }] });
     expect((await app.inject('/api/v2/activity?kind=bogus')).statusCode).toBe(400);
     expect((await app.inject('/api/v2/activity?createdAtFrom=not-a-date')).statusCode).toBe(400);
     expect((await app.inject('/api/v2/activity?createdAtFrom=2026-02-01T00%3A00%3A00Z&createdAtTo=2026-01-01T00%3A00%3A00Z')).statusCode).toBe(400);
+    expect((await app.inject('/api/v2/activity?status=partial')).json()).toMatchObject({items:[{searchId:'tv',submission:{outcome:'partial'}}]});
+    expect((await app.inject('/api/v2/activity?status=not-attempted')).json()).toMatchObject({items:[{searchId:'movie',submission:{outcome:'not-attempted'}}]});
   });
   it('requires valid input and rejects cross-origin mutations without network work', async () => {
     const { app, reads } = await fixture();
     expect((await app.inject({ method: 'POST', url: '/api/v2/searches', payload: { prompt: '' } })).statusCode).toBe(400);
+    expect((await app.inject({ method: 'POST', url: '/api/v2/searches', payload: { prompt: 'Find', preferredDownloadClientId: 0 } })).statusCode).toBe(400);
     expect((await app.inject({ method: 'POST', url: '/api/v2/searches', headers: { origin: 'http://evil.test' }, payload: { prompt: 'Find' } })).statusCode).toBe(403);
     expect((await app.inject('/api/v2/activity?limit=999')).statusCode).toBe(400);
     expect((await app.inject('/api/v2/searches/unknown')).statusCode).toBe(404);

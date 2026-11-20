@@ -14,6 +14,8 @@ import { createProwlarrMcpServer } from './search/prowlarr-mcp';
 
 declare module 'fastify' { interface FastifyInstance { refreshScheduler?: () => void } }
 const identifier = z.string().trim().min(1).max(200);
+const prepareExecutionSchema=z.object({searchId:identifier,planId:identifier,version:z.number().int().positive(),candidateIds:z.array(identifier).min(1).max(100),downloadClientId:z.number().int().positive()}).strict();
+const commitExecutionSchema=z.object({confirmationId:identifier,searchId:identifier,planId:identifier,version:z.number().int().positive(),idempotencyKey:identifier}).strict();
 const activityQuery = z.object({ limit: z.coerce.number().int().min(1).max(100).default(50), offset: z.coerce.number().int().min(0).max(1_000_000).default(0), q: z.string().max(200).optional(), status: activityStatusSchema.optional(), source: z.enum(['manual', 'automation', 'arr']).optional(), kind: z.enum(['tv', 'movie', 'other']).optional(), createdAtFrom: z.string().max(40).datetime({ offset: true }).optional(), createdAtTo: z.string().max(40).datetime({ offset: true }).optional() }).strict().refine(q => !q.createdAtFrom || !q.createdAtTo || Date.parse(q.createdAtFrom) <= Date.parse(q.createdAtTo), { message: 'createdAtFrom must be on or before createdAtTo' });
 function mutationAllowed(request: { headers: Record<string, string | string[] | undefined> }): boolean {
   if (request.headers['sec-fetch-site'] === 'cross-site') return false;
@@ -21,6 +23,16 @@ function mutationAllowed(request: { headers: Record<string, string | string[] | 
     try { return new URL(request.headers.origin).host.toLowerCase() === String(request.headers.host).toLowerCase(); } catch { return false; }
   }
   return true;
+}
+function publicExecutionError(error:unknown):{code:string;message:string;action:string} {
+  const raw=error instanceof Error?error.message:'execution-unavailable';
+  const known=new Set(['plan-unavailable','plan-changed','whole-plan-selection-required','dry-run-enabled','search-source-not-manual','prowlarr-source-unavailable','source-changed','candidate-not-selected','candidate-expired','candidate-source-unverified','invalid-candidate-set','download-client-unavailable','download-client-protocol-mismatch','grab-adapter-unavailable','invalid-idempotency-key','confirmation-expired','safety-changed','client-changed','idempotency-conflict','physical-release-busy','execution-ownership-lost']);
+  const code=known.has(raw)?raw:'execution-unavailable';
+  const message=code==='physical-release-busy'?'A selected release is temporarily reserved; inspect its receipt or retry after the hold expires.'
+    :code==='idempotency-conflict'?'This idempotency key is already bound to a different confirmation; use a new key after checking the receipt.'
+    :['source-changed','client-changed','safety-changed','plan-changed','candidate-expired','candidate-source-unverified','confirmation-expired'].includes(code)?'The source, plan, candidate, client, or safety settings changed; review current search details and confirm again.'
+    :code==='execution-unavailable'?'Execution is unavailable; review the current search and configuration.':'Review the selected plan and current client configuration, then prepare a new confirmation.';
+  return {code,message,action:code==='physical-release-busy'?'retry-later':code==='idempotency-conflict'?'new-idempotency-key':'reconfirm'};
 }
 
 export async function buildApp(stack: Stack, options: { webRoot?: string } = {}) {
@@ -56,6 +68,7 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
   };
   app.addHook('preClose', async () => {
     runtime.quiesce();
+    await runtime.drain();
     await runtime.closeProwlarrMcpSessions();
   });
   app.addHook('onRequest', async (request, reply) => {
@@ -133,6 +146,18 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
     return runtime.activity(activityQuery.parse(raw));
   });
   app.get('/api/v2/download-clients', async () => ({ items: await runtime.downloadClients() }));
+  app.post('/api/v2/executions/prepare', async (request,reply) => {
+    try { return await runtime.prepareExecution(prepareExecutionSchema.parse(request.body)); }
+    catch(error) { const failure=publicExecutionError(error); return reply.code(error instanceof z.ZodError?400:409).send({code:failure.code,error:failure.message,action:failure.action}); }
+  });
+  app.post('/api/v2/executions/commit', async (request,reply) => {
+    try { return await runtime.commitExecution(commitExecutionSchema.parse(request.body)); }
+    catch(error) { const failure=publicExecutionError(error); return reply.code(error instanceof z.ZodError?400:409).send({code:failure.code,error:failure.message,action:failure.action}); }
+  });
+  app.get('/api/v2/executions/:id', async (request,reply) => {
+    const receipt=runtime.executionReceipt(identifier.parse((request.params as {id:string}).id));
+    return receipt ?? reply.code(404).send({error:'Execution receipt not found',code:'receipt-not-found'});
+  });
   app.post('/api/v2/submissions', async (_request, reply) => reply.code(410).send({ error: 'Release execution is deferred', code: 'execution-deferred' }));
   app.get('/api/v2/submissions/:id', async (request, reply) => {
     const receipt = runtime.store.getSubmission(identifier.parse((request.params as { id: string }).id));

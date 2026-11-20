@@ -24,6 +24,7 @@ const requestContext = z.object({
 export const searchRequestSchema = z.object({
   prompt: nonempty.max(4000), context: requestContext.optional(), preferences: languagePreferences.optional(),
   arrTargetIds: z.array(nonempty.max(200)).max(200).optional(),
+  preferredDownloadClientId: z.number().int().positive().optional(),
 }).strict().superRefine((request, ctx) => {
   if (request.arrTargetIds && new Set(request.arrTargetIds).size !== request.arrTargetIds.length)
     ctx.addIssue({ code: 'custom', path: ['arrTargetIds'], message: 'Arr target IDs must be distinct' });
@@ -46,4 +47,4 @@ export const submissionRequestSchema = z.object({ searchId: nonempty, optionId: 
 export type SubmissionRequest = z.infer<typeof submissionRequestSchema>;
 export const submissionOutcomeSchema = z.enum(['submitting', 'submitted', 'rejected', 'uncertain', 'deferred', 'conflict', 'failed', 'dry-run', 'expired']);
 export type SubmissionOutcome = z.infer<typeof submissionOutcomeSchema>;
-export const activityStatusSchema = z.union([searchStatusSchema, submissionOutcomeSchema]);
+export const activityStatusSchema = z.union([searchStatusSchema, submissionOutcomeSchema, z.enum(['partial', 'not-attempted'])]);

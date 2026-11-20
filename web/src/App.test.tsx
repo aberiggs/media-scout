@@ -5,8 +5,9 @@ import { defaults } from './types'
 
 const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'http://localhost/' })
 Object.defineProperty(globalThis, 'CustomEvent', { configurable: true, value: dom.window.CustomEvent })
-for (const [name, value] of Object.entries({ window: dom.window, document: dom.window.document, location: dom.window.location, navigator: dom.window.navigator, HTMLElement: dom.window.HTMLElement, Node: dom.window.Node, MutationObserver: dom.window.MutationObserver, getComputedStyle: dom.window.getComputedStyle.bind(dom.window) })) Object.defineProperty(globalThis, name, { configurable: true, value })
+for (const [name, value] of Object.entries({ window: dom.window, document: dom.window.document, location: dom.window.location, navigator: dom.window.navigator, sessionStorage: dom.window.sessionStorage, HTMLElement: dom.window.HTMLElement, Node: dom.window.Node, MutationObserver: dom.window.MutationObserver, getComputedStyle: dom.window.getComputedStyle.bind(dom.window) })) Object.defineProperty(globalThis, name, { configurable: true, value })
 Object.defineProperty(globalThis, 'IS_REACT_ACT_ENVIRONMENT', { configurable: true, writable: true, value: true })
+Object.defineProperty(globalThis, 'requestAnimationFrame', { configurable: true, value: (callback: FrameRequestCallback) => window.setTimeout(() => callback(0), 0) })
 const { cleanup, fireEvent, render, screen, within, waitFor } = await import('@testing-library/react')
 const { default: App } = await import('./App')
 const originalFetch = globalThis.fetch
@@ -14,7 +15,279 @@ const originalCrypto = globalThis.crypto
 const env = { settings: defaults, status: { ready: false, missing: [], monitoringEnabled: false, cycleRunning: false } }
 const matched = { searchId: 's1', status: 'matched', createdAt: '2026-11-15T00:00:00Z', prompt: 'Find Example', plan: { version: 1, planId: 'p1', status: 'matched', selections: [{ candidateId: 'c1', targetIds: ['target-1'], reason: 'Best evidence', uncertainty: 'Audio not verified' }], coverage: { covered: ['target-1'], gaps: [], deferred: [], broad: { status: 'complete', gaps: [] } }, warnings: [] }, candidates: [{ candidateId: 'c1', observations: [{ title: 'Example 1080p', indexer: 'Index', seeders: 20 }] }], events: [], counts: { decisions: 2, searches: 1, candidates: 1 } }
 
-afterEach(() => { cleanup(); window.history.replaceState(null, '', '/'); globalThis.fetch = originalFetch; Object.defineProperty(globalThis, 'crypto', { configurable: true, value: originalCrypto }) })
+afterEach(() => { cleanup(); window.history.replaceState(null, '', '/'); sessionStorage.clear(); globalThis.fetch = originalFetch; Object.defineProperty(globalThis, 'crypto', { configurable: true, value: originalCrypto }) })
+
+const semanticSearch = { ...matched, searchId: 'life', plan: { version: 2, planId: 'plan-life', status: 'matched', selections: [{ candidateId: 'c1', coverage: 'Season one', reason: 'Complete release set', uncertainty: '' }], covered: ['Season one'], gaps: [], deferred: [], scopeGaps: [], extras: [], usefulOverlap: [], broadCoverage: 'complete', coverage: { covered: ['Season one'], gaps: [], deferred: [], broad: { status: 'complete', gaps: [] } } }, candidates: [{ candidateId: 'c1', observations: [{ title: 'Season One Pack' }] }] }
+const preparedConfirmation = { confirmationId: 'confirm-life', expiresAt: '2099-01-01T00:00:00Z', searchId: 'life', planId: 'plan-life', version: 2, client: { id: 8, name: 'qBittorrent', protocol: 'torrent', configuredCategories: [], defaultCategory: 'tv' }, dryRun: true, children: [{ candidateId: 'c1', title: 'Season One Pack', effectiveCategory: 'tv', categoryRouting: 'default', categoryNote: 'Client default category: tv', releaseCategoryIds: [5000] }] }
+
+function lifecycleFetch(handler: (url: string, init?: RequestInit) => Response | Promise<Response>) {
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/settings') return Response.json(env)
+    return handler(url, init)
+  }
+}
+
+it('prepares and commits the complete semantic v2 release set and shows its receipt', async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = []
+  globalThis.fetch = async (input, init) => {
+    const url = String(input); calls.push({ url, init })
+    if (url === '/api/settings') return Response.json(env)
+    if (url.startsWith('/api/v2/activity')) return Response.json({ items: [{ searchId: 'v2', prompt: 'Find North Shore', status: 'matched', source: 'manual', createdAt: matched.createdAt }], total: 1 })
+    if (url === '/api/v2/searches/v2') return Response.json({ ...matched, searchId: 'v2', plan: { version: 2, planId: 'plan-v2', status: 'matched', selections: [{ candidateId: 'c1', coverage: 'Season one with overlap', reason: 'Useful complete pack', uncertainty: '' }], covered: ['Season one'], gaps: [], deferred: [], scopeGaps: [], extras: ['Bonus episode'], usefulOverlap: ['Episode two'], broadCoverage: 'complete', coverage: { covered: ['Season one'], gaps: [], deferred: [], broad: { status: 'complete', gaps: [] } } }, receipts: [] })
+    if (url === '/api/v2/download-clients') return Response.json({ items: [{ id: 8, name: 'qBittorrent', protocol: 'torrent', categoryMap: [] }] })
+    if (url === '/api/v2/executions/prepare') return Response.json({ confirmationId: 'confirm-1', expiresAt: '2099-01-01T00:00:00Z', searchId: 'v2', planId: 'plan-v2', version: 2, client: { id: 8, name: 'qBittorrent', protocol: 'torrent', configuredCategories: [], defaultCategory: 'tv' }, dryRun: true, children: [{ candidateId: 'c1', title: 'North Shore complete pack', effectiveCategory: 'tv', categoryRouting: 'default', categoryNote: 'Prowlarr client default', releaseCategoryIds: [5000] }] })
+    if (url === '/api/v2/executions/commit') return Response.json({ executionId: 'exec-1', searchId: 'v2', planId: 'plan-v2', version: 2, outcome: 'dry-run', updatedAt: '2026-11-15T00:00:00Z', dryRun: true, children: [{ candidateId: 'c1', outcome: 'dry-run', effectiveCategory: 'tv' }] })
+    return Response.json({ items: [] })
+  }
+  const { SearchPage } = await import('./Search')
+  render(<SearchPage settings={defaults} searchId="v2" searchRevision={1} onSearchStarted={() => {}} />)
+  assert.ok(await screen.findByText(/Season one with overlap/))
+  assert.ok(screen.getByText('Bonus episode'))
+  assert.equal(screen.queryByText(/target-1/), null)
+  fireEvent.click(screen.getByRole('button', { name: 'Choose Prowlarr client' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Prepare confirmation' }))
+  assert.ok(await screen.findByRole('dialog', { name: 'Confirm whole release set' }))
+  assert.ok(screen.getByText('Client default category').parentElement?.textContent?.includes('tv'))
+  assert.ok(screen.getByText('None configured; using the client default.'))
+  fireEvent.click(screen.getByRole('button', { name: 'Run dry-run' }))
+  assert.ok(await screen.findByText('Execution receipt'))
+  assert.ok(screen.getAllByText('dry-run').length > 0)
+  const prepare = calls.find(call => call.url === '/api/v2/executions/prepare')
+  assert.deepEqual(JSON.parse(String(prepare?.init?.body)), { searchId: 'v2', planId: 'plan-v2', version: 2, candidateIds: ['c1'], downloadClientId: 8 })
+  const commit = calls.find(call => call.url === '/api/v2/executions/commit')
+  assert.ok(commit)
+  assert.deepEqual(Object.keys(JSON.parse(String(commit.init?.body))).sort(), ['confirmationId', 'idempotencyKey', 'planId', 'searchId', 'version'])
+})
+
+it('retries a transport-uncertain commit with the exact persisted request and idempotency key', async () => {
+  const commits: string[] = []
+  lifecycleFetch((url, init) => {
+    if (url === '/api/v2/searches/life') return Response.json(semanticSearch)
+    if (url === '/api/v2/download-clients') return Response.json({ items: [{ id: 8, name: 'qBittorrent', protocol: 'torrent', categoryMap: [] }] })
+    if (url === '/api/v2/executions/prepare') return Response.json(preparedConfirmation)
+    if (url === '/api/v2/executions/commit') {
+      commits.push(String(init?.body))
+      if (commits.length === 1) return Promise.reject(new TypeError('connection lost'))
+      return Response.json({ executionId: 'exec-life', searchId: 'life', outcome: 'dry-run', dryRun: true, updatedAt: new Date().toISOString(), children: [{ candidateId: 'c1', outcome: 'dry-run' }] })
+    }
+    return Response.json({})
+  })
+  const { SearchPage } = await import('./Search')
+  render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Choose Prowlarr client' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Prepare confirmation' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Run dry-run' }))
+  assert.ok(await screen.findByRole('button', { name: 'Retry same confirmation' }))
+  await screen.findAllByText(/The exact confirmation and idempotency key are saved/)
+  assert.equal(Boolean(screen.queryByRole('dialog')), false, 'Only same-key recovery is offered after transport uncertainty')
+  const saved = JSON.parse(sessionStorage.getItem('media-scout-execution-pending:life')!)
+  assert.equal(saved.confirmationId, 'confirm-life')
+  fireEvent.click(screen.getByRole('button', { name: 'Retry same confirmation' }))
+  assert.ok(await screen.findByText('Execution receipt'))
+  assert.equal(commits.length, 2)
+  assert.deepEqual(JSON.parse(commits[0]!), JSON.parse(commits[1]!))
+  assert.equal(JSON.parse(commits[0]!).idempotencyKey, saved.idempotencyKey)
+  assert.equal(sessionStorage.getItem('media-scout-execution-pending:life'), null)
+})
+
+it('recovers the same pending commit after a page reload without preparing a new confirmation', async () => {
+  const request = { confirmationId: 'persisted-confirm', searchId: 'life', planId: 'plan-life', version: 2, idempotencyKey: 'stable-key-from-before-reload' }
+  sessionStorage.setItem('media-scout-execution-pending:life', JSON.stringify(request))
+  let commitBody = ''
+  lifecycleFetch((url, init) => {
+    if (url === '/api/v2/searches/life') return Response.json(semanticSearch)
+    if (url === '/api/v2/executions/commit') { commitBody = String(init?.body); return Response.json({ executionId: 'exec-recovered', searchId: 'life', outcome: 'submitted', dryRun: false, updatedAt: new Date().toISOString(), children: [{ candidateId: 'c1', outcome: 'submitted' }] }) }
+    return Response.json({})
+  })
+  const { SearchPage } = await import('./Search')
+  render(<SearchPage settings={defaults} searchId="life" searchRevision={2} onSearchStarted={() => {}} />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Retry same confirmation' }))
+  assert.ok(await screen.findByRole('heading', { name: 'Execution receipt' }))
+  assert.deepEqual(JSON.parse(commitBody), request)
+})
+
+it('retains the exact commit recovery key when an HTTP-success response body is interrupted', async () => {
+  const commits: string[] = []
+  lifecycleFetch((url, init) => {
+    if (url === '/api/v2/searches/life') return Response.json(semanticSearch)
+    if (url === '/api/v2/download-clients') return Response.json({ items: [{ id: 8, name: 'qBittorrent', protocol: 'torrent', categoryMap: [] }] })
+    if (url === '/api/v2/executions/prepare') return Response.json(preparedConfirmation)
+    if (url === '/api/v2/executions/commit') {
+      commits.push(String(init?.body))
+      if (commits.length === 1) return new Response(new ReadableStream({ start(controller) { controller.error(new Error('body interrupted')) } }), { status: 200 })
+      return Response.json({ executionId: 'body-recovered', searchId: 'life', outcome: 'submitted', dryRun: false, updatedAt: new Date().toISOString(), children: [{ candidateId: 'c1', outcome: 'submitted' }] })
+    }
+    return Response.json({})
+  })
+  const { SearchPage } = await import('./Search')
+  render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Choose Prowlarr client' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Prepare confirmation' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Run dry-run' }))
+  await waitFor(() => assert.equal(Boolean(screen.queryByRole('dialog')), false))
+  assert.ok(sessionStorage.getItem('media-scout-execution-pending:life'))
+  fireEvent.click(await screen.findByRole('button', { name: 'Retry same confirmation' }))
+  assert.ok(await screen.findByRole('heading', { name: 'Execution receipt' }))
+  assert.equal(commits[0], commits[1])
+})
+
+it('rejects an incomplete successful preparation without opening a broken dialog', async () => {
+  lifecycleFetch(url => {
+    if (url === '/api/v2/searches/life') return Response.json(semanticSearch)
+    if (url === '/api/v2/download-clients') return Response.json({ items: [{ id: 8, name: 'qBittorrent', protocol: 'torrent', categoryMap: [] }] })
+    if (url === '/api/v2/executions/prepare') return Response.json({ confirmationId: 'incomplete' })
+    return Response.json({})
+  })
+  const { SearchPage } = await import('./Search')
+  render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Choose Prowlarr client' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Prepare confirmation' }))
+  assert.ok(await screen.findByText(/Preparation response was incomplete/))
+  assert.equal(Boolean(screen.queryByRole('dialog')), false)
+})
+
+for (const durable of [true, false]) it(`preserves ${durable ? 'durable' : 'event-only'} submission inspection for retired-format search results`, async () => {
+  lifecycleFetch(url => url === '/api/v2/searches/life' ? Response.json({
+    ...semanticSearch, plan: undefined, legacyResult: { options: [{ title: 'Retired result' }] },
+    legacyReceipts: durable ? [{ searchId: 'life', outcome: 'uncertain', candidateIds: [], outcomes: [] }] : [],
+    events: [{ type: 'submission', data: { outcome: durable ? 'EVENT MUST NOT OVERRIDE' : 'submitted' } }],
+  }) : Response.json({}))
+  const { SearchPage } = await import('./Search')
+  render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
+  assert.ok(await screen.findByRole('heading', { name: 'Legacy search record' }))
+  assert.ok(screen.getByRole('heading', { name: 'Historical submission receipts' }))
+  const history = screen.getByRole('heading', { name: 'Historical submission receipts' }).parentElement!
+  assert.ok(within(history).getByText(durable ? 'uncertain' : /submitted/))
+  assert.equal(Boolean(screen.queryByText(/EVENT MUST NOT OVERRIDE/)), false)
+})
+
+it('clears only a definitive stale-confirmation rejection and allows fresh preparation', async () => {
+  let preparations = 0
+  lifecycleFetch(url => {
+    if (url === '/api/v2/searches/life') return Response.json(semanticSearch)
+    if (url === '/api/v2/download-clients') return Response.json({ items: [{ id: 8, name: 'qBittorrent', protocol: 'torrent', categoryMap: [] }] })
+    if (url === '/api/v2/executions/prepare') return Response.json({ ...preparedConfirmation, confirmationId: `confirm-${++preparations}` })
+    if (url === '/api/v2/executions/commit') return Response.json({ code: 'confirmation-expired', message: 'Confirmation expired.' }, { status: 409 })
+    return Response.json({})
+  })
+  const { SearchPage } = await import('./Search')
+  render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Choose Prowlarr client' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Prepare confirmation' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Run dry-run' }))
+  assert.ok(await screen.findByText(/Prepare a fresh confirmation/))
+  assert.equal(sessionStorage.getItem('media-scout-execution-pending:life'), null)
+  fireEvent.click(screen.getByRole('button', { name: 'Prepare confirmation' }))
+  assert.ok(await screen.findByRole('dialog', { name: 'Confirm whole release set' }))
+  assert.equal(preparations, 2)
+})
+
+it('does not show an old confirmation after selecting another search while prepare is pending', async () => {
+  let resolvePrepare!: (response: Response) => void
+  let started!: () => void
+  const wasStarted = new Promise<void>(resolve => { started = resolve })
+  lifecycleFetch((url) => {
+    if (url === '/api/v2/searches/life') return Response.json(semanticSearch)
+    if (url === '/api/v2/searches/other') return Response.json({ ...semanticSearch, searchId: 'other' })
+    if (url === '/api/v2/download-clients') return Response.json({ items: [{ id: 8, name: 'qBittorrent', protocol: 'torrent', categoryMap: [] }] })
+    if (url === '/api/v2/executions/prepare') { started(); return new Promise<Response>(resolve => { resolvePrepare = resolve }) }
+    return Response.json({})
+  })
+  const { SearchPage } = await import('./Search')
+  const view = render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Choose Prowlarr client' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Prepare confirmation' }))
+  await wasStarted
+  view.rerender(<SearchPage settings={defaults} searchId="other" searchRevision={2} onSearchStarted={() => {}} />)
+  resolvePrepare(Response.json({ ...preparedConfirmation, searchId: 'life' }))
+  await waitFor(() => assert.ok(screen.getByText('Selected release set')))
+  assert.equal(screen.queryByRole('dialog'), null)
+})
+
+it('ignores a delayed receipt poll for the previously selected search', async () => {
+  let resolvePoll!: (response: Response) => void
+  let polled!: () => void
+  const pollStarted = new Promise<void>(resolve => { polled = resolve })
+  lifecycleFetch(url => {
+    if (url === '/api/v2/searches/life') return Response.json({ ...semanticSearch, receipts: [{ executionId: 'old-exec', searchId: 'life', outcome: 'running', dryRun: false, updatedAt: new Date().toISOString(), children: [{ candidateId: 'c1', outcome: 'sending' }] }] })
+    if (url === '/api/v2/searches/other') return Response.json({ ...semanticSearch, searchId: 'other', receipts: [] })
+    if (url === '/api/v2/executions/old-exec') { polled(); return new Promise<Response>(resolve => { resolvePoll = resolve }) }
+    return Response.json({})
+  })
+  const { SearchPage } = await import('./Search')
+  const view = render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
+  await pollStarted
+  view.rerender(<SearchPage settings={defaults} searchId="other" searchRevision={2} onSearchStarted={() => {}} />)
+  resolvePoll(Response.json({ executionId: 'old-exec', searchId: 'life', outcome: 'uncertain', dryRun: false, updatedAt: new Date().toISOString(), children: [{ candidateId: 'c1', outcome: 'uncertain', message: 'OLD SEARCH RECEIPT' }] }))
+  await screen.findByText('Search plan')
+  assert.equal(screen.queryByText('OLD SEARCH RECEIPT'), null)
+})
+
+it('shows child progress from a polled receipt instead of the older history snapshot', async () => {
+  const initial = { executionId: 'progress', searchId: 'life', outcome: 'running', dryRun: false, updatedAt: new Date().toISOString(), children: [{ candidateId: 'c1', outcome: 'sending' }] }
+  lifecycleFetch(url => {
+    if (url === '/api/v2/searches/life') return Response.json({ ...semanticSearch, receipts: [initial] })
+    if (url === '/api/v2/executions/progress') return Response.json({ ...initial, children: [{ candidateId: 'c1', outcome: 'submitted', message: 'Freshly recorded child progress' }] })
+    return Response.json({})
+  })
+  const { SearchPage } = await import('./Search')
+  render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
+  assert.ok(await screen.findByText('Freshly recorded child progress'))
+})
+
+it('traps confirmation focus and restores focus to the actual prepare action', async () => {
+  lifecycleFetch(url => {
+    if (url === '/api/v2/searches/life') return Response.json(semanticSearch)
+    if (url === '/api/v2/download-clients') return Response.json({ items: [{ id: 8, name: 'qBittorrent', protocol: 'torrent', categoryMap: [] }] })
+    if (url === '/api/v2/executions/prepare') return Response.json(preparedConfirmation)
+    return Response.json({})
+  })
+  const { SearchPage } = await import('./Search')
+  render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Choose Prowlarr client' }))
+  const prepare = await screen.findByRole('button', { name: 'Prepare confirmation' })
+  fireEvent.click(prepare)
+  const dialog = await screen.findByRole('dialog', { name: 'Confirm whole release set' })
+  assert.equal(document.activeElement?.textContent, 'Cancel')
+  const buttons = within(dialog).getAllByRole('button')
+  const close = buttons.find(button => button.getAttribute('aria-label') === 'Close confirmation')!
+  const confirm = buttons.find(button => button.textContent === 'Run dry-run')!
+  confirm.focus()
+  fireEvent.keyDown(document, { key: 'Tab' })
+  assert.equal(document.activeElement, close)
+  fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })
+  assert.equal(document.activeElement, confirm)
+  fireEvent.keyDown(document, { key: 'Escape' })
+  assert.equal(screen.queryByRole('dialog'), null)
+  await new Promise(resolve => window.setTimeout(resolve, 5))
+  assert.equal(document.activeElement, prepare)
+})
+
+it('keeps the whole-set dialog open while a commit request is pending', async () => {
+  let releaseCommit!: (response: Response) => void
+  lifecycleFetch(url => {
+    if (url === '/api/v2/searches/life') return Response.json(semanticSearch)
+    if (url === '/api/v2/download-clients') return Response.json({ items: [{ id: 8, name: 'qBittorrent', protocol: 'torrent', categoryMap: [] }] })
+    if (url === '/api/v2/executions/prepare') return Response.json(preparedConfirmation)
+    if (url === '/api/v2/executions/commit') return new Promise<Response>(resolve => { releaseCommit = resolve })
+    return Response.json({})
+  })
+  const { SearchPage } = await import('./Search')
+  render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Choose Prowlarr client' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Prepare confirmation' }))
+  const confirm = await screen.findByRole('button', { name: 'Run dry-run' })
+  fireEvent.click(confirm)
+  await new Promise(resolve => window.setTimeout(resolve, 5))
+  assert.ok(screen.getByRole('button', { name: 'Recording receipt…' }).hasAttribute('disabled'))
+  const dialog = screen.getByRole('dialog')
+  fireEvent.keyDown(document, { key: 'Escape' })
+  fireEvent.mouseDown(dialog.parentElement!, { target: dialog.parentElement })
+  assert.ok(screen.getByRole('dialog'))
+  releaseCommit(Response.json({ executionId: 'exec-pending', searchId: 'life', outcome: 'dry-run', dryRun: true, updatedAt: new Date().toISOString(), children: [{ candidateId: 'c1', outcome: 'dry-run' }] }))
+  assert.ok(await screen.findByRole('heading', { name: 'Execution receipt' }))
+})
 
 it('starts with Search, submits a prompt without downloading, and displays ranked evidence', async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = []
@@ -36,7 +309,7 @@ it('starts with Search, submits a prompt without downloading, and displays ranke
   fireEvent.change(screen.getByLabelText('What are you looking for?'), { target: { value: 'Find North Shore' } })
   fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
   await screen.findByText('Best evidence')
-  assert.ok(screen.getByText(/Audio not verified/))
+  assert.ok(screen.getAllByText(/Audio not verified/).length > 0)
   assert.deepEqual(JSON.parse(String(calls.find((call) => call.url === '/api/v2/searches' && call.init?.method === 'POST')?.init?.body)), { prompt: 'Find North Shore' })
   assert.equal(calls.some((call) => call.url === '/api/v2/submissions'), false)
 })
@@ -102,7 +375,7 @@ it('retains an unsent search draft and optional details while navigating away an
   fireEvent.change(screen.getByLabelText('Preferences'), { target: { value: 'Original audio' } })
   fireEvent.change(screen.getByLabelText(/Structured context/), { target: { value: '{"kind":"movie"}' } })
   fireEvent.click(document.querySelector('a[href="#activity"]')!); fireEvent(window, new dom.window.Event('hashchange'))
-  await screen.findByText('A record of searches, recommendations, and submission outcomes.')
+  await screen.findByText('A record of searches, recommendations, and per-release submission outcomes.')
   assert.equal(document.querySelector('#search-workspace')?.hasAttribute('hidden'), true)
   fireEvent.click(screen.getByRole('link', { name: 'Search' })); fireEvent(window, new dom.window.Event('hashchange'))
   assert.equal(await screen.findByLabelText('What are you looking for?'), prompt)
@@ -131,7 +404,7 @@ it('keeps the current result through navigation and lets Activity replace it wit
   assert.ok(await screen.findByRole('heading', { name: 'Search plan' }))
   assert.ok(screen.getByText('New evidence'))
   fireEvent.click(document.querySelector('a[href="#activity"]')!); fireEvent(window, new dom.window.Event('hashchange'))
-  await screen.findByText('A record of searches, recommendations, and submission outcomes.')
+  await screen.findByText('A record of searches, recommendations, and per-release submission outcomes.')
   fireEvent.click(screen.getByRole('link', { name: 'Search' })); fireEvent(window, new dom.window.Event('hashchange'))
   assert.ok(await screen.findByText('New evidence'))
   fireEvent.click(screen.getByRole('link', { name: 'Activity' })); fireEvent(window, new dom.window.Event('hashchange'))
@@ -161,7 +434,7 @@ it('continues polling a running search while its workspace is hidden', async () 
   fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
   assert.ok(await screen.findByText(/Checking indexers and comparing releases/))
   fireEvent.click(screen.getByRole('link', { name: 'Activity' })); fireEvent(window, new dom.window.Event('hashchange'))
-  await screen.findByText('A record of searches, recommendations, and submission outcomes.')
+  await screen.findByText('A record of searches, recommendations, and per-release submission outcomes.')
   await waitFor(() => assert.ok(reads >= 2), { timeout: 2500 })
   assert.equal(posts, 1)
   fireEvent.click(screen.getByRole('link', { name: 'Search' })); fireEvent(window, new dom.window.Event('hashchange'))
@@ -216,7 +489,7 @@ it('makes a delayed manual search discoverable after ordinary navigation', async
   fireEvent.change(await screen.findByLabelText('What are you looking for?'), { target: { value: 'Manual request' } })
   fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
   fireEvent.click(document.querySelector('a[href="#activity"]')!); fireEvent(window, new dom.window.Event('hashchange'))
-  await screen.findByText('A record of searches, recommendations, and submission outcomes.')
+  await screen.findByText('A record of searches, recommendations, and per-release submission outcomes.')
   finishPost(Response.json({ searchId: 'late-manual' }, { status: 202 }))
   await waitFor(() => assert.deepEqual(reads, ['late-manual']))
   fireEvent.click(screen.getByRole('link', { name: 'Search' })); fireEvent(window, new dom.window.Event('hashchange'))
@@ -273,7 +546,24 @@ it('filters Activity by media and inclusive local dates and offers every submiss
     assert.equal(query.get('offset'), '0')
   })
   const statuses = within(screen.getByLabelText('Status'))
-  for (const name of ['queued', 'rejected', 'deferred', 'expired']) assert.ok(statuses.queryByRole('option', { name }), `${name} is filterable`)
+  for (const name of ['queued', 'rejected', 'partial', 'not-attempted', 'deferred', 'expired']) assert.ok(statuses.queryByRole('option', { name }), `${name} is filterable`)
+})
+
+it('renders all durable receipt children and suppresses unsafe event fallback when legacy receipts exist', async () => {
+  const result = { ...semanticSearch, receipts: [
+    { executionId: 'exec-partial', searchId: 'life', outcome: 'partial', dryRun: false, updatedAt: '2026-11-19T12:00:00.000Z', client: { name: 'Client A', defaultCategory: 'tv' }, children: [{ candidateId: 'c1', outcome: 'submitted', categoryRouting: 'default', categoryNote: 'Client default: tv' }, { candidateId: 'c2', outcome: 'not-attempted', message: 'Stopped after prior rejection.' }] },
+    { executionId: 'exec-rejected', searchId: 'life', outcome: 'rejected', dryRun: false, updatedAt: '2026-11-19T12:01:00.000Z', children: [{ candidateId: 'c1', outcome: 'rejected', categoryRouting: 'configured-mapping' }] },
+  ], legacyReceipts: [{ searchId: 'life', optionId: 'legacy-option', outcome: 'uncertain', candidateIds: ['c1'], outcomes: [{ candidateId: 'c1', outcome: 'submitted' }] }], events: [{ type: 'submission', data: { secret: 'SHOULD-NOT-RENDER' } }] }
+  lifecycleFetch(url => url === '/api/v2/searches/life' ? Response.json(result) : Response.json({}))
+  const { SearchPage } = await import('./Search')
+  render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
+  assert.ok(await screen.findByRole('heading', { name: 'Durable execution receipts' }))
+  assert.equal(screen.getAllByRole('heading', { name: 'Execution receipt' }).length, 2)
+  assert.ok(screen.getByText('not-attempted'))
+  assert.ok(screen.getByText(/Prowlarr client default/))
+  assert.ok(screen.getByText(/Configured category mapping/))
+  assert.ok(screen.getByRole('heading', { name: 'Historical submission receipts' }))
+  assert.equal(screen.queryByText('SHOULD-NOT-RENDER'), null)
 })
 
 it('shows an unknown count while the initial Activity request is pending', async () => {
@@ -362,10 +652,10 @@ it('renders a nested read-only plan without acquisition controls or submission r
   render(<App />)
   fireEvent.click(await screen.findByRole('button', { name: 'View search details' }))
   assert.ok(await screen.findByText('Best evidence'))
-  assert.ok(screen.getByText(/Covered: target-1/))
-  assert.ok(screen.getByText(/Audio not verified/))
+  assert.ok(screen.getByText('target-1'))
+  assert.ok(screen.getAllByText(/Audio not verified/).length > 0)
   assert.ok(screen.getAllByText(/execution is unavailable/i)[0])
-  assert.equal(screen.queryByRole('button', { name: /download|submission|confirm option/i }), null)
+  assert.equal(screen.queryByRole('button', { name: /^(run dry-run|confirm and submit set|prepare confirmation|choose prowlarr client)$/i }), null)
   assert.equal(requests.some(url => /submissions|download-clients/.test(url)), false)
 })
 
@@ -375,8 +665,8 @@ it('keeps historical submission receipts inspectable without offering execution'
   render(<App />)
   fireEvent.click(await screen.findByRole('button', { name: 'View search details' }))
   assert.ok(await screen.findByRole('heading', { name: 'Historical submission receipts' }))
-  assert.ok(screen.getByText(/uncertain/))
-  assert.equal(screen.queryByRole('button', { name: /confirm|download/i }), null)
+  assert.ok(screen.getAllByText(/uncertain/).length > 0)
+  assert.equal(screen.queryByRole('button', { name: /^(run dry-run|confirm and submit set|prepare confirmation|choose prowlarr client)$/i }), null)
 })
 
 it('keeps search available in dry-run and distinguishes a saved refresh from a live poll', async () => {

@@ -91,13 +91,25 @@ export const downloadClientCategorySchema = z.object({
 });
 
 /** Prowlarr download-client entry — resolved by name to route grabs (D6). */
-export const downloadClientSchema = z.object({
+const downloadClientBaseSchema = z.object({
   id: z.number().int(),
   name: z.string(),
   enable: z.boolean().catch(false),
   protocol: downloadProtocolSchema,
   supportsCategories: z.boolean().catch(false),
   categories: z.array(downloadClientCategorySchema).catch([]),
+  /** Optional for injected clients; parsed Prowlarr entries always expose a value or null. */
+  defaultCategory: z.string().nullable().optional(),
 });
-export type DownloadClient = z.infer<typeof downloadClientSchema>;
+const downloadClientFieldSchema = z.object({ name: z.string(), value: z.unknown().optional() }).passthrough();
+export const downloadClientSchema = downloadClientBaseSchema.extend({
+  fields: z.array(downloadClientFieldSchema).optional(),
+}).transform(({ fields, ...client }) => {
+  const category = fields?.find(field => field.name === 'category')?.value;
+  return {
+    ...client,
+    defaultCategory: typeof category === 'string' ? category : client.defaultCategory ?? null,
+  };
+});
+export type DownloadClient = z.input<typeof downloadClientBaseSchema>;
 export const downloadClientListSchema = z.array(downloadClientSchema);

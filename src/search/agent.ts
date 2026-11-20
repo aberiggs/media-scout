@@ -14,6 +14,7 @@ export interface AgentSearchOptions {
   requestTimeoutMs: number;
   ledger: () => FinalizationLedger;
   ownsSearch: () => boolean;
+  sanitizeFinalizerInput?: (input: unknown) => unknown;
   onFinalize: (result: ReleaseSet) => Promise<void> | void;
   onModelTurn?: (turn: number) => void;
   onUsage?: (usage: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cost?: number }) => void;
@@ -52,7 +53,7 @@ export async function runAgentSearch(options: AgentSearchOptions): Promise<Relea
         if (!options.ownsSearch()) throw new Error('Search ownership lost');
         finalizing = true;
         try {
-          const validated = finalizeReleaseSet(input, options.ledger());
+          const validated = finalizeReleaseSet(options.sanitizeFinalizerInput?.(input) ?? input, options.ledger());
           await options.onFinalize(validated);
           if (!options.ownsSearch() || options.signal.aborted) throw new Error('Search ownership lost');
           finalized = validated;

@@ -156,6 +156,30 @@ describe('search runtime', () => {
     f.store.updateSubmissionResult('crash', 'submitted', { outcomes: [{ candidateId: 'candidate', outcome: 'submitted' }] });
     expect(f.runtime.activity({ status: 'submitted' }).items[0]?.submission).toMatchObject({ outcome: 'submitted', outcomes: [{ candidateId: 'candidate', outcome: 'submitted' }] });
   });
+  it('keeps durable legacy receipts authoritative over newer incidental events and exposes only safe receipt fields', async () => {
+    const f = setup();
+    matched(f, f.now + 1000);
+    f.store.beginSubmission({
+      idempotencyKey: 'durable-legacy',
+      payload: { request: { searchId: 'matched', optionId: 'option-1' }, candidateIds: ['candidate'] },
+      createdAt: f.now,
+    });
+    f.store.updateSubmissionResult('durable-legacy', 'submitted', {
+      outcomes: [{ candidateId: 'candidate', outcome: 'submitted' }],
+      privateLocator: 'PRIVATE-LOCATOR-CANARY',
+    });
+    f.store.appendEvent('matched', { type: 'submission', data: { outcome: 'rejected', outcomes: [] } }, f.now + 100);
+
+    expect(f.runtime.activity().items.find(item => item.searchId === 'matched')?.submission).toMatchObject({
+      outcome: 'submitted', outcomes: [{ candidateId: 'candidate', outcome: 'submitted' }],
+    });
+    const detail=await f.runtime.getSearch('matched');
+    expect(detail?.legacyReceipts).toMatchObject([{
+      searchId: 'matched', optionId: 'option-1', outcome: 'submitted',
+      candidateIds: ['candidate'], outcomes: [{ candidateId: 'candidate', outcome: 'submitted' }],
+    }]);
+    expect(JSON.stringify(detail?.legacyReceipts)).not.toContain('PRIVATE-LOCATOR-CANARY');
+  });
   it('does not cache mixed-source observations when configuration changes during a read', async () => {
     const store = openSearchStore(':memory:'); stores.push(store);
     const settings = structuredClone(defaultSettings);

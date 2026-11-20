@@ -11,11 +11,11 @@ import { createServer } from 'node:http';
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const close of cleanups.splice(0)) await close(); });
-async function fixture(clientOverride?: RuntimeClients) {
+async function fixture(clientOverride?: RuntimeClients, now?: () => number) {
   let reads = 0, grabs = 0;
   const initialSettings = { ...defaultSettings, ai: { ...defaultSettings.ai, apiKey: 'private-model' }, integrations: { ...defaultSettings.integrations, prowlarr: { ...defaultSettings.integrations.prowlarr, url: 'http://indexer.test', apiKey: 'private-indexer' }, sonarr: { url: 'http://sonarr.test', apiKey: 'private-sonarr' }, radarr: { url: '', apiKey: '' } } };
   const runtime = new SearchRuntime({
-    store: openSearchStore(':memory:'), initialSettings,
+    store: openSearchStore(':memory:'), initialSettings, now,
     clients: () => clientOverride ?? ({
       prowlarr: {
         getIndexers: async () => { reads++; return [{ id: 1, name: 'Index', enable: true }]; },
@@ -43,13 +43,197 @@ describe('search-first HTTP contract', () => {
     try {
       await app.listen({ host: '127.0.0.1', port: 0 });
       runtime.store.setProviderDeadline('model', Date.now() + 60_000);
+      runtime.saveSettings({ ...runtime.getSettings(), monitoring: { ...runtime.getSettings().monitoring, enabled: true, allowDownloads: true }, safety: { dryRun: false } });
       await runtime.poll();
+      expect(runtime.activity().items).toHaveLength(0);
       const id = runtime.automationStatus().items[0]!.targetId;
       const started = await runtime.startArrSearch(id);
+      expect(await runtime.getSearch(started.searchId)).toMatchObject({ source: 'arr', manualExecutionEligible: false });
       const intent = (await runtime.getSearch(started.searchId))!.normalizedRequest!.intents[0]!;
       expect(intent).toMatchObject({ season: 2, episode: 1 });
       expect(intent).not.toHaveProperty('absoluteEpisode');
     } finally { await app.close(); await runtime.close(); }
+  });
+  it('keeps scheduled automation disabled until explicitly activated', async () => {
+    const { runtime, reads } = await fixture();
+    await expect(runtime.runAutomation()).resolves.toMatchObject({ ran: false, reason: 'automation-disabled' });
+    expect(reads()).toBe(0);
+  });
+  it('does not apply saved automation preferences to an explicit manual search', async () => {
+    const { app, runtime } = await fixture();
+    await app.listen({ host: '127.0.0.1', port: 0 });
+    runtime.saveSettings({ ...runtime.getSettings(), ai: { ...runtime.getSettings().ai, preferences: 'automation-only-note' } });
+    const started = await runtime.startSearch({ prompt: 'Manual preference scope' });
+    expect((await runtime.getSearch(started.searchId))?.normalizedRequest?.preferences).toEqual({});
+    await app.close(); await runtime.close();
+  });
+  it('scheduled pass observes complete state under the shared lease but does not create work when nothing is missing', async () => {
+    const { app, runtime } = await fixture({
+      sonarr: {
+        getSeries: async () => [{ id: 4, tvdbId: 44, title: 'Owned Show', titleSlug: 'owned-show', seriesType: 'standard', monitored: true, seasons: [], alternateTitles: [] }],
+        getEpisodes: async () => [{ id: 40, seriesId: 4, seasonNumber: 1, episodeNumber: 1, absoluteEpisodeNumber: 1, title: 'Owned', airDate: '2020-01-01', airDateUtc: null, finaleType: null, monitored: true, hasFile: true }],
+        getQueue: async () => [],
+      },
+    });
+    await app.listen({ host: '127.0.0.1', port: 0 });
+    runtime.saveSettings({ ...runtime.getSettings(), monitoring: { ...runtime.getSettings().monitoring, enabled: true } });
+    await expect(runtime.runAutomation()).resolves.toMatchObject({ ran: false, reason: 'no-actionable-target' });
+    expect(runtime.activity().items).toHaveLength(0);
+    expect(runtime.store.hasLiveLease('automation-pass', Date.now())).toBe(false);
+    await app.close(); await runtime.close();
+  });
+  it('schedules one canonical show workload as an automation-owned search', async () => {
+    let calls = 0;
+    const responses = createServer(async (_request, response) => {
+      calls++;
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        id: 'scheduled-fixture', object: 'response', created_at: 1, completed_at: 1, status: 'completed',
+        error: null, incomplete_details: null, instructions: null, model: 'fixture/model',
+        output: [{ id: 'scheduled-call', type: 'function_call', call_id: 'scheduled-call', name: 'finalize_release_set',
+          arguments: JSON.stringify({ status: 'no-match', selections: [], covered: [], gaps: ['No suitable release observed'], deferred: [], broadCoverage: 'none', scopeGaps: [] }), status: 'completed' }],
+        parallel_tool_calls: false, tool_choice: 'auto', tools: [], usage: null, metadata: null,
+        frequency_penalty: null, presence_penalty: null, temperature: null, top_p: null,
+      }));
+    });
+    await new Promise<void>(resolve => responses.listen(0, '127.0.0.1', resolve));
+    const upstream = responses.address();
+    if (!upstream || typeof upstream === 'string') throw new Error('Missing scheduled Responses fixture');
+    const { app, runtime } = await fixture({
+      sonarr: {
+        getSeries: async () => [4, 5].map(id => ({ id, tvdbId: id * 10, title: `Show ${id}`, titleSlug: `show-${id}`, seriesType: 'standard' as const, monitored: true, seasons: [], alternateTitles: [] })),
+        getEpisodes: async id => [1, 2].map(n => ({ id: id * 10 + n, seriesId: id, seasonNumber: 1, episodeNumber: n, absoluteEpisodeNumber: n, title: `Episode ${n}`, airDate: '2020-01-01', airDateUtc: null, finaleType: null, monitored: true, hasFile: false })),
+        getQueue: async () => [],
+      },
+    });
+    try {
+      runtime.saveSettings({ ...runtime.getSettings(), ai: { ...runtime.getSettings().ai, baseUrl: `http://127.0.0.1:${upstream.port}` }, monitoring: { ...runtime.getSettings().monitoring, enabled: true } });
+      await app.listen({ host: '127.0.0.1', port: 0 });
+      const pass = await runtime.runAutomation();
+      const search = runtime.activity().items[0] && await runtime.getSearch(runtime.activity().items[0]!.searchId);
+      expect({ pass, search }).toMatchObject({ pass: { ran: true, reason: 'no-match' }, search: { status: 'no-match' } });
+      await expect(runtime.runAutomation()).resolves.toMatchObject({ ran: true, reason: 'no-match' });
+      expect(calls).toBe(2);
+      expect(runtime.activity().items).toHaveLength(2);
+      const searches=await Promise.all(runtime.activity().items.map(item=>runtime.getSearch(item.searchId)));
+      expect(searches.map(item=>item?.prompt).sort()).toEqual(['Find releases for Show 4 (2 aired missing episodes)','Find releases for Show 5 (2 aired missing episodes)']);
+      expect(searches.every(item=>item?.source==='automation'&&!item.manualExecutionEligible&&item.status==='no-match')).toBe(true);
+      expect(searches.every(item=>item?.normalizedRequest?.intents.map(intent=>[intent.season,intent.episode]).join('|')==='1,1|1,2')).toBe(true);
+      expect(runtime.store.getSetting(`search-source:${runtime.activity().items[0]!.searchId}`)).toBe('automation');
+    } finally {
+      await app.close(); await runtime.close();
+      await new Promise<void>((resolve, reject) => responses.close(error => error ? reject(error) : resolve()));
+    }
+  });
+  it('internally executes only the persisted automation selection as an automation receipt', async () => {
+    let calls=0,runtimeRef:SearchRuntime|undefined,autoGrabs=0, newlyAired=false, arrCaughtUp=false, clock=Date.now();
+    const release=releaseSchema.parse({guid:'scheduled-release',age:1,size:100,files:null,grabs:null,indexerId:1,indexer:'Index',subGroup:null,title:'Show 4 S01 1080p',tvdbId:40,tmdbId:null,publishDate:'',downloadUrl:null,indexerFlags:[],categories:[],magnetUrl:null,infoHash:'a'.repeat(40),seeders:1,leechers:0,protocol:'torrent',downloadClientId:null});
+    const responses=createServer(async(request,response)=>{
+      const chunks:Buffer[]=[];for await(const chunk of request)chunks.push(Buffer.from(chunk));
+      const body=JSON.parse(Buffer.concat(chunks).toString()) as {tools?:Array<{name?:string}>};
+      calls++;
+      const name=calls===1?(body.tools?.find(tool=>tool.name?.includes('prowlarr_search'))?.name??'prowlarr_search'):'finalize_release_set';
+      const candidate=runtimeRef?.store.listCandidates(runtimeRef.activity().items[0]?.searchId??'')[0]?.candidateId;
+      const args=calls>2?{status:'no-match',selections:[],covered:[],gaps:['Still missing'],deferred:[],broadCoverage:'none',scopeGaps:[]}:name==='prowlarr_search'?{query:'Show 4'}:{status:'matched',selections:[{candidateId:candidate,coverage:'The requested episodes',reason:'The release covers the requested episodes',uncertainty:''}],covered:['The requested episodes'],gaps:[],deferred:[],broadCoverage:'complete',scopeGaps:[]};
+      response.writeHead(200,{'content-type':'application/json'});
+      response.end(JSON.stringify({id:`scheduled-${calls}`,object:'response',created_at:1,completed_at:1,status:'completed',error:null,incomplete_details:null,instructions:null,model:'fixture/model',output:[{id:`call-${calls}`,type:'function_call',call_id:`call-${calls}`,name,arguments:JSON.stringify(args),status:'completed'}],parallel_tool_calls:false,tool_choice:'auto',tools:[],usage:null,metadata:null,frequency_penalty:null,presence_penalty:null,temperature:null,top_p:null}));
+    });
+    await new Promise<void>(resolve=>responses.listen(0,'127.0.0.1',resolve));
+    const address=responses.address(); if(!address||typeof address==='string')throw new Error('Missing automation execution fixture');
+    const {app,runtime,grabs}=await fixture({
+      prowlarr:{getIndexers:async()=>[{id:1,name:'Index',enable:true}],getIndexerStatuses:async()=>[],search:async()=>[release],getDownloadClients:async()=>[{id:7,name:'TV',protocol:'torrent',enable:true,supportsCategories:true,categories:[]}],grab:async()=>{autoGrabs++;}},
+      sonarr:{getSeries:async()=>[{id:4,tvdbId:40,title:'Show 4',titleSlug:'show-4',seriesType:'standard',monitored:true,seasons:[],alternateTitles:[]}],getEpisodes:async id=>(newlyAired?[1,2,3]:[1,2]).map(n=>({id:40+n,seriesId:id,seasonNumber:n,episodeNumber:n,absoluteEpisodeNumber:n,title:`Episode ${n}`,airDate:'2020-01-01',airDateUtc:null,finaleType:null,monitored:true,hasFile:arrCaughtUp&&n===2})),getQueue:async()=>arrCaughtUp?[{seriesId:4,episodeId:41,status:'downloading'}]:[]},
+    },()=>clock);
+    runtimeRef=runtime;
+    try{
+      runtime.saveSettings({...runtime.getSettings(),ai:{...runtime.getSettings().ai,baseUrl:`http://127.0.0.1:${address.port}`,preferences:'Prefer 1080p, never send private-sonarr'},integrations:{...runtime.getSettings().integrations,prowlarr:{...runtime.getSettings().integrations.prowlarr,tvClient:'7'}},monitoring:{...runtime.getSettings().monitoring,enabled:true,allowDownloads:true},safety:{dryRun:false}});
+      await app.listen({host:'127.0.0.1',port:0});
+      await expect(runtime.runAutomation()).resolves.toMatchObject({ran:true,reason:'matched'});
+      const searchId=runtime.activity().items[0]!.searchId;
+      expect(await runtime.getSearch(searchId)).toMatchObject({source:'automation',manualExecutionEligible:false,status:'matched',receipts:[{outcome:'submitted',children:[{outcome:'submitted'}]}]});
+      expect(autoGrabs).toBe(1);
+      newlyAired=true;
+      await expect(runtime.runAutomation()).resolves.toMatchObject({ran:false,reason:'no-actionable-target'});
+      expect(runtime.automationStatus().items.find(item=>item.seasonNumber===3)).toMatchObject({status:'grace',eligible:false});
+      expect(JSON.stringify(await runtime.getSearch(searchId))).not.toContain('private-sonarr');
+      expect(calls).toBe(2);
+      arrCaughtUp=true;clock+=30*60_000;
+      await expect(runtime.runAutomation()).resolves.toMatchObject({ran:true,reason:'no-match'});
+      const next=await runtime.getSearch(runtime.activity().items[0]!.searchId);
+      expect(next?.normalizedRequest?.intents).toMatchObject([{season:3,episode:3}]);
+      expect(next?.normalizedRequest?.contextEpisodes).toMatchObject([{contextReason:'observed-in-queue'},{contextReason:'already-owned'}]);
+      expect(autoGrabs).toBe(1);
+      expect(grabs()).toBe(0);
+    }finally{
+      await app.close();await runtime.close();
+      await new Promise<void>((resolve,reject)=>responses.close(error=>error?reject(error):resolve()));
+    }
+  });
+  it.each(['route','new-queue','same-plan-tail','external-tail','dry-run'] as const)('fences automatic sending at the %s boundary', async mode => {
+    let calls=0,lists=0,runtimeRef:SearchRuntime|undefined,grabs=0,queued=false;
+    const release=releaseSchema.parse({guid:'client-race-release',age:1,size:100,files:null,grabs:null,indexerId:1,indexer:'Index',subGroup:null,title:'Show 4 S01 1080p',tvdbId:40,tmdbId:null,publishDate:'',downloadUrl:null,indexerFlags:[],categories:[],magnetUrl:null,infoHash:'b'.repeat(40),seeders:1,leechers:0,protocol:'torrent',downloadClientId:null});
+    const tail=mode==='same-plan-tail'||mode==='external-tail';
+    const responses=createServer(async(request,response)=>{
+      const chunks:Buffer[]=[];for await(const chunk of request)chunks.push(Buffer.from(chunk));
+      const body=JSON.parse(Buffer.concat(chunks).toString()) as {tools?:Array<{name?:string}>};
+      calls++;
+      const name=calls===1?(body.tools?.find(tool=>tool.name?.includes('prowlarr_search'))?.name??'prowlarr_search'):'finalize_release_set';
+      const candidates=runtimeRef?.store.listCandidates(runtimeRef.activity().items[0]?.searchId??'')??[];
+      if(mode==='dry-run'&&name==='finalize_release_set')runtimeRef!.saveSettings({...runtimeRef!.getSettings(),safety:{dryRun:false}});
+      const args=name==='prowlarr_search'?{query:'Show 4'}:{status:'matched',selections:candidates.map(({candidateId})=>({candidateId,coverage:'The requested episode',reason:'Observed release',uncertainty:''})),covered:['The requested episode'],gaps:[],deferred:[],broadCoverage:'complete',scopeGaps:[]};
+      response.writeHead(200,{'content-type':'application/json'});
+      response.end(JSON.stringify({id:`client-race-${calls}`,object:'response',created_at:1,completed_at:1,status:'completed',error:null,incomplete_details:null,instructions:null,model:'fixture/model',output:[{id:`call-${calls}`,type:'function_call',call_id:`call-${calls}`,name,arguments:JSON.stringify(args),status:'completed'}],parallel_tool_calls:false,tool_choice:'auto',tools:[],usage:null,metadata:null,frequency_penalty:null,presence_penalty:null,temperature:null,top_p:null}));
+    });
+    await new Promise<void>(resolve=>responses.listen(0,'127.0.0.1',resolve));
+    const address=responses.address();if(!address||typeof address==='string')throw new Error('Missing client race Responses fixture');
+    const {app,runtime}=await fixture({
+      prowlarr:{getIndexers:async()=>[{id:1,name:'Index',enable:true}],getIndexerStatuses:async()=>[],search:async()=>tail?[release,{...release,guid:'tail-release',infoHash:'c'.repeat(40),title:'Show 4 E02 1080p'}]:[release],getDownloadClients:async()=>{
+        lists++;
+        if(lists===4&&mode==='route')runtimeRef!.saveSettings({...runtimeRef!.getSettings(),integrations:{...runtimeRef!.getSettings().integrations,prowlarr:{...runtimeRef!.getSettings().integrations.prowlarr,tvClient:'8'}}});
+        if(lists===4&&mode==='new-queue')queued=true;
+        return [{id:7,name:'TV',protocol:'torrent',enable:true,supportsCategories:true,categories:[]}];
+      },grab:async()=>{grabs++;if(tail)queued=true;}},
+      sonarr:{getSeries:async()=>[{id:4,tvdbId:40,title:'Show 4',titleSlug:'show-4',seriesType:'standard',monitored:true,seasons:[],alternateTitles:[]}],getEpisodes:async id=>(tail?[1,2]:[1]).map(n=>({id:40+n,seriesId:id,seasonNumber:n,episodeNumber:n,absoluteEpisodeNumber:n,title:'Episode',airDate:'2020-01-01',airDateUtc:null,finaleType:null,monitored:true,hasFile:false})),getQueue:async()=>queued?[{seriesId:4,status:'downloading',downloadId:mode==='same-plan-tail'?release.infoHash:'d'.repeat(40)}]:[]},
+    });
+    runtimeRef=runtime;
+    try{
+      runtime.saveSettings({...runtime.getSettings(),ai:{...runtime.getSettings().ai,baseUrl:`http://127.0.0.1:${address.port}`,model:'fixture-model'},integrations:{...runtime.getSettings().integrations,prowlarr:{...runtime.getSettings().integrations.prowlarr,tvClient:'7'}},monitoring:{...runtime.getSettings().monitoring,enabled:true,allowDownloads:true},safety:{dryRun:mode==='dry-run'}});
+      await app.listen({host:'127.0.0.1',port:0});
+      await expect(runtime.poll()).resolves.toMatchObject({ran:false,reason:'observation-only'});
+      expect(calls).toBe(0);
+      await expect(runtime.runAutomation()).resolves.toMatchObject({ran:true,reason:'matched'});
+      const search=await runtime.getSearch(runtime.activity().items[0]!.searchId);
+      expect(lists).toBe(tail?5:mode==='dry-run'?0:4);
+      expect(grabs).toBe(mode==='same-plan-tail'?2:mode==='external-tail'?1:0);
+      expect(search?.receipts?.map(receipt=>receipt.outcome)).toEqual(mode==='dry-run'?[]:[mode==='same-plan-tail'?'submitted':mode==='external-tail'?'partial':'not-attempted']);
+      expect(search?.automationPending).toBeUndefined();
+    }finally{
+      await app.close();await runtime.close();
+      await new Promise<void>((resolve,reject)=>responses.close(error=>error?reject(error):resolve()));
+    }
+  });
+  it('canonicalizes one automated movie from the fresh Radarr observation', async () => {
+    const responses=createServer(async(_request,response)=>{
+      for await(const _chunk of _request) { /* consume */ }
+      response.writeHead(200,{'content-type':'application/json'});
+      response.end(JSON.stringify({id:'movie-schedule',object:'response',created_at:1,completed_at:1,status:'completed',error:null,incomplete_details:null,instructions:null,model:'fixture/model',output:[{id:'movie-final',type:'function_call',call_id:'movie-final',name:'finalize_release_set',arguments:JSON.stringify({status:'no-match',selections:[],covered:[],gaps:['No suitable movie release observed'],deferred:[],broadCoverage:'none',scopeGaps:[]}),status:'completed'}],parallel_tool_calls:false,tool_choice:'auto',tools:[],usage:null,metadata:null,frequency_penalty:null,presence_penalty:null,temperature:null,top_p:null}));
+    });
+    await new Promise<void>(resolve=>responses.listen(0,'127.0.0.1',resolve));
+    const address=responses.address();if(!address||typeof address==='string')throw new Error('Missing movie automation fixture');
+    const {app,runtime}=await fixture({radarr:{
+      getMovies:async()=>[{id:77,tmdbId:770,title:'Observed Movie',titleSlug:'observed-movie',year:2020,monitored:true,hasFile:false,isAvailable:true,sizeOnDisk:0,qualityProfileId:1,tags:[]}],
+      getQueue:async()=>[],
+    }});
+    try{
+      runtime.saveSettings({...runtime.getSettings(),ai:{...runtime.getSettings().ai,baseUrl:`http://127.0.0.1:${address.port}`},integrations:{...runtime.getSettings().integrations,radarr:{url:'http://radarr.test',apiKey:'private-radarr'}},monitoring:{...runtime.getSettings().monitoring,enabled:true}});
+      await app.listen({host:'127.0.0.1',port:0});
+      await expect(runtime.runAutomation()).resolves.toMatchObject({ran:true,reason:'no-match'});
+      const search=await runtime.getSearch(runtime.activity().items[0]!.searchId);
+      expect(search).toMatchObject({source:'automation',prompt:expect.stringContaining('Observed Movie'),normalizedRequest:{kind:'movie',externalIds:{tmdb:770},intents:[{type:'movie'}]}});
+    }finally{
+      await app.close();await runtime.close();
+      await new Promise<void>((resolve,reject)=>responses.close(error=>error?reject(error):resolve()));
+    }
   });
 
   it('drains in-flight Arr preparation and refuses enqueue after quiesce', async () => {
@@ -413,7 +597,7 @@ describe('search-first HTTP contract', () => {
   });
   it('uses v2 settings with optional Arr and omits all legacy mutation routes', async () => {
     const { app, grabs } = await fixture();
-    expect((await app.inject('/api/settings')).json()).toMatchObject({ settings: { version: 3 }, status: { ready: true } });
+    expect((await app.inject('/api/settings')).json()).toMatchObject({ settings: { version: 4, monitoring: { allowDownloads: false } }, status: { ready: true } });
     expect((await app.inject({ method: 'POST', url: '/cycle' })).statusCode).toBe(404);
     expect((await app.inject({ method: 'POST', url: '/api/operations/work/action', payload: { action: 'reset' } })).statusCode).toBe(404);
     expect(grabs()).toBe(0);

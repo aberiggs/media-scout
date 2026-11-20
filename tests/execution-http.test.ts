@@ -128,6 +128,13 @@ describe('execution API through real Prowlarr HTTP adapter',()=>{
     await expect(f.runtime.commitExecution({confirmationId:c.confirmationId,searchId:f.searchId,planId:'plan-one',version:2,idempotencyKey:'source-race'})).rejects.toThrow('source-changed');
     expect(f.posts).toHaveLength(0);
   });
+  it('does not POST when the pinned Prowlarr source changes during commit-time client discovery',async()=>{
+    const f=await fixture();
+    const c=await f.runtime.prepareExecution({searchId:f.searchId,planId:'plan-one',version:2,candidateIds:f.candidateIds,downloadClientId:7});
+    f.changeSourceOnNextClientList();
+    await expect(f.runtime.commitExecution({confirmationId:c.confirmationId,searchId:f.searchId,planId:'plan-one',version:2,idempotencyKey:'source-final-discovery-race'})).rejects.toThrow('source-changed');
+    expect(f.posts).toHaveLength(0);
+  });
   it('stores candidate source identity from the capability snapshot during in-flight research',async()=>{
     const f=await fixture();
     const token=f.runtime.createProwlarrMcpCapability(f.searchId).token;

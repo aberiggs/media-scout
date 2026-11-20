@@ -1,6 +1,7 @@
 import { callModel, stepCountIs, tool } from '@openrouter/agent';
 import { createMCPTools } from '@openrouter/agent/mcp';
 import { finalizeReleaseSetInputSchema, type FinalizationLedger, type ReleaseSet, finalizeReleaseSet } from './agent-contracts';
+import { connectApprovedResearchTools, type enabledResearchServerConfigs } from './research-mcp';
 
 export interface AgentSearchOptions {
   client: Parameters<typeof callModel>[0];
@@ -9,6 +10,9 @@ export interface AgentSearchOptions {
   instructions?: string;
   mcpUrl: string;
   capability: string;
+  researchServers?: ReturnType<typeof enabledResearchServerConfigs>;
+  researchEndpoints?: readonly string[];
+  researchSecrets?: readonly string[];
   signal: AbortSignal;
   maxSteps: number;
   requestTimeoutMs: number;
@@ -18,6 +22,7 @@ export interface AgentSearchOptions {
   onFinalize: (result: ReleaseSet) => Promise<void> | void;
   onModelTurn?: (turn: number) => void;
   onUsage?: (usage: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cost?: number }) => void;
+  onResearchWarning?: (message: string) => void;
 }
 export class AgentBudgetExhaustedError extends Error {
   constructor() { super('Agent step budget exhausted without a validated release set'); this.name = 'AgentBudgetExhaustedError'; }
@@ -32,6 +37,7 @@ export async function runAgentSearch(options: AgentSearchOptions): Promise<Relea
     signal: options.signal,
     resources: false,
   });
+  let external: Awaited<ReturnType<typeof connectApprovedResearchTools>> | undefined;
   let finalized: ReleaseSet | undefined;
   let finalizing = false;
   let modelTurns = 0;
@@ -41,6 +47,9 @@ export async function runAgentSearch(options: AgentSearchOptions): Promise<Relea
   else options.signal.addEventListener('abort', abort, { once: true });
   try {
     if (options.signal.aborted) throw options.signal.reason ?? new Error('aborted');
+    if (options.researchServers?.length) {
+      external = await connectApprovedResearchTools(options.researchServers, options.researchEndpoints ?? [], controller.signal, options.researchSecrets ?? [], options.onResearchWarning);
+    }
     const finalizer = tool({
       name: 'finalize_release_set',
       description: 'Finalize exactly one release set from observed candidates. Call only when research is complete.',
@@ -66,7 +75,7 @@ export async function runAgentSearch(options: AgentSearchOptions): Promise<Relea
       model: options.model,
       input: options.input,
       ...(options.instructions ? { instructions: options.instructions } : {}),
-      tools: [...handle.tools, finalizer] as const,
+      tools: [...handle.tools, ...(external?.tools ?? []), finalizer] as const,
       stopWhen: [stepCountIs(options.maxSteps), () => !!finalized],
       allowFinalResponse: false,
       signal: controller.signal,
@@ -96,6 +105,7 @@ export async function runAgentSearch(options: AgentSearchOptions): Promise<Relea
   } finally {
     options.signal.removeEventListener('abort', abort);
     controller.abort();
+    try { await external?.close(); } catch { /* Preserve the run's actual outcome. */ }
     try { await handle.close(); } catch { /* Preserve the run's actual outcome. */ }
   }
 }

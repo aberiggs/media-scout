@@ -3,6 +3,7 @@ import { Activity as ActivityIcon, Bot, Check, CheckCircle2, CircleAlert, Copy, 
 import { defaults, mergeSettings, type Settings, type SettingsEnvelope } from './types'
 import { SearchPage } from './Search'
 import { ActivityPage, AutomationPage } from './Activity'
+import { ResearchMcpSettings } from './ResearchMcpSettings'
 
 type Page = 'search' | 'activity' | 'automation' | 'settings'
 function pageFromHash(): Page { const value = location.hash.slice(1); return ['activity', 'automation', 'settings'].includes(value) ? value as Page : 'search' }
@@ -112,7 +113,8 @@ export default function App() {
              <div className="rail-card cycle-card"><div className="rail-icon"><Radio size={17}/></div><div className="cycle-title"><strong>Automatic monitoring</strong><span className={status?.monitoringEnabled ? 'state-on' : 'state-off'}><span className="tiny-dot"/>{status?.monitoringEnabled ? 'Enabled' : 'Paused'}</span></div><p>Scheduled checks use your Arr libraries. You can still search manually while monitoring is paused.</p></div>
              <div className="privacy-card"><div className="privacy-icon"><KeyRound size={16}/></div><div><strong>Keep this instance private</strong><p>API keys are stored here and visible to anyone with access. Only expose this app on a trusted network.</p></div></div>
              {committed?.safety.dryRun && <div className="dry-run-note"><ShieldCheck size={15}/><span>Dry-run prevents download submission. Searches still call your model and indexers.</span></div>}
-           </aside></div></form>}
+            </aside></div></form>}
+            {!loading && <div className="research-settings"><ResearchMcpSettings/></div>}
         </>}
         <footer className="page-footer"><span>Media Scout</span><span className="footer-divider"/><span>Made for your home lab</span></footer>
       </main>

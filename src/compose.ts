@@ -7,5 +7,6 @@ export type BuildStackDeps = SearchRuntimeOptions & { config: Config; logger?: p
 
 /** One modular runtime, not two acquisition engines. */
 export function buildStack(deps: BuildStackDeps): Stack {
-  return { config: deps.config, logger: deps.logger ?? pino({ level: deps.config.LOG_LEVEL }), runtime: new SearchRuntime({ ...deps, databasePath: deps.config.DB_PATH }) };
+  const { RESEARCH_MCP_ENDPOINTS, ...runtimeOptions } = deps.config;
+  return { config: deps.config, logger: deps.logger ?? pino({ level: deps.config.LOG_LEVEL }), runtime: new SearchRuntime({ ...deps, ...runtimeOptions, researchMcpEndpoints: RESEARCH_MCP_ENDPOINTS.split(',').filter(Boolean), databasePath: deps.config.DB_PATH }) };
 }

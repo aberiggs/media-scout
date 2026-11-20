@@ -1,6 +1,6 @@
 import type { ArrTarget } from './arr';
 import { EPISODE_SET_LIMITS, searchRequestSchema, type SearchRequest } from './contracts';
-import { safeText } from './service';
+import { safeText } from './release-observation';
 
 export function buildEpisodeSetRequest(input: {
   show?: Record<string, unknown>; targets: ArrTarget[]; related: ArrTarget[]; observedAt: number;

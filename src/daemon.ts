@@ -8,13 +8,13 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { buildStack, type Stack } from './compose';
 import { loadConfig } from './config';
-import { searchRequestSchema, submissionRequestSchema, activityStatusSchema } from './search/contracts';
+import { searchRequestSchema, activityStatusSchema } from './search/contracts';
 import { missingSettings, type Settings } from './settings';
 import { createProwlarrMcpServer } from './search/prowlarr-mcp';
 
 declare module 'fastify' { interface FastifyInstance { refreshScheduler?: () => void } }
 const identifier = z.string().trim().min(1).max(200);
-const activityQuery = z.object({ limit: z.coerce.number().int().min(1).max(100).default(50), offset: z.coerce.number().int().min(0).max(1_000_000).default(0), q: z.string().max(200).optional(), status: activityStatusSchema.optional(), source: z.enum(['manual', 'automation']).optional(), kind: z.enum(['tv', 'movie', 'other']).optional(), createdAtFrom: z.string().max(40).datetime({ offset: true }).optional(), createdAtTo: z.string().max(40).datetime({ offset: true }).optional() }).strict().refine(q => !q.createdAtFrom || !q.createdAtTo || Date.parse(q.createdAtFrom) <= Date.parse(q.createdAtTo), { message: 'createdAtFrom must be on or before createdAtTo' });
+const activityQuery = z.object({ limit: z.coerce.number().int().min(1).max(100).default(50), offset: z.coerce.number().int().min(0).max(1_000_000).default(0), q: z.string().max(200).optional(), status: activityStatusSchema.optional(), source: z.enum(['manual', 'automation', 'arr']).optional(), kind: z.enum(['tv', 'movie', 'other']).optional(), createdAtFrom: z.string().max(40).datetime({ offset: true }).optional(), createdAtTo: z.string().max(40).datetime({ offset: true }).optional() }).strict().refine(q => !q.createdAtFrom || !q.createdAtTo || Date.parse(q.createdAtFrom) <= Date.parse(q.createdAtTo), { message: 'createdAtFrom must be on or before createdAtTo' });
 function mutationAllowed(request: { headers: Record<string, string | string[] | undefined> }): boolean {
   if (request.headers['sec-fetch-site'] === 'cross-site') return false;
   if (typeof request.headers.origin === 'string') {
@@ -26,6 +26,13 @@ function mutationAllowed(request: { headers: Record<string, string | string[] | 
 export async function buildApp(stack: Stack, options: { webRoot?: string } = {}) {
   const { runtime } = stack;
   const app = Fastify({ loggerInstance: stack.logger.child({ component: 'daemon' }), bodyLimit: 1_048_576, logController: new LogController({ disableRequestLogging: true }) });
+  app.server.once('listening', () => {
+    const address = app.server.address();
+    if (address && typeof address !== 'string') {
+      const host = address.address === '::' ? '::1' : address.address === '0.0.0.0' ? '127.0.0.1' : address.address;
+      runtime.setInternalMcpUrl(`http://${host.includes(':') ? `[${host}]` : host}:${address.port}/internal/mcp/prowlarr`);
+    }
+  });
   type ProwlarrSession = { token: string; transport: NodeStreamableHTTPServerTransport; responses: Set<Promise<void>> };
   const prowlarrSessions = new Map<string, ProwlarrSession>();
   const serveProwlarrSession = async (session: ProwlarrSession, request: FastifyRequest, reply: FastifyReply) => {
@@ -61,6 +68,10 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
   });
   const envelope = () => { const settings = runtime.getSettings(), missing = missingSettings(settings); return { settings, status: { ready: missing.length === 0, missing, monitoringEnabled: settings.monitoring.enabled, cycleRunning: runtime.automationStatus().running } }; };
   app.get('/health', async () => ({ status: 'ok', interfaceVersion: 2, dryRun: runtime.getSettings().safety.dryRun }));
+  app.get('/api/v2/status', async () => {
+    const missing = runtime.missingSettings();
+    return { ready: missing.length === 0, missing, ...runtime.automationStatus() };
+  });
   app.get('/api/settings', async () => envelope());
   app.put('/api/settings', async (request, reply) => {
     const saved = runtime.saveSettings(request.body);
@@ -68,7 +79,7 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
     app.refreshScheduler?.();
     return envelope();
   });
-  app.post('/api/v2/searches', async (request, reply) => reply.code(202).send(runtime.startSearch(searchRequestSchema.parse(request.body))));
+  app.post('/api/v2/searches', async (request, reply) => reply.code(202).send(await runtime.startSearch(searchRequestSchema.parse(request.body))));
   app.all('/internal/mcp/prowlarr', async (request, reply) => {
     const match = /^Bearer ([a-f\d]{64})$/i.exec(String(request.headers.authorization ?? ''));
     if (!match || !runtime.hasProwlarrMcpCapability(match[1]!)) return reply.code(401).send({ error: 'Unauthorized' });
@@ -122,7 +133,7 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
     return runtime.activity(activityQuery.parse(raw));
   });
   app.get('/api/v2/download-clients', async () => ({ items: await runtime.downloadClients() }));
-  app.post('/api/v2/submissions', async request => runtime.submit(submissionRequestSchema.parse(request.body)));
+  app.post('/api/v2/submissions', async (_request, reply) => reply.code(410).send({ error: 'Release execution is deferred', code: 'execution-deferred' }));
   app.get('/api/v2/submissions/:id', async (request, reply) => {
     const receipt = runtime.store.getSubmission(identifier.parse((request.params as { id: string }).id));
     if (!receipt) return reply.code(404).send({ error: 'Submission not found' });

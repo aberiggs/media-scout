@@ -1,23 +1,21 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openSearchStore } from '../src/search/store';
-import { SearchRuntime, type RuntimeClients } from '../src/search/runtime';
+import { SearchRuntime } from '../src/search/runtime';
 import { showCooldownSettingKey } from '../src/search/automation';
 import { defaultSettings, type Settings } from '../src/search/settings';
-import type { LLMClient } from '../src/clients/llm';
 import { releaseSchema } from '../src/types/prowlarr';
 
 const stores: ReturnType<typeof openSearchStore>[] = [];
 afterEach(() => { for (const store of stores.splice(0)) store.close(); });
-function setup(llmOverride?: LLMClient) {
+function setup() {
   const store = openSearchStore(':memory:'); stores.push(store);
   const settings = { version: 3, integrations: { prowlarr: { url: 'http://localhost:9696', apiKey: 'private', tvClient: '', movieClient: '' }, sonarr: { url: '', apiKey: '' }, radarr: { url: '', apiKey: '' } }, ai: { apiKey: 'private-ai', model: 'test/model', baseUrl: 'https://example.test/v1', preferences: '' }, monitoring: { enabled: false, intervalMinutes: 5, searchRetryMinutes: 30, failureBackoffMinMinutes: 5, failureBackoffMaxMinutes: 60, queueGraceMinutes: 30 }, search: { maxDecisions: 20, maxSearches: 12, deadlineMinutes: 10 }, safety: { dryRun: true } } satisfies Settings;
-  const llm = llmOverride ?? { json: async () => ({ action: 'finish', query: null, categories: null, indexerIds: null, status: 'no-match', options: null, message: 'Nothing suitable' }) } as unknown as LLMClient;
   let indexerReads = 0;
   let now = 1_800_000_000_000;
-  const runtime = new SearchRuntime({ store, now: () => now, clients: () => ({ prowlarr: { getIndexers: async () => { indexerReads++; return [{ id: 1, name: 'Test', enable: true }]; }, getIndexerStatuses: async () => [], search: async () => [], getDownloadClients: async () => [{ id: 7, name: 'TV', enable: true, protocol: 'torrent', supportsCategories: false, categories: [] }], grab: async () => {} } }), llm, initialSettings: settings });
+  const runtime = new SearchRuntime({ store, now: () => now, clients: () => ({ prowlarr: { getIndexers: async () => { indexerReads++; return [{ id: 1, name: 'Test', enable: true }]; }, getIndexerStatuses: async () => [], search: async () => [], getDownloadClients: async () => [{ id: 7, name: 'TV', enable: true, protocol: 'torrent', supportsCategories: false, categories: [] }], grab: async () => {} } }), initialSettings: settings });
   return { runtime, store, settings, reads: () => indexerReads, get now() { return now; }, set now(value: number) { now = value; } };
 }
 function matched(f: ReturnType<typeof setup>, expires: number) {
@@ -26,6 +24,19 @@ function matched(f: ReturnType<typeof setup>, expires: number) {
 }
 
 describe('search runtime', () => {
+  it('retains all completed evidence while private candidates expire at different times', async () => {
+    const f = setup();
+    const evidence = ['early', 'late'].map(candidateId => ({ candidateId, observations: [{ title: `${candidateId} release` }] }));
+    f.store.createSearch({ searchId: 'staggered', prompt: '{"prompt":"Find"}', status: 'matched', createdAt: f.now,
+      result: { version: 1, candidateEvidence: evidence, counts: { decisions: 2, searches: 2, candidates: 2 } } });
+    for (const [index, safe] of evidence.entries()) f.store.addCandidate({
+      searchId: 'staggered', candidateId: safe.candidateId, safe, privateData: {},
+      expiresAt: f.now + (index + 1) * 1000,
+    });
+    f.now += 1001;
+    expect(f.store.listCandidates('staggered', f.now)).toHaveLength(1);
+    expect((await f.runtime.getSearch('staggered'))!.candidates).toEqual(evidence);
+  });
   it('projects a source-scoped show cooldown in automation status', () => {
     const f = setup();
     const deadline = f.now + 120_000, target = { key: 'sonarr:fp:7:20:2', provider: 'sonarr', sourceFingerprint: 'fp', serviceId: 7, externalId: 20, episodeId: 2, monitored: true, hasFile: false, available: true, eligible: true, context: { title: 'Show', seasonNumber: 3, episodeNumber: 2 } };
@@ -33,37 +44,9 @@ describe('search runtime', () => {
     f.store.setSetting(showCooldownSettingKey('fp', 7), deadline);
     expect(f.runtime.automationStatus().items[0]).toMatchObject({ status: 'cooldown', eligible: false, nextAttemptAt: new Date(deadline).toISOString() });
   });
-  it.each([2019, 4000])('passes all %s default preference characters through to the model', async length => {
-    let received: unknown;
-    const llm = { json: async ({ user }: { user: string }) => {
-      received = JSON.parse(user).request.preferences.notes;
-      return { action: 'finish', query: null, categories: null, indexerIds: null, status: 'no-match', options: null, message: null };
-    } } as unknown as LLMClient;
-    const f = setup(llm), notes = `${'p'.repeat(length - 1)}${length === 4000 ? 'Z' : 'Y'}`;
-    f.settings.ai.preferences = notes;
-    f.runtime.saveSettings(f.settings);
-    const started = f.runtime.startSearch({ prompt: 'Find' });
-    await f.runtime.drain();
-    expect(received).toBe(notes);
-    expect((await f.runtime.getSearch(started.searchId))?.status).toBe('no-match');
-  });
-  it('preserves an explicit per-request preference over the configured default', async () => {
-    let received: unknown;
-    const llm = { json: async ({ user }: { user: string }) => {
-      received = JSON.parse(user).request.preferences.notes;
-      return { action: 'finish', query: null, categories: null, indexerIds: null, status: 'no-match', options: null, message: null };
-    } } as unknown as LLMClient;
-    const f = setup(llm);
-    f.settings.ai.preferences = 'Configured default';
-    f.runtime.saveSettings(f.settings);
-    const started = f.runtime.startSearch({ prompt: 'Find', preferences: { notes: 'Per-request choice' } });
-    await f.runtime.drain();
-    expect(received).toBe('Per-request choice');
-    expect((await f.runtime.getSearch(started.searchId))?.status).toBe('no-match');
-  });
-  it('rejects per-request preference notes longer than 4000 characters', () => {
+  it('rejects per-request preference notes longer than 4000 characters', async () => {
     const f = setup();
-    expect(() => f.runtime.startSearch({ prompt: 'Find', preferences: { notes: 'x'.repeat(4001) } })).toThrow();
+    await expect(f.runtime.startSearch({ prompt: 'Find', preferences: { notes: 'x'.repeat(4001) } })).rejects.toThrow();
   });
   it('durably queues requests in FIFO order and shares a three-search execution cap', () => {
     const f = setup();
@@ -71,7 +54,6 @@ describe('search runtime', () => {
     const claims = [1, 2, 3].map(i => f.store.claimNextSearch(`owner-${i}`, f.now + 10, 90_000));
     expect(claims.map(work => work?.searchId)).toEqual(['queued-1', 'queued-2', 'queued-3']);
     expect(f.store.claimNextSearch('owner-4', f.now + 10, 90_000)).toBeNull();
-    expect(f.store.startAutomationSearch({searchId:'automation-fourth',prompt:'{}',owner:'automation',now:f.now+10,ttl:90_000,maxActive:3,context:{}})).toBeNull();
     expect(f.store.queuePosition('queued-4')).toBe(1);
   });
   it('arbitrates the shared concurrency cap across independent SQLite connections', () => {
@@ -96,26 +78,16 @@ describe('search runtime', () => {
     expect(f.store.queuePosition('manual-second')).toBe(1);
     expect(f.store.queuePosition('automation-first')).toBe(2);
   });
-  it('defers automation behind queued manual work instead of creating orphaned automation jobs', () => {
-    const f=setup();
-    f.store.enqueueSearch({searchId:'manual-backlog',prompt:'{}',now:f.now});
-    const work=f.store.startAutomationSearch({searchId:'automation-attempt',prompt:'{}',owner:'automation-owner',now:f.now,ttl:90_000,maxActive:3,context:{targetKeys:['sonarr:item']}});
-    expect(work).toBeNull();
-    expect(f.store.getSearch('automation-attempt')).toBeNull();
-    expect(f.store.queuePosition('manual-backlog')).toBe(1);
-  });
   it('never shortens a provider cooldown when concurrent responses arrive out of order', () => {
     const f = setup();
     f.store.setProviderDeadline('prowlarr', f.now + 60_000);
     f.store.setProviderDeadline('prowlarr', f.now + 5_000);
     expect(f.store.getProviderDeadline('prowlarr')).toBe(f.now + 60_000);
   });
-  it('keeps queued requests off cooldown-bound providers and exposes the retry time', async () => {
+  it('does not accept work without a bound daemon MCP listener', async () => {
     const f = setup();
     f.store.setProviderDeadline('prowlarr', f.now + 60_000);
-    const started = f.runtime.startSearch({ prompt: 'Find Example' });
-    const status = await f.runtime.getSearch(started.searchId);
-    expect(status).toMatchObject({ status: 'queued', waitingReason: 'provider-cooldown', retryAt: new Date(f.now + 60_000).toISOString() });
+    await expect(f.runtime.startSearch({ prompt: 'Find Example' })).rejects.toThrow('daemon-mcp-unavailable');
     expect(f.reads()).toBe(0);
   });
   it('recovers expired work during status maintenance without requiring provider readiness', async () => {
@@ -125,6 +97,15 @@ describe('search runtime', () => {
     f.now += 1001;
     expect((await f.runtime.getSearch('expired-work'))?.status).toBe('interrupted');
     expect(f.store.getSearch('expired-work')?.result).toMatchObject({ message: expect.stringMatching(/lease expired/i) });
+  });
+  it('renews only a live owned search-work lease', () => {
+    const f = setup();
+    f.store.enqueueSearch({ searchId: 'heartbeat', prompt: '{}', now: f.now });
+    expect(f.store.claimNextSearch('owner', f.now, 10_000)?.searchId).toBe('heartbeat');
+    expect(f.store.renewSearchWork('heartbeat', 'other', f.now + 1, 20_000)).toBe(false);
+    expect(f.store.renewSearchWork('heartbeat', 'owner', f.now + 1, 20_000)).toBe(true);
+    expect(f.store.ownsSearch('heartbeat', 'owner', f.now + 10_001)).toBe(true);
+    expect(f.store.renewSearchWork('heartbeat', 'owner', f.now + 30_002, 20_000)).toBe(false);
   });
   it('preserves live peer-owned searches and queued requests during another runtime startup', () => {
     const f = setup();
@@ -152,7 +133,7 @@ describe('search runtime', () => {
     store.setSetting('search-arr:legacy-grab', { key: 'grab' });
     store.setSetting('search-source:legacy-grab', 'automation');
     store.recordSubmission({ idempotencyKey: 'receipt', payload: { targets: ['grab'] }, outcome: 'submitted', createdAt: now });
-    const runtime = new SearchRuntime({ store, now: () => now, initialSettings: legacy as Settings, llm: {} as LLMClient });
+    const runtime = new SearchRuntime({ store, now: () => now, initialSettings: legacy as Settings });
     expect(runtime.getSettings()).toMatchObject({ version: 3, monitoring: { searchRetryMinutes: 30 } });
     expect(store.getAutomationAttempt('search')?.deadline).toBe(now + 25 * 60_000);
     expect(store.getDeadline('search')).toBe(now + 25 * 60_000);
@@ -214,108 +195,6 @@ describe('search runtime', () => {
     expect(items.find(item => item.title === 'queued')?.status).toBe('downloading');
     expect(items.find(item => item.title === 'cooldown')?.status).toBe('cooldown');
   });
-  it('keeps automated search target bindings so later manual submission revalidates fresh Arr state', async () => {
-    const store = openSearchStore(':memory:'), settings = structuredClone(defaultSettings);
-    settings.integrations.prowlarr = { url: 'http://prowlarr', apiKey: 'private', tvClient: 'TV', movieClient: 'Movies' };
-    settings.integrations.sonarr = { url: 'http://sonarr', apiKey: 'sonarr-secret' };
-    settings.ai.apiKey = 'model-secret';
-    settings.monitoring.enabled = true;
-    settings.safety.dryRun = true;
-    let hasFile = false, clock = 1_800_000_000_000;
-    const release = releaseSchema.parse({ guid: 'release-guid', age: 1, size: null, files: null, grabs: null, indexerId: 1, indexer: 'Test', subGroup: null, title: 'Example S01E01', tvdbId: null, tmdbId: null, publishDate: '', downloadUrl: 'https://private.test/release', indexerFlags: [], categories: [], magnetUrl: null, infoHash: 'a'.repeat(40), seeders: 3, leechers: 0, protocol: 'torrent', downloadClientId: null });
-    const clients = () => ({
-      prowlarr: {
-        getIndexers: async () => [{ id: 1, name: 'Test', enable: true }],
-        getIndexerStatuses: async () => [],
-        search: async () => [release],
-        getDownloadClients: async () => [{ id: 7, name: 'TV', enable: true, protocol: 'torrent' as const, supportsCategories: false, categories: [] }],
-        grab: async () => { throw new Error('must not grab after the episode imports'); },
-      },
-      sonarr: {
-        getSeries: async () => [{ id: 1, tvdbId: 20, title: 'Example', titleSlug: 'example', seriesType: 'standard' as const, monitored: true, seasons: [], alternateTitles: [] }],
-        getEpisodes: async () => [{ id: 2, seriesId: 1, seasonNumber: 1, episodeNumber: 1, absoluteEpisodeNumber: null, title: 'Pilot', airDate: '2020-01-01', airDateUtc: null, finaleType: null, monitored: true, hasFile }],
-        getQueue: async () => [],
-      },
-    } as RuntimeClients);
-    const llm = { json: async ({ user }: { user: string }) => {
-      const input = JSON.parse(user) as { candidates: Array<{ candidateId: string }>; request: { context?: { targets?: Array<{ targetId: string }> } } };
-      if (!input.candidates.length) return { action: 'search_releases', query: 'Example S01E01', categories: [], indexerIds: [1], status: null, options: null, message: null };
-      return { action: 'finish', query: null, categories: null, indexerIds: null, status: 'matched', options: [{ optionId: 'rank-one', rank: 1, releases: [{ candidateId: input.candidates[0]!.candidateId }], coveredTargetIds: input.request.context?.targets?.map(t => t.targetId) ?? [], reason: 'Correct episode', uncertainty: '' }], message: null };
-    } } as unknown as LLMClient;
-    const runtime = new SearchRuntime({ store, now: () => clock, initialSettings: settings, clients, llm });
-    try {
-      await runtime.poll();
-      const item = runtime.activity().items[0];
-      expect(item?.status).toBe('matched');
-      expect(store.getSetting(`search-arr:${item!.searchId}`)).toMatchObject({ provider: 'sonarr', episodeId: 2 });
-      hasFile = true;
-      runtime.saveSettings({ ...settings, safety: { dryRun: false } });
-      expect((await runtime.submit({ searchId: item!.searchId, optionId: 'rank-one', idempotencyKey: 'manual-after-import' })).outcome).toBe('failed');
-    } finally { await runtime.close(); }
-  });
-  it('persists manual Arr target bindings before queued execution for fresh submission validation', async () => {
-    const store=openSearchStore(':memory:'), settings=structuredClone(defaultSettings);
-    settings.integrations.prowlarr={url:'http://prowlarr',apiKey:'private',tvClient:'TV',movieClient:'Movies'};
-    settings.integrations.sonarr={url:'http://sonarr',apiKey:'sonarr-secret'};
-    settings.ai.apiKey='model-secret';
-    settings.safety.dryRun=false;
-    let hasFile=false, clock=1_800_000_000_000;
-    const grab=vi.fn(async()=>{throw new Error('must not grab imported media');});
-    const release=releaseSchema.parse({guid:'manual-release',age:1,size:null,files:null,grabs:null,indexerId:1,indexer:'Test',subGroup:null,title:'Example S01E01',tvdbId:null,tmdbId:null,publishDate:'',downloadUrl:'https://private.test/release',indexerFlags:[],categories:[],magnetUrl:null,infoHash:'c'.repeat(40),seeders:3,leechers:0,protocol:'torrent',downloadClientId:null});
-    const clients=()=>({
-      prowlarr:{getIndexers:async()=>[{id:1,name:'Test',enable:true}],getIndexerStatuses:async()=>[],search:async()=>[release],getDownloadClients:async()=>[{id:7,name:'TV',enable:true,protocol:'torrent' as const,supportsCategories:false,categories:[]}],grab},
-      sonarr:{getSeries:async()=>[{id:1,tvdbId:20,title:'Example',titleSlug:'example',seriesType:'standard' as const,monitored:true,seasons:[],alternateTitles:[]}],getEpisodes:async()=>[{id:2,seriesId:1,seasonNumber:1,episodeNumber:1,absoluteEpisodeNumber:null,title:'Pilot',airDate:'2020-01-01',airDateUtc:null,finaleType:null,monitored:true,hasFile}],getQueue:async()=>[]},
-    } as RuntimeClients);
-    const llm={json:async({user}:{user:string})=>{const input=JSON.parse(user) as {candidates:Array<{candidateId:string}>;request:{context?:{targets?:Array<{targetId:string}>}}};return input.candidates.length?{action:'finish',query:null,categories:null,indexerIds:null,status:'matched',options:[{optionId:'rank-one',rank:1,releases:[{candidateId:input.candidates[0]!.candidateId}],coveredTargetIds:input.request.context?.targets?.map(target=>target.targetId)??[],reason:'match',uncertainty:''}],message:null}:{action:'search_releases',query:'Example S01E01',categories:[],indexerIds:[1],status:null,options:null,message:null};}} as unknown as LLMClient;
-    const runtime=new SearchRuntime({store,now:()=>clock,initialSettings:settings,clients,llm});
-    try {
-      await runtime.poll();
-      const targetId=runtime.automationStatus().items[0]!.targetId;
-      const observedTarget=(store.getObservation('sonarr')?.payload as any).targets[0];
-      store.setSetting(showCooldownSettingKey(observedTarget.sourceFingerprint, observedTarget.serviceId), clock + 300_000);
-      settings.safety.dryRun=false;
-      const started=await runtime.startArrSearch(targetId);
-      expect(store.getSetting(`search-arr:${started.searchId}`)).toMatchObject({provider:'sonarr',episodeId:2});
-      await runtime.drain();
-      const searched=await runtime.getSearch(started.searchId); expect(searched).toMatchObject({status:'matched'});
-      hasFile=true;
-      const submission=await runtime.submit({searchId:started.searchId,optionId:'rank-one',idempotencyKey:'manual-arr-validation'});
-      expect(submission).toMatchObject({outcome:'failed',outcomes:[{outcome:'failed'}]});
-      expect(grab).not.toHaveBeenCalled();
-    } finally { await runtime.close(); }
-  });
-  it('does not grab when automation is paused during fresh pre-submit validation', async () => {
-    const store = openSearchStore(':memory:'), settings = structuredClone(defaultSettings);
-    settings.integrations.prowlarr = { url: 'http://prowlarr', apiKey: 'private', tvClient: 'TV', movieClient: 'Movies' };
-    settings.integrations.sonarr = { url: 'http://sonarr', apiKey: 'sonarr-secret' };
-    settings.ai.apiKey = 'model-secret';
-    settings.safety.dryRun = false;
-    let paused = false, episodeReads = 0, clock = 1_800_000_000_000;
-    const episode = { id: 2, seriesId: 1, seasonNumber: 1, episodeNumber: 1, absoluteEpisodeNumber: null, title: 'Pilot', airDate: '2020-01-01', airDateUtc: null, finaleType: null, monitored: true, hasFile: false };
-    const release = releaseSchema.parse({ guid: 'release-guid', age: 1, size: null, files: null, grabs: null, indexerId: 1, indexer: 'Test', subGroup: null, title: 'Example S01E01', tvdbId: null, tmdbId: null, publishDate: '', downloadUrl: 'https://private.test/release', indexerFlags: [], categories: [], magnetUrl: null, infoHash: 'b'.repeat(40), seeders: 3, leechers: 0, protocol: 'torrent', downloadClientId: null });
-    const grab = vi.fn(async () => {});
-    const clients = () => ({
-      prowlarr: { getIndexers: async () => [], getIndexerStatuses: async () => [], search: async () => [], getDownloadClients: async () => [{ id: 7, name: 'TV', enable: true, protocol: 'torrent' as const, supportsCategories: false, categories: [] }], grab },
-      sonarr: {
-        getSeries: async () => [{ id: 1, tvdbId: 20, title: 'Example', titleSlug: 'example', seriesType: 'standard' as const, monitored: true, seasons: [], alternateTitles: [] }],
-        getEpisodes: async () => { if (++episodeReads > 1) paused = true; return [episode]; },
-        getQueue: async () => [],
-      },
-    } as RuntimeClients);
-    const runtime = new SearchRuntime({ store, now: () => clock, initialSettings: settings, clients });
-    try {
-      await runtime.poll();
-      const observation = store.getObservation('sonarr')?.payload as { targets: Array<{ key: string; provider: string }> };
-      const target = observation.targets[0]!;
-      store.createSearch({ searchId: 'automated', prompt: '{"context":{"kind":"tv"}}', status: 'matched', createdAt: clock, finishedAt: clock, result: { options: [{ optionId: 'rank-one', rank: 1, releases: [{ candidateId: 'candidate' }], coveredTargetIds: [], reason: 'Match', uncertainty: '' }] } });
-      store.addCandidate({ searchId: 'automated', candidateId: 'candidate', safe: {}, privateData: { release, physicalKey: 'physical' }, expiresAt: clock + 60_000 });
-      store.setSetting('search-arr:automated', target);
-      const result = await runtime.submit({ searchId: 'automated', optionId: 'rank-one', idempotencyKey: 'pause-during-validation' }, { available: () => !paused });
-      expect(result.outcome).toBe('failed');
-      expect(paused).toBe(true);
-      expect(grab).not.toHaveBeenCalled();
-    } finally { await runtime.close(); }
-  });
   it('interrupts legacy abandoned jobs instead of trusting the obsolete global worker lease', async () => {
     const f = setup();
     f.store.createSearch({ searchId: 'abandoned', prompt: '{"prompt":"Find"}', status: 'running', createdAt: f.now });
@@ -340,16 +219,11 @@ describe('search runtime', () => {
     const f = setup();
     expect(f.runtime.saveSettings({ ...f.settings, monitoring: { ...f.settings.monitoring, searchRetryMinutes: 1_000_000_000_000_000 } }).ok).toBe(false);
   });
-  it('reports expiry distinctly and records dry-run confirmation outcomes in Activity', async () => {
+  it('blocks execution regardless of saved dry-run policy', async () => {
     const f = setup(); matched(f, f.now - 1);
     f.runtime.saveSettings({ ...f.settings, safety: { dryRun: false } });
-    expect((await f.runtime.submit({ searchId: 'matched', optionId: 'option', idempotencyKey: 'expired', downloadClientId: 7 })).outcome).toBe('expired');
-    f.store.expireCandidatesAt('matched', f.now + 1000);
-    f.runtime.saveSettings(f.settings);
-    expect((await f.runtime.submit({ searchId: 'matched', optionId: 'option', idempotencyKey: 'dry-run', downloadClientId: 7 })).outcome).toBe('dry-run');
-    const activity = f.runtime.activity({ status: 'dry-run' });
-    expect(activity.total).toBe(1);
-    expect(activity.items[0]?.submission).toMatchObject({ outcome: 'dry-run' });
+    expect((await f.runtime.submit({ searchId: 'matched', optionId: 'option', idempotencyKey: 'blocked', downloadClientId: 7 })).outcome).toBe('deferred');
+    expect(f.runtime.getSettings().safety.dryRun).toBe(false);
   });
   it('uses strict version 3 settings and requires only standalone search integrations', async () => {
     const { runtime, settings } = setup();
@@ -367,26 +241,20 @@ describe('search runtime', () => {
     expect(runtime.getSettings()).toEqual(next);
   });
 
-  it('returns an id immediately, then exposes safe flat status without requiring Arr', async () => {
+  it('requires a daemon MCP listener and leaves no work queued when unavailable', async () => {
     const { runtime, reads } = setup();
-    const started = runtime.startSearch({ prompt: 'Find a film' });
-    expect(started.searchId).toMatch(/^[0-9a-f-]{36}$/i);
-    expect(started.status).toBe('queued');
-    await runtime.drain();
-    const result = await runtime.getSearch(started.searchId);
-    expect(result).toMatchObject({ searchId: started.searchId, status: 'no-match', prompt: 'Find a film', counts: { decisions: 1, searches: 0 } });
-    expect(result?.createdAt).toEqual(new Date(1_800_000_000_000).toISOString());
-    expect(reads()).toBe(1);
+    await expect(runtime.startSearch({ prompt: 'Find a film' })).rejects.toThrow('daemon-mcp-unavailable');
+    expect(runtime.activity().items).toHaveLength(0);
+    expect(reads()).toBe(0);
   });
 
   it('keeps status and activity reads offline and projects activity safely', async () => {
     const { runtime, reads } = setup();
-    const started = runtime.startSearch({ prompt: 'Find a film' });
-    await runtime.drain();
+    runtime.store.createSearch({ searchId: 'offline-read', prompt: '{"prompt":"Find a film"}', status: 'no-match', createdAt: 1_800_000_000_000 });
     const before = reads();
     expect(await runtime.getSearch('not-found')).toBeNull();
     const activity = runtime.activity();
-    expect(activity.items[0]).toMatchObject({ searchId: started.searchId, prompt: 'Find a film', status: 'no-match', source: 'manual' });
+    expect(activity.items[0]).toMatchObject({ searchId: 'offline-read', prompt: 'Find a film', status: 'no-match', source: 'manual' });
     expect(activity.retention).toEqual({ days: 30, maxEntries: 10000 });
     expect(reads()).toBe(before);
   });

@@ -12,7 +12,7 @@ const { default: App } = await import('./App')
 const originalFetch = globalThis.fetch
 const originalCrypto = globalThis.crypto
 const env = { settings: defaults, status: { ready: false, missing: [], monitoringEnabled: false, cycleRunning: false } }
-const matched = { searchId: 's1', status: 'matched', createdAt: '2026-11-15T00:00:00Z', prompt: 'Find Example', options: [{ optionId: 'o1', rank: 1, releases: [{ candidateId: 'c1' }], coveredTargetIds: [], reason: 'Best evidence', uncertainty: 'Audio not verified' }], candidates: [{ candidateId: 'c1', observations: [{ title: 'Example 1080p', indexer: 'Index', seeders: 20 }] }], events: [], counts: { decisions: 2, searches: 1, candidates: 1 } }
+const matched = { searchId: 's1', status: 'matched', createdAt: '2026-11-15T00:00:00Z', prompt: 'Find Example', plan: { version: 1, planId: 'p1', status: 'matched', selections: [{ candidateId: 'c1', targetIds: ['target-1'], reason: 'Best evidence', uncertainty: 'Audio not verified' }], coverage: { covered: ['target-1'], gaps: [], deferred: [], broad: { status: 'complete', gaps: [] } }, warnings: [] }, candidates: [{ candidateId: 'c1', observations: [{ title: 'Example 1080p', indexer: 'Index', seeders: 20 }] }], events: [], counts: { decisions: 2, searches: 1, candidates: 1 } }
 
 afterEach(() => { cleanup(); window.history.replaceState(null, '', '/'); globalThis.fetch = originalFetch; Object.defineProperty(globalThis, 'crypto', { configurable: true, value: originalCrypto }) })
 
@@ -22,7 +22,7 @@ it('starts with Search, submits a prompt without downloading, and displays ranke
     const url = String(input); calls.push({ url, init })
     if (url === '/api/settings') return Response.json(env)
     if (url === '/api/v2/searches' && init?.method === 'POST') return Response.json({ searchId: 's1', status: 'running' }, { status: 202 })
-    if (url === '/api/v2/searches/s1') return Response.json({ searchId: 's1', status: 'matched', createdAt: '2026-11-15T00:00:00Z', prompt: 'Find North Shore', options: [{ optionId: 'o1', rank: 1, releases: [{ candidateId: 'c1' }], coveredTargetIds: [], reason: 'Best evidence', uncertainty: 'Audio not verified' }], candidates: [{ candidateId: 'c1', observations: [{ title: 'North Shore 1080p', indexer: 'Example', size: 1000, seeders: 20, leechers: 2 }] }], events: [{ type: 'query-result', data: { query: 'North Shore', count: 4 } }], counts: { decisions: 2, searches: 1, candidates: 4 } })
+    if (url === '/api/v2/searches/s1') return Response.json({ searchId: 's1', status: 'matched', createdAt: '2026-11-15T00:00:00Z', prompt: 'Find North Shore', plan: { version: 1, planId: 'p1', status: 'matched', selections: [{ candidateId: 'c1', targetIds: ['target-1'], reason: 'Best evidence', uncertainty: 'Audio not verified' }], coverage: { covered: ['target-1'], gaps: [], deferred: [], broad: { status: 'complete', gaps: [] } }, warnings: [] }, candidates: [{ candidateId: 'c1', observations: [{ title: 'North Shore 1080p', indexer: 'Example', size: 1000, seeders: 20, leechers: 2 }] }], events: [{ type: 'query-result', data: { query: 'North Shore', count: 4 } }], counts: { decisions: 2, searches: 1, candidates: 4 } })
     return Response.json({ items: [] })
   }
   render(<App />)
@@ -32,11 +32,11 @@ it('starts with Search, submits a prompt without downloading, and displays ranke
   for (const label of ['Search', 'Activity', 'Automation', 'Settings']) assert.ok(within(nav).getByRole('link', { name: label }))
   assert.equal(screen.getByLabelText('What are you looking for?').getAttribute('aria-label'), 'What are you looking for?')
   assert.ok(screen.getByRole('complementary', { name: 'Search information' }))
-  assert.ok(screen.getByText('Dry-run is on'))
+  assert.ok(screen.getAllByText(/Dry-run saved preference: on/)[0])
   fireEvent.change(screen.getByLabelText('What are you looking for?'), { target: { value: 'Find North Shore' } })
   fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
   await screen.findByText('Best evidence')
-  assert.ok(screen.getByText('Audio not verified'))
+  assert.ok(screen.getByText(/Audio not verified/))
   assert.deepEqual(JSON.parse(String(calls.find((call) => call.url === '/api/v2/searches' && call.init?.method === 'POST')?.init?.body)), { prompt: 'Find North Shore' })
   assert.equal(calls.some((call) => call.url === '/api/v2/submissions'), false)
 })
@@ -53,7 +53,7 @@ it('labels failed searches as an operational error and shows the actionable caus
   render(<App />)
   fireEvent.change(await screen.findByLabelText('What are you looking for?'), { target: { value: 'Find Example' } })
   fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
-  assert.ok(await screen.findByRole('heading', { name: 'Search could not complete' }))
+  assert.ok(await screen.findByRole('heading', { name: 'Search failed' }))
   assert.ok(screen.getAllByText(/another search is already running/i).length > 0)
 })
 
@@ -120,7 +120,7 @@ it('keeps the current result through navigation and lets Activity replace it wit
     if (url === '/api/v2/searches' ) return Response.json({ searchId: 'new-search' }, { status: 202 })
     if (url.startsWith('/api/v2/searches/')) {
       const id = url.split('/').at(-1)
-      return Response.json({ ...matched, searchId: id, prompt: id === 'new-search' ? 'New search' : 'Old search', options: [{ ...matched.options[0], reason: id === 'new-search' ? 'New evidence' : 'Old evidence' }] })
+      return Response.json({ ...matched, searchId: id, prompt: id === 'new-search' ? 'New search' : 'Old search', plan: { ...matched.plan!, selections: [{ ...matched.plan!.selections[0]!, reason: id === 'new-search' ? 'New evidence' : 'Old evidence' }] } })
     }
     if (url.startsWith('/api/v2/activity')) return Response.json({ items: [{ searchId: 'old-search', prompt: 'Old search', status: 'matched', source: 'manual', createdAt: matched.createdAt }], total: 1 })
     return Response.json({ items: [] })
@@ -128,7 +128,7 @@ it('keeps the current result through navigation and lets Activity replace it wit
   render(<App />)
   fireEvent.change(await screen.findByLabelText('What are you looking for?'), { target: { value: 'New search' } })
   fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
-  assert.ok(await screen.findByRole('heading', { name: 'Ranked options' }))
+  assert.ok(await screen.findByRole('heading', { name: 'Search plan' }))
   assert.ok(screen.getByText('New evidence'))
   fireEvent.click(document.querySelector('a[href="#activity"]')!); fireEvent(window, new dom.window.Event('hashchange'))
   await screen.findByText('A record of searches, recommendations, and submission outcomes.')
@@ -151,7 +151,7 @@ it('continues polling a running search while its workspace is hidden', async () 
     if (url === '/api/v2/searches' ) { posts++; return Response.json({ searchId: 'live-search' }, { status: 202 }) }
     if (url === '/api/v2/searches/live-search') {
       reads++
-      return Response.json({ ...matched, searchId: 'live-search', status: reads === 1 ? 'running' : 'matched', options: reads === 1 ? [] : matched.options })
+      return Response.json({ ...matched, searchId: 'live-search', status: reads === 1 ? 'running' : 'matched', plan: reads === 1 ? undefined : matched.plan })
     }
     if (url.startsWith('/api/v2/activity')) return Response.json({ items: [], total: 0 })
     return Response.json({ items: [] })
@@ -180,7 +180,7 @@ it('ignores a delayed manual-search response after a newer history selection', a
     if (url.startsWith('/api/v2/searches/')) {
       const id = url.split('/').at(-1)!
       reads.push(id)
-      return Response.json({ ...matched, searchId: id, options: [{ ...matched.options[0], reason: id === 'history-a' ? 'History A evidence' : 'Late manual evidence' }] })
+      return Response.json({ ...matched, searchId: id, plan: { ...matched.plan!, selections: [{ ...matched.plan!.selections[0]!, reason: id === 'history-a' ? 'History A evidence' : 'Late manual evidence' }] } })
     }
     if (url.startsWith('/api/v2/activity')) return Response.json({ items: [{ searchId: 'history-a', prompt: 'Saved A', status: 'matched', source: 'manual', createdAt: matched.createdAt }], total: 1 })
     return Response.json({ items: [] })
@@ -207,7 +207,7 @@ it('makes a delayed manual search discoverable after ordinary navigation', async
     if (url === '/api/v2/searches' && init?.method === 'POST') return latePost
     if (url === '/api/v2/searches/late-manual') {
       reads.push('late-manual')
-      return Response.json({ ...matched, searchId: 'late-manual', options: [{ ...matched.options[0], reason: 'Late manual evidence' }] })
+      return Response.json({ ...matched, searchId: 'late-manual', plan: { ...matched.plan!, selections: [{ ...matched.plan!.selections[0]!, reason: 'Late manual evidence' }] } })
     }
     if (url.startsWith('/api/v2/activity')) return Response.json({ items: [], total: 0 })
     return Response.json({ items: [] })
@@ -232,7 +232,7 @@ it('reloads an explicitly reopened history result when its ID is already selecte
     if (url.startsWith('/api/v2/activity')) return Response.json({ items: [{ searchId: 'history-a', prompt: 'Saved A', status: 'matched', source: 'manual', createdAt: matched.createdAt }], total: 1 })
     if (url === '/api/v2/searches/history-a') {
       historyReads++
-      return Response.json({ ...matched, searchId: 'history-a', options: [{ ...matched.options[0], reason: 'History A evidence' }] })
+      return Response.json({ ...matched, searchId: 'history-a', plan: { ...matched.plan!, selections: [{ ...matched.plan!.selections[0]!, reason: 'History A evidence' }] } })
     }
     if (url === '/api/v2/searches' && init?.method === 'POST') return Response.json({ error: 'Manual request failed' }, { status: 503 })
     return Response.json({ items: [] })
@@ -355,73 +355,28 @@ it('hides stale Activity rows and disables pagination when a filtered request fa
   assert.equal(queries.at(-1)?.get('offset'), '0')
 })
 
-it('shows per-release submission history in saved search details', async () => {
+it('renders a nested read-only plan without acquisition controls or submission requests', async () => {
   window.history.replaceState(null, '', '/#activity')
-  globalThis.fetch = async input => {
-    const url = String(input)
-    if (url === '/api/settings') return Response.json(env)
-    if (url.startsWith('/api/v2/activity')) return Response.json({ items: [{ searchId: 's1', prompt: 'Saved request', status: 'matched', source: 'manual', createdAt: matched.createdAt }], total: 1 })
-    return Response.json({ ...matched, events: [{ type: 'submission', data: { outcome: 'uncertain', outcomes: [{ candidateId: 'c1', outcome: 'submitted' }, { candidateId: 'c2', outcome: 'uncertain' }] } }] })
-  }
+  const requests: string[] = []
+  globalThis.fetch = async input => { const url = String(input); requests.push(url); if (url === '/api/settings') return Response.json(env); if (url.startsWith('/api/v2/activity')) return Response.json({ items: [{ searchId: 's1', prompt: 'Saved request', status: 'matched', source: 'manual', createdAt: matched.createdAt }], total: 1 }); return Response.json(matched) }
   render(<App />)
   fireEvent.click(await screen.findByRole('button', { name: 'View search details' }))
-  assert.ok(await screen.findByRole('heading', { name: 'Submission history' }))
-  assert.ok(screen.getByText('Example 1080p: submitted'))
-  assert.ok(screen.getByText('Release 2: uncertain'))
-  assert.equal(screen.queryByText('Submission is not proof of downloading or import.'), null)
+  assert.ok(await screen.findByText('Best evidence'))
+  assert.ok(screen.getByText(/Covered: target-1/))
+  assert.ok(screen.getByText(/Audio not verified/))
+  assert.ok(screen.getAllByText(/execution is unavailable/i)[0])
+  assert.equal(screen.queryByRole('button', { name: /download|submission|confirm option/i }), null)
+  assert.equal(requests.some(url => /submissions|download-clients/.test(url)), false)
 })
 
-it('sends numeric configured client IDs and reuses a submission key after transport failure', async () => {
-  const bodies: Array<Record<string, unknown>> = []
-  let randomCalls = 0
-  Object.defineProperty(globalThis, 'crypto', { configurable: true, value: { getRandomValues: (bytes: Uint8Array) => { bytes.fill(++randomCalls); return bytes } } })
-  globalThis.fetch = async (input, init) => {
-    const url = String(input)
-    if (url === '/api/settings') return Response.json(env)
-    if (url === '/api/v2/searches') return Response.json({ searchId: 's1' }, { status: 202 })
-    if (url === '/api/v2/searches/s1') return Response.json(matched)
-    if (url === '/api/v2/download-clients') return Response.json({ items: [{ id: 7, name: 'TV category', protocol: 'torrent', categories: true }] })
-    if (url === '/api/v2/submissions') { bodies.push(JSON.parse(String(init?.body))); return bodies.length === 1 ? Response.json({ error: 'Temporary failure' }, { status: 503 }) : Response.json({ outcome: 'dry-run' }) }
-    return Response.json({ items: [] })
-  }
+it('keeps historical submission receipts inspectable without offering execution', async () => {
+  window.history.replaceState(null, '', '/#activity')
+  globalThis.fetch = async input => String(input) === '/api/settings' ? Response.json(env) : String(input).startsWith('/api/v2/activity') ? Response.json({ items: [{ searchId: 's1', prompt: 'Saved request', status: 'matched', source: 'manual', createdAt: matched.createdAt }], total: 1 }) : Response.json({ ...matched, events: [{ type: 'submission', data: { outcome: 'uncertain', outcomes: [{ candidateId: 'c1', outcome: 'submitted' }] } }] })
   render(<App />)
-  fireEvent.change(await screen.findByLabelText('What are you looking for?'), { target: { value: 'Find Example' } })
-  fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
-  fireEvent.click(await screen.findByRole('button', { name: 'Preview submission' }))
-  await screen.findByRole('option', { name: /TV category/ })
-  assert.ok(screen.getByText('Dry-run is on. No download will be submitted.'))
-  assert.equal(screen.queryByText(/Scout does not cancel existing jobs/), null)
-  fireEvent.change(screen.getByLabelText('Download client (optional)'), { target: { value: '7' } })
-  fireEvent.click(screen.getByRole('button', { name: 'Confirm option' }))
-  await screen.findByText('Temporary failure')
-  fireEvent.click(screen.getByRole('button', { name: 'Confirm option' }))
-  await waitFor(() => assert.equal(bodies.length, 2))
-  assert.equal(bodies[0]?.downloadClientId, 7)
-  assert.equal(bodies[0]?.idempotencyKey, bodies[1]?.idempotencyKey)
-  assert.match(String(bodies[0]?.idempotencyKey), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
-  assert.equal(randomCalls, 1, 'a retry reuses its idempotency key instead of generating a new one')
-  assert.ok(await screen.findByText('Submission outcome: dry-run'))
-  assert.equal(screen.queryByText(/Submitted does not mean imported/), null)
-})
-
-it('keeps live confirmation focused on the configured route without extra caveats', async () => {
-  const settings = structuredClone(defaults)
-  settings.safety.dryRun = false
-  globalThis.fetch = async input => {
-    const url = String(input)
-    if (url === '/api/settings') return Response.json({ ...env, settings })
-    if (url === '/api/v2/searches') return Response.json({ searchId: 's1' }, { status: 202 })
-    if (url === '/api/v2/searches/s1') return Response.json(matched)
-    if (url === '/api/v2/download-clients') return Response.json({ items: [] })
-    return Response.json({ items: [] })
-  }
-  render(<App />)
-  fireEvent.change(await screen.findByLabelText('What are you looking for?'), { target: { value: 'Find Example' } })
-  fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
-  fireEvent.click(await screen.findByRole('button', { name: 'Choose and confirm download' }))
-  const dialog = await screen.findByRole('dialog', { name: 'Confirm this option' })
-  assert.ok(within(dialog).getByText('Choose the configured client and category route.'))
-  assert.equal(within(dialog).queryByText(/Confirming may start a download/), null)
+  fireEvent.click(await screen.findByRole('button', { name: 'View search details' }))
+  assert.ok(await screen.findByRole('heading', { name: 'Historical submission receipts' }))
+  assert.ok(screen.getByText(/uncertain/))
+  assert.equal(screen.queryByRole('button', { name: /confirm|download/i }), null)
 })
 
 it('keeps search available in dry-run and distinguishes a saved refresh from a live poll', async () => {
@@ -435,13 +390,13 @@ it('keeps search available in dry-run and distinguishes a saved refresh from a l
     return Response.json({ searchId: 's1' }, { status: 202 })
   }
   render(<App />)
-  const search = await screen.findByRole('button', { name: 'Search this item' })
+  await screen.findByText(/Items to watch/)
   assert.ok(screen.getByRole('complementary', { name: 'Automation guidance' }))
   assert.ok(screen.getByText('Poll is explicit'))
-  assert.equal(search.hasAttribute('disabled'), false)
+  assert.equal(screen.queryByRole('button', { name: 'Search this item' }), null)
   fireEvent.click(screen.getByRole('button', { name: 'Refresh saved view' }))
   assert.equal(calls.some(c => c.url.endsWith('/poll')), false)
-  fireEvent.click(screen.getByRole('button', { name: 'Poll now' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh Arr observations' }))
   await waitFor(() => assert.equal(calls.filter(c => c.url.endsWith('/poll')).length, 1))
 })
 
@@ -525,15 +480,15 @@ it('uses committed safety settings across navigation while preserving drafts and
   fireEvent.click(screen.getByRole('link', { name: 'Activity' }))
   assert.ok(await screen.findByText(/unsaved settings/i))
   fireEvent.click(await screen.findByRole('button', { name: 'View search details' }))
-  assert.ok(await screen.findByRole('button', { name: 'Choose and confirm download' }))
-  assert.ok(screen.getAllByText('Downloads enabled').length > 0)
+  assert.ok(await screen.findAllByText(/execution is unavailable/i).then(items => items[0]!))
+  assert.ok(screen.getAllByText(/Dry-run saved preference: off/)[0])
   fireEvent.click(screen.getByRole('link', { name: 'Settings' }))
   assert.equal((await screen.findByRole('switch', { name: 'Dry-run mode' })).getAttribute('aria-checked'), 'true')
   fireEvent.click(screen.getByRole('button', { name: 'Save changes' }))
   await screen.findByRole('alert')
   assert.ok(screen.getByText(/unsaved settings/i))
   fireEvent.click(screen.getByRole('link', { name: 'Search' }))
-  assert.ok(await screen.findByRole('button', { name: 'Choose and confirm download' }))
+  assert.ok(await screen.findAllByText(/execution is unavailable/i).then(items => items[0]!))
 })
 
 it('blocks operational search when committed settings cannot be loaded and allows retry', async () => {
@@ -568,12 +523,12 @@ it('uses committed dry-run after a draft turns it off, and save success commits 
   fireEvent.click(await screen.findByRole('switch', { name: 'Dry-run mode' }))
   fireEvent.click(screen.getByRole('link', { name: 'Activity' }))
   fireEvent.click(await screen.findByRole('button', { name: 'View search details' }))
-  assert.ok(await screen.findByRole('button', { name: 'Preview submission' }))
+  assert.ok(await screen.findAllByText(/execution is unavailable/i).then(items => items[0]!))
   fireEvent.click(screen.getByRole('link', { name: 'Settings' }))
   fireEvent.click(await screen.findByRole('button', { name: 'Save changes' }))
   await screen.findByText('Settings saved.')
   fireEvent.click(screen.getByRole('link', { name: 'Search' }))
-  assert.ok(await screen.findByRole('button', { name: 'Choose and confirm download' }))
+  assert.ok(await screen.findAllByText(/execution is unavailable/i).then(items => items[0]!))
 })
 
 it('keeps a cleared numeric field blank instead of silently turning it into zero', async () => {
@@ -616,74 +571,4 @@ it('explains when secure clipboard access is unavailable instead of silently ign
   fireEvent.click(screen.getByRole('button', { name: 'Copy Prowlarr API key' }))
   assert.ok(await screen.findByRole('status'))
   assert.match(screen.getByRole('status').textContent ?? '', /clipboard.*unavailable.*copy it manually/i)
-})
-
-it('explains that expired results require a new search', async () => {
-  globalThis.fetch = async input => {
-    const url = String(input)
-    if (url === '/api/settings') return Response.json(env)
-    if (url === '/api/v2/searches') return Response.json({ searchId: 's1' }, { status: 202 })
-    if (url === '/api/v2/searches/s1') return Response.json(matched)
-    if (url === '/api/v2/download-clients') return Response.json({ items: [] })
-    if (url === '/api/v2/submissions') return Response.json({ outcome: 'expired', message: 'Search results expired; start a new search.' })
-    return Response.json({ items: [] })
-  }
-  render(<App />)
-  fireEvent.change(await screen.findByLabelText('What are you looking for?'), { target: { value: 'Find Example' } })
-  fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
-  fireEvent.click(await screen.findByRole('button', { name: 'Preview submission' }))
-  fireEvent.click(await screen.findByRole('button', { name: 'Confirm option' }))
-  assert.ok(await screen.findByText('Search results expired. Start a new search before submitting.'))
-})
-
-it('manages confirmation focus for keyboard users and restores the option trigger', async () => {
-  globalThis.fetch = async input => {
-    const url = String(input)
-    if (url === '/api/settings') return Response.json(env)
-    if (url === '/api/v2/searches') return Response.json({ searchId: 's1' }, { status: 202 })
-    if (url === '/api/v2/searches/s1') return Response.json(matched)
-    if (url === '/api/v2/download-clients') return Response.json({ items: [{ id: 7, name: 'TV category', protocol: 'torrent', categories: true }] })
-    return Response.json({ items: [] })
-  }
-  render(<App />)
-  fireEvent.change(await screen.findByLabelText('What are you looking for?'), { target: { value: 'Find Example' } })
-  fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
-  const trigger = await screen.findByRole('button', { name: 'Preview submission' })
-  trigger.focus()
-  fireEvent.click(trigger)
-  const dialog = await screen.findByRole('dialog', { name: 'Confirm this option' })
-  const close = within(dialog).getByRole('button', { name: 'Close confirmation' })
-  assert.equal(document.activeElement, close)
-  await screen.findByRole('option', { name: /TV category/ })
-  const confirm = within(dialog).getByRole('button', { name: 'Confirm option' })
-  fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })
-  assert.ok(document.activeElement === confirm, 'reverse Tab wraps to the final control')
-  confirm.focus()
-  fireEvent.keyDown(document, { key: 'Tab' })
-  assert.equal(document.activeElement, close)
-  fireEvent.keyDown(document, { key: 'Escape' })
-  await waitFor(() => assert.equal(screen.queryByRole('dialog'), null))
-  assert.ok(document.activeElement === trigger, 'focus returns to the option trigger')
-})
-
-it('closes confirmation on navigation without restoring focus into the hidden Search page', async () => {
-  globalThis.fetch = async input => {
-    const url = String(input)
-    if (url === '/api/settings') return Response.json(env)
-    if (url === '/api/v2/searches') return Response.json({ searchId: 's1' }, { status: 202 })
-    if (url === '/api/v2/searches/s1') return Response.json(matched)
-    if (url === '/api/v2/download-clients') return Response.json({ items: [] })
-    if (url.startsWith('/api/v2/activity')) return Response.json({ items: [], total: 0 })
-    return Response.json({ items: [] })
-  }
-  render(<App />)
-  fireEvent.change(await screen.findByLabelText('What are you looking for?'), { target: { value: 'Find Example' } })
-  fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
-  const trigger = await screen.findByRole('button', { name: 'Preview submission' })
-  fireEvent.click(trigger)
-  await screen.findByRole('dialog', { name: 'Confirm this option' })
-  window.history.replaceState(null, '', '/#activity')
-  fireEvent(window, new dom.window.Event('hashchange'))
-  await waitFor(() => assert.equal(screen.queryByRole('dialog'), null))
-  assert.equal(document.activeElement?.closest('#search-workspace'), null)
 })

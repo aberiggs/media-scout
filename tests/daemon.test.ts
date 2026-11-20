@@ -1,8 +1,6 @@
 import { expect, it, vi } from 'vitest';
 import { createMonitorScheduler, createShutdown } from '../src/daemon';
 import { defaultSettings } from '../src/settings';
-import { ArrAutomation } from '../src/search/automation';
-import { openSearchStore } from '../src/search/store';
 it('does not schedule when disabled and stops scheduling on shutdown', async () => {
   vi.useFakeTimers();
   const settings = structuredClone(defaultSettings), run = vi.fn(async () => {});
@@ -65,28 +63,6 @@ it('promptly rechecks an explicit deadline that elapsed before scheduling', asyn
     await vi.advanceTimersByTimeAsync(1);
     expect(run).toHaveBeenCalledTimes(2);
   } finally { scheduler.stop(); vi.useRealTimers(); }
-});
-it('uses the real automation earliest show deadline after an unrelated show completes', async () => {
-  vi.useFakeTimers(); const started = Date.parse('2026-01-01'); vi.setSystemTime(started);
-  const settings = structuredClone(defaultSettings); settings.monitoring.enabled = true; settings.monitoring.intervalMinutes = 1;
-  const mk = (key: string, serviceId: number, episodeNumber: number) => ({ key, provider: 'sonarr' as const, sourceFingerprint: 'fp', serviceId, externalId: 20, episodeId: episodeNumber, monitored: true, hasFile: false, available: true, eligible: true, context: { title: `Show ${serviceId}`, titles: [`Show ${serviceId}`], seasonNumber: 1, episodeNumber } });
-  const targets = [mk('a1', 1, 1), mk('a2', 1, 2), mk('b', 2, 1)], store = openSearchStore(':memory:');
-  const observer: any = { observe: async () => ({ observedAt: Date.now(), sonarr: { known: true }, radarr: { known: false }, targets }) };
-  let searches = 0;
-  const automation = new ArrAutomation({ store, observer, search: { run: async () => {
-    searches++;
-    if (searches === 2) vi.setSystemTime(Date.now() + 50_001); // B finishes 50s after A.
-    return { searchId: String(searches), status: 'no-match', options: [], candidates: [], counts: { decisions: 1, searches: 1, candidates: 0 }, events: [], promptVersion: 'test' };
-  } }, submission: { submit: vi.fn() }, getPolicy: () => ({ enabled: true, dryRun: false, intervalMinutes: 1 }), clock: () => Date.now() });
-  const passes: unknown[] = [];
-  const scheduler = createMonitorScheduler(() => settings, async () => { const pass = await automation.runPass(); passes.push(pass); return pass; });
-  try {
-    scheduler.refresh(); await vi.advanceTimersByTimeAsync(60_000); await vi.advanceTimersByTimeAsync(1);
-    expect(passes[0]).toMatchObject({ ran: true, targetKey: 'a1' });
-    expect(searches).toBe(2);
-    await vi.advanceTimersByTimeAsync(0); // idle pass at +50s schedules A's +60s deadline.
-    await vi.advanceTimersByTimeAsync(20_000); expect(searches).toBe(3); // before the one-minute idle cadence.
-  } finally { scheduler.stop(); store.close(); vi.useRealTimers(); }
 });
 it('does not rearm after stop while an attempt is in flight', async () => {
   vi.useFakeTimers();

@@ -1,5 +1,12 @@
 # Show-level acquisition planning
 
+> **Superseded implementation plan (2026-11):** the approved #52+#55 release-set
+> backend uses one asynchronous search request and a single overlap-tolerant
+> release-set result. Do not implement this document's separate batch API,
+> ranked alternatives, disjoint per-release target assignment, or acquisition
+> flow. The current backend is read-only; execution and whole-show automation
+> remain deferred. Retain this document as historical design context only.
+
 **Status: approved; implementation in progress.** Torrent inspection and CRW
 remain out of scope. Validation must not send live download-client requests.
 Offline characterization is not live search evaluation. Search-only live probes

@@ -1,6 +1,6 @@
 # Media Scout
 
-Media Scout turns a natural-language request into bounded Prowlarr searches and ranked release alternatives. Search is separate from explicit download submission; Sonarr/Radarr automation is optional.
+Media Scout turns a natural-language request into bounded Prowlarr searches and a versioned release-set plan. Search is read-only; download execution and acquisition automation are currently deferred.
 
 Prowlarr provides indexer search and routed submissions. Sonarr/Radarr supply library and queue observations for optional automation.
 
@@ -25,15 +25,15 @@ For a fixed image, replace `ghcr.io/aberiggs/media-scout:latest` in both command
 
 ## Setup and safety
 
-- Prowlarr with configured indexers and enabled download clients, and an LLM API endpoint, are needed for searching. Sonarr/Radarr are optional.
-- Settings, including integration credentials, are stored in SQLite in the data volume; protect that volume and its backups as secrets. Monitoring starts disabled and dry-run enabled. Dry-run prevents download submission, but searches can still incur indexer and LLM costs.
+- Prowlarr with configured indexers and an LLM API endpoint are needed for searching. Sonarr/Radarr are optional context providers.
+- Settings, including integration credentials, are stored in SQLite in the data volume; protect that volume and its backups as secrets. Monitoring starts disabled. Submission APIs return execution-deferred while #56 is pending; searches can still incur indexer and LLM costs.
 - The web interface and API have no authentication. The quickstart binds to loopback; expose it only on trusted networks.
 
-Configure Prowlarr, LLM, and optional Arr connection details in the web UI. For Arr automation, configure download-client categories consistently between Prowlarr and Sonarr/Radarr, then enter the exact Prowlarr client names in Media Scout.
+Configure Prowlarr, LLM, and optional Arr connection details in the web UI. Arr polling remains read-only; saved monitoring preferences are retained but cannot trigger acquisition.
 
-## Automation cadence
+## Search execution
 
-The saved monitoring `intervalMinutes` setting is both the idle observation cadence and the per-show automation cooldown. After an actual Sonarr search attempt completes, all eligible episodes in that show wait that duration (default five minutes); identity is scoped to the Sonarr source fingerprint and series ID. A different show or Radarr movie can be searched immediately after the preceding automation pass completes. Existing target retry/backoff and provider cooldowns still apply.
+Search jobs require the daemon's bound internal Streamable HTTP MCP route. The standalone stdio MCP adapter can read status/history, but cannot start a search when no daemon HTTP listener exists. The backend refuses instead of launching a second listener or alternate engine.
 
 ## Develop from source
 

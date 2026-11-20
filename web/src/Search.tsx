@@ -2,32 +2,17 @@ import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { Check, CircleAlert, LoaderCircle, Search as SearchIcon, ShieldCheck, Waves } from 'lucide-react'
 import type { Settings } from './types'
 
-type Option = { optionId: string; rank: number; releases: Array<{ candidateId: string }>; coveredTargetIds: string[]; reason: string; uncertainty: string }
-type Candidate = { candidateId: string; observations: Array<{ title: string; indexer?: string; size?: number | null; seeders?: number | null }>; excluded?: boolean }
-type SearchResult = { searchId: string; status: string; prompt: string; options: Option[]; candidates: Candidate[]; events: Array<{ type: string; data: Record<string, unknown> }>; counts: { decisions: number; searches: number; candidates: number }; queuePosition?: number; waitingReason?: string; retryAt?: string; message?: string }
-type Client = { id: number; name: string; protocol: string; categories: boolean }
-type SubmissionEvent = { outcome: string; outcomes?: Array<{ candidateId: string; outcome: string }> }
+type Candidate = { candidateId: string; observations?: Array<{ title: string; indexer?: string; size?: number | null; seeders?: number | null }>; excluded?: boolean }
+type Selection = { candidateId: string; targetIds: string[]; reason: string; uncertainty: string }
+type Plan = { version: number; planId: string; status: string; selections: Selection[]; coverage: { covered: string[]; gaps: string[]; deferred: string[]; broad: { status: string; gaps: string[] } }; warnings?: string[]; message?: string }
+type SearchResult = { searchId: string; status: string; normalizedRequest?: unknown; plan?: Plan; legacyResult?: unknown; candidates?: Candidate[]; events?: Array<{ type: string; data: Record<string, unknown> }>; counts?: { decisions: number; searches: number; candidates: number }; queuePosition?: number; waitingReason?: string; retryAt?: string; message?: string }
 const running = (status?: string) => status === 'queued' || status === 'running'
-function newSubmissionKey() {
-  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID()
-  const bytes = crypto.getRandomValues(new Uint8Array(16))
-  bytes[6] = (bytes[6]! & 0x0f) | 0x40
-  bytes[8] = (bytes[8]! & 0x3f) | 0x80
-  const hex = [...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('')
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
-}
-
-export function SearchPage({ settings, searchId, searchRevision, active, onSearchStarted }: { settings: Settings; searchId?: string; searchRevision: number; active: boolean; onSearchStarted(id: string, startingRevision: number): void }) {
+export function SearchPage({ settings, searchId, searchRevision, onSearchStarted }: { settings: Settings; searchId?: string; searchRevision: number; active?: boolean; onSearchStarted(id: string, startingRevision: number): void }) {
   const [prompt, setPrompt] = useState(''), [advanced, setAdvanced] = useState(false)
   const [context, setContext] = useState(''), [preferences, setPreferences] = useState('')
   const [result, setResult] = useState<SearchResult | null>(null), [busy, setBusy] = useState(false)
   const [error, setError] = useState(''), [notice, setNotice] = useState('')
-  const [selected, setSelected] = useState<Option | null>(null), [confirm, setConfirm] = useState(false)
-  const [clients, setClients] = useState<Client[]>([]), [client, setClient] = useState('')
-  const [submitting, setSubmitting] = useState(false), [clientError, setClientError] = useState('')
   const timer = useRef<number>(), controller = useRef<AbortController | null>(null)
-  const opener = useRef<HTMLElement | null>(null), dialog = useRef<HTMLElement | null>(null)
-  const submissionKeys = useRef(new Map<string, string>())
 
   useEffect(() => {
     if (!searchId) return
@@ -36,26 +21,6 @@ export function SearchPage({ settings, searchId, searchRevision, active, onSearc
     void loadResult(searchId)
   }, [searchId, searchRevision])
   useEffect(() => () => { controller.current?.abort(); window.clearTimeout(timer.current) }, [])
-  useEffect(() => {
-    if (!confirm) return
-    if (!active) { setConfirm(false); return }
-    opener.current = document.activeElement as HTMLElement
-    dialog.current?.querySelector<HTMLElement>('button')?.focus()
-    const key = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setConfirm(false)
-      if (event.key !== 'Tab') return
-      const items = [...(dialog.current?.querySelectorAll<HTMLElement>('button:not(:disabled),select:not(:disabled)') ?? [])]
-      if (!items.length) { event.preventDefault(); return }
-      if (event.shiftKey && document.activeElement === items[0]) { event.preventDefault(); items.at(-1)?.focus() }
-      else if (!event.shiftKey && document.activeElement === items.at(-1)) { event.preventDefault(); items[0]?.focus() }
-    }
-    document.addEventListener('keydown', key)
-    return () => {
-      document.removeEventListener('keydown', key)
-      if (!opener.current?.closest('[hidden], [inert]')) opener.current?.focus()
-    }
-  }, [confirm, active])
-
   async function loadResult(id: string) {
     window.clearTimeout(timer.current)
     controller.current?.abort()
@@ -85,35 +50,13 @@ export function SearchPage({ settings, searchId, searchRevision, active, onSearc
     } catch (failure) { setError(failure instanceof SyntaxError ? 'Context must be valid JSON.' : failure instanceof Error ? failure.message : 'Search could not start.') }
     finally { setBusy(false) }
   }
-  async function choose(option: Option) {
-    setSelected(option); setConfirm(true); setNotice(''); setClientError(''); setClients([])
-    try {
-      const response = await fetch('/api/v2/download-clients')
-      if (!response.ok) throw new Error('Could not load configured clients. Check Prowlarr and try again.')
-      setClients(((await response.json()) as { items: Client[] }).items)
-    } catch (failure) { setClientError(failure instanceof Error ? failure.message : 'Clients unavailable.') }
-  }
-  async function submitOption() {
-    if (!result || !selected || submitting) return
-    const identity = `${result.searchId}:${selected.optionId}:${client}`
-    const key = submissionKeys.current.get(identity) ?? newSubmissionKey()
-    submissionKeys.current.set(identity, key)
-    setSubmitting(true)
-    try {
-      const response = await fetch('/api/v2/submissions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ searchId: result.searchId, optionId: selected.optionId, idempotencyKey: key, ...(client ? { downloadClientId: Number(client) } : {}) }) })
-      const data = await response.json() as { outcome: string; error?: string; message?: string }
-      if (!response.ok) throw new Error(data.error ?? 'Submission status is uncertain. Retry this confirmation to check the same submission, not create another.')
-      setConfirm(false); setNotice(data.outcome === 'expired' ? 'Search results expired. Start a new search before submitting.' : `Submission outcome: ${data.outcome}`)
-    } catch (failure) { setNotice(failure instanceof Error ? failure.message : 'Submission status is uncertain. Retry to check the same submission.') }
-    finally { setSubmitting(false) }
-  }
-
-  const byId = new Map((result?.candidates ?? []).map(candidate => [candidate.candidateId, candidate]))
-  const submissions = (result?.events ?? []).filter(event => event.type === 'submission').map(event => event.data as unknown as SubmissionEvent)
+   const byId = new Map((result?.candidates ?? []).map(candidate => [candidate.candidateId, candidate]))
+   const plan = result?.plan
+   const receipts = (result?.events ?? []).filter(event => event.type === 'submission').map(event => event.data)
   const progress = busy
   const searchReady = Boolean(settings.integrations.prowlarr.url && settings.integrations.prowlarr.apiKey && settings.ai.apiKey)
   return <div className="search-layout"><div className="search-main">
-    <div className="page-heading"><div><h1>Search<span className="heading-period">.</span></h1><p className="page-intro">Describe what you’re looking for. Scout compares releases; you choose what to download.</p></div></div>
+    <div className="page-heading"><div><h1>Search<span className="heading-period">.</span></h1><p className="page-intro">Describe what you’re looking for. Scout researches one best-effort release-set plan.</p></div></div>
     <form className="search-composer" onSubmit={search}>
       <label className="field" htmlFor="search-prompt">What are you looking for?<textarea id="search-prompt" aria-label="What are you looking for?" rows={3} value={prompt} onChange={event => setPrompt(event.target.value)} placeholder="Find the film, episode, or season you want…" maxLength={4000}/></label>
       <div className="search-form-actions"><button className="text-button" type="button" aria-expanded={advanced} onClick={() => setAdvanced(!advanced)}>{advanced ? 'Hide optional details' : 'Add optional details'}</button><button className="button button-primary" type="submit" disabled={progress || !prompt.trim()}>{progress ? <LoaderCircle className="spin" size={16}/> : <SearchIcon size={16}/>}Search releases</button></div>
@@ -123,22 +66,15 @@ export function SearchPage({ settings, searchId, searchRevision, active, onSearc
     {error && <div role="alert" className="notice notice-error">{error}</div>}
     {notice && <div role="status" className="notice">{notice}</div>}
     {result && <section className="search-results" aria-live="polite">
-      <div className="search-result-heading"><div><h2>{result.status === 'matched' ? 'Ranked options' : result.status === 'queued' ? 'Search queued' : result.status === 'running' ? 'Searching…' : result.status === 'no-match' ? 'No suitable match' : `Search ${result.status}`}</h2><p>{result.message ?? `${result.counts.candidates} candidates · ${result.counts.searches} searches · ${result.counts.decisions} model decisions`}</p></div><span className="ops-status">{result.status}</span></div>
-      {result.events.some(event => event.type.startsWith('query-')) && <details className="query-trail" open><summary>Search trail</summary><ol>{result.events.filter(event => event.type.startsWith('query-')).map((event, index) => <li key={index}><strong>{event.type === 'query-start' ? 'Query' : 'Results'}:</strong> {String(event.data.query ?? 'Indexer query')}{event.data.count !== undefined && ` · ${String(event.data.count)} results`}</li>)}</ol></details>}
-       {submissions.length > 0 && <section className="query-trail" aria-labelledby="submission-history"><h3 id="submission-history">Submission history</h3>{submissions.map((submission, index) => <div key={index}><p>Outcome: {submission.outcome}</p><ul>{submission.outcomes?.map((release, releaseIndex) => <li key={releaseIndex}>{byId.get(release.candidateId)?.observations[0]?.title ?? `Release ${releaseIndex + 1}`}: {release.outcome}</li>)}</ul></div>)}</section>}
-      {result.status === 'queued' ? <p role="status" className="ops-state-panel"><LoaderCircle className="spin"/>Queued{result.queuePosition ? ` · ${Math.max(0, result.queuePosition - 1)} ahead` : ''}{result.waitingReason === 'provider-cooldown' && result.retryAt ? ` · Provider cooldown until ${new Date(result.retryAt).toLocaleTimeString()}` : result.waitingReason === 'settings-incomplete' ? ' · Complete Settings to start it' : result.waitingReason === 'capacity' ? ' · Waiting for an execution slot' : ''}. Your search will start automatically.</p> : result.status === 'running' ? <p role="status" className="ops-state-panel"><LoaderCircle className="spin"/>Checking indexers and comparing releases…</p> : !result.options.length ? <div className="ops-state-panel ops-empty"><h2>{result.status === 'no-match' ? 'No suitable releases found' : ['failed', 'interrupted', 'budget-exhausted'].includes(result.status) ? 'Search could not complete' : 'Search did not produce a recommendation'}</h2><p>{result.message ?? 'Try an alternate title or add more context.'}</p></div> : <div className="ranked-options">{result.options.map(option => <article className="ranked-option" key={option.optionId}>
-        <div className="option-title"><h3>{option.rank === 1 ? 'Best match' : `Alternative ${option.rank - 1}`}</h3><span>Option {option.rank}</span></div>
-        <p className="option-reason">{option.reason}</p>{option.uncertainty && <p className="option-uncertainty">{option.uncertainty}</p>}
-        <ul className="option-releases">{option.releases.map(release => { const candidate = byId.get(release.candidateId), evidence = candidate?.observations[0]; return <li key={release.candidateId}><strong>{evidence?.title ?? 'Release details unavailable'}</strong>{evidence && <span>{[evidence.indexer, evidence.size ? `${(evidence.size / 1e9).toFixed(1)} GB` : null, evidence.seeders != null ? `${evidence.seeders} seeders` : 'Seeders unknown'].filter(Boolean).join(' · ')}</span>}{candidate?.excluded && <span>Temporarily excluded after a previous attempt</span>}</li> })}</ul>
-         {option.coveredTargetIds.length > 0 && <p className="field-hint">Covers {option.coveredTargetIds.length} requested target(s).</p>}
-        <button className="button button-primary" type="button" onClick={() => void choose(option)} disabled={result.status !== 'matched'}>{settings.safety.dryRun ? 'Preview submission' : 'Choose and confirm download'}</button>
-      </article>)}</div>}
-      {!!result.candidates.length && <details className="all-candidates"><summary>All candidates ({result.candidates.length})</summary><ul>{result.candidates.map(candidate => <li key={candidate.candidateId}>{candidate.observations[0]?.title ?? 'Untitled candidate'}{candidate.excluded && ' · Temporarily excluded'}</li>)}</ul></details>}
+       <div className="search-result-heading"><div><h2>{result.status === 'matched' ? 'Search plan' : result.status === 'queued' ? 'Search queued' : result.status === 'running' ? 'Searching…' : result.status === 'no-match' ? 'No suitable match' : `Search ${result.status}`}</h2><p>{result.message ?? `${result.counts?.candidates ?? 0} candidates · ${result.counts?.searches ?? 0} searches · ${result.counts?.decisions ?? 0} model decisions`}</p></div><span className="ops-status">{result.status}</span></div>
+       {(result.events ?? []).some(event => event.type.startsWith('query-')) && <details className="query-trail" open><summary>Search trail</summary><ol>{(result.events ?? []).filter(event => event.type.startsWith('query-')).map((event, index) => <li key={index}><strong>{event.type === 'query-start' ? 'Query' : 'Results'}:</strong> {String(event.data.query ?? 'Indexer query')}{event.data.count !== undefined && ` · ${String(event.data.count)} results`}</li>)}</ol></details>}
+       {receipts.length > 0 && <section className="query-trail" aria-labelledby="submission-history"><h3 id="submission-history">Historical submission receipts</h3><p>Read-only records from the previous execution workflow.</p>{receipts.map((receipt, index) => <pre key={index}>{JSON.stringify(receipt, null, 2)}</pre>)}</section>}
+        {result.status === 'queued' ? <p role="status" className="ops-state-panel"><LoaderCircle className="spin"/>Queued{result.queuePosition ? ` · ${Math.max(0, result.queuePosition - 1)} ahead` : ''}{result.waitingReason === 'provider-cooldown' && result.retryAt ? ` · Provider cooldown until ${new Date(result.retryAt).toLocaleTimeString()}` : result.waitingReason === 'settings-incomplete' ? ' · Complete Settings to start it' : result.waitingReason === 'capacity' ? ' · Waiting for an execution slot' : ''}. Your search will start automatically.</p> : result.status === 'running' ? <p role="status" className="ops-state-panel"><LoaderCircle className="spin"/>Checking indexers and comparing releases…</p> : result.legacyResult ? <div className="ops-state-panel"><h2>Legacy search record</h2><p>This saved result uses a retired format and is available for inspection only.</p><pre>{JSON.stringify(result.legacyResult, null, 2)}</pre></div> : <><p className="ops-info-box">Plan only. Download execution is unavailable in this version.</p>{(plan?.selections ?? []).map((selection, index) => { const candidate = byId.get(selection.candidateId), evidence = candidate?.observations?.[0]; return <article className="ranked-option" key={`${selection.candidateId}-${index}`}><h3>{evidence?.title ?? 'Selected candidate'}</h3><p>{selection.reason}</p>{selection.uncertainty && <p className="option-uncertainty">Uncertainty: {selection.uncertainty}</p>}<p className="field-hint">Targets: {selection.targetIds.join(', ') || 'Not specified'}</p></article> })}<div className="query-trail"><h3>Coverage</h3><p>Covered: {(plan?.coverage?.covered ?? []).join(', ') || 'None reported'}</p><p>Gaps: {(plan?.coverage?.gaps ?? []).join(', ') || 'None reported'}</p><p>Deferred: {(plan?.coverage?.deferred ?? []).join(', ') || 'None'}</p>{plan?.coverage?.broad && <p>Broad search: {plan.coverage.broad.status} · {plan.coverage.broad.gaps.join(', ')}</p>}{plan?.warnings?.map((warning, index) => <p key={index}>{warning}</p>)}</div></>}
+       {!!result.candidates?.length && <details className="all-candidates"><summary>All candidates ({result.candidates.length})</summary><ul>{result.candidates.map(candidate => <li key={candidate.candidateId}>{candidate.observations?.[0]?.title ?? 'Untitled candidate'}{candidate.excluded && ' · Temporarily excluded'}</li>)}</ul></details>}
     </section>}
-    {confirm && selected && <div className="ops-dialog-backdrop"><section ref={dialog} className="ops-dialog search-confirm" role="dialog" aria-modal="true" aria-labelledby="confirm-title"><div className="ops-dialog-head"><div><h2 id="confirm-title">Confirm this option</h2><p>Choose the configured client and category route.</p></div><button className="icon-button" aria-label="Close confirmation" disabled={submitting} onClick={() => setConfirm(false)}>×</button></div><div className="ops-dialog-body"><p>{selected.reason}</p>{settings.safety.dryRun && <p className="ops-info-box">Dry-run is on. No download will be submitted.</p>}{clientError && <p role="alert">{clientError}</p>}<label className="field">Download client (optional)<select value={client} disabled={submitting} onChange={event => setClient(event.target.value)}><option value="">Use configured default route</option>{clients.map(item => <option key={item.id} value={item.id}>{item.name} · {item.protocol}{item.categories ? ' · categories' : ''}</option>)}</select></label><div className="ops-dialog-actions"><button className="button button-secondary" disabled={submitting} onClick={() => setConfirm(false)}>Cancel</button><button className="button button-primary" disabled={submitting || !!clientError} onClick={() => void submitOption()}>{submitting ? 'Submitting…' : 'Confirm option'}</button></div></div></section></div>}
     </div><aside className="search-rail" aria-label="Search information">
       <section className="rail-card search-rail-status"><div className="search-rail-icon"><Waves size={17}/></div><strong>{searchReady ? 'Search setup complete' : 'Setup needed'}</strong><p>{searchReady ? 'Services are configured. Run a search to test live connections.' : 'Add a Prowlarr URL, API key, and model API key in Settings.'}</p><div className="search-checks"><span className={settings.integrations.prowlarr.url && settings.integrations.prowlarr.apiKey ? 'configured' : ''}>{settings.integrations.prowlarr.url && settings.integrations.prowlarr.apiKey ? <Check size={14}/> : <CircleAlert size={14}/>} Prowlarr {settings.integrations.prowlarr.url && settings.integrations.prowlarr.apiKey ? 'configured' : 'needed'}</span><span className={settings.ai.apiKey ? 'configured' : ''}>{settings.ai.apiKey ? <Check size={14}/> : <CircleAlert size={14}/>} AI model {settings.ai.apiKey ? 'configured' : 'needed'}</span></div></section>
-      <section className={`rail-card search-safety ${settings.safety.dryRun ? 'is-dry-run' : 'is-live'}`}><div className="search-rail-icon">{settings.safety.dryRun ? <ShieldCheck size={17}/> : <CircleAlert size={17}/>}</div><strong>{settings.safety.dryRun ? 'Dry-run is on' : 'Downloads enabled'}</strong><p>{settings.safety.dryRun ? 'Search and review real results safely. Confirmations are recorded, but no download is sent.' : 'Search does not download. A download starts only after you confirm an option.'}</p><a href="#settings">Review safety settings</a></section>
+       <section className={`rail-card search-safety ${settings.safety.dryRun ? 'is-dry-run' : 'is-live'}`}><div className="search-rail-icon">{settings.safety.dryRun ? <ShieldCheck size={17}/> : <CircleAlert size={17}/>}</div><strong>{settings.safety.dryRun ? 'Dry-run saved preference: on' : 'Dry-run saved preference: off'}</strong><p>Download execution is unavailable in this version. Search plans are read-only.</p><a href="#settings">Review safety settings</a></section>
       <p className="search-rail-footnote">Searches use live model and indexer calls, which may incur provider costs.</p>
     </aside></div>
 }

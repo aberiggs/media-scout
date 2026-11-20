@@ -1,6 +1,43 @@
 # Search subsystem
 
-HTTP and MCP adapters share the search domain. Search queries Prowlarr and returns ranked alternatives; it does not download. Submission is a distinct explicit operation. Automation reads Sonarr/Radarr state and is optional. Dry-run is the default and prevents grab requests, not search/provider costs.
+HTTP and public MCP adapters share one asynchronous search domain. The OpenRouter Agent SDK owns tool orchestration; the backend validates a single versioned release-set against the owning-search ledger. Search is read-only and never grabs. Release execution (#56) and automation acquisition (#57) are disabled; saved preferences and observer data remain intact.
+
+## Canonical request and result
+
+`POST /api/v2/searches` and public MCP `ma_search_v2` accept the same request.
+Creation returns HTTP 202 / `{searchId,status:"queued"}`; read the persisted result
+with `GET /api/v2/searches/:id` or `ma_search_status_v2`.
+
+```json
+{"prompt":"Find seasons 1-4 of Example; useful partial sets are welcome","context":{"kind":"tv","titles":["Example"],"scope":{"type":"unspecified"}}}
+```
+
+For exact generic targets, supply distinct opaque `context.targets[].targetId`
+references with numbering evidence. For Arr-backed acquisition intent, supply
+`arrTargetIds` from the saved observation view instead: the backend freshly resolves
+and validates them, then persists immutable canonical bindings. Generic target IDs
+never grant Arr authority, even if they happen to equal an Arr reference.
+
+A completed result has one `plan`, not `options`. Abbreviated example:
+
+```json
+{"searchId":"backend-id","status":"matched","plan":{"version":1,"planId":"backend-id","status":"matched","selections":[{"candidateId":"observed-id","targetIds":[],"reason":"Observed pack covers seasons 1-3","uncertainty":"Inferred from title; contents not inspected"}],"gaps":[],"deferred":[],"broadCoverage":"partial","scopeGaps":["Season 4 not found"],"coverage":{"covered":[],"gaps":[],"deferred":[],"broad":{"status":"partial","gaps":["Season 4 not found"]}}}}
+```
+
+`targetIds` refer only to explicit requested targets; broad free-text requests use
+descriptive scope coverage/gaps. Atomic target coverage is the backend-computed
+union across selections, so useful overlap is valid. An empty **validated** set is
+`no-match`; failed/interrupted/budget-exhausted research has no executable plan.
+Safe candidate evidence is retained with history independently of private locator
+expiry. Consumers resolve selected IDs through the owning backend ledger, never
+through client-supplied magnets or tracker URLs. Download execution is not available
+until #56; inferred coverage does not establish download or import completion.
+
+Fresh defaults are 100 SDK steps, 100 indexer searches and a 30-minute job deadline;
+model requests have a 10-minute ceiling. Existing saved lower limits are preserved.
+Capabilities cover the job plus cleanup within 35 minutes, worker leases renew,
+and private candidates outlive the maximum research deadline. Numeric usage,
+elapsed time and stop reasons are retained when available, not reasoning traces.
 
 ## Internal Prowlarr MCP
 
@@ -11,7 +48,7 @@ The daemon serves Streamable HTTP at `/internal/mcp/prowlarr` using MCP TypeScri
 
 The route accepts only a backend-minted short-lived bearer capability. `SearchRuntime.createProwlarrMcpCapability(searchId, ttlMs)` is the private #55 integration seam: it requires an existing owning search, snapshots saved settings, and returns a token/expiry; the worker must revoke it with `revokeProwlarrMcpCapability` on completion/cancellation. Lifetimes are finite, validated, and capped at 35 minutes to accommodate bounded agent work. There is deliberately no token-minting HTTP endpoint and tool arguments cannot select a search ID. Stateful SDK transport sessions are bound to their authorizing capability and closed on revocation, daemon shutdown, or runtime quiesce. Prowlarr `429` responses update the shared provider cooldown, using a 60-second fallback when `Retry-After` is absent. Search cancellation and bounded timeout abort the upstream request.
 
-Each tool call gets its Prowlarr client from that immutable settings snapshot, so a settings edit affects subsequent jobs, not an in-flight job. Candidate observations and `{release, physicalKey}` private data are persisted in the existing candidate store under the owner search ID; submission remains the existing guarded `SubmissionService` boundary. Safe DTO text redacts configured Prowlarr credentials and known release GUIDs/locators, URLs, magnets and hashes. Parsed scope contains numeric claims only, not raw upstream text. Repeated physical releases share one candidate ID within a search; differing observations remain separate evidence.
+Each tool call gets its Prowlarr client from that immutable settings snapshot, so a settings edit affects subsequent jobs, not an in-flight job. Candidate observations and `{release, physicalKey}` private data are persisted under the owner search ID. Safe DTO text redacts configured credentials and release locators; private data never enters model prompts or public results. Repeated physical releases share one candidate ID within a search; differing observations remain separate evidence.
 
 Example calls and abbreviated safe results:
 
@@ -28,24 +65,30 @@ Example calls and abbreviated safe results:
 [{"candidateId":"opaque-uuid","observations":[{"title":"Example.S01.1080p","indexer":"Example","size":1234,"seeders":8,"protocol":"torrent","categories":[{"id":5000,"name":"TV"}]}]}]
 ```
 
-Results are JSON text MCP content; the search result count describes that response batch, not all possible matches. Search timeouts default to 30 seconds and accept 100–120,000 ms; discovery uses a 15-second upstream timeout. Omitted indexer IDs select enabled, non-cooling, search-capable indexers; an explicit empty/unavailable selection fails rather than broadening. Missing upstream capability flags retain the existing permissive eligibility behavior. These tools make no release-set, coverage partition, ranking, or plan-selection decisions.
+Results are JSON text MCP content; the search result count describes that response batch, not all possible matches. Upstream search timeout defaults to 120 seconds with a 120-second ceiling; discovery uses a 15-second timeout. Omitted indexer IDs select enabled, non-cooling, search-capable indexers; an explicit empty/unavailable selection fails rather than broadening.
 
-For #52 + #55, create a capability after the backend owns/persists the search, pass its token as bearer auth to `createMCPTools` from `@openrouter/agent/mcp`, and always close the client and revoke the capability in `finally`. The current Agent SDK package makes the former `@openrouter/mcp` package a deprecated facade; the interoperability test uses the canonical entry point, dev-only, without a model request. The caller—not tool arguments—owns the search and lifetime. Use `http://127.0.0.1:<HTTP_PORT>/internal/mcp/prowlarr` from within the daemon/container; another authorized container can use the daemon's Compose service name and container port. No extra port, container, saved setting, or user-entered MCP secret is required. Do not give the token to model prompts, events, public responses, or logs. Existing same-origin checks reject cross-origin browser POSTs.
+The daemon registers its actual bound loopback origin before dispatching work. The job passes its backend-minted capability to the canonical `createMCPTools` import and always closes/revokes it. The caller—not tool arguments—owns the search and lifetime. The public stdio server reuses the daemon architecture and reports unavailable when no HTTP origin is present; it never spawns a second engine/listener. Do not give the token to model prompts, events, public responses, or logs.
 
-Transitional boundary: existing search jobs still use the old planner until #52 + #55 installs its replacement and wires capability creation into each job. The Prowlarr client remains shared with explicit submission, so it is not dead code and must not be removed at agent cut-over. The existing UI and public stdio tools remain functional. This foundation does not implement a new plan API, agent loop, external-MCP settings, or submission path.
+Legacy history remains inspectable via the explicit `legacyResult` projection and is never converted to release-set plans. Submission routes are blocked with `execution-deferred`; automation polling remains observation-only and reports the same block reason. External research MCP settings (#54) and per-release execution (#56) are out of scope.
 
 The public Media Scout stdio adapter remains available and uses SDK v2. It is separate from this read-only internal server and does not expose recursive agent tools.
 
+`arrTargetIds` explicitly requests fresh Arr resolution; arbitrary generic
+`context.targets` remain opaque request references and never gain Arr authority
+from their shape or a coincidental ID match. Arr-backed requests bind only fresh,
+eligible targets from one show or one movie, and persist their canonical bindings
+as a versioned array separate from historical single-binding settings.
+
 Implementation map:
 
-- `service.ts`, `selection.ts`: bounded search orchestration and candidate validation.
-- `contracts.ts`, `arr.ts`, `automation.ts`: shared contracts and Arr automation.
-- `submission.ts`: explicit submission and idempotency boundary.
+- `agent.ts`, `agent-contracts.ts`: SDK orchestration and ledger-validated finalization.
+- `contracts.ts`, `arr.ts`, `automation.ts`: request contracts, Arr observation, and the retained cooldown-key helper; no acquisition automation engine remains.
+- `submission.ts`: safe receipt projection types only; the release execution service is retired.
 - `store.ts`, `settings.ts`: SQLite persistence.
 - `runtime.ts`, `mcp.ts`, `prowlarr-mcp.ts`: runtime wiring and MCP adapters/capabilities.
 
-Preserve these boundaries: failed or incomplete Arr reads are unknown, not empty. Submission uses idempotency to avoid duplicate POSTs; uncertain outcomes are not automatically replayed. A matched search or submitted grab does not prove download or import completion. Private download locators are kept out of public responses and model context.
+Preserve these boundaries: failed or incomplete Arr reads are unknown, not empty. Target membership is based only on the owning ledger; explicit identity conflicts and duplicate physical releases reject finalization. Broad-scope coverage is explicit and may be partial/unknown; target coverage is not proof of whole-work completeness.
 
 HTTP routes are registered in `src/daemon.ts`; the internal Prowlarr and public Media Scout MCP tools are registered in `src/search/prowlarr-mcp.ts` and `src/search/mcp.ts`. `src/mcp/server.ts` is the public MCP process entry point. Prefer these implementations and shared contracts as the source of truth for current behavior.
 
-Verification exercised by `tests/prowlarr-http-mcp.test.ts` includes real SDK v2 HTTP initialize/list/call and cancellation, canonical `@openrouter/agent/mcp` discovery and execution with bearer auth and close (without invoking a model), adversarial redaction, candidate ledger scope/downstream dry-run identity, unauthorized/mismatched tokens and sessions, malformed arguments, independent concurrent settings snapshots, unavailable/cooling indexers, 429 cooldown and zero grabs. A disposable HTTP Prowlarr fixture also verifies real upstream timeout, active expiry and shutdown abortion. Delivery additionally exercised the built Node 22 image through a published loopback port, actual MCP/OpenRouter discovery and calls, and clean SIGTERM exit; no production configuration, downloads, model calls or real Prowlarr service were used.
+Verification includes a scripted Responses server driving the real Agent SDK through the bound Fastify MCP listener, Prowlarr tool invocation and validated release-set persistence; contract tests cover foreign/fabricated membership, duplicate physical identity, overlaps, partial broad coverage and explicit no-match. Internal MCP tests cover bearer scoping, cancellation, expiry, provider cooldown, privacy, and zero grabs. The fixture model response is not live provider evidence.

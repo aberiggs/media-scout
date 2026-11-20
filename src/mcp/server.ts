@@ -1,4 +1,4 @@
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { pathToFileURL } from 'node:url';
 import pino from 'pino';
 import { buildStack, type Stack } from '../compose';

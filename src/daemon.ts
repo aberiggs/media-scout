@@ -1,6 +1,8 @@
-import Fastify, { LogController } from 'fastify';
+import Fastify, { LogController, type FastifyRequest, type FastifyReply } from 'fastify';
+import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node';
 import fastifyStatic from '@fastify/static';
 import { z } from 'zod';
+import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -8,6 +10,7 @@ import { buildStack, type Stack } from './compose';
 import { loadConfig } from './config';
 import { searchRequestSchema, submissionRequestSchema, activityStatusSchema } from './search/contracts';
 import { missingSettings, type Settings } from './settings';
+import { createProwlarrMcpServer } from './search/prowlarr-mcp';
 
 declare module 'fastify' { interface FastifyInstance { refreshScheduler?: () => void } }
 const identifier = z.string().trim().min(1).max(200);
@@ -23,6 +26,31 @@ function mutationAllowed(request: { headers: Record<string, string | string[] | 
 export async function buildApp(stack: Stack, options: { webRoot?: string } = {}) {
   const { runtime } = stack;
   const app = Fastify({ loggerInstance: stack.logger.child({ component: 'daemon' }), bodyLimit: 1_048_576, logController: new LogController({ disableRequestLogging: true }) });
+  type ProwlarrSession = { token: string; transport: NodeStreamableHTTPServerTransport; responses: Set<Promise<void>> };
+  const prowlarrSessions = new Map<string, ProwlarrSession>();
+  const serveProwlarrSession = async (session: ProwlarrSession, request: FastifyRequest, reply: FastifyReply) => {
+    // A closed SSE response is not a terminal tool result to legacy clients.
+    // Drain POST responses before closing the SDK transport; long-lived GET
+    // event streams must instead be closed by the transport itself.
+    if (request.method === 'POST') {
+      let finish!: () => void;
+      const response = new Promise<void>(resolve => { finish = resolve; });
+      session.responses.add(response);
+      const done = () => {
+        reply.raw.off('finish', done);
+        reply.raw.off('close', done);
+        session.responses.delete(response);
+        finish();
+      };
+      reply.raw.once('finish', done);
+      reply.raw.once('close', done);
+    }
+    return session.transport.handleRequest(request.raw, reply.raw, request.body);
+  };
+  app.addHook('preClose', async () => {
+    runtime.quiesce();
+    await runtime.closeProwlarrMcpSessions();
+  });
   app.addHook('onRequest', async (request, reply) => {
     if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method) && !mutationAllowed(request)) return reply.code(403).send({ error: 'Cross-origin mutation rejected', code: 'origin-rejected' });
   });
@@ -41,6 +69,50 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
     return envelope();
   });
   app.post('/api/v2/searches', async (request, reply) => reply.code(202).send(runtime.startSearch(searchRequestSchema.parse(request.body))));
+  app.all('/internal/mcp/prowlarr', async (request, reply) => {
+    const match = /^Bearer ([a-f\d]{64})$/i.exec(String(request.headers.authorization ?? ''));
+    if (!match || !runtime.hasProwlarrMcpCapability(match[1]!)) return reply.code(401).send({ error: 'Unauthorized' });
+    const token = match[1]!, sessionId = String(request.headers['mcp-session-id'] ?? '');
+    if (sessionId) {
+      const session = prowlarrSessions.get(sessionId);
+      if (!session || session.token !== token || !runtime.hasProwlarrMcpSession(sessionId, token))
+        return reply.code(404).send({ error: 'MCP session not found' });
+      return serveProwlarrSession(session, request, reply);
+    }
+    if (request.method !== 'POST') return reply.code(400).send({ error: 'MCP session required' });
+    const createdSessionId = randomUUID().replaceAll('-', '');
+    const server = createProwlarrMcpServer(runtime, token);
+    const transport = new NodeStreamableHTTPServerTransport({ sessionIdGenerator: () => createdSessionId });
+    const session: ProwlarrSession = { token, transport, responses: new Set() };
+    prowlarrSessions.set(createdSessionId, session);
+    if (!runtime.registerProwlarrMcpSession(createdSessionId, token, async () => {
+      prowlarrSessions.delete(createdSessionId);
+      await Promise.allSettled([...session.responses]);
+      await server.close();
+    })) {
+      prowlarrSessions.delete(createdSessionId);
+      await server.close();
+      return reply.code(401).send({ error: 'Unauthorized' });
+    }
+    transport.onclose = () => {
+      prowlarrSessions.delete(createdSessionId);
+      runtime.unregisterProwlarrMcpSession(createdSessionId);
+    };
+    try {
+      await server.connect(transport);
+      await serveProwlarrSession(session, request, reply);
+      if (!transport.sessionId) {
+        runtime.unregisterProwlarrMcpSession(createdSessionId);
+        prowlarrSessions.delete(createdSessionId);
+        await server.close();
+      }
+    } catch (error) {
+      runtime.unregisterProwlarrMcpSession(createdSessionId);
+      prowlarrSessions.delete(createdSessionId);
+      await server.close();
+      throw error;
+    }
+  });
   app.get('/api/v2/searches/:id', async (request, reply) => {
     const value = await runtime.getSearch(identifier.parse((request.params as { id: string }).id));
     return value ?? reply.code(404).send({ error: 'Search not found' });

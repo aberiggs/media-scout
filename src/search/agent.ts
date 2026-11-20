@@ -47,7 +47,7 @@ export async function runAgentSearch(options: AgentSearchOptions): Promise<Relea
       timeoutMs: options.requestTimeoutMs,
       execute: async (input, context) => {
         if (context?.signal.aborted || options.signal.aborted) throw context?.signal.reason ?? options.signal.reason;
-        if (modelTurns >= options.maxSteps) throw new AgentBudgetExhaustedError();
+        if (modelTurns > options.maxSteps) throw new AgentBudgetExhaustedError();
         if (finalized || finalizing) throw new Error('Release set already finalized');
         if (!options.ownsSearch()) throw new Error('Search ownership lost');
         finalizing = true;

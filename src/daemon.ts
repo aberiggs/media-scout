@@ -28,7 +28,10 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
   const app = Fastify({ loggerInstance: stack.logger.child({ component: 'daemon' }), bodyLimit: 1_048_576, logController: new LogController({ disableRequestLogging: true }) });
   app.server.once('listening', () => {
     const address = app.server.address();
-    if (address && typeof address !== 'string') runtime.setInternalMcpUrl(`http://127.0.0.1:${address.port}/internal/mcp/prowlarr`);
+    if (address && typeof address !== 'string') {
+      const host = address.address === '::' ? '::1' : address.address === '0.0.0.0' ? '127.0.0.1' : address.address;
+      runtime.setInternalMcpUrl(`http://${host.includes(':') ? `[${host}]` : host}:${address.port}/internal/mcp/prowlarr`);
+    }
   });
   type ProwlarrSession = { token: string; transport: NodeStreamableHTTPServerTransport; responses: Set<Promise<void>> };
   const prowlarrSessions = new Map<string, ProwlarrSession>();

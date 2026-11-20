@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createServer } from 'node:http';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { buildApp } from '../src/daemon';
@@ -14,12 +14,11 @@ import { OpenRouter } from '@openrouter/sdk';
 import { runAgentSearch } from '../src/search/agent';
 
 describe('internal Prowlarr Streamable HTTP MCP', () => {
-  it('never accepts natural-language or empty output as a plan, nor runs a finalizer after lease loss or exhausted budget', async () => {
+  it('never accepts natural-language or empty output as a plan, nor runs a finalizer after lease loss', async () => {
     const scenarios = [
       { name: 'empty completion', output: [], maxSteps: 4, ownsSearch: true },
       { name: 'natural-language completion', output: [{ id: 'message', type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: 'The search looks complete.', annotations: [] }] }], maxSteps: 4, ownsSearch: true },
       { name: 'lease lost before finalizer', output: [{ id: 'final', type: 'function_call', call_id: 'final', name: 'finalize_release_set', arguments: JSON.stringify({ status: 'no-match', selections: [], gaps: [], deferred: [], broadCoverage: 'none' }), status: 'completed' }], maxSteps: 4, ownsSearch: false },
-      { name: 'finalizer at exhausted step budget', output: [{ id: 'final', type: 'function_call', call_id: 'final', name: 'finalize_release_set', arguments: JSON.stringify({ status: 'no-match', selections: [], gaps: [], deferred: [], broadCoverage: 'none' }), status: 'completed' }], maxSteps: 1, ownsSearch: true },
     ];
     for (const scenario of scenarios) {
       const responses = createServer(async (request, response) => {
@@ -62,6 +61,76 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
       }
     }
   }, 30_000);
+
+  it.each([
+    { maxSteps: 1, finalizeAt: 1, accepted: true },
+    { maxSteps: 2, finalizeAt: 2, accepted: true },
+    { maxSteps: 2, finalizeAt: 3, accepted: false },
+  ])('bounds SDK finalization at $maxSteps steps (finalizeAt=$finalizeAt)', async ({ maxSteps, finalizeAt, accepted }) => {
+    let requests = 0;
+    const responses = createServer(async (request, response) => {
+      for await (const _chunk of request) { /* consume */ }
+      requests++;
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        id: 'last-turn', object: 'response', created_at: 1, completed_at: 1, status: 'completed',
+        error: null, incomplete_details: null, instructions: null, model: 'fixture/model',
+        output: [{ id: `call-${requests}`, type: 'function_call', call_id: `call-${requests}`,
+          name: requests >= finalizeAt ? 'finalize_release_set' : 'prowlarr_indexers',
+          arguments: JSON.stringify(requests >= finalizeAt ? { status: 'no-match', selections: [], gaps: [], deferred: [], broadCoverage: 'none' } : {}), status: 'completed' }],
+        parallel_tool_calls: false, tool_choice: 'auto', tools: [], usage: null, metadata: null,
+        frequency_penalty: null, presence_penalty: null, temperature: null, top_p: null,
+      }));
+    });
+    await new Promise<void>(resolve => responses.listen(0, '127.0.0.1', resolve));
+    const responseAddress = responses.address();
+    if (!responseAddress || typeof responseAddress === 'string') throw new Error('No Responses listener');
+    const runtime = new SearchRuntime({ initialSettings: defaultSettings, store: openSearchStore(':memory:'), clients: () => ({ prowlarr: { getIndexers: async () => [], getIndexerStatuses: async () => [], search: async () => [], getDownloadClients: async () => [], grab: async () => {} } }) });
+    const app = await buildApp({ runtime, logger: pino({ level: 'silent' }) } as unknown as Stack, { webRoot: '/missing' });
+    try {
+      await app.listen({ host: '127.0.0.1', port: 0 });
+      const address = app.server.address();
+      if (!address || typeof address === 'string') throw new Error('No daemon listener');
+      runtime.store.createSearch({ searchId: 'last-turn', prompt: '{}', status: 'running', createdAt: Date.now() });
+      const { token } = runtime.createProwlarrMcpCapability('last-turn');
+      let staged = 0;
+      const result = runAgentSearch({
+        client: new OpenRouter({ apiKey: 'fixture', serverURL: `http://127.0.0.1:${responseAddress.port}`, retryConfig: { strategy: 'none' } }),
+        model: 'fixture/model', input: 'test', mcpUrl: `http://127.0.0.1:${address.port}/internal/mcp/prowlarr`,
+        capability: token, signal: new AbortController().signal, maxSteps, requestTimeoutMs: 5_000,
+        ledger: () => ({ searchId: 'last-turn', targets: [], candidates: [] }), ownsSearch: () => true, onFinalize: () => { staged++; },
+      });
+      if (accepted) await expect(result).resolves.toMatchObject({ status: 'no-match' });
+      else await expect(result).rejects.toThrow(/budget exhausted/i);
+      expect(staged).toBe(accepted ? 1 : 0);
+      expect(requests).toBe(finalizeAt);
+    } finally {
+      await app.close(); await runtime.close();
+      await new Promise<void>(resolve => responses.close(() => resolve()));
+    }
+  });
+
+  it.each(['127.0.0.1', '0.0.0.0', '::1', '::'])('connects real internal MCP tools through listener %s', async host => {
+    const runtime = new SearchRuntime({ initialSettings: defaultSettings, store: openSearchStore(':memory:'), clients: () => ({ prowlarr: { getIndexers: async () => [], getIndexerStatuses: async () => [], search: async () => [], getDownloadClients: async () => [], grab: async () => {} } }) });
+    const origin = vi.spyOn(runtime, 'setInternalMcpUrl');
+    const app = await buildApp({ runtime, logger: pino({ level: 'silent' }) } as unknown as Stack, { webRoot: '/missing' });
+    try {
+      await app.listen({ host, port: 0 });
+      const url = origin.mock.calls[0]![0];
+      expect(new URL(url).hostname).toBe(host.includes(':') ? '[::1]' : '127.0.0.1');
+      runtime.store.createSearch({ searchId: 'listener', prompt: '{}', status: 'running', createdAt: Date.now() });
+      const { token } = runtime.createProwlarrMcpCapability('listener');
+      const client = new Client({ name: 'listener-test', version: '1' });
+      try {
+        await client.connect(new StreamableHTTPClientTransport(new URL(url), { requestInit: { headers: { authorization: `Bearer ${token}` } } }));
+        expect((await client.listTools()).tools.map(tool => tool.name)).toContain('prowlarr_indexers');
+        const result = await client.callTool({ name: 'prowlarr_indexers', arguments: {} });
+        expect(result.isError).not.toBe(true);
+      } finally { await client.close(); }
+    } finally {
+      await app.close(); await runtime.close();
+    }
+  });
 
   it('cancels an active Responses request when the runner signal aborts', async () => {
     let modelRequestSeen!: () => void, modelRequestClosed!: () => void;

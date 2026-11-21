@@ -131,7 +131,7 @@ Results are JSON text MCP content; the search result count describes that respon
 
 The daemon registers its actual bound loopback origin before dispatching work. The job passes its backend-minted capability to the canonical `createMCPTools` import and always closes/revokes it. The caller—not tool arguments—owns the search and lifetime. The public stdio server reuses the daemon architecture and reports unavailable when no HTTP origin is present; it never spawns a second engine/listener. Do not give the token to model prompts, events, public responses, or logs.
 
-This release requires a fresh `DB_PATH`; it does not migrate old settings, searches or receipts. The retired `/api/v2/submissions` mutation route returns `410`; release-set execution uses `/api/v2/executions/*`. Configured external research MCPs (#54) are deferred as an optional capability, not required for parity with the Prowlarr-based setup.
+This release requires a fresh `DB_PATH` when migrating from the retired database. External research MCPs are an additive setting on the current database; they are not required for Prowlarr searches. The retired `/api/v2/submissions` mutation route returns `410`; release-set execution uses `/api/v2/executions/*`.
 
 The public Media Scout stdio adapter remains available and uses SDK v2. It is separate from this read-only internal server and does not expose recursive agent tools.
 
@@ -153,3 +153,21 @@ Preserve these boundaries: failed or incomplete Arr reads are unknown, not empty
 HTTP routes are registered in `src/daemon.ts`; the internal Prowlarr and public Media Scout MCP tools are registered in `src/search/prowlarr-mcp.ts` and `src/search/mcp.ts`. `src/mcp/server.ts` is the public MCP process entry point. Prefer these implementations and shared contracts as the source of truth for current behavior.
 
 Verification includes a scripted Responses server driving the real Agent SDK through the bound Fastify MCP listener, Prowlarr tool invocation and validated release-set persistence; contract tests cover foreign/fabricated membership, duplicate physical identity, overlaps, partial broad coverage and explicit no-match. Internal MCP tests cover bearer scoping, cancellation, expiry, provider cooldown, privacy, and zero grabs. The fixture model response is not live provider evidence.
+## Optional external research MCPs
+
+The administration API is `GET /api/research-mcp`, `POST /api/research-mcp`,
+`PUT /api/research-mcp/:id`, and `DELETE /api/research-mcp/:id`. Save connects
+and discovers usable tools before persisting; name-only and disable changes do
+not probe an unchanged connection, while enabling a disabled server probes it.
+The GET result is `{servers: ResearchMcpServer[]}` where each server has
+`id`, `name`, `url`, `enabled`, `credentialConfigured`, and `toolNames`.
+POST/PUT accept `{name,url,enabled,credential?}`. Credentials are stored under
+a separate SQLite key and never returned; they do not modify v5 application
+settings. Connecting trusts the endpoint: all usable tools it exposes are
+available to the model, and arguments can include search context. Tool output is
+untrusted. Enabled connections are attempted in parallel at job start with a
+bounded connection timeout; tool calls have a separate short timeout. Optional
+failures are warnings and do not block Prowlarr. The SDK exposes tools in the
+existing agent loop under a readable server label plus stable unique ID prefix.
+Redirects and metadata/link-local targets are blocked; localhost and private
+LAN targets are allowed. Auth is sent only to the exact configured URL.

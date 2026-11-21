@@ -33,6 +33,20 @@ async function fixture(clientOverride?: RuntimeClients, now?: () => number) {
 }
 
 describe('search-first HTTP contract', () => {
+  it('keeps research MCP credentials out of API reads and stores disabled connections without probing', async () => {
+    const store = openSearchStore(':memory:');
+    const runtime = new SearchRuntime({ store });
+    const stack = { runtime, config: {}, logger: pino({ level: 'silent' }) } as unknown as Stack;
+    const app = await buildApp(stack, { webRoot: '/nonexistent-ui' });
+    cleanups.push(async () => { await app.close(); await runtime.close(); });
+    const created = await app.inject({ method: 'POST', url: '/api/research-mcp', payload: { name: 'Local', url: 'http://127.0.0.1:4141/mcp', enabled: false, credential: { mode: 'replace', header: 'X-Key', value: 'never-echo-this' } } });
+    expect(created.statusCode).toBe(201);
+    expect(created.body).not.toContain('never-echo-this');
+    const read = await app.inject({ method: 'GET', url: '/api/research-mcp' });
+    expect(read.json()).toMatchObject({ servers: [{ id: created.json().id, name: 'Local', url: 'http://127.0.0.1:4141/mcp', enabled: false, credentialConfigured: true, toolNames: [] }] });
+    expect(read.body).not.toContain('never-echo-this');
+  });
+
   it('accepts ordinary Arr episodes without absolute numbering', async () => {
     const { app, runtime } = await fixture({
       sonarr: {

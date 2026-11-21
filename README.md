@@ -43,6 +43,14 @@ search. Durable receipts distinguish accepted submissions, partial failure,
 uncertain sends and releases not attempted; accepted does not mean downloaded or
 imported. Interrupted/uncertain sets are never automatically replayed.
 
+### Optional research tools
+
+1. In **Settings → Optional research services**, paste the exact Streamable HTTP MCP URL reachable from Media Scout and choose **Connect**. For a self-hosted CRW server on a shared container network, this could be `http://crw:3000/mcp`. Do not put credentials in the URL.
+2. Optionally configure bearer auth using the `Authorization` header and `Bearer <token>` value, or a supported custom header. Connecting verifies the server and makes its usable tools available to the planner; there is no separate discovery or per-tool approval step.
+3. The existing planner may use connected tools when external validation is useful, such as an anime batch with unclear season numbering. Missing or unavailable research tools do not block Prowlarr searches.
+
+Connecting trusts the server: every usable tool it exposes may be called by the model, and model-authored tool arguments can include the search request/context. Use only trusted services. Credentials are stored in SQLite and hidden from Settings readbacks. The integration supports Streamable HTTP and static headers, not stdio, OAuth, or credential-bearing URLs. Redirects are rejected; metadata and link-local destinations are blocked while localhost and trusted private LAN endpoints are supported.
+
 ## Search execution
 
 Search jobs require the daemon's bound internal Streamable HTTP MCP route. The standalone stdio MCP adapter can read status/history, but cannot start a search when no daemon HTTP listener exists. The backend refuses instead of launching a second listener or alternate engine.

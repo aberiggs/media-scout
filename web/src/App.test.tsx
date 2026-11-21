@@ -60,6 +60,56 @@ it('prepares and commits the complete semantic v2 release set and shows its rece
   assert.deepEqual(Object.keys(JSON.parse(String(commit.init?.body))).sort(), ['confirmationId', 'idempotencyKey', 'planId', 'searchId', 'version'])
 })
 
+it('connects a research MCP from a pasted URL in one request', async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = []
+  globalThis.fetch = async (input, init) => {
+    const url = String(input); calls.push({ url, init })
+    if (url === '/api/settings') return Response.json(env)
+    if (url === '/api/research-mcp' && !init?.method) return Response.json({ servers: [] })
+    if (url === '/api/research-mcp' && init?.method === 'POST') return Response.json({ id: 'srv-1', name: 'research.example', url: 'https://research.example/mcp', enabled: true, credentialConfigured: false, toolNames: ['research_mal_123_search_anime'] }, { status: 201 })
+    return Response.json({})
+  }
+  window.location.hash = '#settings'
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Add a research service' }))
+  fireEvent.change(screen.getByLabelText('MCP URL'), { target: { value: 'https://research.example/mcp' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
+  assert.ok(await screen.findByText('Connected · 1 tool available'))
+  const writes = calls.filter(call => call.init?.method === 'POST')
+  assert.equal(writes.length, 1)
+  assert.equal(writes[0]!.url, '/api/research-mcp')
+  assert.deepEqual(JSON.parse(String(writes[0]!.init?.body)), { name: 'research.example', url: 'https://research.example/mcp', enabled: true })
+  assert.equal(screen.queryByRole('button', { name: /discover|approve/i }), null)
+})
+
+it('does not carry a typed research credential across endpoints and keeps a failed save draft', async () => {
+  const writes: Array<Record<string, unknown>> = []
+  globalThis.fetch = async (input, init) => {
+    const url = String(input)
+    if (url === '/api/settings') return Response.json(env)
+    if (url === '/api/research-mcp' && !init?.method) return Response.json({
+      servers: [{ id: 'srv-1', name: 'Catalog', url: 'http://old.test/mcp', enabled: true, credentialConfigured: true, toolNames: [] }],
+    })
+    if (url === '/api/research-mcp/srv-1' && init?.method === 'PUT') {
+      writes.push(JSON.parse(String(init.body)))
+      return Response.json({ error: 'MCP server is unavailable.' }, { status: 502 })
+    }
+    return Response.json({})
+  }
+  window.location.hash = '#settings'
+  render(<App />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Edit' }))
+  fireEvent.click(screen.getByRole('radio', { name: 'Replace' }))
+  fireEvent.change(screen.getByLabelText('Credential value'), { target: { value: 'Bearer leave-at-old-endpoint' } })
+  fireEvent.change(screen.getByLabelText('MCP URL'), { target: { value: 'http://new.test/mcp' } })
+  assert.ok(!screen.queryByLabelText('Credential value'), 'Changing the endpoint must discard the typed credential')
+  fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
+  assert.ok(await screen.findByText('MCP server is unavailable.'))
+  assert.equal((screen.getByLabelText('MCP URL') as HTMLInputElement).value, 'http://new.test/mcp')
+  assert.equal(writes.length, 1)
+  assert.equal('credential' in writes[0]!, false)
+})
+
 it('retries a transport-uncertain commit with the exact persisted request and idempotency key', async () => {
   const commits: string[] = []
   lifecycleFetch((url, init) => {
@@ -305,7 +355,7 @@ it('labels failed searches as an operational error and shows the actionable caus
     const url = String(input)
     if (url === '/api/settings') return Response.json(env)
     if (url === '/api/v2/searches' && init?.method === 'POST') return Response.json({ searchId: 'busy-search', status: 'running' }, { status: 202 })
-    if (url === '/api/v2/searches/busy-search') return Response.json({ searchId: 'busy-search', status: 'failed', prompt: 'Find Example', options: [], candidates: [], events: [{ type: 'error', data: { code: 'search-busy' } }], counts: { decisions: 0, searches: 0, candidates: 0 }, message: 'Another search is already running. Please retry after it finishes.' })
+    if (url === '/api/v2/searches/busy-search') return Response.json({ searchId: 'busy-search', status: 'failed', prompt: 'Find Example', options: [], candidates: [], events: [{ type: 'error', data: { code: 'search-busy' } }], counts: { decisions: 0, searches: 0, candidates: 0 }, researchWarnings: ['MAL was unavailable; continuing without optional research.'], message: 'Another search is already running. Please retry after it finishes.' })
     return Response.json({ items: [] })
   }
   render(<App />)
@@ -313,6 +363,7 @@ it('labels failed searches as an operational error and shows the actionable caus
   fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
   assert.ok(await screen.findByRole('heading', { name: 'Search failed' }))
   assert.ok(screen.getAllByText(/another search is already running/i).length > 0)
+  assert.ok(screen.getByText('Research service notice'))
 })
 
 it('shows a queued search and lets another request be submitted', async () => {

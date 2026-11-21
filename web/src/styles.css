@@ -585,6 +585,52 @@ h1 { color: #f0f2ef; font-family: var(--display); font-size: clamp(1.875rem, 3vw
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
 
+.research-settings { margin-bottom: 15px; }
+.research-section { overflow: visible; }
+.research-section :is(button, input, select, h3) { scroll-margin-block-start: 76px; }
+.research-trust, .research-empty { margin-bottom: 15px; color: #c4b58f; font-size: var(--type-small); line-height: 1.55; }
+.research-empty { color: var(--muted); }
+.research-trust { padding: 11px 12px; border-left: 2px solid var(--amber); background: #201e18; }
+.research-empty p { margin-top: 5px; }
+.research-empty code { color: #c7d9cb; overflow-wrap: anywhere; }
+.research-list { display: grid; gap: 8px; margin: 0 0 13px; padding: 0; list-style: none; }
+.research-item { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 15px; padding: 13px; border: 1px solid var(--line); border-radius: 6px; background: #131614; }
+.research-item-main { display: grid; min-width: 0; gap: 4px; }
+.research-item-main strong { color: #e2e8e2; font-weight: 600; }
+.research-item-main span { color: var(--muted); font-size: var(--type-small); }
+.research-item-main code { color: #9db8a4; font-size: var(--type-small); overflow-wrap: anywhere; }
+.research-actions { display: flex; flex: none; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+.research-actions .button { min-height: 36px; padding: 0 10px; font-size: var(--type-small); }
+.research-editor { display: grid; gap: 16px; margin-top: 14px; padding: 16px; border: 1px solid #39443b; border-radius: 7px; background: #141815; }
+.research-editor-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.research-editor-heading h3 { color: #e0e7e1; font: 700 var(--type-body) var(--display); }
+.research-editor .field select { width: 100%; }
+.research-enabled, .research-credential-options label { display: flex; align-items: center; gap: 8px; color: #c1cbc3; font-size: var(--type-small); }
+.research-enabled input, .research-credential input, .research-tool input { accent-color: var(--mint-bright); }
+.research-credential, .research-tools { display: grid; min-width: 0; gap: 11px; margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 5px; }
+.research-credential legend, .research-tools legend { padding: 0 5px; color: #d2dbd3; font-size: var(--type-small); font-weight: 600; }
+.research-credential-options { display: flex; flex-wrap: wrap; gap: 8px 18px; }
+.research-tools { gap: 8px; }
+.research-tool { display: flex; align-items: flex-start; gap: 9px; padding: 9px; border: 1px solid #303832; border-radius: 5px; background: #111512; cursor: pointer; }
+.research-tool input { margin-top: 3px; }
+.research-tool span { display: grid; min-width: 0; gap: 4px; }
+.research-tool strong { color: #d4e2d7; overflow-wrap: anywhere; }
+.research-tool small { color: var(--muted); line-height: 1.45; }
+.research-editor-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.research-message { margin: 12px 0 0; }
+.research-result-warnings { display: grid; gap: 5px; padding: 11px 13px; border: 1px solid #564832; border-radius: 5px; background: #211e18; color: #d9c493; font-size: var(--type-small); line-height: 1.5; }
+.research-result-warnings strong { color: #e2c98e; }
+.research-result-warnings p { overflow-wrap: anywhere; }
+@media (max-width: 680px) {
+  .research-section, .research-section :is(button, input, select, h3) { scroll-margin-block-start: 114px; }
+  .research-item { align-items: stretch; flex-direction: column; }
+  .research-actions { justify-content: flex-start; }
+  .research-actions .button { min-height: 40px; }
+  .research-editor { padding: 12px; }
+  .research-credential-options { display: grid; grid-template-columns: 1fr; }
+  .research-editor-actions .button { width: 100%; }
+}
+
 /* Search-first workspace: retain the established charcoal, mint and type tokens. */
 .search-layout { display: grid; grid-template-columns: minmax(0, 1fr) 250px; align-items: start; gap: 20px; }
 .search-main { min-width: 0; }

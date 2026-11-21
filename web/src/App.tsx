@@ -3,6 +3,7 @@ import { Activity as ActivityIcon, Bot, Check, CheckCircle2, CircleAlert, Copy, 
 import { defaults, mergeSettings, type Settings, type SettingsEnvelope } from './types'
 import { SearchPage } from './Search'
 import { ActivityPage, AutomationPage } from './Activity'
+import { ResearchMcpSettings } from './ResearchMcpSettings'
 
 type Page = 'search' | 'activity' | 'automation' | 'settings'
 function pageFromHash(): Page { const value = location.hash.slice(1); return ['activity', 'automation', 'settings'].includes(value) ? value as Page : 'search' }
@@ -83,6 +84,7 @@ export default function App() {
         {page === 'settings' && <>
           <div className="page-heading"><div><h1>Settings<span className="heading-period">.</span></h1><p className="page-intro">Connect search services. Add Arr only if you want automation.</p></div></div>
            {message && <div className={`notice ${messageIsError ? 'notice-error' : 'notice-success'}`} role={messageIsError ? 'alert' : 'status'}>{messageIsError ? <CircleAlert size={17}/> : <CheckCircle2 size={17}/>}<span>{message}</span></div>}
+          {!loading && <div className="research-settings"><ResearchMcpSettings/></div>}
           {loading ? <p role="status">Loading settings…</p> : <form id="settings-form" onSubmit={save}><div className="content-grid"><div className="settings-stack">
              <Section title="Search services" description="Connect the indexers and model Scout uses to find and compare releases." icon={<SearchIcon size={18}/>}>
               <Group title="Prowlarr" fields={[["Prowlarr URL", settings.integrations.prowlarr.url, 'url'], ["Prowlarr API key", settings.integrations.prowlarr.apiKey, 'apiKey']]} update={(key, value) => setSettings(s => ({ ...s, integrations: { ...s.integrations, prowlarr: { ...s.integrations.prowlarr, [key]: value } } }))}/>
@@ -112,7 +114,7 @@ export default function App() {
              <div className="rail-card cycle-card"><div className="rail-icon"><Radio size={17}/></div><div className="cycle-title"><strong>Automatic monitoring</strong><span className={status?.monitoringEnabled ? 'state-on' : 'state-off'}><span className="tiny-dot"/>{status?.monitoringEnabled ? 'Enabled' : 'Paused'}</span></div><p>Scheduled checks use your Arr libraries. You can still search manually while monitoring is paused.</p></div>
              <div className="privacy-card"><div className="privacy-icon"><KeyRound size={16}/></div><div><strong>Keep this instance private</strong><p>API keys are stored here and visible to anyone with access. Only expose this app on a trusted network.</p></div></div>
              {committed?.safety.dryRun && <div className="dry-run-note"><ShieldCheck size={15}/><span>Dry-run prevents download submission. Searches still call your model and indexers.</span></div>}
-           </aside></div></form>}
+            </aside></div></form>}
         </>}
         <footer className="page-footer"><span>Media Scout</span><span className="footer-divider"/><span>Made for your home lab</span></footer>
       </main>

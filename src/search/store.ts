@@ -143,8 +143,6 @@ export class SearchStore {
       this.db.prepare('INSERT INTO search_work(search_id,sequence,source,context_json) VALUES(?,?,?,?)').run(input.searchId, Number((this.db.prepare('SELECT COALESCE(MAX(sequence),0)+1 AS n FROM search_work').get() as {n:number}).n), input.source ?? 'manual', json(input.context ?? {}));
       this.db.prepare("INSERT INTO search_events(search_id,event_json,created_at) VALUES(?,?,?)").run(input.searchId,json({type:'queued',data:{source:input.source ?? 'manual'}}),input.now);
       this.setSetting(`search-source:${input.searchId}`, input.source ?? 'manual');
-       const bindings = (input.context as {targetBindings?:Array<unknown>}|undefined)?.targetBindings;
-       if (bindings?.length) this.setSetting(`search-arr-bindings-v1:${input.searchId}`, bindings);
     }).immediate();
   }
   claimNextSearch(owner: string, now: number, ttl: number, maxActive = 3): SearchWork | null {
@@ -258,7 +256,7 @@ export class SearchStore {
         this.db.prepare('DELETE FROM search_events WHERE search_id=?').run(row.id);
         this.db.prepare('DELETE FROM search_work WHERE search_id=?').run(row.id);
         this.db.prepare('DELETE FROM searches WHERE id=?').run(row.id);
-        for (const prefix of ['search-source:', 'search-arr-bindings-v1:']) this.db.prepare('DELETE FROM settings WHERE key=?').run(`${prefix}${row.id}`);
+         for (const prefix of ['search-source:', 'search-arr-bindings-v1:']) this.db.prepare('DELETE FROM settings WHERE key=?').run(`${prefix}${row.id}`);
       }
     })();
   }

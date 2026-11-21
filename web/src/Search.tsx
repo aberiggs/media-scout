@@ -10,7 +10,7 @@ type Receipt = { executionId: string; searchId: string; planId?: string; outcome
 type Confirmation = { confirmationId: string; expiresAt: string; searchId: string; planId: string; version: number; client: { id: number; name: string; protocol: string; defaultCategory?: string | null; configuredCategories: Array<{ clientCategory: string | null; categories: number[] | null }> }; dryRun: boolean; children: Child[] }
 type DownloadClient = { id: number; name: string; protocol: string; defaultCategory?: string | null; categoryMap: Array<{ clientCategory: string | null; categories: number[] | null }> }
 type CommitRequest = { confirmationId: string; searchId: string; planId: string; version: number; idempotencyKey: string }
-type SearchResult = { searchId: string; status: string; source?: 'manual' | 'arr' | 'automation'; manualExecutionEligible?: boolean; automationPending?: boolean; automationWorkload?: { deferredTargets: number; omittedRelatedEpisodes: number }; normalizedRequest?: unknown; prompt?: string; preferredDownloadClientId?: number; plan?: Plan; candidates?: Candidate[]; events?: Array<{ type: string; data: Record<string, unknown> }>; receipts?: Receipt[]; counts?: { decisions: number; searches: number; candidates: number }; queuePosition?: number; waitingReason?: string; retryAt?: string; message?: string; researchWarnings?: string[]; diagnostics?: { modelTurns: number; stopReason: string; elapsedMs?: number; usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cost?: number } } }
+type SearchResult = { searchId: string; status: string; source?: 'manual' | 'arr' | 'automation'; manualExecutionEligible?: boolean; automationPending?: boolean; automationWorkload?: { deferredTargets: number }; prompt?: string; plan?: Plan; candidates?: Candidate[]; events?: Array<{ type: string; data: Record<string, unknown> }>; receipts?: Receipt[]; counts?: { decisions: number; searches: number; candidates: number }; queuePosition?: number; waitingReason?: string; retryAt?: string; message?: string; researchWarnings?: string[]; diagnostics?: { modelTurns: number; stopReason: string; elapsedMs?: number; usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cost?: number } } }
 const running = (status?: string) => status === 'queued' || status === 'running'
 const safeBody = async (response: Response) => { try { return await response.json() } catch { return {} } }
 const idempotencyKey = () => {
@@ -53,12 +53,10 @@ function validConfirmation(value: any): value is Confirmation {
 function items(values?: string[]) { return values?.length ? <ul className="semantic-list">{values.map((value, i) => <li key={`${value}-${i}`}>{value}</li>)}</ul> : <p className="field-hint">None reported</p> }
 
 export function SearchPage({ settings, searchId, searchRevision, active = true, onSearchStarted }: { settings: Settings; searchId?: string; searchRevision: number; active?: boolean; onSearchStarted(id: string, startingRevision: number): void }) {
-  const [prompt, setPrompt] = useState(''), [advanced, setAdvanced] = useState(false)
-  const [context, setContext] = useState(''), [preferences, setPreferences] = useState('')
+  const [prompt, setPrompt] = useState('')
   const [result, setResult] = useState<SearchResult | null>(null), [busy, setBusy] = useState(false)
   const [error, setError] = useState(''), [notice, setNotice] = useState('')
   const [clients, setClients] = useState<DownloadClient[]>([]), [clientId, setClientId] = useState('')
-  const [clientsLoading, setClientsLoading] = useState(false)
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null), [execError, setExecError] = useState('')
   const [pendingCommit, setPendingCommit] = useState<CommitRequest | null>(null)
   const [execBusy, setExecBusy] = useState(false), [receipt, setReceipt] = useState<Receipt | null>(null)
@@ -72,7 +70,7 @@ export function SearchPage({ settings, searchId, searchRevision, active = true, 
     const token = ++generation.current
     window.clearTimeout(timer.current); window.clearTimeout(receiptTimer.current)
     controller.current?.abort(); receiptController.current?.abort()
-    setResult(null); setError(''); setNotice(''); setConfirmation(null); setReceipt(null); setExecError(''); setPendingCommit(searchId ? readPending(searchId) : null)
+    setResult(null); setError(''); setNotice(''); setConfirmation(null); setReceipt(null); setExecError(''); setPendingCommit(searchId ? readPending(searchId) : null); setClients([]); setClientId('')
     if (searchId) void loadResult(searchId, token)
     return () => { window.clearTimeout(timer.current); window.clearTimeout(receiptTimer.current); controller.current?.abort(); receiptController.current?.abort() }
   }, [searchId, searchRevision])
@@ -137,13 +135,12 @@ export function SearchPage({ settings, searchId, searchRevision, active = true, 
     controller.current?.abort(); window.clearTimeout(timer.current)
     setError(''); setNotice(''); setResult(null); setReceipt(null); setBusy(true)
     try {
-      const parsed: unknown = context.trim() ? JSON.parse(context) : undefined
-      const body = { prompt: prompt.trim(), ...(preferences.trim() ? { preferences: { notes: preferences.trim() } } : {}), ...(parsed ? { context: parsed } : {}), ...(clientId ? { preferredDownloadClientId: Number(clientId) } : {}) }
+      const body = { prompt }
       const response = await fetch('/api/v2/searches', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       const data = await safeBody(response)
       if (!response.ok || !data.searchId) throw new Error(errorMessage(data, 'Search could not start. Check your search settings.'))
       onSearchStarted(data.searchId, startingRevision)
-    } catch (failure) { setError(failure instanceof SyntaxError ? 'Context must be valid JSON.' : failure instanceof Error ? failure.message : 'Search could not start.') }
+    } catch (failure) { setError(failure instanceof Error ? failure.message : 'Search could not start.') }
     finally { setBusy(false) }
   }
   async function prepare() {
@@ -160,30 +157,12 @@ export function SearchPage({ settings, searchId, searchRevision, active = true, 
       if (!isCurrent(id, token) || !activeNow.current) return
       const available = (data.items ?? []) as DownloadClient[]
       setClients(available)
-      const preferred = available.some(client => client.id === result.preferredDownloadClientId) ? String(result.preferredDownloadClientId) : clientId
-      if (!preferred && available.length === 1) setClientId(String(available[0]!.id))
-      else if (preferred) setClientId(preferred)
       setConfirmation(null)
       setExecError(available.length ? '' : 'No enabled download clients are available in Prowlarr.')
-      setClientId(preferred || (available.length === 1 ? String(available[0]!.id) : ''))
+      setClientId('')
       setNotice('Choose a Prowlarr download client, then prepare this complete release set.')
     } catch (failure) { if (isCurrent(id, token) && activeNow.current) setExecError(failure instanceof Error ? failure.message : 'Download clients could not be loaded.') }
     finally { opLock.current = false; setExecBusy(false) }
-  }
-  async function loadClientOptions() {
-    if (clientsLoading) return
-    setClientsLoading(true); setExecError('')
-    try {
-      const response = await fetch('/api/v2/download-clients')
-      const data = await safeBody(response)
-      if (!response.ok) throw new Error(errorMessage(data, 'Download clients could not be loaded.'))
-      const available = (data.items ?? []) as DownloadClient[]
-      setClients(available)
-      if (result?.preferredDownloadClientId && available.some(client => client.id === result.preferredDownloadClientId)) setClientId(String(result.preferredDownloadClientId))
-      else if (available.length === 1) setClientId(String(available[0]!.id))
-      if (!available.length) setExecError('No enabled download clients are available in Prowlarr.')
-    } catch (failure) { setExecError(failure instanceof Error ? failure.message : 'Download clients could not be loaded.') }
-    finally { setClientsLoading(false) }
   }
   async function prepareConfirmation() {
     if (!result?.plan || !clientId || opLock.current || !activeNow.current) return
@@ -251,11 +230,9 @@ export function SearchPage({ settings, searchId, searchRevision, active = true, 
   const coverage = plan?.coverage
   return <div className="search-layout"><div className="search-main">
     <div className="page-heading"><div><h1>Search<span className="heading-period">.</span></h1><p className="page-intro">Describe what you’re looking for. Scout researches one best-effort release-set plan.</p></div></div>
-    <form className="search-composer" onSubmit={search}>
-      <label className="field" htmlFor="search-prompt">What are you looking for?<textarea id="search-prompt" aria-label="What are you looking for?" rows={3} value={prompt} onChange={event => setPrompt(event.target.value)} placeholder="Find the film, episode, or season you want…" maxLength={4000}/></label>
-      <div className="search-form-actions"><button className="text-button" type="button" aria-expanded={advanced} onClick={() => setAdvanced(!advanced)}>{advanced ? 'Hide optional details' : 'Add optional details'}</button><button className="button button-primary" type="submit" disabled={busy || !prompt.trim()}>{busy ? <LoaderCircle className="spin" size={16}/> : <SearchIcon size={16}/>}Search releases</button></div>
-      {clients.length > 0 ? <label className="field">Preferred download client (optional)<select value={clientId} onChange={event => setClientId(event.target.value)}><option value="">Choose during confirmation</option>{clients.map(client => <option key={client.id} value={client.id}>{client.name} · {client.protocol}</option>)}</select><span className="field-hint">This preference is saved with the search; Prowlarr still controls final category routing.</span></label> : <button className="text-button client-load-link" type="button" disabled={clientsLoading} onClick={() => void loadClientOptions()}>{clientsLoading ? 'Loading download clients…' : 'Set an optional preferred download client'}</button>}
-      {advanced && <div className="search-optional"><label className="field">Preferences<textarea rows={2} value={preferences} onChange={event => setPreferences(event.target.value)} placeholder="Original audio, English or multi-sub, preferably 1080p"/></label><label className="field">Structured context (JSON, optional)<textarea rows={4} value={context} onChange={event => setContext(event.target.value)} placeholder={'{"kind":"tv","titles":["Example"]}'}/></label></div>}
+     <form className="search-composer" onSubmit={search}>
+       <label className="field" htmlFor="search-prompt">What are you looking for?<textarea id="search-prompt" aria-label="What are you looking for?" rows={4} value={prompt} onChange={event => setPrompt(event.target.value)} placeholder={'Describe a film, episode, or season. Add preferences in the same prompt, e.g. “original audio, English subtitles, preferably 1080p.”'} maxLength={4000}/><span className="field-hint">Include media preferences or useful context in the same message.</span></label>
+       <div className="search-form-actions"><button className="button button-primary" type="submit" disabled={busy || !prompt.trim()}>{busy ? <LoaderCircle className="spin" size={16}/> : <SearchIcon size={16}/>}Search releases</button></div>
       <p className="field-hint">Searching can incur model and indexer costs. Search never downloads automatically. Don’t include passwords or private links.</p>
     </form>
     {error && <div role="alert" className="notice notice-error">{error}<button className="text-button" onClick={() => searchId && void loadResult(searchId)}>Retry</button></div>}
@@ -263,12 +240,12 @@ export function SearchPage({ settings, searchId, searchRevision, active = true, 
     {notice && <div role="status" className="notice">{notice}</div>}
     {pendingCommit && pendingCommit.searchId === searchId && <div className="ops-warning-box pending-execution" role="status"><strong>Confirmation outcome not yet reconciled</strong><p>Retrying sends the same saved confirmation and idempotency key. It will not create a new submission identity.</p>{result && (result.source === 'automation' || result.manualExecutionEligible === false) ? <p>This automated search is read-only here; inspect Activity for the durable outcome.</p> : <button className="button button-secondary" type="button" disabled={execBusy || !active} onClick={() => void sendCommit(pendingCommit)}>{execBusy ? 'Checking saved confirmation…' : 'Retry same confirmation'}</button>}</div>}
     {result && <section className="search-results" aria-live="polite">
-       <div className="search-result-heading"><div><h2>{result.status === 'matched' ? 'Search plan' : result.status === 'queued' ? 'Search queued' : result.status === 'running' ? 'Searching…' : result.status === 'no-match' ? 'No suitable match' : `Search ${result.status}`}</h2><p>{result.message ?? result.prompt ?? `${result.counts?.candidates ?? 0} candidates · ${result.counts?.searches ?? 0} searches · ${result.counts?.decisions ?? 0} model decisions`}</p></div><span className="ops-status">{result.status}</span></div>
+        <div className="search-result-heading"><div><h2>{result.status === 'matched' ? 'Search plan' : result.status === 'queued' ? 'Search queued' : result.status === 'running' ? 'Searching…' : result.status === 'no-match' ? 'No suitable match' : `Search ${result.status}`}</h2>{result.prompt && <p className="result-title prompt-preview">{result.prompt}</p>}{result.message && <p>{result.message}</p>}</div><span className="ops-status">{result.status}</span></div>
        {!!result.researchWarnings?.length && <div className="research-result-warnings" role="status"><strong>Research service notice</strong>{result.researchWarnings.map((warning, index) => <p key={index}>{warning}</p>)}</div>}
       {result.automationPending && <p role="status" className="ops-info-box">Automation is checking whether it can submit this set.</p>}
       {!!result.automationWorkload?.deferredTargets && <p className="ops-info-box">{result.automationWorkload.deferredTargets} other due episodes were outside this search. They remain unsearched for a later pass.</p>}
+      {result.prompt && <details className="saved-prompt"><summary>Saved search prompt</summary><pre tabIndex={0} aria-label="Exact saved search prompt">{result.prompt}</pre></details>}
       {result.status === 'queued' ? <p role="status" className="ops-state-panel"><LoaderCircle className="spin"/>Search queued{result.queuePosition ? ` · ${Math.max(0, result.queuePosition - 1)} ahead` : ''}. It has not started yet.</p> : result.status === 'running' ? <p role="status" className="ops-state-panel"><LoaderCircle className="spin"/>Checking indexers and comparing releases…</p> : <>
-         {result.normalizedRequest && <details className="normalized-request"><summary>Saved search request</summary><p>Preferred client: {result.preferredDownloadClientId ?? 'Not set'} · normalized request preview (up to 12,000 characters)</p><pre>{JSON.stringify(result.normalizedRequest, null, 2).slice(0, 12000)}</pre></details>}
          {plan?.status === 'matched' && <section className="release-set" aria-labelledby="selected-set"><div className="release-section-heading"><div><h3 id="selected-set">Selected release set</h3><p>{plan.selections.length} release{plan.selections.length === 1 ? '' : 's'} · whole set only</p></div>{receipt && <span className={`ops-status status-${receipt.outcome === 'submitted' ? 'mint' : receipt.outcome === 'uncertain' || receipt.outcome === 'partial' ? 'amber' : 'quiet'}`}>{receipt.outcome}</span>}</div>
           {plan.selections.map((selection, index) => { const evidence = byId.get(selection.candidateId)?.observations?.[0]; return <article className="ranked-option" key={`${selection.candidateId}-${index}`}><h4>{evidence?.title ?? `Selected release ${index + 1}`}</h4><p>{selection.reason}</p><p className="field-hint">{selection.coverage ?? 'Coverage is inferred from release metadata.'}{evidence?.indexer ? ` · ${evidence.indexer}` : ''}{evidence?.size ? ` · ${formatSize(evidence.size)}` : ''}{evidence?.seeders != null ? ` · ${evidence.seeders} seeders` : ''}</p>{selection.uncertainty && <p className="option-uncertainty">Worth checking: {selection.uncertainty}</p>}</article> })}
           <div className="coverage-grid"><Coverage title="Covered" values={plan.covered ?? coverage?.covered}/><Coverage title="Gaps" values={plan.gaps ?? coverage?.gaps}/><Coverage title="Deferred" values={plan.deferred ?? coverage?.deferred}/><Coverage title="Requested scope not covered" values={plan.scopeGaps ?? coverage?.broad?.gaps}/><Coverage title="Extras" values={plan.extras}/><Coverage title="Useful overlap" values={plan.usefulOverlap}/></div>

@@ -30,6 +30,5 @@ export function createHttpSearchDomain(origin: string, fetcher: typeof fetch = f
       return request(`/api/v2/activity${params.size ? `?${params}` : ''}`);
     },
     async poll(): Promise<ArrObservationPass> { return request('/api/v2/automation/poll', { method: 'POST', body: '{}' }); },
-    async startArrSearch(targetId) { return request('/api/v2/automation/search', { method: 'POST', body: JSON.stringify({ targetId }) }); },
   };
 }

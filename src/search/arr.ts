@@ -55,7 +55,7 @@ function isTerminal(row: { trackedDownloadStatus?: string | null; trackedDownloa
   return /(^|\W)(failed|removed)(\W|$)/.test(status);
 }
 function safeContext(input: Record<string, unknown>): Record<string, unknown> {
-  const allowed = new Set(['title','titles','year','seasonNumber','episodeNumber','absoluteEpisodeNumber','episodeTitle','overview','originalLanguage','seriesType','profileContext','externalIds']);
+  const allowed = new Set(['title','titles','titleAliases','year','seasonNumber','episodeNumber','absoluteEpisodeNumber','episodeTitle','airDate','overview','originalLanguage','seriesType','profileContext','externalIds']);
   const sanitize = (value: unknown): unknown => typeof value === 'string' ? safeText(value) : Array.isArray(value) ? value.map(sanitize) : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([k,v]) => [k,sanitize(v)])) : value;
   return Object.fromEntries(Object.entries(input).filter(([key, value]) => allowed.has(key) && value !== undefined).map(([key,value])=>[key,sanitize(value)]));
 }
@@ -152,8 +152,10 @@ export class ArrObserver {
           const eligible = series.monitored && episode.monitored && !episode.hasFile && available && !queueCovered;
           const key = targetKey('sonarr', fp, series.id, series.tvdbId, episode.id);
           const profile = profiles?.find(p => p.id === series.qualityProfileId);
-          const showContext = safeContext({ title: series.title, titles: [series.title, ...series.alternateTitles.map(t => t.title)], overview: series.overview ?? undefined, originalLanguage: languageName(series.originalLanguage), seriesType: series.seriesType, profileContext: summarizeProfile(client.getQualityProfiles ? profile : series.qualityProfile), externalIds: { tvdb: series.tvdbId } });
-          const episodeContext = safeContext({ seasonNumber: episode.seasonNumber, episodeNumber: episode.episodeNumber, absoluteEpisodeNumber: episode.absoluteEpisodeNumber, episodeTitle: episode.title, episodeOverview: episode.overview ?? undefined });
+          const showContext = safeContext({ title: series.title, titles: [series.title, ...series.alternateTitles.map(t => t.title)],
+            titleAliases: series.alternateTitles.filter(alias => typeof alias.seasonNumber === 'number' && alias.seasonNumber >= 0),
+            overview: series.overview ?? undefined, originalLanguage: languageName(series.originalLanguage), seriesType: series.seriesType, profileContext: summarizeProfile(client.getQualityProfiles ? profile : series.qualityProfile), externalIds: { tvdb: series.tvdbId } });
+          const episodeContext = safeContext({ seasonNumber: episode.seasonNumber, episodeNumber: episode.episodeNumber, absoluteEpisodeNumber: episode.absoluteEpisodeNumber, episodeTitle: episode.title, airDate: series.seriesType === 'daily' && /^\d{4}-\d{2}-\d{2}$/u.test(episode.airDate ?? '') ? episode.airDate : undefined });
           targets.push({ key, provider: 'sonarr', sourceFingerprint: fp, serviceId: series.id, externalId: series.tvdbId, episodeId: episode.id, monitored: series.monitored && episode.monitored, hasFile: episode.hasFile, available, queued: queueCovered, ...(queueCovered ? { queueReason: 'observed-in-queue' } : {}), eligible,
             ...(airing === undefined ? {} : { airAt: airing }), showContext, episodeContext, context: safeContext({ ...showContext, ...episodeContext, overview: episode.overview ?? series.overview ?? undefined }) });
         }

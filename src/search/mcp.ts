@@ -9,7 +9,7 @@ const safeError = (error: unknown): string => {
   if (error instanceof ApiError) return `Upstream request failed (${error.status > 0 ? `HTTP ${error.status}` : 'network or timeout failure'}${error.retryAfter === undefined ? '' : `; retry after ${error.retryAfter}s`})`;
   if (error instanceof z.ZodError) return 'Upstream response was invalid';
   if (error instanceof Error) {
-    const allow = ['settings-incomplete', 'prowlarr-unavailable', 'runtime-closed', 'target-not-eligible', 'target-held', 'daemon-mcp-unavailable'];
+    const allow = ['settings-incomplete', 'prowlarr-unavailable', 'runtime-closed', 'daemon-mcp-unavailable'];
     if (allow.includes(error.message)) return error.message;
     if (error.message.startsWith('LLM ')) return 'LLM request failed';
   }
@@ -26,7 +26,6 @@ export interface SearchDomain {
   getSearch(searchId: string): Promise<PublicSearchStatus | null> | PublicSearchStatus | null;
   activity(query: ActivityQuery): unknown | Promise<unknown>;
   poll(): Promise<ArrObservationPass> | ArrObservationPass;
-  startArrSearch(targetId: string): Promise<{ searchId: string; status: 'queued' }> | { searchId: string; status: 'queued' };
 }
 export function createSearchMcpServer(runtime: SearchDomain | SearchRuntime): McpServer {
   const server = new McpServer({ name: 'media-agent', version: '0.2.0' });
@@ -42,6 +41,5 @@ export function createSearchMcpServer(runtime: SearchDomain | SearchRuntime): Mc
   server.registerTool('ma_activity_v2', { description: 'List filtered stored search history and submission outcomes.', inputSchema: z.object({ limit: z.number().int().min(1).max(100).optional(), offset: z.number().int().min(0).max(1_000_000).optional(), q: z.string().max(200).optional(), status: activityStatusSchema.optional(), source: z.enum(['manual', 'automation', 'arr']).optional(), kind: z.enum(['tv', 'movie', 'other']).optional(), createdAtFrom: z.string().max(40).datetime({ offset: true }).optional(), createdAtTo: z.string().max(40).datetime({ offset: true }).optional() }).strict().refine(q => !q.createdAtFrom || !q.createdAtTo || Date.parse(q.createdAtFrom) <= Date.parse(q.createdAtTo), { message: 'createdAtFrom must be on or before createdAtTo' }), annotations: { readOnlyHint: true } }, async query => guarded(async () => json(await runtime.activity(query))));
    server.registerTool('ma_automation_status_v2', { description: 'Read saved automation settings and observations only.', annotations: { readOnlyHint: true } }, async () => guarded(async () => json(await runtime.automationStatus())));
    server.registerTool('ma_automation_poll_v2', { description: 'Refresh read-only Arr observations; acquisition automation is deferred.', annotations: { readOnlyHint: true } }, async () => guarded(async () => json(await runtime.poll())));
-   server.registerTool('ma_automation_search_v2', { description: 'Start a search for an eligible Arr target.', inputSchema: z.object({ targetId: z.string().trim().min(1) }).strict(), annotations: { readOnlyHint: true, openWorldHint: true } }, async ({ targetId }) => guarded(async () => json(await runtime.startArrSearch(targetId))));
   return server;
 }

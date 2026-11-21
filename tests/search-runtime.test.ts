@@ -43,9 +43,9 @@ describe('search runtime', () => {
     f.store.setSetting(`automation:show-cooldown:fp:7`, deadline);
     expect(f.runtime.automationStatus().items[0]).toMatchObject({ status: 'missing', eligible: true });
   });
-  it('rejects per-request preference notes longer than 4000 characters', async () => {
-    const f = setup();
-    await expect(f.runtime.startSearch({ prompt: 'Find', preferences: { notes: 'x'.repeat(4001) } })).rejects.toThrow();
+  it('rejects former preference fields from the public search contract', async () => {
+    const { searchRequestSchema } = await import('../src/search/contracts');
+    expect(searchRequestSchema.safeParse({ prompt: 'Find', preferences: { notes: 'old preference' } }).success).toBe(false);
   });
   it('durably queues requests in FIFO order and shares a three-search execution cap', () => {
     const f = setup();
@@ -193,11 +193,15 @@ describe('search runtime', () => {
   });
   it('actually removes expired private material and old history', () => {
     const f = setup(); matched(f, f.now - 1);
+    f.store.enqueueSearch({ searchId: 'new', prompt: 'new prompt', now: f.now, context: { targetBindings: [{ secret: 'private' }] } });
+    expect(f.store.getSetting('search-arr-bindings-v1:new')).toBeNull();
     f.store.createSearch({ searchId: 'old', prompt: 'old', status: 'no-match', createdAt: f.now - 31 * 86_400_000 });
     f.store.setSetting('search-source:old', 'manual');
+    f.store.setSetting('search-arr-bindings-v1:old', [{ secret: 'historic private' }]);
     f.runtime.activity();
     expect(f.store.getSearch('old')).toBeNull();
     expect(f.store.getSetting('search-source:old')).toBeNull();
+    expect(f.store.getSetting('search-arr-bindings-v1:old')).toBeNull();
     expect(f.store.getCandidate('matched', 'candidate', 0)).toBeNull();
   });
   it('rejects extreme retry intervals instead of accepting settings that break ISO projections', () => {

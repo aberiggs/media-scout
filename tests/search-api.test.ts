@@ -6,9 +6,13 @@ import { SearchRuntime, type RuntimeClients } from '../src/search/runtime';
 import { openSearchStore } from '../src/search/store';
 import { defaultSettings } from '../src/search/settings';
 import { releaseSchema } from '../src/types/prowlarr';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
-import { ApiError } from '../src/http';
+import { ApiError, Http } from '../src/http';
+import { ProwlarrClient } from '../src/clients/prowlarr';
 import { seriesListSchema } from '../src/types/sonarr';
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -20,9 +24,9 @@ async function fixture(clientOverride?: RuntimeClients, now?: () => number) {
     store: openSearchStore(':memory:'), initialSettings, now,
     clients: () => clientOverride ?? ({
       prowlarr: {
-        getIndexers: async () => { reads++; return [{ id: 1, name: 'Index', enable: true }]; },
-        getIndexerStatuses: async () => [], search: async () => [],
-        getDownloadClients: async () => [{ id: 7, name: 'TV', protocol: 'torrent', enable: true, supportsCategories: true, categories: [] }],
+         getIndexers: async () => { reads++; return [{ id: 1, name: 'Index', enable: true }]; },
+         getIndexerStatuses: async () => { reads++; return []; }, search: async () => { reads++; return []; },
+         getDownloadClients: async () => { reads++; return [{ id: 7, name: 'TV', protocol: 'torrent', enable: true, supportsCategories: true, categories: [] }]; },
         grab: async () => { grabs++; },
       },
     } as unknown as RuntimeClients),
@@ -32,8 +36,245 @@ async function fixture(clientOverride?: RuntimeClients, now?: () => number) {
   cleanups.push(async () => { await app.close(); await runtime.close(); });
   return { app, runtime, reads: () => reads, grabs: () => grabs };
 }
+async function drainScheduled(runtime:SearchRuntime):Promise<void>{await new Promise<void>(resolve=>setImmediate(resolve));await runtime.drain();}
 
 describe('search-first HTTP contract', () => {
+  it('accepts an idempotent acquisition without upstream calls before durable queueing', async () => {
+    const { app, runtime, reads } = await fixture();
+    runtime.store.setProviderDeadline('model',Date.now()+60_000);
+    await app.listen({ host: '127.0.0.1', port: 0 });
+    const address=app.server.address();if(!address||typeof address==='string')throw new Error('Missing daemon listener');
+    const base=`http://127.0.0.1:${address.port}`;
+    const payload = { prompt: 'Find the film', downloadClientId: 7 };
+    const post=(key:string,body=payload)=>fetch(`${base}/api/v2/acquisitions`,{method:'POST',headers:{'content-type':'application/json','idempotency-key':key},body:JSON.stringify(body)});
+    const [first,replay] = await Promise.all([
+      post('intake-33'),
+      post('intake-33'),
+    ]);
+    expect(first.status).toBe(202);
+    const firstBody=await first.json() as {searchId:string;status:string;statusUrl:string},replayBody=await replay.json() as {searchId:string},searchId=firstBody.searchId;
+    expect(firstBody).toMatchObject({ searchId, status: 'queued', statusUrl: `/api/v2/searches/${searchId}` });
+    expect(reads()).toBe(0);
+    expect(replay.status).toBe(202);
+    expect(replayBody.searchId).toBe(searchId);
+    expect((await post('intake-33',{...payload,prompt:'Other'})).status).toBe(409);
+    expect((await fetch(`${base}/api/v2/acquisitions`,{method:'POST',headers:{'content-type':'application/json','idempotency-key':'bad'},body:JSON.stringify({...payload,extra:true})})).status).toBe(400);
+    expect((await fetch(`${base}/api/v2/acquisitions`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)})).status).toBe(400);
+    expect((await post('bad key')).status).toBe(400);
+    expect((await post('bad-client',{...payload,downloadClientId:0})).status).toBe(400);
+    await runtime.drain();
+    const detail=await fetch(`${base}${firstBody.statusUrl}`);
+    expect(await detail.json()).toMatchObject({ source: 'manual', manualExecutionEligible: false, acquisition: { downloadClientId: 7 } });
+  });
+  it('deduplicates before requiring configuration and never turns a durable acceptance into an error',async()=>{
+    const {app,runtime}=await fixture();
+    runtime.store.setProviderDeadline('model',Date.now()+60_000);
+    await app.listen({host:'127.0.0.1',port:0});
+    const runtimeInternals=runtime as unknown as {dispatchQueued:()=>void};
+    const dispatch=runtimeInternals.dispatchQueued;
+    runtimeInternals.dispatchQueued=()=>{throw new Error('simulated dispatch failure');};
+    const payload={prompt:'Same request',downloadClientId:7},headers={'idempotency-key':'settings-independent-key'};
+    const accepted=await app.inject({method:'POST',url:'/api/v2/acquisitions',headers,payload});
+    await new Promise<void>(resolve=>setImmediate(resolve));
+    runtimeInternals.dispatchQueued=dispatch;
+    expect(accepted.statusCode).toBe(202);
+    const {searchId}=accepted.json();
+    const settings=runtime.getSettings();
+    runtime.saveSettings({...settings,integrations:{...settings.integrations,prowlarr:{...settings.integrations.prowlarr,url:'',apiKey:'',tvClientId:null,movieClientId:null}}});
+    expect((await app.inject({method:'POST',url:'/api/v2/acquisitions',headers,payload})).json().searchId).toBe(searchId);
+    expect((await app.inject({method:'POST',url:'/api/v2/acquisitions',headers,payload:{...payload,prompt:'Different'}})).statusCode).toBe(409);
+  });
+  it('accepts a socket burst into the shared three-worker FIFO and dispatches the durable tail',async()=>{
+    let started=0,releaseFirst!:()=>void,releaseTail!:()=>void,firstThree!:()=>void,allFive!:()=>void;
+    const firstGate=new Promise<void>(resolve=>{releaseFirst=resolve;}),tailGate=new Promise<void>(resolve=>{releaseTail=resolve;});
+    const firstStarted=new Promise<void>(resolve=>{firstThree=resolve;}),tailStarted=new Promise<void>(resolve=>{allFive=resolve;});
+    const startedPrompts:string[]=[];
+    const model=createServer(async(req,res)=>{
+      const chunks:Buffer[]=[];for await(const chunk of req)chunks.push(Buffer.from(chunk));
+      const body=JSON.parse(Buffer.concat(chunks).toString()) as {input:string};
+      started++;startedPrompts.push(body.input);
+      if(started===3)firstThree();if(started===5)allFive();
+      await(started<=3?firstGate:tailGate);
+      res.writeHead(200,{'content-type':'application/json'});
+      res.end(JSON.stringify({id:`burst-${started}`,object:'response',created_at:1,completed_at:1,status:'completed',error:null,incomplete_details:null,instructions:null,model:'fixture/model',output:[{id:`final-${started}`,type:'function_call',call_id:`final-${started}`,name:'finalize_release_set',arguments:JSON.stringify({status:'no-match',selections:[],covered:[],gaps:['No release observed'],deferred:[],broadCoverage:'none',scopeGaps:[]}),status:'completed'}],parallel_tool_calls:false,tool_choice:'auto',tools:[],usage:null,metadata:null,frequency_penalty:null,presence_penalty:null,temperature:null,top_p:null}));
+    });
+    await new Promise<void>(resolve=>model.listen(0,'127.0.0.1',resolve));const modelAddress=model.address();if(!modelAddress||typeof modelAddress==='string')throw new Error('No gated model listener');
+    const {app,runtime}=await fixture();
+    try{
+      runtime.saveSettings({...runtime.getSettings(),ai:{...runtime.getSettings().ai,baseUrl:`http://127.0.0.1:${modelAddress.port}`}});
+      await app.listen({host:'127.0.0.1',port:0});const listener=app.server.address();if(!listener||typeof listener==='string')throw new Error('No daemon listener');
+      const base=`http://127.0.0.1:${listener.port}`;
+      const ids:string[]=[];
+      for(let i=0;i<5;i++){
+        // Order HTTP acceptance, but don't release any of the search workers.
+        const response=await fetch(`${base}/api/v2/acquisitions`,{method:'POST',headers:{'content-type':'application/json','idempotency-key':`burst-${i}`},body:JSON.stringify({prompt:`Burst prompt ${i}`,downloadClientId:7})});
+        expect(response.status).toBe(202);
+        ids.push((await response.json() as {searchId:string}).searchId);
+      }
+      await Promise.race([firstStarted,new Promise((_,reject)=>setTimeout(()=>reject(new Error('first three workers did not start')),10_000))]);
+      const before=await Promise.all(ids.map(async id=>(await (await fetch(`${base}/api/v2/searches/${id}`)).json() as {status:string}).status));
+      expect(before.filter(status=>status==='running')).toHaveLength(3);
+      expect(before.filter(status=>status==='queued')).toHaveLength(2);
+      expect(before.slice(0,3)).toEqual(['running','running','running']);
+      expect(before.slice(3)).toEqual(['queued','queued']);
+      expect(new Set(startedPrompts)).toEqual(new Set(['Burst prompt 0','Burst prompt 1','Burst prompt 2']));
+      releaseFirst();
+      await Promise.race([tailStarted,new Promise((_,reject)=>setTimeout(()=>reject(new Error('queued tail did not dispatch')),10_000))]);
+      expect(new Set(startedPrompts)).toEqual(new Set(ids.map((_,i)=>`Burst prompt ${i}`)));
+      const duringTail=await Promise.all(ids.map(async id=>(await (await fetch(`${base}/api/v2/searches/${id}`)).json() as {status:string}).status));
+      expect(duringTail.filter(status=>status==='running')).toHaveLength(2);
+      expect(duringTail.filter(status=>status==='no-match')).toHaveLength(3);
+      expect(duringTail.slice(0,3)).toEqual(['no-match','no-match','no-match']);
+      expect(duringTail.slice(3)).toEqual(['running','running']);
+      releaseTail();await runtime.drain();
+    }finally{
+      releaseFirst();releaseTail();await app.close();await runtime.close();await new Promise<void>(resolve=>model.close(()=>resolve()));
+    }
+  },30_000);
+  it.each([true,false])('acquisition executes the entire selected set with dryRun=%s', async dryRun => {
+    let runtimeRef:SearchRuntime|undefined,calls=0,grabs=0;
+    const releases=[0,1].map(i=>releaseSchema.parse({guid:`acq-${i}`,age:1,size:100,files:null,grabs:null,indexerId:1,indexer:'Index',subGroup:null,title:`Film 2020 part ${i}`,tvdbId:null,tmdbId:null,publishDate:'',downloadUrl:null,indexerFlags:[],categories:[],magnetUrl:null,infoHash:String(i+1).repeat(40),seeders:1,leechers:0,protocol:'torrent',downloadClientId:null}));
+    const model=createServer(async(req,res)=>{
+      const chunks:Buffer[]=[];for await(const chunk of req)chunks.push(Buffer.from(chunk));
+      const body=JSON.parse(Buffer.concat(chunks).toString()) as {tools?:Array<{name?:string}>};calls++;
+      const searchId=runtimeRef!.activity().items[0]!.searchId,ids=runtimeRef!.store.listCandidates(searchId).map(x=>x.candidateId);
+      const name=calls===1?(body.tools?.find(t=>t.name?.includes('prowlarr_search'))?.name??'prowlarr_search'):'finalize_release_set';
+      const args=name.includes('prowlarr_search')?{query:'Film'}:{status:'matched',selections:ids.map(candidateId=>({candidateId,coverage:'The requested films',reason:'Observed in Prowlarr',uncertainty:''})),covered:['The requested films'],gaps:[],deferred:[],broadCoverage:'complete',scopeGaps:[]};
+      res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({id:`acquisition-${calls}`,object:'response',created_at:1,completed_at:1,status:'completed',error:null,incomplete_details:null,instructions:null,model:'fixture/model',output:[{id:`call-${calls}`,type:'function_call',call_id:`call-${calls}`,name,arguments:JSON.stringify(args),status:'completed'}],parallel_tool_calls:false,tool_choice:'auto',tools:[],usage:null,metadata:null,frequency_penalty:null,presence_penalty:null,temperature:null,top_p:null}));
+    });
+    await new Promise<void>(resolve=>model.listen(0,'127.0.0.1',resolve));const address=model.address();if(!address||typeof address==='string')throw new Error('No model fixture');
+    const {app,runtime}=await fixture({prowlarr:{getIndexers:async()=>[{id:1,name:'Index',enable:true}],getIndexerStatuses:async()=>[],search:async()=>releases,getDownloadClients:async()=>[{id:7,name:'TV',protocol:'torrent',enable:true,supportsCategories:true,categories:[]}],grab:async()=>{grabs++;}}});
+    runtimeRef=runtime;
+    try{
+      runtime.saveSettings({...runtime.getSettings(),ai:{...runtime.getSettings().ai,baseUrl:`http://127.0.0.1:${address.port}`},safety:{dryRun}});
+      await app.listen({host:'127.0.0.1',port:0});
+      const accepted=await app.inject({method:'POST',url:'/api/v2/acquisitions',headers:{'idempotency-key':`acq-${dryRun}`},payload:{prompt:'Find two films',downloadClientId:7}});
+      expect(accepted.statusCode).toBe(202);
+      await drainScheduled(runtime);
+      const detail=(await app.inject(accepted.json().statusUrl)).json();
+      expect(detail).toMatchObject({status:'matched',manualExecutionEligible:false,acquisition:{downloadClientId:7,status:dryRun?'dry-run':'submitted'},receipts:[{children:[{outcome:dryRun?'dry-run':'submitted'},{outcome:dryRun?'dry-run':'submitted'}]}]});
+      const manualPrepare=await app.inject({method:'POST',url:'/api/v2/executions/prepare',payload:{searchId:detail.searchId,planId:detail.plan.planId,version:detail.plan.version,candidateIds:detail.plan.selections.map((item:{candidateId:string})=>item.candidateId),downloadClientId:7}});
+      expect(manualPrepare.statusCode).toBe(409);
+      expect(grabs).toBe(dryRun?0:2);
+    }finally{await app.close();await runtime.close();await new Promise<void>(resolve=>model.close(()=>resolve()));}
+  });
+  it.each(['submitted','no-match','disabled-client','protocol-mismatch','routing-changed'] as const)('uses the real Prowlarr HTTP adapter for acquisition outcome %s',async scenario=>{
+    let runtimeRef:SearchRuntime|undefined,modelCalls=0;const grabs:Array<{downloadClientId:number;guid:string}>=[];
+    const release=releaseSchema.parse({guid:'real-http-grab',age:1,size:100,files:null,grabs:null,indexerId:1,indexer:'Index',subGroup:null,title:'Film 2020',tvdbId:null,tmdbId:null,publishDate:'',downloadUrl:'http://prowlarr.test/download',indexerFlags:[],categories:[],magnetUrl:null,infoHash:'e'.repeat(40),seeders:1,leechers:0,protocol:'torrent',downloadClientId:null});
+    const releases=[release,{...release,guid:'real-http-grab-2',title:'Film 2021',infoHash:'f'.repeat(40)}];
+    const prowlarrServer=createServer(async(req,res)=>{
+      const url=new URL(req.url??'/',`http://${req.headers.host}`);
+      if(req.method==='GET'&&url.pathname==='/api/v1/indexer')return res.end(JSON.stringify([{id:1,name:'Index',enable:true}]));
+      if(req.method==='GET'&&url.pathname==='/api/v1/indexerstatus')return res.end('[]');
+      if(req.method==='GET'&&url.pathname==='/api/v1/search')return res.end(JSON.stringify(releases));
+      if(req.method==='GET'&&url.pathname==='/api/v1/downloadclient')return res.end(JSON.stringify([{id:7,name:'Selected',enable:scenario!=='disabled-client'&&!(scenario==='routing-changed'&&grabs.length),protocol:scenario==='protocol-mismatch'?'usenet':'torrent',supportsCategories:true,categories:[]}]));
+      if(req.method==='POST'&&url.pathname==='/api/v1/search'){
+        const chunks:Buffer[]=[];for await(const chunk of req)chunks.push(Buffer.from(chunk));
+        grabs.push(JSON.parse(Buffer.concat(chunks).toString()));res.writeHead(200,{'content-type':'application/json'});return res.end('{}');
+      }
+      res.writeHead(404);res.end();
+    });
+    await new Promise<void>(resolve=>prowlarrServer.listen(0,'127.0.0.1',resolve));const pAddress=prowlarrServer.address();if(!pAddress||typeof pAddress==='string')throw new Error('No Prowlarr HTTP fixture');
+    const model=createServer(async(req,res)=>{
+      for await(const _chunk of req) { /* consume */ }modelCalls++;
+      const searchId=runtimeRef!.activity().items[0]!.searchId,candidates=runtimeRef!.store.listCandidates(searchId).map(item=>item.candidateId);
+      const name=modelCalls===1?'prowlarr_search':'finalize_release_set';
+      const args=name==='prowlarr_search'?{query:'Film'}:scenario==='no-match'?{status:'no-match',selections:[],covered:[],gaps:['No suitable release'],deferred:[],broadCoverage:'none',scopeGaps:[]}:{status:'matched',selections:candidates.map(candidateId=>({candidateId,coverage:'The films',reason:'Observed release',uncertainty:''})),covered:['The films'],gaps:[],deferred:[],broadCoverage:'complete',scopeGaps:[]};
+      res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({id:`http-${modelCalls}`,object:'response',created_at:1,completed_at:1,status:'completed',error:null,incomplete_details:null,instructions:null,model:'fixture/model',output:[{id:`call-${modelCalls}`,type:'function_call',call_id:`call-${modelCalls}`,name,arguments:JSON.stringify(args),status:'completed'}],parallel_tool_calls:false,tool_choice:'auto',tools:[],usage:null,metadata:null,frequency_penalty:null,presence_penalty:null,temperature:null,top_p:null}));
+    });
+    await new Promise<void>(resolve=>model.listen(0,'127.0.0.1',resolve));const mAddress=model.address();if(!mAddress||typeof mAddress==='string')throw new Error('No model fixture');
+    const adapter=new ProwlarrClient(new Http({baseUrl:`http://127.0.0.1:${pAddress.port}`,apiKey:'fixture-key'}));
+    const {app,runtime}=await fixture({prowlarr:adapter as unknown as RuntimeClients['prowlarr']});runtimeRef=runtime;
+    try{
+      runtime.saveSettings({...runtime.getSettings(),ai:{...runtime.getSettings().ai,baseUrl:`http://127.0.0.1:${mAddress.port}`},safety:{dryRun:false}});
+      await app.listen({host:'127.0.0.1',port:0});
+      const response=await app.inject({method:'POST',url:'/api/v2/acquisitions',headers:{'idempotency-key':`real-${scenario}`},payload:{prompt:'Find Film',downloadClientId:7}});
+      expect(response.statusCode).toBe(202);await drainScheduled(runtime);
+      const detail=await runtime.getSearch(response.json().searchId);
+      if(scenario==='no-match'){
+        expect(detail).toMatchObject({status:'no-match',acquisition:{status:'not-attempted'}});
+        expect(grabs).toHaveLength(0);
+      }else if(scenario==='disabled-client'||scenario==='protocol-mismatch'){
+        expect(detail).toMatchObject({status:'matched',acquisition:{status:'not-attempted',code:scenario==='disabled-client'?'download-client-unavailable':'download-client-protocol-mismatch'}});
+        expect(grabs).toHaveLength(0);
+      }else if(scenario==='routing-changed'){
+        expect(detail).toMatchObject({status:'matched',acquisition:{status:'partial'},receipts:[{children:[{outcome:'submitted'},{outcome:'not-attempted'}]}]});
+        expect(grabs).toEqual([{indexerId:1,downloadClientId:7,guid:release.guid}]);
+      }else{
+        expect(detail).toMatchObject({status:'matched',acquisition:{status:'submitted'},receipts:[{children:[{outcome:'submitted'},{outcome:'submitted'}]}]});
+        expect(grabs).toEqual(releases.map(item=>({indexerId:1,downloadClientId:7,guid:item.guid})));
+      }
+    }finally{
+      await app.close();await runtime.close();
+      await Promise.all([new Promise<void>(resolve=>model.close(()=>resolve())),new Promise<void>(resolve=>prowlarrServer.close(()=>resolve()))]);
+    }
+  });
+  it.each(['dry-run','prowlarr-source'] as const)('stops an accepted acquisition before research when %s changes while queued', async change=>{
+    let now=Date.now();const {app,runtime,reads}=await fixture(undefined,()=>now);
+    runtime.store.setProviderDeadline('model',now+100);
+    await app.listen({host:'127.0.0.1',port:0});
+    const accepted=await app.inject({method:'POST',url:'/api/v2/acquisitions',headers:{'idempotency-key':'queued-settings-change'},payload:{prompt:'Find a title',downloadClientId:7}});
+    expect(accepted.statusCode).toBe(202);
+    if(change==='dry-run')runtime.saveSettings({...runtime.getSettings(),safety:{dryRun:false}});
+    else {
+      const current=runtime.getSettings();
+      runtime.saveSettings({...current,integrations:{...current.integrations,prowlarr:{...current.integrations.prowlarr,url:'http://changed-indexer.test',apiKey:'changed-key'}}});
+    }
+    now+=101;
+    runtime.setInternalMcpUrl('http://127.0.0.1:1/internal/mcp/prowlarr');
+    await runtime.drain();
+    const detail=(await app.inject(accepted.json().statusUrl)).json();
+    expect(detail).toMatchObject({status:'failed',acquisition:{status:'not-attempted',code:change==='dry-run'?'safety-changed':'source-changed'}});
+    expect(reads()).toBe(0);
+  });
+  it('dispatches unclaimed acquisitions but does not replay started acquisitions after a listener restart',async()=>{
+    const directory=mkdtempSync(join(tmpdir(),'acquisition-restart-')),path=join(directory,'state.sqlite');
+    let modelCalls=0;
+    const model=createServer(async(req,res)=>{
+      for await(const _chunk of req) { /* consume */ }modelCalls++;
+      res.writeHead(200,{'content-type':'application/json'});
+      res.end(JSON.stringify({id:'restart-no-match',object:'response',created_at:1,completed_at:1,status:'completed',error:null,incomplete_details:null,instructions:null,model:'fixture/model',output:[{id:'restart-finalize',type:'function_call',call_id:'restart-finalize',name:'finalize_release_set',arguments:JSON.stringify({status:'no-match',selections:[],covered:[],gaps:['No suitable release observed'],deferred:[],broadCoverage:'none',scopeGaps:[]}),status:'completed'}],parallel_tool_calls:false,tool_choice:'auto',tools:[],usage:null,metadata:null,frequency_penalty:null,presence_penalty:null,temperature:null,top_p:null}));
+    });
+    await new Promise<void>(resolve=>model.listen(0,'127.0.0.1',resolve));const modelAddress=model.address();if(!modelAddress||typeof modelAddress==='string')throw new Error('No restart model fixture');
+    const settings={...defaultSettings,ai:{...defaultSettings.ai,apiKey:'fixture-model',baseUrl:`http://127.0.0.1:${modelAddress.port}`},integrations:{...defaultSettings.integrations,prowlarr:{...defaultSettings.integrations.prowlarr,url:'http://indexer.test',apiKey:'fixture-indexer'}}};
+    const sourceFingerprint=createHash('sha256').update(`prowlarr\0${settings.integrations.prowlarr.url}\0${settings.integrations.prowlarr.apiKey}`).digest('hex');
+    const seeded=openSearchStore(path);
+    const now=Date.now(),startedAt=now-60_000;
+    const seedRequest=(key:string,prompt:string,at:number)=>seeded.acceptAcquisition({key,hash:createHash('sha256').update(JSON.stringify({prompt,downloadClientId:7})).digest('hex'),now:at,snapshot:()=>({prompt,clientId:7,sourceFingerprint,dryRun:true})});
+    const matched=seedRequest('before-journal','Matched before crash',startedAt);
+    expect(seeded.claimNextSearch('worker',startedAt,5_000)?.searchId).toBe(matched.searchId);
+    expect(seeded.finishOwnedSearch(matched.searchId,'worker','matched',{version:1},startedAt+1,true)).toBe(true);
+    const sending=seedRequest('sending','Sending before crash',startedAt+2);
+    expect(seeded.claimNextSearch('worker-2',startedAt+3,5_000)?.searchId).toBe(sending.searchId);
+    expect(seeded.finishOwnedSearch(sending.searchId,'worker-2','matched',{version:1},startedAt+4,true)).toBe(true);
+    expect(seeded.createExecution({id:'sending-execution',key:`!acquisition:${sending.searchId}`,hash:'execution',searchId:sending.searchId,planId:'plan',version:2,payload:{dryRun:false},children:[{candidateId:'release',physicalKey:'release',state:'prepared'}],owner:'sender',now:startedAt+5,leaseUntil:startedAt+5_000})).toBe('created');
+    expect(seeded.updateExecutionChild('sending-execution','sender',startedAt+6,0,'sending')).toBe(true);
+    const accepted=seedRequest('survives-restart','Search after restart',now);
+    expect(seeded.getSearch(accepted.searchId)?.status).toBe('queued');
+    seeded.setSetting('application-settings',settings);seeded.close();
+    let grabs=0;
+    const runtime=new SearchRuntime({databasePath:path,clients:()=>({prowlarr:{getIndexers:async()=>[],getIndexerStatuses:async()=>[],search:async()=>[],getDownloadClients:async()=>[],grab:async()=>{grabs++;}}}),initialSettings:settings});
+    const stack={runtime,config:{HTTP_HOST:'127.0.0.1',HTTP_PORT:7877,DB_PATH:path,LOG_LEVEL:'silent'},logger:pino({level:'silent'})} as unknown as Stack;
+    const app=await buildApp(stack,{webRoot:'/nonexistent-ui'});
+    try{
+      const base=await app.listen({host:'127.0.0.1',port:0});
+      const replay=async(key:string,prompt:string)=>{
+        const response=await fetch(`${base}/api/v2/acquisitions`,{method:'POST',headers:{'content-type':'application/json','idempotency-key':key},body:JSON.stringify({prompt,downloadClientId:7})});
+        expect(response.status).toBe(202);
+        return response.json();
+      };
+      expect(await replay('before-journal','Matched before crash')).toMatchObject({searchId:matched.searchId});
+      expect(await replay('sending','Sending before crash')).toMatchObject({searchId:sending.searchId});
+      await drainScheduled(runtime);
+      expect(modelCalls).toBe(1);
+      expect(await runtime.getSearch(accepted.searchId)).toMatchObject({status:'no-match',acquisition:{status:'not-attempted'},receipts:[]});
+      expect(await runtime.getSearch(matched.searchId)).toMatchObject({acquisition:{status:'interrupted'},receipts:[]});
+      expect(await runtime.getSearch(sending.searchId)).toMatchObject({acquisition:{status:'uncertain'},receipts:[{outcome:'uncertain',children:[{outcome:'uncertain'}]}]});
+      expect(grabs).toBe(0);
+    }finally{
+      await app.close();await runtime.close();await new Promise<void>(resolve=>model.close(()=>resolve()));rmSync(directory,{recursive:true,force:true});
+    }
+  },15_000);
   it('bounds activity prompt previews without losing tail search or detail', async () => {
     const { app, runtime } = await fixture();
     const prefix = `${'x'.repeat(238)}🧪`;

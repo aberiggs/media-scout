@@ -55,6 +55,8 @@ Connecting trusts the server: every usable tool it exposes may be called by the 
 
 Search jobs require the daemon's bound internal Streamable HTTP MCP route. The standalone stdio MCP adapter can read status/history, but cannot start a search when no daemon HTTP listener exists. The backend refuses instead of launching a second listener or alternate engine.
 
+Trusted server-to-server callers can submit idempotent search-and-acquire requests through [`POST /api/v2/acquisitions`](src/search/README.md#trusted-server-to-server-acquisition). This route has no authentication; expose it only on a trusted network.
+
 ## Develop from source
 
 See [source development and checks](src/README.md). The default `docker-compose.yml` builds the source image; use `docker-compose.ghcr.yml` explicitly for the published image.

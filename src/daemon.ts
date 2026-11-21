@@ -8,7 +8,7 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { buildStack, type Stack } from './compose';
 import { loadConfig } from './config';
-import { searchRequestSchema, activityStatusSchema } from './search/contracts';
+import { acquisitionRequestSchema, idempotencyKeySchema, searchRequestSchema, activityStatusSchema } from './search/contracts';
 import { missingSettings, type Settings } from './settings';
 import { createProwlarrMcpServer } from './search/prowlarr-mcp';
 import { LEGACY_DATABASE_ERROR } from './search/store';
@@ -141,6 +141,18 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
     return envelope();
   });
   app.post('/api/v2/searches', async (request, reply) => reply.code(202).send(await runtime.startSearch(searchRequestSchema.parse(request.body))));
+  app.post('/api/v2/acquisitions', async (request, reply) => {
+    const key=request.headers['idempotency-key'];
+    if(typeof key!=='string'||!idempotencyKeySchema.safeParse(key).success)return reply.code(400).send({code:'invalid-idempotency-key',error:'A valid Idempotency-Key header is required.'});
+    const body=acquisitionRequestSchema.parse(request.body);
+    try {
+      const accepted=await runtime.startAcquisition({...body,idempotencyKey:key});
+      return reply.code(202).send({searchId:accepted.searchId,status:'queued',statusUrl:`/api/v2/searches/${accepted.searchId}`});
+    } catch(error) {
+      const code=error instanceof Error&&error.message==='idempotency-conflict'?'idempotency-conflict':'acquisition-unavailable';
+      return reply.code(code==='idempotency-conflict'?409:503).send({code,error:code==='idempotency-conflict'?'This key is already bound to a different acquisition request.':'Acquisition could not be accepted; check configuration.'});
+    }
+  });
   app.all('/internal/mcp/prowlarr', async (request, reply) => {
     const match = /^Bearer ([a-f\d]{64})$/i.exec(String(request.headers.authorization ?? ''));
     if (!match || !runtime.hasProwlarrMcpCapability(match[1]!)) return reply.code(401).send({ error: 'Unauthorized' });

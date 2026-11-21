@@ -1,81 +1,47 @@
 import { describe, expect, it } from 'vitest';
-import { buildEpisodeSetRequest } from '../src/search/workload';
-import { ArrObserver } from '../src/search/arr';
+import { buildAutomationPrompt } from '../src/search/workload';
 import type { ArrTarget } from '../src/search/arr';
 
-const target = (episodeId: number, airAt: number, context: Record<string, unknown> = {}): ArrTarget => ({
-  key: `sonarr:fp:show:${episodeId}`, provider: 'sonarr', sourceFingerprint: 'fp', serviceId: 7, externalId: 77,
-  episodeId, monitored: true, hasFile: false, eligible: true, available: true, airAt, context: { seasonNumber: 3, episodeNumber: episodeId, ...context },
+const target = (episode: number, details: Record<string, unknown> = {}): ArrTarget => ({
+  key: `internal-key:${episode}`, provider: 'sonarr', sourceFingerprint: 'internal-source', serviceId: 7, externalId: 77,
+  episodeId: episode, monitored: true, hasFile: false, eligible: true, available: true,
+  airAt: Date.parse('2025-01-02') + episode,
+  showContext: { title: 'The Show', titles: ['The Show', 'Alias'], overview: 'Internal synopsis', externalIds: { tvdb: 77 } },
+  context: { seasonNumber: 3, episodeNumber: episode, ...details },
 });
-describe('episode-set workload', () => {
-  it('orders requested targets oldest first, retains show overview once, and labels contextual episodes', () => {
-    const result = buildEpisodeSetRequest({ show: { titles: ['Show'], overview: 'Series synopsis' },
-      targets: [target(2, 20), target(1, 10)], related: [{ ...target(3, 30), eligible: false, available: false }],
-      observedAt: 40 });
-    expect(result.targetRefs.map(r => r.key)).toEqual(['sonarr:fp:show:1', 'sonarr:fp:show:2']);
-    expect(result.request.context?.overview).toBe('Series synopsis');
-    expect(result.request.context?.targets).toHaveLength(2);
-    expect(result.request.context?.relatedEpisodes?.[0]).toMatchObject({ available: false, contextReason: 'not-yet-available' });
+const base = { preferences: '', secrets: [] };
+describe('scheduled prompt workload', () => {
+  it('selects oldest due episodes first, caps the workload and rejects mixed shows', () => {
+    const targets = Array.from({ length: 201 }, (_, i) => target(i + 1)).reverse();
+    const result = buildAutomationPrompt({ ...base, targets });
+    expect(result.selectedTargets.map(item => item.episodeId)).toEqual(Array.from({ length: 200 }, (_, i) => i + 1));
+    expect(result.deferredTargets).toBe(1);
+    expect(result.prompt).not.toMatch(/"episode":201\b|Internal synopsis|internal-key|internal-source|tvdb/);
+    expect(() => buildAutomationPrompt({ ...base, targets: [target(1), { ...target(2), serviceId: 8 }] })).toThrow(/one observed/);
   });
-  it('rejects mixed-show targets and bounds selected work', () => {
-    const targets = Array.from({ length: 201 }, (_, i) => target(i + 1, i));
-    const result = buildEpisodeSetRequest({ show: {}, targets, related: [], observedAt: 1 });
-    expect(result.targetRefs).toHaveLength(200);
-    expect(() => buildEpisodeSetRequest({ show: {}, targets: [target(1, 0), { ...target(2, 1), serviceId: 8 }], related: [], observedAt: 1 })).toThrow(/one observed show/);
-    expect(() => buildEpisodeSetRequest({ show: {}, targets: [target(1, 0)], related: [{ ...target(2, 1), serviceId: 8 }], observedAt: 1 })).toThrow(/related episodes/);
-  });
-  it('renders real Arr target context through the strict episode schema without calling series title an episode title', async () => {
-    const episodes = [
-      { id: 1, seriesId: 7, seasonNumber: 1, episodeNumber: 1, absoluteEpisodeNumber: null, title: 'Pilot', airDate: '2020-01-01', airDateUtc: null, monitored: true, hasFile: false },
-      { id: 2, seriesId: 7, seasonNumber: 1, episodeNumber: 2, absoluteEpisodeNumber: 2, title: 'Owned', airDate: '2020-01-01', airDateUtc: null, monitored: true, hasFile: true },
-      { id: 3, seriesId: 7, seasonNumber: 1, episodeNumber: 3, absoluteEpisodeNumber: null, title: 'Unmonitored', airDate: '2020-01-01', airDateUtc: null, monitored: false, hasFile: false },
-      { id: 4, seriesId: 7, seasonNumber: 1, episodeNumber: 4, absoluteEpisodeNumber: null, title: 'Future', airDate: '2030-01-01', airDateUtc: null, monitored: true, hasFile: false },
-      { id: 5, seriesId: 7, seasonNumber: 1, episodeNumber: 5, absoluteEpisodeNumber: null, title: 'Queued', airDate: '2020-01-01', airDateUtc: null, monitored: true, hasFile: false },
-    ];
-    const snapshot = await new ArrObserver({ sonarr: {
-      getSeries: async () => [{ id: 7, tvdbId: 77, title: 'A Show', titleSlug: 'a-show', seriesType: 'standard', monitored: true, alternateTitles: [], overview: 'Show synopsis', seasons: [], originalLanguage: { name: 'English' } }],
-      getEpisodes: async () => episodes, getQueue: async () => [{ seriesId: 7, episodeId: 5, status: 'downloading' }],
-    } as any, source: { sonarr: { id: 's', url: 'http://local', apiKey: 'k' } as any }, clock: () => Date.parse('2026-01-01') }).observe();
-    const targets = snapshot.sonarr.targets;
-    const built = buildEpisodeSetRequest({
-      targets: targets.filter(t => t.eligible), related: targets.filter(t => !t.eligible), observedAt: snapshot.observedAt });
-    expect(built.request.context?.titles).toEqual(['A Show']);
-    expect(built.request.context?.overview).toBe('Show synopsis');
-    expect(built.request.context?.targets?.[0]).toMatchObject({ title: 'Pilot' });
-    expect(built.request.context?.targets?.[0]).not.toHaveProperty('absoluteEpisodeNumber');
-    expect(built.request.context?.relatedEpisodes?.map(r => r.contextReason)).toEqual(['already-owned', 'unmonitored', 'not-yet-available', 'observed-in-queue']);
-    expect(built.request.context?.relatedEpisodes?.[1]?.queued).toBe(false);
-    expect(built.request.context?.relatedEpisodes?.[3]?.queued).toBe(true);
-    expect(JSON.stringify(built.request)).not.toContain('episodeTitle');
-  });
-  it('reports omitted related context and returns a clear error when targets cannot fit faithfully', () => {
-    const one = target(1, 1);
-    const result = buildEpisodeSetRequest({ show: {}, targets: [one], related: Array.from({ length: 100 }, (_, i) => target(i + 10, i + 10)), observedAt: 1, maxContextBytes: 2_000 });
-    expect(result.omittedRelatedEpisodes).toBeGreaterThan(0);
-    expect(result.request.context?.relatedEpisodesOmitted).toBe(result.omittedRelatedEpisodes);
-    expect(() => buildEpisodeSetRequest({ show: {}, targets: [target(1, 1, { episodeTitle: 'x'.repeat(5_000) })], related: [], observedAt: 1, maxContextBytes: 1_000 })).toThrow(/cannot fit/);
-  });
-  it('bounds very long related inventories before strict schema validation', () => {
-    const built = buildEpisodeSetRequest({ targets: [target(1, 1)], related: Array.from({ length: 5001 }, (_, i) => target(i + 2, i + 2)), observedAt: 1 });
-    expect(built.omittedRelatedEpisodes).toBeGreaterThan(0);
-    expect((built.request.context?.relatedEpisodes?.length ?? 0) + built.omittedRelatedEpisodes).toBe(5001);
-    expect(Buffer.byteLength(JSON.stringify(built.request))).toBeLessThanOrEqual(48_000);
-  });
-  it('includes omission metadata when deciding whether the minimum request fits', () => {
-    const base = { targets: [target(1, 1)], related: [], observedAt: 1 };
-    const targetOnlyBytes = Buffer.byteLength(JSON.stringify(buildEpisodeSetRequest(base).request));
-    expect(() => buildEpisodeSetRequest({ ...base, related: [target(2, 2)], maxContextBytes: targetOnlyBytes })).toThrow(/context budget/);
-  });
-  it('rotates oversize targets and marks byte-deferred episodes as unsearched context', () => {
-    const targets=[target(1,1,{episodeTitle:'A'.repeat(700)}),target(2,2,{episodeTitle:'B'.repeat(700)}),target(3,3)];
-    const setup={targets,related:targets,observedAt:40,maxContextBytes:1_000,allowByteDeferral:true,contextReason:()=> 'deferred-unsearched'};
-    const first=buildEpisodeSetRequest(setup);
-    expect(first.targetRefs.map(t=>t.key)).toEqual([targets[0]!.key]);
-    expect(first.deferredTargets).toBe(2);
-    const next=buildEpisodeSetRequest({...setup,maxContextBytes:1_200,prioritize:(a,b)=>Number(a.episodeId===1)-Number(b.episodeId===1)});
-    expect(next.targetRefs.map(t=>t.key)).toEqual([targets[1]!.key,targets[2]!.key]);
+
+  it('budgets the final UTF-8 prompt, keeps rows whole and rotates deferred work by attempt priority', () => {
+    const a = target(1, { episodeTitle: '星'.repeat(150) });
+    const b = target(2, { episodeTitle: '月'.repeat(150) });
+    const targets = [a, b];
+    const preferences = 'Prefer English subs\nPrefer the uncensored release';
+    const setup = { ...base, targets, preferences, maxBytes: 1450 };
+    const first = buildAutomationPrompt(setup);
+    const next = buildAutomationPrompt({ ...setup, prioritize: (left, right) => Number(left === a) - Number(right === a) });
+    expect(first.selectedTargets).toEqual([a]);
+    expect(next.selectedTargets).toEqual([b]);
     expect(next.deferredTargets).toBe(1);
-    expect(Buffer.byteLength(JSON.stringify(next.request))).toBeLessThanOrEqual(1_200);
-    expect((next.request.context?.relatedEpisodes?.length??0)+next.omittedRelatedEpisodes).toBe(1);
+    expect(next.prompt).toContain(JSON.stringify({ season: 3, episode: 2, title: '月'.repeat(150) }));
+    expect(next.prompt).toContain(preferences);
+    expect(Buffer.byteLength(next.prompt)).toBeLessThanOrEqual(setup.maxBytes);
+    expect(() => buildAutomationPrompt({ ...setup, maxBytes: 100 })).toThrow(/cannot fit/);
+  });
+
+  it('keeps meaningful daily air dates and escapes metadata while scrubbing secrets', () => {
+    const episode = target(1, { episodeTitle: 'A "quoted" name with private-key', absoluteEpisodeNumber: 0, airDate: '2025-01-01' });
+    episode.showContext = { ...episode.showContext, seriesType: 'daily' };
+    const result = buildAutomationPrompt({ ...base, targets: [episode], secrets: ['private-key'] });
+    expect(result.prompt).toContain('{"season":3,"episode":1,"title":"A \\"quoted\\" name with [redacted]","airDate":"2025-01-01"}');
+    expect(result.prompt).not.toContain('private-key');
   });
 });

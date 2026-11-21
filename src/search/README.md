@@ -12,14 +12,19 @@ search metadata and returned by search status. It is not sent to the research mo
 and does not validate or select a client during search.
 
 ```json
-{"prompt":"Find seasons 1-4 of Example; useful partial sets are welcome","context":{"kind":"tv","titles":["Example"],"scope":{"type":"unspecified"}}}
+{"prompt":"Find seasons 1–4 of Example. Prefer original audio with English subtitles; useful partial sets are welcome."}
 ```
 
-For exact generic targets, supply distinct opaque `context.targets[].targetId`
-references with numbering evidence. For Arr-backed acquisition intent, supply
-`arrTargetIds` from the saved observation view instead: the backend freshly resolves
-and validates them, then persists immutable canonical bindings. Generic target IDs
-never grant Arr authority, even if they happen to equal an Arr reference.
+Manual searches need only a prompt. Existing callers can still supply `context`,
+`preferences`, or `arrTargetIds`. The backend renders useful semantic context into
+the prompt; it does not forward target references, provider identity IDs, or
+related episode inventories. Explicit Arr selectors are resolved locally from
+fresh observations. Generic target references never grant Arr authority.
+
+New search details return the exact redacted model input as `prompt`. Older
+records retain their original short `prompt` and can return the saved full input
+as `modelPrompt`. System guidance is separate from the saved per-search prompt.
+No database format change is needed.
 
 A completed result has one `plan`, not `options`. New plans are version 2:
 
@@ -73,10 +78,14 @@ Activity filters accept search statuses and submission/execution outcomes, inclu
 ## Scheduled Arr automation
 
 The scheduler uses one lease and selects one fair title per pass. Sonarr workloads
-group all due missing episodes across seasons; Radarr workloads describe one
-movie. Unknown inventories are not empty. Context-only episodes, bounded-workload
-deferrals and omitted related detail are kept distinct from searched targets.
-Oversized workloads rotate by last attempt, not season alone. No additional batch
+group due missing episodes across seasons; Radarr workloads describe one movie.
+The show prompt includes provider titles as search hints, exact requested episode
+rows, and a preference for healthy, useful packs, including overlapping packs.
+A movie prompt uses the title and year when known. Saved automation preferences
+are appended only to scheduled searches. Owned, unmonitored, queued and future
+episodes are not dumped into the prompt. The size limit applies to the rendered
+prompt, and oversized workloads defer whole episodes and rotate by last attempt.
+Unknown inventories are not empty. No additional batch
 API or release-to-episode assignment is involved. The explicit poll endpoint only
 refreshes observations and returns promptly when another pass owns the lease.
 
@@ -144,11 +153,12 @@ as a versioned array separate from historical single-binding settings.
 Implementation map:
 
 - `agent.ts`, `agent-contracts.ts`: SDK orchestration and ledger-validated finalization.
-- `contracts.ts`, `arr.ts`, `automation.ts`: request contracts, Arr observation, and the retained cooldown-key helper; no acquisition automation engine remains.
+- `prompt.ts`, `workload.ts`: system research guidance, semantic request rendering and bounded scheduled prompts.
+- `contracts.ts`, `arr.ts`: public request contracts and Arr observation.
 - `store.ts`, `settings.ts`: SQLite persistence.
 - `runtime.ts`, `mcp.ts`, `prowlarr-mcp.ts`: runtime wiring and MCP adapters/capabilities.
 
-Preserve these boundaries: failed or incomplete Arr reads are unknown, not empty. Target membership is based only on the owning ledger; explicit identity conflicts and duplicate physical releases reject finalization. Broad-scope coverage is explicit and may be partial/unknown; target coverage is not proof of whole-work completeness.
+Preserve these boundaries: failed or incomplete Arr reads are unknown, not empty. Only candidates in the owning ledger may be finalized; duplicate physical releases are rejected. Candidate identity is evaluated by the agent semantically, not vetoed by TVDB/TMDB IDs. Broad-scope coverage is explicit and may be partial/unknown; target coverage is not proof of whole-work completeness.
 
 HTTP routes are registered in `src/daemon.ts`; the internal Prowlarr and public Media Scout MCP tools are registered in `src/search/prowlarr-mcp.ts` and `src/search/mcp.ts`. `src/mcp/server.ts` is the public MCP process entry point. Prefer these implementations and shared contracts as the source of truth for current behavior.
 

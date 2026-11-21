@@ -159,7 +159,6 @@ export type ReleaseSet = z.infer<typeof releaseSetSchema>;
 export interface LedgerCandidate {
   id: string;
   physicalId: string;
-  identityConflict?: boolean;
 }
 export interface FinalizationLedger {
   searchId: string;
@@ -177,7 +176,6 @@ export function finalizeReleaseSet(raw: unknown, ledger: FinalizationLedger): Re
   for (const selection of input.selections) {
     const candidate = candidates.get(selection.candidateId);
     if (!candidate) throw new Error('Candidate does not belong to owning search');
-    if (candidate.identityConflict) throw new Error('Candidate has explicit identity conflict');
     if (selectedPhysical.has(candidate.physicalId)) throw new Error('Duplicate physical release');
     selectedPhysical.add(candidate.physicalId);
   }

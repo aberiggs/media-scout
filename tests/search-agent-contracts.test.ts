@@ -117,11 +117,11 @@ describe('agent release-set contract', () => {
     expect(() => finalizeReleaseSet({ ...semantic, status: 'no-match', selections: [], covered: [], broadCoverage: 'complete' }, ledger)).toThrow(/complete.*matched/i);
   });
 
-  it('rejects foreign candidates, duplicate physical releases and explicit identity conflicts', () => {
+  it('rejects foreign candidates and duplicate physical releases without identity vetoes', () => {
     const ctx = { searchId: 's', candidates: [
       { id: 'a', physicalId: 'same', identityConflict: false },
       { id: 'b', physicalId: 'same', identityConflict: false },
-      { id: 'c', physicalId: 'other', identityConflict: true },
+      { id: 'c', physicalId: 'other' },
     ] };
     const common = { status: 'matched', covered: ['Requested season'], gaps: [], deferred: [], broadCoverage: 'complete', scopeGaps: [] };
     expect(() => finalizeReleaseSet({ ...common, selections: [{ candidateId: 'not-owned', coverage: 'Requested season', reason: 'x', uncertainty: '' }] }, ctx)).toThrow(/owning search/i);
@@ -129,7 +129,7 @@ describe('agent release-set contract', () => {
       { candidateId: 'a', coverage: 'Requested season', reason: 'x', uncertainty: '' },
       { candidateId: 'b', coverage: 'Requested season', reason: 'x', uncertainty: '' },
     ] }, ctx)).toThrow(/physical release/i);
-    expect(() => finalizeReleaseSet({ ...common, selections: [{ candidateId: 'c', coverage: 'Requested season', reason: 'x', uncertainty: '' }] }, ctx)).toThrow(/identity conflict/i);
+    expect(finalizeReleaseSet({ ...common, selections: [{ candidateId: 'c', coverage: 'Requested season', reason: 'x', uncertainty: '' }] }, ctx).status).toBe('matched');
   });
 
   it('rejects historical v1 target assignment plans', () => {

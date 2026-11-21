@@ -27,6 +27,11 @@ function lifecycleFetch(handler: (url: string, init?: RequestInit) => Response |
     return handler(url, init)
   }
 }
+async function selectConfirmationClient(id = '8') {
+  fireEvent.click(await screen.findByRole('button', { name: 'Choose Prowlarr client' }))
+  const select = await screen.findByLabelText('Prowlarr download client') as HTMLSelectElement
+  if (select.value !== id) fireEvent.change(select, { target: { value: id } })
+}
 
 it('prepares and commits the complete semantic v2 release set and shows its receipt', async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = []
@@ -45,7 +50,7 @@ it('prepares and commits the complete semantic v2 release set and shows its rece
   assert.ok(await screen.findByText(/Season one with overlap/))
   assert.ok(screen.getByText('Bonus episode'))
   assert.equal(screen.queryByText(/target-1/), null)
-  fireEvent.click(screen.getByRole('button', { name: 'Choose Prowlarr client' }))
+  await selectConfirmationClient()
   fireEvent.click(await screen.findByRole('button', { name: 'Prepare confirmation' }))
   assert.ok(await screen.findByRole('dialog', { name: 'Confirm whole release set' }))
   assert.ok(screen.getByText('Client default category').parentElement?.textContent?.includes('tv'))
@@ -58,6 +63,58 @@ it('prepares and commits the complete semantic v2 release set and shows its rece
   const commit = calls.find(call => call.url === '/api/v2/executions/commit')
   assert.ok(commit)
   assert.deepEqual(Object.keys(JSON.parse(String(commit.init?.body))).sort(), ['confirmationId', 'idempotencyKey', 'planId', 'searchId', 'version'])
+})
+
+it('submits one retained prompt draft without an early client lookup and shows the exact long saved prompt', async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = []
+  const longPrompt = `Find the complete season\n${'keep original audio and subtitles. '.repeat(400)}`
+  lifecycleFetch((url, init) => {
+    calls.push({ url, init })
+    if (url === '/api/v2/searches/long') return Response.json({ ...semanticSearch, searchId: 'long', prompt: 'The Expanse', modelPrompt: longPrompt, preferredDownloadClientId: 42 })
+    if (url === '/api/v2/searches') return Response.json({ searchId: 'long' })
+    return Response.json({})
+  })
+  const { SearchPage } = await import('./Search')
+  const started: string[] = []
+  const view = render(<SearchPage settings={defaults} searchRevision={1} onSearchStarted={id => started.push(id)} />)
+  const prompt = screen.getByLabelText('What are you looking for?') as HTMLTextAreaElement
+  const draft = 'The Expanse season 2\nOriginal audio, preferably 1080p'
+  fireEvent.change(prompt, { target: { value: draft } })
+  fireEvent.submit(prompt.closest('form')!)
+  await waitFor(() => assert.deepEqual(started, ['long']))
+  view.rerender(<SearchPage settings={defaults} searchId="long" searchRevision={2} onSearchStarted={() => {}} />)
+  assert.deepEqual(JSON.parse(String(calls.find(call => call.url === '/api/v2/searches')?.init?.body)), { prompt: draft })
+  assert.equal(prompt.value, draft)
+  assert.equal(calls.some(call => call.url === '/api/v2/download-clients'), false)
+  assert.ok(await screen.findByText('The Expanse'))
+  const disclosure = screen.getByText('Saved search prompt')
+  fireEvent.click(disclosure)
+  assert.equal(screen.getByLabelText('Exact saved search prompt').textContent, longPrompt)
+  assert.ok(longPrompt.length > 12000)
+})
+
+it('preselects a saved preferred client only after opening confirmation client selection', async () => {
+  const calls: string[] = []
+  lifecycleFetch(url => {
+    calls.push(url)
+    if (url === '/api/v2/searches/life') return Response.json({ ...semanticSearch, preferredDownloadClientId: 8 })
+    if (url === '/api/v2/searches/other') return Response.json({ ...semanticSearch, searchId: 'other', prompt: 'Other result' })
+    if (url === '/api/v2/download-clients') return Response.json({ items: [{ id: 8, name: 'qBittorrent', protocol: 'torrent', categoryMap: [] }, { id: 9, name: 'SABnzbd', protocol: 'usenet', categoryMap: [] }] })
+    if (url === '/api/v2/executions/prepare') return Response.json(preparedConfirmation)
+    return Response.json({})
+  })
+  const { SearchPage } = await import('./Search')
+  const view = render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
+  await screen.findByText('Selected release set')
+  assert.equal(calls.includes('/api/v2/download-clients'), false)
+  fireEvent.click(screen.getByRole('button', { name: 'Choose Prowlarr client' }))
+  const clientSelect = await screen.findByLabelText('Prowlarr download client') as HTMLSelectElement
+  await waitFor(() => assert.equal(clientSelect.value, '8'))
+  view.rerender(<SearchPage settings={defaults} searchId="other" searchRevision={2} onSearchStarted={() => {}} />)
+  await waitFor(() => assert.equal(document.querySelector('.result-title')?.textContent, 'Other result'))
+  fireEvent.click(screen.getByRole('button', { name: 'Choose Prowlarr client' }))
+  const nextClientSelect = await screen.findByLabelText('Prowlarr download client') as HTMLSelectElement
+  await waitFor(() => assert.equal(nextClientSelect.value, '', 'A different search must not inherit the previous destination'))
 })
 
 it('connects a research MCP from a pasted URL in one request', async () => {
@@ -125,7 +182,7 @@ it('retries a transport-uncertain commit with the exact persisted request and id
   })
   const { SearchPage } = await import('./Search')
   render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
-  fireEvent.click(await screen.findByRole('button', { name: 'Choose Prowlarr client' }))
+  await selectConfirmationClient()
   fireEvent.click(await screen.findByRole('button', { name: 'Prepare confirmation' }))
   fireEvent.click(await screen.findByRole('button', { name: 'Run dry-run' }))
   assert.ok(await screen.findByRole('button', { name: 'Retry same confirmation' }))
@@ -172,7 +229,7 @@ it('retains the exact commit recovery key when an HTTP-success response body is 
   })
   const { SearchPage } = await import('./Search')
   render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
-  fireEvent.click(await screen.findByRole('button', { name: 'Choose Prowlarr client' }))
+  await selectConfirmationClient()
   fireEvent.click(await screen.findByRole('button', { name: 'Prepare confirmation' }))
   fireEvent.click(await screen.findByRole('button', { name: 'Run dry-run' }))
   await waitFor(() => assert.equal(Boolean(screen.queryByRole('dialog')), false))
@@ -191,7 +248,7 @@ it('rejects an incomplete successful preparation without opening a broken dialog
   })
   const { SearchPage } = await import('./Search')
   render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
-  fireEvent.click(await screen.findByRole('button', { name: 'Choose Prowlarr client' }))
+  await selectConfirmationClient()
   fireEvent.click(await screen.findByRole('button', { name: 'Prepare confirmation' }))
   assert.ok(await screen.findByText(/Preparation response was incomplete/))
   assert.equal(Boolean(screen.queryByRole('dialog')), false)
@@ -208,7 +265,7 @@ it('clears only a definitive stale-confirmation rejection and allows fresh prepa
   })
   const { SearchPage } = await import('./Search')
   render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
-  fireEvent.click(await screen.findByRole('button', { name: 'Choose Prowlarr client' }))
+  await selectConfirmationClient()
   fireEvent.click(await screen.findByRole('button', { name: 'Prepare confirmation' }))
   fireEvent.click(await screen.findByRole('button', { name: 'Run dry-run' }))
   assert.ok(await screen.findByText(/Prepare a fresh confirmation/))
@@ -231,7 +288,7 @@ it('does not show an old confirmation after selecting another search while prepa
   })
   const { SearchPage } = await import('./Search')
   const view = render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
-  fireEvent.click(await screen.findByRole('button', { name: 'Choose Prowlarr client' }))
+  await selectConfirmationClient()
   fireEvent.click(await screen.findByRole('button', { name: 'Prepare confirmation' }))
   await wasStarted
   view.rerender(<SearchPage settings={defaults} searchId="other" searchRevision={2} onSearchStarted={() => {}} />)
@@ -280,7 +337,7 @@ it('traps confirmation focus and restores focus to the actual prepare action', a
   })
   const { SearchPage } = await import('./Search')
   render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
-  fireEvent.click(await screen.findByRole('button', { name: 'Choose Prowlarr client' }))
+  await selectConfirmationClient()
   const prepare = await screen.findByRole('button', { name: 'Prepare confirmation' })
   fireEvent.click(prepare)
   const dialog = await screen.findByRole('dialog', { name: 'Confirm whole release set' })
@@ -310,7 +367,7 @@ it('keeps the whole-set dialog open while a commit request is pending', async ()
   })
   const { SearchPage } = await import('./Search')
   render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
-  fireEvent.click(await screen.findByRole('button', { name: 'Choose Prowlarr client' }))
+  await selectConfirmationClient()
   fireEvent.click(await screen.findByRole('button', { name: 'Prepare confirmation' }))
   const confirm = await screen.findByRole('button', { name: 'Run dry-run' })
   fireEvent.click(confirm)
@@ -401,23 +458,19 @@ it('opens saved search details from Activity after navigating to Search', async 
   assert.ok(await screen.findByText('Best evidence'))
 })
 
-it('retains an unsent search draft and optional details while navigating away and back', async () => {
+it('retains the single unsent prompt draft while navigating away and back', async () => {
   window.history.replaceState(null, '', '/#search')
   globalThis.fetch = async input => String(input) === '/api/settings' ? Response.json(env) : Response.json({ items: [], total: 0 })
   render(<App />)
   const prompt = await screen.findByLabelText('What are you looking for?')
-  fireEvent.change(prompt, { target: { value: 'Find a film' } })
-  fireEvent.click(screen.getByRole('button', { name: 'Add optional details' }))
-  fireEvent.change(screen.getByLabelText('Preferences'), { target: { value: 'Original audio' } })
-  fireEvent.change(screen.getByLabelText(/Structured context/), { target: { value: '{"kind":"movie"}' } })
+  fireEvent.change(prompt, { target: { value: 'Find a film\nOriginal audio; movie context' } })
   fireEvent.click(document.querySelector('a[href="#activity"]')!); fireEvent(window, new dom.window.Event('hashchange'))
   await screen.findByText('A record of searches, recommendations, and per-release submission outcomes.')
   assert.equal(document.querySelector('#search-workspace')?.hasAttribute('hidden'), true)
   fireEvent.click(screen.getByRole('link', { name: 'Search' })); fireEvent(window, new dom.window.Event('hashchange'))
   assert.equal(await screen.findByLabelText('What are you looking for?'), prompt)
-  assert.equal((prompt as HTMLTextAreaElement).value, 'Find a film')
-  assert.equal((screen.getByLabelText('Preferences') as HTMLTextAreaElement).value, 'Original audio')
-  assert.equal((screen.getByLabelText(/Structured context/) as HTMLTextAreaElement).value, '{"kind":"movie"}')
+  assert.equal((prompt as HTMLTextAreaElement).value, 'Find a film\nOriginal audio; movie context')
+  assert.equal(screen.queryByLabelText('Preferences'), null)
 })
 
 it('keeps the current result through navigation and lets Activity replace it with an older result', async () => {

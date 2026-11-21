@@ -140,7 +140,7 @@ it('connects on save and exposes the server tools to the existing planner, which
   f.redirect();
   const status = await f.search();
   expect(f.requests[0]?.tools?.map(tool => tool.name)).toEqual(expect.arrayContaining([...good.server.toolNames, 'prowlarr_search', 'finalize_release_set']));
-  expect(f.requests[0]?.instructions).toMatch(/large or ambiguous batches.+consider using connected research MCP tools before querying Prowlarr/is);
+  expect(f.requests[0]?.instructions).toMatch(/use suitable connected research MCP tools before, during, or after indexer queries when they can improve search queries or resolve uncertainty that could change selection/i);
   expect(JSON.stringify(f.requests[1]?.input)).toContain('MAL lists two cours');
   expect(f.calls).toEqual(['lookup:Example Anime season layout site:myanimelist.net', 'prowlarr:Example Anime Silver Cour']);
   expect(status.json()).toMatchObject({ status: 'no-match', counts: { decisions: 3, searches: 1 }, researchWarnings: [expect.any(String)] });

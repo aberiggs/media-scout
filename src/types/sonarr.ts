@@ -22,6 +22,7 @@ export const seasonSchema = z.object({
 /** Alternate titles feed the planner's query variants (D2 rationale: they break deterministic filters). */
 export const alternateTitleSchema = z.object({
   title: z.string(),
+  seasonNumber: z.number().int().nullish().catch(undefined),
 });
 
 const languageSchema = z.object({ id: z.number().int().optional(), name: z.string().optional() }).passthrough();

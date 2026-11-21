@@ -35,7 +35,7 @@ This release requires a fresh database. Set `DB_PATH=data/media-scout-agent.db` 
 
 Configure Prowlarr, LLM, and optional Arr connections in the web UI. In **Settings → Automation and retries**, choose the TV and/or movie download client and set any preferences for scheduled searches. Enable monitoring for scheduled searches. Automatic downloads additionally require **Allow automatic downloads** and dry-run off. A fresh database starts with dry-run on and both monitoring and automatic downloads off. **Refresh Arr observations** never starts a search or download.
 
-Each scheduled search covers a show's currently actionable episodes across seasons, or one movie. After a submitted or possibly submitted download, Scout waits for Arr to see it before researching that title again (30 minutes by default). Scout does not inspect or repair qBittorrent downloads or Arr imports.
+Each scheduled search lists the show's actionable episodes across seasons, or one movie, and adds the saved automation preferences to the prompt. Manual Search uses one prompt for the request and any preferences; open a saved result to see its full prompt. After a submitted or possibly submitted download, Scout waits for Arr to see it before researching that title again (30 minutes by default). Scout does not inspect or repair qBittorrent downloads or Arr imports.
 
 Manual confirmation uses an explicit Prowlarr download client, its configured
 category routing, and the saved dry-run setting. Expired candidates require a new
@@ -47,7 +47,7 @@ imported. Interrupted/uncertain sets are never automatically replayed.
 
 1. In **Settings → Optional research services**, paste the exact Streamable HTTP MCP URL reachable from Media Scout and choose **Connect**. For a self-hosted CRW server on a shared container network, this could be `http://crw:3000/mcp`. Do not put credentials in the URL.
 2. Optionally configure bearer auth using the `Authorization` header and `Bearer <token>` value, or a supported custom header. Connecting verifies the server and makes its usable tools available to the planner; there is no separate discovery or per-tool approval step.
-3. The existing planner may use connected tools when external validation is useful, such as an anime batch with unclear season numbering. Missing or unavailable research tools do not block Prowlarr searches.
+3. The planner uses suitable tools when they can improve search terms or clarify evidence that could change the selection, such as an anime batch with unclear season numbering. Missing or unavailable research tools do not block Prowlarr searches.
 
 Connecting trusts the server: every usable tool it exposes may be called by the model, and model-authored tool arguments can include the search request/context. Use only trusted services. Credentials are stored in SQLite and hidden from Settings readbacks. The integration supports Streamable HTTP and static headers, not stdio, OAuth, or credential-bearing URLs. Redirects are rejected; metadata and link-local destinations are blocked while localhost and trusted private LAN endpoints are supported.
 

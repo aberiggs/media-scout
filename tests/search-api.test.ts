@@ -34,6 +34,23 @@ async function fixture(clientOverride?: RuntimeClients, now?: () => number) {
 }
 
 describe('search-first HTTP contract', () => {
+  it('bounds activity prompt previews without losing tail search or detail', async () => {
+    const { app, runtime } = await fixture();
+    const prefix = `${'x'.repeat(238)}🧪`;
+    const long = `${prefix}\nDistinctive-tail`;
+    const now = Date.now();
+    runtime.store.createSearch({ searchId: 'long', prompt: JSON.stringify({ version: 3, prompt: long, kind: 'tv' }), status: 'no-match', createdAt: now });
+    runtime.store.setSetting('search-source:long', 'automation');
+    runtime.store.createSearch({ searchId: 'short', prompt: JSON.stringify({ version: 1, request: { prompt: 'Short legacy title' } }), status: 'no-match', createdAt: now - 1 });
+    const response = await app.inject({ method: 'GET', url: '/api/v2/activity?q=distinctive-tail&source=automation&kind=tv' });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ total: 1, items: [{ searchId: 'long', prompt: `${prefix}…` }] });
+    const page = await app.inject({ method: 'GET', url: '/api/v2/activity?limit=1&offset=1' });
+    expect(page.json()).toMatchObject({ total: 2, items: [{ searchId: 'short', prompt: 'Short legacy title' }] });
+    const detail = await app.inject({ method: 'GET', url: '/api/v2/searches/long' });
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json().prompt).toBe(long);
+  });
   it('keeps research MCP credentials out of API reads and stores disabled connections without probing', async () => {
     const store = openSearchStore(':memory:');
     const runtime = new SearchRuntime({ store });

@@ -30,7 +30,7 @@ export function buildAutomationPrompt(input: {
   const titleHints = titles.map(title => aliasSeasons.has(title) ? { title, providerSeasons: [...aliasSeasons.get(title)!] } : title);
   const budget = input.maxBytes ?? AUTOMATION_PROMPT_LIMITS.requestBytes;
   const preferences = safeText(input.preferences, input.secrets, true).trim();
-  const preferenceSection = preferences ? `\n\nTry to find releases that match these preferences as closely as possible:\n${preferences}` : '';
+  const preferenceSection = preferences ? `\n\nSaved automation preferences and requirements:\n${preferences}` : '';
   const movie = first.provider === 'radarr';
   const year = typeof media.year === 'number' && media.year >= 1888 && media.year <= 2200 ? ` (${media.year})` : '';
   const intro = `Find releases for ${movie ? 'the movie ' : 'the series '}${JSON.stringify(titles[0])}${year}.`;

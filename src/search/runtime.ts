@@ -90,6 +90,16 @@ const savedPromptText = (stored: StoredPrompt): string => {
   const prompt = (stored.request as {prompt?: unknown} | undefined)?.prompt ?? stored.prompt;
   return typeof prompt === 'string' ? prompt : 'Search request';
 };
+const ACTIVITY_PROMPT_LIMIT = 240;
+function activityPromptPreview(prompt: string): string {
+  if (prompt.length <= ACTIVITY_PROMPT_LIMIT) return prompt;
+  let count = 0, end = 0;
+  for (const character of prompt) {
+    if (++count > ACTIVITY_PROMPT_LIMIT) return `${prompt.slice(0, end)}…`;
+    if (count < ACTIVITY_PROMPT_LIMIT) end += character.length;
+  }
+  return prompt;
+}
 const SAFE_INTERNAL_ERRORS = new Set([
   'runtime-closed', 'daemon-mcp-unavailable', 'search-ownership-lost',
   'finalization-not-staged', 'finalization-invalid',
@@ -377,13 +387,21 @@ export class SearchRuntime {
     const limit = Math.max(1, Math.min(query.limit ?? 50, 100));
     const offset = Math.max(0, query.offset ?? 0);
     const secrets = promptSecrets(this.getSettings());
-    const records = this.store.listSearches(10000, false).map((record) => this.activityItem(record, secrets));
+    const term = query.q?.toLocaleLowerCase();
     const from = query.createdAtFrom ? Date.parse(query.createdAtFrom) : undefined, to = query.createdAtTo ? Date.parse(query.createdAtTo) : undefined;
-    const matches = records.filter((item) => {
+    const items: ActivityItem[] = [];
+    let total = 0;
+    for (const record of this.store.listSearches(10000, false)) {
+      if ((from !== undefined && record.createdAt < from) || (to !== undefined && record.createdAt > to)) continue;
+      const item = this.activityItem(record, secrets, term);
+      if (!item) continue;
       const kind = item.kind;
-      return (!query.q || item.prompt.toLocaleLowerCase().includes(query.q.toLocaleLowerCase())) && (!query.status || item.status === query.status || item.submission?.outcome === query.status) && (!query.source || item.source === query.source) && (!query.kind || (query.kind === 'other' ? !kind : kind === query.kind)) && (from === undefined || Date.parse(item.createdAt) >= from) && (to === undefined || Date.parse(item.createdAt) <= to);
-    });
-    return { items: matches.slice(offset, offset + limit), total: matches.length, retention: { days: 30, maxEntries: 10000 } };
+      if ((query.status && item.status !== query.status && item.submission?.outcome !== query.status) ||
+        (query.source && item.source !== query.source) || (query.kind && (query.kind === 'other' ? !!kind : kind !== query.kind))) continue;
+      if (total >= offset && items.length < limit) items.push(item);
+      total++;
+    }
+    return { items, total, retention: { days: 30, maxEntries: 10000 } };
   }
 
   async downloadClients(): Promise<Array<{id:number;name:string;protocol:string;defaultCategory:string|null;categoryMap:Array<{clientCategory:string|null;categories:number[]|null}>}>> {
@@ -816,18 +834,20 @@ export class SearchRuntime {
     try{return await operation;}finally{this.executionOperations.delete(operation);}
   }
 
-  private activityItem(record: SearchRecord, secrets: readonly string[]): ActivityItem {
+  private activityItem(record: SearchRecord, secrets: readonly string[], term?: string): ActivityItem | undefined {
+    const stored = readStoredPrompt(record.prompt);
+    const prompt = safeText(savedPromptText(stored), secrets, true);
+    if (term && !prompt.toLocaleLowerCase().includes(term)) return;
     const result = record.result as Pick<AgentSearchResult, 'counts'> | undefined;
     const execution=this.store.executionsForSearch(record.searchId).at(-1);
     const event = !execution ? (this.store.getEvents(record.searchId) as Array<{type:string;data?:ActivityItem['submission']}>).findLast(e => e.type === 'submission') : undefined;
     const submission = execution ? {outcome:execution.outcome,outcomes:execution.children.map(c=>({candidateId:c.candidateId,outcome:c.state}))} : event?.data;
-    const stored = readStoredPrompt(record.prompt);
     const oldContext = stored.context && typeof stored.context === 'object' ? stored.context as {kind?:unknown} : undefined;
     const oldRequest = stored.request && typeof stored.request === 'object' ? stored.request as {kind?:unknown} : undefined;
     const media = stored.kind ?? oldContext?.kind ?? oldRequest?.kind;
     const kind = media === 'tv' || media === 'show' ? 'tv' : media === 'movie' ? 'movie' : undefined;
     const savedSource = this.store.getSetting(`search-source:${record.searchId}`);
-    return { searchId: record.searchId, prompt: safeText(savedPromptText(stored), secrets, true), status: record.status, createdAt: new Date(record.createdAt).toISOString(), ...(record.finishedAt === undefined ? {} : { finishedAt: new Date(record.finishedAt).toISOString() }), source: savedSource === 'automation' || savedSource === 'arr' ? savedSource : 'manual', ...(kind ? { kind } : {}), ...(result?.counts ? { counts: result.counts } : {}), ...(submission ? { submission: { outcome: submission.outcome, outcomes: submission.outcomes } } : {}) };
+    return { searchId: record.searchId, prompt: activityPromptPreview(prompt), status: record.status, createdAt: new Date(record.createdAt).toISOString(), ...(record.finishedAt === undefined ? {} : { finishedAt: new Date(record.finishedAt).toISOString() }), source: savedSource === 'automation' || savedSource === 'arr' ? savedSource : 'manual', ...(kind ? { kind } : {}), ...(result?.counts ? { counts: result.counts } : {}), ...(submission ? { submission: { outcome: submission.outcome, outcomes: submission.outcomes } } : {}) };
   }
   private clients(settings: Settings): RuntimeClients {
     if (this.options.clients) return this.options.clients(settings);

@@ -65,15 +65,24 @@ Manual execution endpoints do not accept automation-owned plans. The scheduler m
 Confirmation always requires an explicit download-client choice.
 Activity filters accept search statuses and submission/execution outcomes, including
 `partial` and `not-attempted`.
+Activity prompt previews are capped at 240 Unicode code points; `q` still searches
+the full stored prompt, while search detail retains its exact text.
 
 ## Scheduled Arr automation
 
 The scheduler uses one lease and selects one fair title per pass. Sonarr workloads
 group due missing episodes across seasons; Radarr workloads describe one movie.
 The show prompt includes provider titles as search hints, exact requested episode
-rows, and a preference for healthy, useful packs, including overlapping packs.
+rows, and a preference for healthy, useful packs, including overlapping packs,
+among candidates that satisfy explicit requirements. Preferences are tradeoffs,
+not vetoes; coverage preferences never justify a disqualified release. For example,
+if the user requires a subtitle language and prefers a resolution, a qualifying
+lower-resolution episode is preferable to a pack without the required subtitles.
+A useful partial set can be selected with its gaps named. Connected research is
+optional and can happen before, between, or after indexer queries. If no useful
+indexer query is possible, the result should explain why without claiming a search ran.
 A movie prompt uses the title and year when known. Saved automation preferences
-are appended only to scheduled searches. Owned, unmonitored, queued and future
+default to blank and are appended only to scheduled searches. Owned, unmonitored, queued and future
 episodes are not dumped into the prompt. The size limit applies to the rendered
 prompt, and oversized workloads defer whole episodes and rotate by last attempt.
 Unknown inventories are not empty. No additional batch

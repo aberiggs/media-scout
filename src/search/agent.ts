@@ -1,7 +1,7 @@
 import { callModel, stepCountIs, tool } from '@openrouter/agent';
 import { createMCPTools } from '@openrouter/agent/mcp';
 import { finalizeReleaseSetInputSchema, type FinalizationLedger, type ReleaseSet, finalizeReleaseSet } from './agent-contracts';
-import { connectApprovedResearchTools, type enabledResearchServerConfigs } from './research-mcp';
+import { connectResearchTools, type enabledResearchServerConfigs } from './research-mcp';
 
 export interface AgentSearchOptions {
   client: Parameters<typeof callModel>[0];
@@ -11,7 +11,6 @@ export interface AgentSearchOptions {
   mcpUrl: string;
   capability: string;
   researchServers?: ReturnType<typeof enabledResearchServerConfigs>;
-  researchEndpoints?: readonly string[];
   researchSecrets?: readonly string[];
   signal: AbortSignal;
   maxSteps: number;
@@ -37,7 +36,7 @@ export async function runAgentSearch(options: AgentSearchOptions): Promise<Relea
     signal: options.signal,
     resources: false,
   });
-  let external: Awaited<ReturnType<typeof connectApprovedResearchTools>> | undefined;
+  let external: Awaited<ReturnType<typeof connectResearchTools>> | undefined;
   let finalized: ReleaseSet | undefined;
   let finalizing = false;
   let modelTurns = 0;
@@ -48,7 +47,7 @@ export async function runAgentSearch(options: AgentSearchOptions): Promise<Relea
   try {
     if (options.signal.aborted) throw options.signal.reason ?? new Error('aborted');
     if (options.researchServers?.length) {
-      external = await connectApprovedResearchTools(options.researchServers, options.researchEndpoints ?? [], controller.signal, options.researchSecrets ?? [], options.onResearchWarning);
+      external = await connectResearchTools(options.researchServers, controller.signal, options.researchSecrets ?? [], options.onResearchWarning);
     }
     const finalizer = tool({
       name: 'finalize_release_set',

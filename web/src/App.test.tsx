@@ -60,31 +60,26 @@ it('prepares and commits the complete semantic v2 release set and shows its rece
   assert.deepEqual(Object.keys(JSON.parse(String(commit.init?.body))).sort(), ['confirmationId', 'idempotencyKey', 'planId', 'searchId', 'version'])
 })
 
-it('saves a research MCP before discovery and requires explicit tool approval', async () => {
+it('connects a research MCP from a pasted URL in one request', async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = []
   globalThis.fetch = async (input, init) => {
     const url = String(input); calls.push({ url, init })
     if (url === '/api/settings') return Response.json(env)
-    if (url === '/api/research-mcp' && !init?.method) return Response.json({ allowedEndpoints: ['https://research.example/mcp'], servers: [] })
-    if (url === '/api/research-mcp' && init?.method === 'POST') return Response.json({ id: 'srv-1', name: 'MAL', namespace: 'mal', url: 'https://research.example/mcp', enabled: true, credentialConfigured: false, approvedTools: [] }, { status: 201 })
-    if (url.endsWith('/discover')) return Response.json({ tools: [{ name: 'search_anime', description: 'Search anime', fingerprint: 'a'.repeat(64) }] })
+    if (url === '/api/research-mcp' && !init?.method) return Response.json({ servers: [] })
+    if (url === '/api/research-mcp' && init?.method === 'POST') return Response.json({ id: 'srv-1', name: 'research.example', url: 'https://research.example/mcp', enabled: true, credentialConfigured: false, toolNames: ['research_mal_123_search_anime'] }, { status: 201 })
     return Response.json({})
   }
   window.location.hash = '#settings'
   render(<App />)
   fireEvent.click(await screen.findByRole('button', { name: 'Add a research service' }))
-  fireEvent.change(screen.getByLabelText('Server name'), { target: { value: 'MAL' } })
-  fireEvent.change(screen.getByLabelText(/^Namespace/), { target: { value: 'mal' } })
-  fireEvent.change(screen.getByLabelText('Endpoint'), { target: { value: 'https://research.example/mcp' } })
-  fireEvent.click(screen.getByRole('button', { name: 'Save server' }))
-  const discover = await screen.findByRole('button', { name: 'Discover tools' })
-  assert.ok(calls.some(call => call.url === '/api/research-mcp' && call.init?.method === 'POST'))
-  fireEvent.click(discover)
-  const tool = await screen.findByLabelText(/search_anime/)
-  assert.equal((tool as HTMLInputElement).checked, false)
-  fireEvent.click(tool)
-  fireEvent.click(screen.getByRole('button', { name: 'Save approvals' }))
-  await waitFor(() => assert.ok(calls.some(call => call.url === '/api/research-mcp/srv-1' && call.init?.method === 'PUT' && String(call.init.body).includes('search_anime'))))
+  fireEvent.change(screen.getByLabelText('MCP URL'), { target: { value: 'https://research.example/mcp' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
+  assert.ok(await screen.findByText('Connected · 1 tool available'))
+  const writes = calls.filter(call => call.init?.method === 'POST')
+  assert.equal(writes.length, 1)
+  assert.equal(writes[0]!.url, '/api/research-mcp')
+  assert.deepEqual(JSON.parse(String(writes[0]!.init?.body)), { name: 'research.example', url: 'https://research.example/mcp', enabled: true })
+  assert.equal(screen.queryByRole('button', { name: /discover|approve/i }), null)
 })
 
 it('does not carry a typed research credential across endpoints and keeps a failed save draft', async () => {
@@ -93,12 +88,11 @@ it('does not carry a typed research credential across endpoints and keeps a fail
     const url = String(input)
     if (url === '/api/settings') return Response.json(env)
     if (url === '/api/research-mcp' && !init?.method) return Response.json({
-      allowedEndpoints: ['http://old.test/mcp', 'http://new.test/mcp'],
-      servers: [{ id: 'srv-1', name: 'Catalog', namespace: 'catalog', url: 'http://old.test/mcp', enabled: true, credentialConfigured: true, approvedTools: [] }],
+      servers: [{ id: 'srv-1', name: 'Catalog', url: 'http://old.test/mcp', enabled: true, credentialConfigured: true, toolNames: [] }],
     })
     if (url === '/api/research-mcp/srv-1' && init?.method === 'PUT') {
       writes.push(JSON.parse(String(init.body)))
-      return Response.json({ error: 'Choose a unique namespace.' }, { status: 400 })
+      return Response.json({ error: 'MCP server is unavailable.' }, { status: 502 })
     }
     return Response.json({})
   }
@@ -107,11 +101,11 @@ it('does not carry a typed research credential across endpoints and keeps a fail
   fireEvent.click(await screen.findByRole('button', { name: 'Edit' }))
   fireEvent.click(screen.getByRole('radio', { name: 'Replace' }))
   fireEvent.change(screen.getByLabelText('Credential value'), { target: { value: 'Bearer leave-at-old-endpoint' } })
-  fireEvent.change(screen.getByLabelText('Endpoint'), { target: { value: 'http://new.test/mcp' } })
+  fireEvent.change(screen.getByLabelText('MCP URL'), { target: { value: 'http://new.test/mcp' } })
   assert.ok(!screen.queryByLabelText('Credential value'), 'Changing the endpoint must discard the typed credential')
-  fireEvent.click(screen.getByRole('button', { name: 'Save server' }))
-  assert.ok(await screen.findByText('Choose a unique namespace.'))
-  assert.equal((screen.getByLabelText('Endpoint') as HTMLSelectElement).value, 'http://new.test/mcp')
+  fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
+  assert.ok(await screen.findByText('MCP server is unavailable.'))
+  assert.equal((screen.getByLabelText('MCP URL') as HTMLInputElement).value, 'http://new.test/mcp')
   assert.equal(writes.length, 1)
   assert.equal('credential' in writes[0]!, false)
 })

@@ -33,20 +33,17 @@ async function fixture(clientOverride?: RuntimeClients, now?: () => number) {
 }
 
 describe('search-first HTTP contract', () => {
-  it('keeps research MCP credentials out of API reads and enforces deployment endpoint allowlist', async () => {
+  it('keeps research MCP credentials out of API reads and stores disabled connections without probing', async () => {
     const store = openSearchStore(':memory:');
-    const runtime = new SearchRuntime({ store, researchMcpEndpoints: ['http://127.0.0.1:4141/mcp'] });
+    const runtime = new SearchRuntime({ store });
     const stack = { runtime, config: {}, logger: pino({ level: 'silent' }) } as unknown as Stack;
     const app = await buildApp(stack, { webRoot: '/nonexistent-ui' });
     cleanups.push(async () => { await app.close(); await runtime.close(); });
-    const denied = await app.inject({ method: 'POST', url: '/api/research-mcp', payload: { name: 'X', namespace: 'x', url: 'http://evil.test/mcp', enabled: true, approvedTools: [], credential: { mode: 'replace', header: 'X-Key', value: 'never-echo-this' } } });
-    expect(denied.statusCode).toBe(400);
-    expect(denied.json()).toMatchObject({ code: 'endpoint-denied' });
-    const created = await app.inject({ method: 'POST', url: '/api/research-mcp', payload: { name: 'Local', namespace: 'local', url: 'http://127.0.0.1:4141/mcp', enabled: true, approvedTools: [], credential: { mode: 'replace', header: 'X-Key', value: 'never-echo-this' } } });
+    const created = await app.inject({ method: 'POST', url: '/api/research-mcp', payload: { name: 'Local', url: 'http://127.0.0.1:4141/mcp', enabled: false, credential: { mode: 'replace', header: 'X-Key', value: 'never-echo-this' } } });
     expect(created.statusCode).toBe(201);
     expect(created.body).not.toContain('never-echo-this');
     const read = await app.inject({ method: 'GET', url: '/api/research-mcp' });
-    expect(read.json()).toMatchObject({ allowedEndpoints: ['http://127.0.0.1:4141/mcp'], servers: [{ namespace: 'local', credentialConfigured: true }] });
+    expect(read.json()).toMatchObject({ servers: [{ id: created.json().id, name: 'Local', url: 'http://127.0.0.1:4141/mcp', enabled: false, credentialConfigured: true, toolNames: [] }] });
     expect(read.body).not.toContain('never-echo-this');
   });
 

@@ -14,7 +14,6 @@ services:
       HTTP_PORT: ${HTTP_PORT:-7877}
       HTTP_HOST: 0.0.0.0
       LOG_LEVEL: ${LOG_LEVEL:-info}
-      RESEARCH_MCP_ENDPOINTS: ${RESEARCH_MCP_ENDPOINTS:-}
     ports:
       # Web UI, health, settings, and v2 search/automation API on HTTP_PORT (default 7877).
       # The explicit container HTTP_PORT and this mapping share the same Compose

@@ -155,21 +155,19 @@ HTTP routes are registered in `src/daemon.ts`; the internal Prowlarr and public 
 Verification includes a scripted Responses server driving the real Agent SDK through the bound Fastify MCP listener, Prowlarr tool invocation and validated release-set persistence; contract tests cover foreign/fabricated membership, duplicate physical identity, overlaps, partial broad coverage and explicit no-match. Internal MCP tests cover bearer scoping, cancellation, expiry, provider cooldown, privacy, and zero grabs. The fixture model response is not live provider evidence.
 ## Optional external research MCPs
 
-The deployment owner may set `RESEARCH_MCP_ENDPOINTS` to a comma-separated list
-of exact canonical HTTP(S) MCP endpoint URLs (no query, fragment, or userinfo).
-This is an egress allowlist, not a proxy; include trusted LAN endpoints explicitly.
-The administration API is `GET/POST /api/research-mcp`, `PUT/DELETE
-/api/research-mcp/:id`, and `POST /api/research-mcp/:id/discover`. Connections
-are never probed during save/read. Save a connection, explicitly discover its
-tools, then approve selected name/fingerprint pairs. Credentials are separate
-from v5 application settings and are never returned by the API. Never configure
-untrusted MCP endpoints: approved tools are model-callable and their arguments
-may contain normal search context. Tool output is untrusted. Enabled connections
-with approved tools are attempted in parallel at job start, with a bounded
-connection timeout. Tool calls have a separate short timeout so a stalled
-optional endpoint does not use the whole search budget. Changed/missing tools or optional connection failures are
-reported in search details; unaffected tools remain available. The SDK exposes
-approved definitions under `research_<namespace>_<tool>` in the existing tool
-loop, not a separate model pass. Redirections are not followed, and auth is
-scoped to the exact configured URL. URL or credential changes require fresh
-discovery and approval. Changes apply to future jobs.
+The administration API is `GET /api/research-mcp`, `POST /api/research-mcp`,
+`PUT /api/research-mcp/:id`, and `DELETE /api/research-mcp/:id`. Save connects
+and discovers usable tools before persisting; name-only and disable changes do
+not probe an unchanged connection, while enabling a disabled server probes it.
+The GET result is `{servers: ResearchMcpServer[]}` where each server has
+`id`, `name`, `url`, `enabled`, `credentialConfigured`, and `toolNames`.
+POST/PUT accept `{name,url,enabled,credential?}`. Credentials are stored under
+a separate SQLite key and never returned; they do not modify v5 application
+settings. Connecting trusts the endpoint: all usable tools it exposes are
+available to the model, and arguments can include search context. Tool output is
+untrusted. Enabled connections are attempted in parallel at job start with a
+bounded connection timeout; tool calls have a separate short timeout. Optional
+failures are warnings and do not block Prowlarr. The SDK exposes tools in the
+existing agent loop under a readable server label plus stable unique ID prefix.
+Redirects and metadata/link-local targets are blocked; localhost and private
+LAN targets are allowed. Auth is sent only to the exact configured URL.

@@ -12,7 +12,7 @@ import { searchRequestSchema, activityStatusSchema } from './search/contracts';
 import { missingSettings, type Settings } from './settings';
 import { createProwlarrMcpServer } from './search/prowlarr-mcp';
 import { LEGACY_DATABASE_ERROR } from './search/store';
-import { deleteResearchServer, discoverResearchTools, listResearchServers, saveResearchServer } from './search/research-mcp';
+import { deleteResearchServer, listResearchServers, saveResearchServer } from './search/research-mcp';
 
 declare module 'fastify' { interface FastifyInstance { refreshScheduler?: () => void } }
 const identifier = z.string().trim().min(1).max(200);
@@ -88,50 +88,51 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
     return { ready: missing.length === 0, missing, ...runtime.automationStatus() };
   });
   app.get('/api/settings', async () => envelope());
-  app.get('/api/research-mcp', async () => ({ servers: listResearchServers(runtime.store), allowedEndpoints: runtime.researchMcpEndpoints }));
+  app.get('/api/research-mcp', async () => ({ servers: listResearchServers(runtime.store) }));
   const researchInput = z.object({
-    name: z.string().trim().min(1).max(100), namespace: z.string().trim().regex(/^[a-zA-Z][a-zA-Z0-9_-]{0,39}$/),
+    name: z.string().trim().min(1).max(100),
     url: z.string().min(1).max(2048), enabled: z.boolean(),
-    approvedTools: z.array(z.object({ name: z.string().min(1).max(200), fingerprint: z.string().regex(/^[a-f0-9]{64}$/) }).strict()).max(100),
     credential: z.discriminatedUnion('mode', [
       z.object({ mode: z.literal('replace'), header: z.string().min(1).max(100), value: z.string().min(1).max(4096) }).strict(),
       z.object({ mode: z.literal('clear') }).strict(),
     ]).optional(),
   }).strict();
   const researchError = (error: unknown) => {
-    if (error instanceof z.ZodError) return { code: 'invalid-request', error: 'Provide a valid server name, namespace, URL, enabled flag, approvals, and credential.' };
+    if (error instanceof z.ZodError) return { code: 'invalid-request', error: 'Provide a valid server name, HTTP(S) URL, enabled flag, and credential.' };
     const errors: Record<string,string> = {
-      'invalid-endpoint':'Use a canonical HTTP(S) endpoint without credentials, query, or fragment.',
-      'endpoint-denied':'This endpoint is not in the deployment allowlist.',
+      'invalid-endpoint':'Use an HTTP(S) URL without credentials, query, or fragment.',
       'invalid-header':'The credential header is invalid or prohibited.',
       'invalid-credential':'The credential value is invalid.',
-      'namespace-conflict':'Choose a unique namespace.',
       'not-found':'Research MCP server not found.',
       'server-limit':'Remove an existing research server before adding another.',
       'research-auth-failed':'The MCP server rejected the connection. Check its credential and permissions.',
       'research-redirect-denied':'MCP redirects are not followed. Configure the final Streamable HTTP endpoint.',
-      'research-settings-changed':'The connection changed during discovery. Try discovering tools again.',
+      'research-settings-changed':'The saved connection changed while it was connecting. Review current settings and connect again.',
       'research-timeout':'The MCP server took too long to respond. Check its address or try again.',
+      'research-metadata-endpoint-denied':'This address resolves to a blocked metadata or link-local network.',
+      'research-endpoint-unavailable':'The endpoint hostname could not be resolved.',
+      'research-no-usable-tools':'The server connected but exposed no supported tools.',
+      'research-tool-limit':'The server exposes too many or too much tool metadata to connect safely.',
       'research-mcp-unavailable':'The MCP server could not be reached or returned an unsupported response.',
     };
     const code = error instanceof Error && Object.hasOwn(errors, error.message) ? error.message : 'research-mcp-unavailable';
     return { code, error: errors[code]! };
   };
+  const researchErrorStatus = (code: string) => code === 'not-found' ? 404
+    : code === 'research-settings-changed' ? 409
+    : ['research-metadata-endpoint-denied','research-no-usable-tools','research-tool-limit'].includes(code) ? 422
+      : ['research-auth-failed','research-redirect-denied','research-timeout','research-endpoint-unavailable','research-mcp-unavailable'].includes(code) ? 502 : 400;
   app.post('/api/research-mcp', async (request, reply) => {
-    try { return reply.code(201).send(saveResearchServer(runtime.store, runtime.researchMcpEndpoints, undefined, researchInput.parse(request.body))); }
-    catch (error) { const result = researchError(error); return reply.code(result.code === 'not-found' ? 404 : 400).send(result); }
+    try { return reply.code(201).send(await saveResearchServer(runtime.store, undefined, researchInput.parse(request.body))); }
+    catch (error) { const result = researchError(error); return reply.code(researchErrorStatus(result.code)).send(result); }
   });
   app.put('/api/research-mcp/:id', async (request, reply) => {
-    try { return saveResearchServer(runtime.store, runtime.researchMcpEndpoints, identifier.parse((request.params as {id:string}).id), researchInput.parse(request.body)); }
-    catch (error) { const result = researchError(error); return reply.code(result.code === 'not-found' ? 404 : 400).send(result); }
+    try { return await saveResearchServer(runtime.store, identifier.parse((request.params as {id:string}).id), researchInput.parse(request.body)); }
+    catch (error) { const result = researchError(error); return reply.code(researchErrorStatus(result.code)).send(result); }
   });
   app.delete('/api/research-mcp/:id', async (request, reply) => {
     if (!deleteResearchServer(runtime.store, identifier.parse((request.params as {id:string}).id))) return reply.code(404).send({ code: 'not-found', error: 'Research MCP server not found.' });
     return reply.code(204).send();
-  });
-  app.post('/api/research-mcp/:id/discover', async (request, reply) => {
-    try { return { tools: await discoverResearchTools(runtime.store, runtime.researchMcpEndpoints, identifier.parse((request.params as {id:string}).id)) }; }
-    catch (error) { const result = researchError(error); return reply.code(result.code === 'not-found' ? 404 : 502).send(result); }
   });
   app.put('/api/settings', async (request, reply) => {
     const saved = runtime.saveSettings(request.body);

@@ -11,7 +11,6 @@ services:
       HTTP_PORT: ${HTTP_PORT:-7877}
       HTTP_HOST: 0.0.0.0
       LOG_LEVEL: ${LOG_LEVEL:-info}
-      RESEARCH_MCP_ENDPOINTS: ${RESEARCH_MCP_ENDPOINTS:-}
     ports:
       - "127.0.0.1:${HTTP_PORT:-7877}:${HTTP_PORT:-7877}"
     volumes:

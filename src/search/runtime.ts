@@ -7,9 +7,9 @@ import { Http } from '../http';
 import { ArrObserver, type ArrProvider, type ArrTarget } from './arr';
 import { buildAutomationPrompt } from './workload';
 import { physicalRelease, safeReleaseObservation, safeText } from './release-observation';
-import { normalizeAgentRequest, type AgentRequest, type FinalizationLedger, type ReleaseSet } from './agent-contracts';
+import type { FinalizationLedger, ReleaseSet } from './agent-contracts';
 import { AgentBudgetExhaustedError, runAgentSearch } from './agent';
-import { renderSearchPrompt, RESEARCH_INSTRUCTIONS } from './prompt';
+import { RESEARCH_INSTRUCTIONS } from './prompt';
 import { openSearchStore, type SearchStore, type SearchRecord } from './store';
 import { enabledResearchServerConfigs } from './research-mcp';
 import { defaultSettings, missingSettings, settingsSchema, type Settings } from './settings';
@@ -64,21 +64,19 @@ function sanitizePrivateText<T>(value: T, secrets: string[]): T {
 }
 export interface PublicSearchStatus {
   searchId: string; status: string; createdAt: string; finishedAt?: string; prompt: string; source: 'manual' | 'arr' | 'automation'; manualExecutionEligible: boolean;
-  modelPrompt?: string;
-  preferredDownloadClientId?: number;
-  automationWorkload?: {selectedTargets:number;deferredTargets:number;omittedRelatedEpisodes?:number};
+  automationWorkload?: {selectedTargets:number;deferredTargets:number};
   automationPending?: boolean;
-  requestVersion?: 1; normalizedRequest?: AgentRequest; plan?: ReleaseSet; candidates: unknown[]; events: unknown[]; receipts?: ExecutionReceipt[]; queuePosition?: number; waitingReason?: string; retryAt?: string;
+  plan?: ReleaseSet; candidates: unknown[]; events: unknown[]; receipts?: ExecutionReceipt[]; queuePosition?: number; waitingReason?: string; retryAt?: string;
   counts: { decisions: number; searches: number; candidates: number }; diagnostics?: { modelTurns: number; stopReason: string; elapsedMs?: number; usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cost?: number } }; message?: string; researchWarnings?: string[];
 }
-interface AgentSearchResult { version: 1; request?: AgentRequest; modelPrompt?: string; plan?: ReleaseSet; candidateEvidence?: unknown[]; status: string; message?: string; researchWarnings?: string[]; counts: { decisions: number; searches: number; candidates: number }; diagnostics?: { modelTurns: number; stopReason: string; elapsedMs?: number; usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cost?: number } } }
+interface AgentSearchResult { version: 1; modelPrompt?: string; plan?: ReleaseSet; candidateEvidence?: unknown[]; status: string; message?: string; researchWarnings?: string[]; counts: { decisions: number; searches: number; candidates: number }; diagnostics?: { modelTurns: number; stopReason: string; elapsedMs?: number; usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cost?: number } } }
 const iso = (time: number | undefined): string | undefined => time === undefined || !Number.isFinite(new Date(time).getTime()) ? undefined : new Date(time).toISOString();
 const sourceFingerprint = (provider: ArrProvider | 'prowlarr', settings: Settings): string | null => {
   const source = settings.integrations[provider];
   if (!source.url || !source.apiKey) return null;
   return createHash('sha256').update(`${provider}\0${source.url}\0${source.apiKey}`).digest('hex');
 };
-type StoredPrompt = { version?: number; prompt?: string; kind?: string; request?: AgentRequest; context?: SearchRequest['context'] };
+type StoredPrompt = { version?: number; prompt?: string; kind?: string; request?: unknown; context?: unknown };
 function readStoredPrompt(value: string): StoredPrompt {
   try {
     const parsed: unknown = JSON.parse(value);
@@ -89,13 +87,12 @@ function readStoredPrompt(value: string): StoredPrompt {
 const promptSecrets = (settings: Settings): string[] =>
   [settings.ai.apiKey, ...Object.values(settings.integrations).flatMap(integration => [integration.apiKey, integration.url])];
 const savedPromptText = (stored: StoredPrompt): string => {
-  const prompt = stored.request?.prompt ?? stored.prompt;
+  const prompt = (stored.request as {prompt?: unknown} | undefined)?.prompt ?? stored.prompt;
   return typeof prompt === 'string' ? prompt : 'Search request';
 };
 const SAFE_INTERNAL_ERRORS = new Set([
-  'runtime-closed', 'daemon-mcp-unavailable', 'search-ownership-lost', 'normalized-request-unavailable',
-  'finalization-not-staged', 'target-not-found', 'target-not-eligible', 'arr-target-scope-conflict',
-  'arr-target-context-conflict', 'finalization-invalid',
+  'runtime-closed', 'daemon-mcp-unavailable', 'search-ownership-lost',
+  'finalization-not-staged', 'finalization-invalid',
 ]);
 function statusCode(error: unknown): number | undefined {
   if (!error || typeof error !== 'object') return;
@@ -120,6 +117,7 @@ function safeSearchError(error: unknown): string {
   if (error instanceof ProwlarrResearchUnavailableError) return 'Prowlarr research failed before a search could complete';
   if (error instanceof AgentBudgetExhaustedError) return 'Search step budget exhausted';
   if (error instanceof ApiError) return `Search provider request failed (HTTP ${error.status})`;
+  if (error instanceof Error && error.message === 'legacy-search-prompt') return 'This saved search uses a retired request format; resubmit it as a prompt-only search.';
   const code = statusCode(error);
   if (code === 429) return 'Model provider rate limited the search';
   if (code !== undefined) return `Search provider request failed (HTTP ${code})`;
@@ -133,7 +131,6 @@ export class SearchRuntime {
   readonly store: SearchStore;
   private readonly clock: () => number;
   private readonly jobs = new Map<string, Promise<AgentSearchResult>>();
-  private readonly searchPreparations = new Set<Promise<unknown>>();
   private readonly workerControllers = new Map<string, AbortController>();
   private internalMcpUrl?: string;
   private closed = false;
@@ -323,28 +320,14 @@ export class SearchRuntime {
     return { ok: true, settings: parsed.data };
   }
 
-  startSearch(request: SearchRequest): Promise<{ searchId: string; status: 'queued' }> {
-    const preparation = this.prepareSearch(request);
-    this.searchPreparations.add(preparation);
-    void preparation.then(
-      () => this.searchPreparations.delete(preparation),
-      () => this.searchPreparations.delete(preparation),
-    );
-    return preparation;
-  }
-
-  private async prepareSearch(request: SearchRequest): Promise<{ searchId: string; status: 'queued' }> {
+  async startSearch(request: SearchRequest): Promise<{ searchId: string; status: 'queued' }> {
     if (this.closed || this.closing) throw new Error('runtime-closed');
     if (!this.internalMcpUrl) throw new Error('daemon-mcp-unavailable');
     const settings = this.getSettings();
-    let effective = searchRequestSchema.parse(request);
-    const bindings = effective.arrTargetIds?.length ? await this.resolveArrTargets(effective) : [];
-    if (this.closed || this.closing) throw new Error('runtime-closed');
-    if (bindings.length) effective = this.canonicalizeArrRequest(effective, bindings);
-    const prompt = renderSearchPrompt(normalizeAgentRequest(effective), promptSecrets(settings));
-    const kind = effective.context?.kind;
+    const effective = searchRequestSchema.parse(request);
+    const prompt = safeText(effective.prompt, promptSecrets(settings), true);
     const searchId = randomUUID();
-    this.store.enqueueSearch({ searchId, prompt: JSON.stringify({ version: 2, prompt, kind }), now: this.clock(), source: bindings.length ? 'arr' : 'manual', context: { version: 1, targetBindings: bindings, ...(effective.preferredDownloadClientId === undefined ? {} : { preferredDownloadClientId: effective.preferredDownloadClientId }) } });
+    this.store.enqueueSearch({ searchId, prompt: JSON.stringify({ version: 3, prompt }), now: this.clock(), source: 'manual' });
     this.dispatchQueued();
     return { searchId, status: 'queued' };
   }
@@ -356,17 +339,16 @@ export class SearchRuntime {
     const result = record.result as AgentSearchResult | undefined;
     if (record.result !== undefined && (result?.version !== 1 || (result.plan && result.plan.version !== 2))) return null;
     const stored = readStoredPrompt(record.prompt);
-    const normalizedRequest = result?.request ?? stored.request;
     const secrets = promptSecrets(this.getSettings());
-    const prompt = stored.version === 2 ? savedPromptText(stored) : safeText(savedPromptText(stored), secrets, true);
-    const modelPrompt = result?.modelPrompt ?? (result?.request ? safeText(JSON.stringify(result.request), secrets, true) : undefined);
+    const prompt = stored.version === 3 ? savedPromptText(stored)
+      : safeText(result?.modelPrompt ?? savedPromptText(stored), secrets, true);
     const liveCandidates = this.store.listCandidates(searchId, this.clock()).map(row => row.safe);
     const candidates = sanitizePrivateText(result?.candidateEvidence ?? liveCandidates, secrets);
     const events = sanitizePrivateText(this.store.getEvents(searchId), secrets);
     const counts = result?.counts ?? { decisions: 0, searches: 0, candidates: candidates.length };
-    const searchContext=this.store.searchWorkContext(searchId) as {preferredDownloadClientId?:unknown;workload?:PublicSearchStatus['automationWorkload'];passOwner?:string}|undefined;
+    const searchContext=this.store.searchWorkContext(searchId) as {workload?:PublicSearchStatus['automationWorkload'];passOwner?:string}|undefined;
+    const workload = searchContext?.workload;
     const savedSource=this.store.getSetting(`search-source:${searchId}`);
-    const preferredDownloadClientId=typeof searchContext?.preferredDownloadClientId==='number'&&Number.isSafeInteger(searchContext.preferredDownloadClientId)&&searchContext.preferredDownloadClientId>0?searchContext.preferredDownloadClientId:undefined;
     const queued = record.status === 'queued';
     const settings = queued ? this.getSettings() : undefined;
     const cooldown = queued ? ['prowlarr','model'].map(provider => this.store.getProviderDeadline(provider) ?? 0).reduce((a,b)=>Math.max(a,b),0) : 0;
@@ -377,10 +359,9 @@ export class SearchRuntime {
       source: savedSource === 'automation' ? 'automation' : savedSource === 'arr' ? 'arr' : 'manual',
       manualExecutionEligible: savedSource === 'manual',
       ...(record.finishedAt === undefined ? {} : { finishedAt: new Date(record.finishedAt).toISOString() }), prompt,
-      ...(modelPrompt === undefined ? {} : { modelPrompt }),
-      ...(normalizedRequest ? { requestVersion: 1 as const, normalizedRequest } : {}),
-      ...(preferredDownloadClientId===undefined?{}:{preferredDownloadClientId}),
-      ...(savedSource==='automation'&&searchContext?.workload?{automationWorkload:searchContext.workload}:{}),
+      ...(savedSource === 'automation' && workload ? { automationWorkload: {
+        selectedTargets: workload.selectedTargets, deferredTargets: workload.deferredTargets,
+      } } : {}),
       ...(savedSource==='automation'&&record.status==='matched'&&searchContext?.passOwner&&!executions.length&&this.store.ownsLease('automation-pass',searchContext.passOwner,this.clock())?{automationPending:true}:{}),
       ...(result?.plan ? { plan: result.plan } : {}),
       receipts: executions.map(row=>(row.receipt as ExecutionReceipt|null)??this.publicExecution(row)),
@@ -395,7 +376,8 @@ export class SearchRuntime {
     this.maintain();
     const limit = Math.max(1, Math.min(query.limit ?? 50, 100));
     const offset = Math.max(0, query.offset ?? 0);
-    const records = this.store.listSearches(10000, false).map((record) => this.activityItem(record));
+    const secrets = promptSecrets(this.getSettings());
+    const records = this.store.listSearches(10000, false).map((record) => this.activityItem(record, secrets));
     const from = query.createdAtFrom ? Date.parse(query.createdAtFrom) : undefined, to = query.createdAtTo ? Date.parse(query.createdAtTo) : undefined;
     const matches = records.filter((item) => {
       const kind = item.kind;
@@ -692,7 +674,7 @@ export class SearchRuntime {
     const { prompt, kind, selectedTargets, deferredTargets } = brief;
     if (!ownsPass()) return {observedAt:this.clock(),ran:false,reason:'lease-lost'};
     const searchId = randomUUID();
-    this.store.enqueueSearch({ searchId, prompt: JSON.stringify({ version: 2, prompt, kind }), now, source: 'automation',
+    this.store.enqueueSearch({ searchId, prompt: JSON.stringify({ version: 3, prompt, kind }), now, source: 'automation',
       context: { passOwner, workload:{selectedTargets:selectedTargets.length,deferredTargets} } });
     const priorFailures=new Map(selectedTargets.map(target=>[target.key,this.store.getAutomationAttempt(target.key)?.failCount??0]));
     const owner = this.store.newOwner(), work = this.store.claimAutomationSearchById(searchId, owner, now, 900_000);
@@ -766,16 +748,15 @@ export class SearchRuntime {
   }
 
   async drain(): Promise<void> {
-    while (this.jobs.size || this.searchPreparations.size || this.pollJob || this.mcpOperations.size || this.mcpSessionCloseJobs.size || this.executionOperations.size) {
+    while (this.jobs.size || this.pollJob || this.mcpOperations.size || this.mcpSessionCloseJobs.size || this.executionOperations.size) {
       await Promise.allSettled([
         ...this.jobs.values(),
-        ...this.searchPreparations,
         ...(this.pollJob ? [this.pollJob.then(() => undefined)] : []),
         ...this.mcpOperations,
         ...this.mcpSessionCloseJobs,
         ...this.executionOperations,
       ]);
-      if (this.jobs.size || this.searchPreparations.size || this.pollJob || this.mcpOperations.size || this.mcpSessionCloseJobs.size || this.executionOperations.size) await new Promise(resolve => setTimeout(resolve, 25));
+      if (this.jobs.size || this.pollJob || this.mcpOperations.size || this.mcpSessionCloseJobs.size || this.executionOperations.size) await new Promise(resolve => setTimeout(resolve, 25));
     }
   }
   async close(): Promise<void> {
@@ -794,74 +775,6 @@ export class SearchRuntime {
     this.passController?.abort();
     for (const controller of this.workerControllers.values()) controller.abort(new Error('runtime-closed'));
     for (const token of [...this.prowlarrCapabilities.keys()]) this.revokeProwlarrMcpCapability(token);
-  }
-
-  async startArrSearch(targetId: string): Promise<{ searchId: string; status: 'queued' }> {
-    return this.startSearch({ prompt: 'Search for the selected Arr target', arrTargetIds: [targetId] });
-  }
-
-  private async resolveArrTargets(request: SearchRequest): Promise<ArrTarget[]> {
-    const ids = request.arrTargetIds ?? [];
-    if (!ids.length) return [];
-    const snapshot = await this.createObserver().observe();
-    const found = ids.map(id => snapshot.targets.find(target => this.targetId(target) === id));
-    if (found.some(target => !target)) throw new Error('target-not-found');
-    const targets = found as ArrTarget[];
-    if (targets.some(target => !snapshot[target.provider].known || !target.eligible || !target.available || !target.monitored || target.hasFile || target.queued))
-      throw new Error('target-not-eligible');
-    const first = targets[0]!;
-    if (targets.some(target => target.provider !== first.provider || (first.provider === 'sonarr' && target.serviceId !== first.serviceId)))
-      throw new Error('arr-target-scope-conflict');
-    if (first.provider === 'radarr' && targets.length !== 1) throw new Error('arr-target-scope-conflict');
-    return structuredClone(targets);
-  }
-
-  private canonicalizeArrRequest(request: SearchRequest, bindings: ArrTarget[]): SearchRequest {
-    const first = bindings[0]!;
-    const episode = first.provider === 'sonarr';
-    const context: NonNullable<SearchRequest['context']> = {
-      kind: episode ? 'tv' as const : 'movie' as const,
-      titles: [...new Set(bindings.flatMap(target => Array.isArray(target.context.titles) ? target.context.titles as string[] : [String(target.context.title ?? '')]).filter(Boolean))],
-      ...(typeof first.context.year === 'number' ? { year: first.context.year } : {}),
-      scope: episode ? { type: 'episode-set' as const } : { type: 'movie' as const },
-      targets: bindings.map(target => ({
-        targetId: this.targetId(target),
-        ...(target.context.seasonNumber === undefined ? {} : { seasonNumber: target.context.seasonNumber as number }),
-        ...(target.context.episodeNumber === undefined ? {} : { episodeNumber: target.context.episodeNumber as number }),
-        ...(target.context.absoluteEpisodeNumber == null ? {} : { absoluteEpisodeNumber: target.context.absoluteEpisodeNumber as number }),
-        ...(target.context.episodeTitle === undefined ? {} : { title: target.context.episodeTitle as string }),
-        ...(target.airAt === undefined ? {} : { airDateUtc: new Date(target.airAt).toISOString() }),
-      })),
-      ...(typeof first.context.originalLanguage === 'string' ? { originalLanguage: first.context.originalLanguage } : {}),
-      ...(first.context.seriesType === 'standard' || first.context.seriesType === 'anime' || first.context.seriesType === 'daily' ? { seriesType: first.context.seriesType } : {}),
-      ...(typeof first.context.episodeTitle === 'string' ? { episodeTitle: first.context.episodeTitle } : {}),
-      ...(typeof first.context.overview === 'string' ? { overview: first.context.overview.slice(0, 4000) } : {}),
-      ...(first.context.profileContext && typeof first.context.profileContext === 'object' ? {
-        profileContext: first.context.profileContext as NonNullable<SearchRequest['context']>['profileContext'],
-      } : {}),
-    };
-    const supplied = request.context;
-    if (supplied?.kind && supplied.kind !== context.kind) throw new Error('arr-target-context-conflict');
-    if (supplied?.scope && ((episode && (supplied.scope.type === 'movie' || supplied.scope.type === 'season' || (bindings.length > 1 && supplied.scope.type === 'episode')))
-      || (!episode && supplied.scope.type !== 'movie' && supplied.scope.type !== 'unspecified')))
-      throw new Error('arr-target-context-conflict');
-    if (supplied?.year !== undefined && context.year !== undefined && supplied.year !== context.year) throw new Error('arr-target-context-conflict');
-    if (supplied?.titles?.length && context.titles?.length && !supplied.titles.some(title => context.titles!.some(canonical => canonical.toLocaleLowerCase() === title.toLocaleLowerCase())))
-      throw new Error('arr-target-context-conflict');
-    const scope = supplied?.scope;
-    const numbering = ['seasonNumber', 'episodeNumber', 'absoluteEpisodeNumber'] as const;
-    if (scope && bindings.length === 1) for (const key of numbering) {
-      const actual = context.targets?.[0]?.[key], caller = scope[key];
-      if (caller !== undefined && actual !== undefined && caller !== actual) throw new Error('arr-target-context-conflict');
-    }
-    if (supplied?.targets) for (const caller of supplied.targets) {
-      const actual = context.targets?.find(target => target.targetId === caller.targetId);
-      if (!actual) throw new Error('arr-target-context-conflict');
-      for (const key of numbering) if (caller[key] !== undefined && actual[key] !== undefined && caller[key] !== actual[key]) throw new Error('arr-target-context-conflict');
-      if (caller.title !== undefined && actual.title !== undefined && caller.title.toLocaleLowerCase() !== actual.title.toLocaleLowerCase()) throw new Error('arr-target-context-conflict');
-      if (caller.airDateUtc !== undefined && caller.airDateUtc !== actual.airDateUtc) throw new Error('arr-target-context-conflict');
-    }
-    return { prompt: request.prompt, ...(request.preferences ? { preferences: request.preferences } : {}), arrTargetIds: [...(request.arrTargetIds ?? [])], context };
   }
 
   private targetId(target: ArrTarget): string { return createHash('sha256').update(target.key ?? `${target.provider}:${target.serviceId}:${target.episodeId ?? target.movieId}`).digest('hex').slice(0, 24); }
@@ -903,16 +816,18 @@ export class SearchRuntime {
     try{return await operation;}finally{this.executionOperations.delete(operation);}
   }
 
-  private activityItem(record: SearchRecord): ActivityItem {
-    const result = record.result as AgentSearchResult | undefined;
+  private activityItem(record: SearchRecord, secrets: readonly string[]): ActivityItem {
+    const result = record.result as Pick<AgentSearchResult, 'counts'> | undefined;
     const execution=this.store.executionsForSearch(record.searchId).at(-1);
     const event = !execution ? (this.store.getEvents(record.searchId) as Array<{type:string;data?:ActivityItem['submission']}>).findLast(e => e.type === 'submission') : undefined;
     const submission = execution ? {outcome:execution.outcome,outcomes:execution.children.map(c=>({candidateId:c.candidateId,outcome:c.state}))} : event?.data;
     const stored = readStoredPrompt(record.prompt);
-    const media = stored.kind ?? stored.context?.kind ?? stored.request?.kind;
+    const oldContext = stored.context && typeof stored.context === 'object' ? stored.context as {kind?:unknown} : undefined;
+    const oldRequest = stored.request && typeof stored.request === 'object' ? stored.request as {kind?:unknown} : undefined;
+    const media = stored.kind ?? oldContext?.kind ?? oldRequest?.kind;
     const kind = media === 'tv' || media === 'show' ? 'tv' : media === 'movie' ? 'movie' : undefined;
     const savedSource = this.store.getSetting(`search-source:${record.searchId}`);
-    return { searchId: record.searchId, prompt: safeText(savedPromptText(stored)), status: record.status, createdAt: new Date(record.createdAt).toISOString(), ...(record.finishedAt === undefined ? {} : { finishedAt: new Date(record.finishedAt).toISOString() }), source: savedSource === 'automation' || savedSource === 'arr' ? savedSource : 'manual', ...(kind ? { kind } : {}), ...(result?.counts ? { counts: result.counts } : {}), ...(submission ? { submission: { outcome: submission.outcome, outcomes: submission.outcomes } } : {}) };
+    return { searchId: record.searchId, prompt: safeText(savedPromptText(stored), secrets, true), status: record.status, createdAt: new Date(record.createdAt).toISOString(), ...(record.finishedAt === undefined ? {} : { finishedAt: new Date(record.finishedAt).toISOString() }), source: savedSource === 'automation' || savedSource === 'arr' ? savedSource : 'manual', ...(kind ? { kind } : {}), ...(result?.counts ? { counts: result.counts } : {}), ...(submission ? { submission: { outcome: submission.outcome, outcomes: submission.outcomes } } : {}) };
   }
   private clients(settings: Settings): RuntimeClients {
     if (this.options.clients) return this.options.clients(settings);
@@ -963,7 +878,6 @@ export class SearchRuntime {
 
   private async runAgentWork(work: import('./store').SearchWork, externalSignal?: AbortSignal): Promise<AgentSearchResult> {
     const settings = this.getSettings();
-    let legacyModelPrompt: string | undefined;
     let stagedPlan: ReleaseSet | undefined;
     let modelTurns = 0;
     let capability: { token: string; expiresAt: number } | undefined;
@@ -985,18 +899,19 @@ export class SearchRuntime {
     const researchWarnings: string[] = [];
     try {
       if (!this.internalMcpUrl) throw new Error('daemon-mcp-unavailable');
-      const privateValues = promptSecrets(settings);
       const stored = readStoredPrompt(work.prompt);
-      const modelPrompt = stored.version === 2 ? stored.prompt :
-        (legacyModelPrompt = renderSearchPrompt(stored.request ?? normalizeAgentRequest(searchRequestSchema.parse(stored)), privateValues));
-      if (!modelPrompt) throw new Error('normalized-request-unavailable');
+      const privateValues = promptSecrets(settings);
+      if (work.source === 'arr' || stored.version !== 3 || typeof stored.prompt !== 'string')
+        throw new Error('legacy-search-prompt');
+      const modelInput = stored.prompt;
+      if (!modelInput.trim()) throw new Error('legacy-search-prompt');
       if (!this.store.ownsSearch(work.searchId, work.owner, this.clock())) throw new Error('search-ownership-lost');
       capability = this.createProwlarrMcpCapability(work.searchId, ttl, work.owner);
       let searches = 0;
       const plan = await runAgentSearch({
         client: new OpenRouter({ apiKey: settings.ai.apiKey, serverURL: settings.ai.baseUrl, retryConfig: { strategy: 'none' } }),
         model: settings.ai.model,
-        input: modelPrompt,
+        input: modelInput,
         instructions: RESEARCH_INSTRUCTIONS,
         mcpUrl: this.internalMcpUrl, capability: capability.token, signal: controller.signal,
         researchServers: enabledResearchServerConfigs(this.store),
@@ -1027,7 +942,7 @@ export class SearchRuntime {
       if (plan.status === 'no-match' && research?.researchFailed && !research.successfulSearches)
         throw new ProwlarrResearchUnavailableError();
       const candidateEvidence = this.store.listCandidates(work.searchId, this.clock()).map(row => row.safe);
-      const result: AgentSearchResult = { version: 1, ...(legacyModelPrompt ? { modelPrompt: legacyModelPrompt } : {}), plan, candidateEvidence, status: plan.status, ...(researchWarnings.length ? { researchWarnings } : {}), counts: { decisions: modelTurns, searches, candidates: candidateEvidence.length }, diagnostics: { modelTurns, stopReason: 'release-set-finalized', elapsedMs: Math.max(0, this.clock() - startedAt), ...(hasUsage ? { usage: modelUsage } : {}) } };
+      const result: AgentSearchResult = { version: 1, plan, candidateEvidence, status: plan.status, ...(researchWarnings.length ? { researchWarnings } : {}), counts: { decisions: modelTurns, searches, candidates: candidateEvidence.length }, diagnostics: { modelTurns, stopReason: 'release-set-finalized', elapsedMs: Math.max(0, this.clock() - startedAt), ...(hasUsage ? { usage: modelUsage } : {}) } };
       if (!this.store.finishOwnedSearch(work.searchId, work.owner, plan.status, result, this.clock())) throw new Error('search-ownership-lost');
       return result;
     } catch (error) {
@@ -1035,7 +950,7 @@ export class SearchRuntime {
       if (statusCode(error) === 429) this.store.setProviderDeadline('model', this.clock() + (retryAfterSeconds(error, this.clock()) ?? 60) * 1000);
       const message = safeSearchError(error);
       const candidateEvidence = this.store.listCandidates(work.searchId, this.clock()).map(row => row.safe);
-      const result: AgentSearchResult = { version: 1, ...(legacyModelPrompt ? { modelPrompt: legacyModelPrompt } : {}), candidateEvidence, status, message, ...(researchWarnings.length ? { researchWarnings } : {}), counts: { decisions: modelTurns, searches: capability ? this.prowlarrCapabilities.get(capability.token)?.searches ?? 0 : 0, candidates: candidateEvidence.length }, diagnostics: { modelTurns, stopReason: status, elapsedMs: Math.max(0, this.clock() - startedAt), ...(hasUsage ? { usage: modelUsage } : {}) } };
+      const result: AgentSearchResult = { version: 1, candidateEvidence, status, message, ...(researchWarnings.length ? { researchWarnings } : {}), counts: { decisions: modelTurns, searches: capability ? this.prowlarrCapabilities.get(capability.token)?.searches ?? 0 : 0, candidates: candidateEvidence.length }, diagnostics: { modelTurns, stopReason: status, elapsedMs: Math.max(0, this.clock() - startedAt), ...(hasUsage ? { usage: modelUsage } : {}) } };
       this.store.finishOwnedSearch(work.searchId, work.owner, status as SearchStatus, result, this.clock());
       return result;
     } finally {

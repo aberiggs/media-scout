@@ -209,10 +209,6 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
   app.post('/api/v2/submissions', async (_request, reply) => reply.code(410).send({ error: 'This endpoint was retired; use release-set execution', code: 'submission-route-retired' }));
   app.get('/api/v2/automation', async () => runtime.automationStatus());
   app.post('/api/v2/automation/poll', async () => runtime.poll());
-  app.post('/api/v2/automation/search', async (request, reply) => {
-    const body = z.object({ targetId: identifier }).strict().parse(request.body);
-    return reply.code(202).send(await runtime.startArrSearch(body.targetId));
-  });
   const webRoot = options.webRoot ?? resolve(process.cwd(), 'web/dist');
   if (existsSync(resolve(webRoot, 'index.html'))) {
     await app.register(fastifyStatic, { root: webRoot, prefix: '/' });

@@ -70,7 +70,7 @@ it('submits one retained prompt draft without an early client lookup and shows t
   const longPrompt = `Find the complete season\n${'keep original audio and subtitles. '.repeat(400)}`
   lifecycleFetch((url, init) => {
     calls.push({ url, init })
-    if (url === '/api/v2/searches/long') return Response.json({ ...semanticSearch, searchId: 'long', prompt: 'The Expanse', modelPrompt: longPrompt, preferredDownloadClientId: 42 })
+    if (url === '/api/v2/searches/long') return Response.json({ ...semanticSearch, searchId: 'long', prompt: longPrompt })
     if (url === '/api/v2/searches') return Response.json({ searchId: 'long' })
     return Response.json({})
   })
@@ -86,18 +86,18 @@ it('submits one retained prompt draft without an early client lookup and shows t
   assert.deepEqual(JSON.parse(String(calls.find(call => call.url === '/api/v2/searches')?.init?.body)), { prompt: draft })
   assert.equal(prompt.value, draft)
   assert.equal(calls.some(call => call.url === '/api/v2/download-clients'), false)
-  assert.ok(await screen.findByText('The Expanse'))
+  await waitFor(() => assert.match(document.querySelector('.result-title')?.textContent ?? '', /^Find the complete season/))
   const disclosure = screen.getByText('Saved search prompt')
   fireEvent.click(disclosure)
   assert.equal(screen.getByLabelText('Exact saved search prompt').textContent, longPrompt)
   assert.ok(longPrompt.length > 12000)
 })
 
-it('preselects a saved preferred client only after opening confirmation client selection', async () => {
+it('requires explicit client choice when opening confirmation client selection', async () => {
   const calls: string[] = []
   lifecycleFetch(url => {
     calls.push(url)
-    if (url === '/api/v2/searches/life') return Response.json({ ...semanticSearch, preferredDownloadClientId: 8 })
+    if (url === '/api/v2/searches/life') return Response.json({ ...semanticSearch })
     if (url === '/api/v2/searches/other') return Response.json({ ...semanticSearch, searchId: 'other', prompt: 'Other result' })
     if (url === '/api/v2/download-clients') return Response.json({ items: [{ id: 8, name: 'qBittorrent', protocol: 'torrent', categoryMap: [] }, { id: 9, name: 'SABnzbd', protocol: 'usenet', categoryMap: [] }] })
     if (url === '/api/v2/executions/prepare') return Response.json(preparedConfirmation)
@@ -109,7 +109,7 @@ it('preselects a saved preferred client only after opening confirmation client s
   assert.equal(calls.includes('/api/v2/download-clients'), false)
   fireEvent.click(screen.getByRole('button', { name: 'Choose Prowlarr client' }))
   const clientSelect = await screen.findByLabelText('Prowlarr download client') as HTMLSelectElement
-  await waitFor(() => assert.equal(clientSelect.value, '8'))
+  await waitFor(() => assert.equal(clientSelect.value, ''))
   view.rerender(<SearchPage settings={defaults} searchId="other" searchRevision={2} onSearchStarted={() => {}} />)
   await waitFor(() => assert.equal(document.querySelector('.result-title')?.textContent, 'Other result'))
   fireEvent.click(screen.getByRole('button', { name: 'Choose Prowlarr client' }))

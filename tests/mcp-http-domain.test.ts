@@ -57,6 +57,10 @@ describe('stdio-to-daemon HTTP MCP domain', () => {
     const address = app.server.address();
     if (!address || typeof address === 'string') throw new Error('Missing daemon listener');
     const port = address.port;
+    expect((await app.inject({ method: 'POST', url: '/api/v2/automation/search', payload: { targetId: 'gone' } })).statusCode).toBe(404);
+    for (const field of ['context', 'preferences', 'arrTargetIds', 'preferredDownloadClientId', 'notAContractField']) {
+      expect((await app.inject({ method: 'POST', url: '/api/v2/searches', payload: { prompt: 'valid', [field]: 'legacy' } })).statusCode).toBe(400);
+    }
     // The daemon config's DB_PATH is deliberately nonexistent. The stdio child receives only
     // the origin settings, so only the in-memory daemon store can receive this queued search.
     const transport = new StdioClientTransport({
@@ -70,15 +74,26 @@ describe('stdio-to-daemon HTTP MCP domain', () => {
     await client.connect(transport);
     const status = await client.callTool({ name: 'ma_status', arguments: {} });
     expect(JSON.stringify(status)).toContain('ai.apiKey');
-    const search = await client.callTool({ name: 'ma_search_v2', arguments: { prompt: 'queued with incomplete settings' } });
+     const removedTool = await client.listTools();
+     expect(removedTool.tools.map(tool => tool.name)).not.toContain('ma_automation_search_v2');
+     for (const field of ['context', 'preferences', 'arrTargetIds', 'preferredDownloadClientId', 'notAContractField']) {
+       const rejected = await client.callTool({ name: 'ma_search_v2', arguments: { prompt: 'legacy', [field]: 'legacy' } });
+       expect(rejected.isError).toBe(true);
+     }
+     const prompt = '  queued with incomplete settings\nsecond line  ';
+     const search = await client.callTool({ name: 'ma_search_v2', arguments: { prompt } });
     const text = (search.content as Array<{ text: string }>)[0]!.text;
     const { searchId } = JSON.parse(text) as { searchId: string; status: string };
      expect(JSON.parse(text).status).toBe('queued');
-     expect(await runtime.getSearch(searchId)).not.toBeNull();
+     expect((await runtime.getSearch(searchId))?.prompt).toBe(prompt);
+     const jsonPrompt = '{"version":1,"request":{"prompt":"this is literal user text"}}';
+     const jsonSearch = await client.callTool({ name: 'ma_search_v2', arguments: { prompt: jsonPrompt } });
+     const jsonSearchId = JSON.parse((jsonSearch.content as Array<{ text: string }>)[0]!.text).searchId as string;
+     expect((await runtime.getSearch(jsonSearchId))?.prompt).toBe(jsonPrompt);
      const history = await client.callTool({ name: 'ma_activity_v2', arguments: { q: 'queued with incomplete settings', status: 'queued' } });
-     expect(JSON.parse((history.content as Array<{ text: string }>)[0]!.text)).toMatchObject({
-       total: 1, items: [{ searchId, status: 'queued' }],
-     });
+      expect(JSON.parse((history.content as Array<{ text: string }>)[0]!.text)).toMatchObject({
+        total: 1, items: [{ searchId, status: 'queued', prompt }],
+      });
     expect(existsSync(dbPath)).toBe(false);
     await transport.close();
     client = undefined;

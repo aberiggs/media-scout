@@ -5,7 +5,6 @@ import { buildStack } from '../src/compose';
 import { loadConfig } from '../src/config';
 import { buildApp } from '../src/daemon';
 import { defaultSettings } from '../src/search/settings';
-import type { AgentRequest } from '../src/search/agent-contracts';
 import { releaseSchema } from '../src/types/prowlarr';
 import { Http } from '../src/http';
 import { ProwlarrClient } from '../src/clients/prowlarr';
@@ -58,10 +57,6 @@ const stack = buildStack({
 
 const now = Date.now();
 const secretFingerprint = createHash('sha256').update(`prowlarr\0${settings.integrations.prowlarr.url}\0${settings.integrations.prowlarr.apiKey}`).digest('hex');
-const baseRequest: AgentRequest = {
-  version: 1, prompt: 'Find Signal Harbor season two', kind: 'show', scope: 'season', titles: ['Signal Harbor'], externalIds: {},
-  intents: [{ id: 'season-two', type: 'season', season: 2 }], targetIds: [], arrTargetIds: [], context: [], contextEpisodes: [], showMetadata: {}, preferences: {},
-};
 
 function release(candidateId: string, title: string, indexerId: number, categories: number[]) {
   return releaseSchema.parse({
@@ -72,13 +67,13 @@ function release(candidateId: string, title: string, indexerId: number, categori
   });
 }
 
-function seedSearch(id: string, prompt: string, request: AgentRequest, plan: Record<string, unknown>, candidateRows: Array<{ id: string; title: string; expiresAt?: number }>) {
+function seedSearch(id: string, prompt: string, plan: Record<string, unknown>, candidateRows: Array<{ id: string; title: string; expiresAt?: number }>) {
   const candidateEvidence = candidateRows.map((row, index) => ({
     candidateId: row.id,
     observations: [{ title: row.title, indexer: 'Synthetic indexer only', size: 1_240_000_000 - index * 100_000_000, seeders: 140 - index * 30 }],
   }));
   stack.runtime.store.createSearch({
-    searchId: id, prompt: JSON.stringify({ version: 1, request }), status: 'matched', createdAt: now,
+    searchId: id, prompt: JSON.stringify({ version: 3, prompt }), status: 'matched', createdAt: now,
   });
   stack.runtime.store.setSetting(`search-source:${id}`, 'manual');
   candidateRows.forEach((row, index) => {
@@ -90,11 +85,11 @@ function seedSearch(id: string, prompt: string, request: AgentRequest, plan: Rec
     });
   });
   stack.runtime.store.finishSearch(id, 'matched', {
-    version: 1, request, plan, candidateEvidence,
+    version: 1, plan, candidateEvidence,
     counts: { decisions: 4, searches: 3, candidates: candidateRows.length },
     diagnostics: { modelTurns: 3, stopReason: 'fixture', elapsedMs: 410, usage: { inputTokens: 820, outputTokens: 140 } },
   }, now);
-  return { searchId: id, prompt, status: 'matched', source: 'manual', kind: request.kind === 'movie' ? 'movie' : 'tv', createdAt: new Date(now).toISOString() };
+  return { searchId: id, prompt, status: 'matched', source: 'manual', createdAt: new Date(now).toISOString() };
 }
 
 const seasonRows = [
@@ -112,38 +107,30 @@ const seasonPlan = {
   coverage: { covered: ['Episodes 1–6'], gaps: ['Episode 7 was not found'], deferred: [], broad: { status: 'partial', gaps: ['Episode 7'] } },
   warnings: ['Coverage is inferred from release names and indexer metadata.'],
 };
-const seasonItem = seedSearch('fixture-season-overlap-gap', 'Signal Harbor season two', baseRequest, seasonPlan, seasonRows);
-const uncertainItem = seedSearch('fixture-uncertain-set', 'Signal Harbor uncertain submission', {
-  ...baseRequest, prompt: 'Signal Harbor uncertain submission',
-}, { ...seasonPlan, planId: 'fixture-plan-uncertain' }, seasonRows);
-const recoveryItem = seedSearch('fixture-transport-recovery', 'Signal Harbor response recovery', {
-  ...baseRequest, prompt: 'Signal Harbor response recovery',
-}, { ...seasonPlan, planId: 'fixture-plan-recovery' }, seasonRows);
+const seasonItem = seedSearch('fixture-season-overlap-gap', 'Signal Harbor season two', seasonPlan, seasonRows);
+const uncertainItem = seedSearch('fixture-uncertain-set', 'Signal Harbor uncertain submission', { ...seasonPlan, planId: 'fixture-plan-uncertain' }, seasonRows);
+const recoveryItem = seedSearch('fixture-transport-recovery', 'Signal Harbor response recovery', { ...seasonPlan, planId: 'fixture-plan-recovery' }, seasonRows);
 
-const movieRequest: AgentRequest = {
-  ...baseRequest, prompt: 'Find Glass Orchard (2024)', kind: 'movie', scope: 'movie', titles: ['Glass Orchard'], year: 2024,
-  intents: [{ id: 'glass-orchard-2024', type: 'movie' }],
-};
 const moviePlan = {
   version: 2, planId: 'fixture-plan-movie', status: 'matched',
   selections: [{ candidateId: 'glass-orchard', coverage: 'Complete feature film', reason: 'Single feature release with matching year and strong metadata.', uncertainty: '' }],
   covered: ['Feature film'], gaps: [], deferred: [], scopeGaps: [], extras: [], usefulOverlap: [], broadCoverage: 'complete',
   coverage: { covered: ['Feature film'], gaps: [], deferred: [], broad: { status: 'complete', gaps: [] } },
 };
-const movieItem = seedSearch('fixture-movie', movieRequest.prompt, movieRequest, moviePlan, [{ id: 'glass-orchard', title: 'Glass Orchard (2024) 1080p WEB-DL' }]);
+const movieItem = seedSearch('fixture-movie', 'Find Glass Orchard (2024)', moviePlan, [{ id: 'glass-orchard', title: 'Glass Orchard (2024) 1080p WEB-DL' }]);
 
 const stalePlan = { ...seasonPlan, planId: 'fixture-plan-stale', selections: [{ candidateId: 'missing-candidate', coverage: 'Season 2', reason: 'Old fixture candidate', uncertainty: '' }] };
-const staleItem = seedSearch('fixture-stale-confirmation', 'Stale Signal Harbor plan', baseRequest, stalePlan, []);
+const staleItem = seedSearch('fixture-stale-confirmation', 'Stale Signal Harbor plan', stalePlan, []);
 const expiredPlan = { ...moviePlan, planId: 'fixture-plan-expired', selections: [{ candidateId: 'expired-movie', coverage: 'Complete feature film', reason: 'Expired candidate sample', uncertainty: '' }] };
-const expiredItem = seedSearch('fixture-expired-candidate', 'Expired Glass Orchard candidate', movieRequest, expiredPlan, [{ id: 'expired-movie', title: 'Glass Orchard (2024) old candidate', expiresAt: now - 1 }]);
+const expiredItem = seedSearch('fixture-expired-candidate', 'Expired Glass Orchard candidate', expiredPlan, [{ id: 'expired-movie', title: 'Glass Orchard (2024) old candidate', expiresAt: now - 1 }]);
 const noMatchPlan = {
   version: 2, planId: 'fixture-plan-no-match', status: 'no-match', selections: [],
   covered: [], gaps: ['No suitable release observed'], deferred: [], scopeGaps: [],
   broadCoverage: 'none', coverage: { covered: [], gaps: ['No suitable release observed'], deferred: [], broad: { status: 'none', gaps: [] } },
 };
-seedSearch('fixture-no-match', 'No suitable release fixture', baseRequest, noMatchPlan, []);
+seedSearch('fixture-no-match', 'No suitable release fixture', noMatchPlan, []);
 stack.runtime.store.finishSearch('fixture-no-match', 'no-match', {
-  version: 1, request: baseRequest, plan: noMatchPlan, candidateEvidence: [],
+  version: 1, plan: noMatchPlan, candidateEvidence: [],
   counts: { decisions: 3, searches: 2, candidates: 0 },
 }, now);
 

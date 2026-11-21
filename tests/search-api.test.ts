@@ -9,7 +9,6 @@ import { releaseSchema } from '../src/types/prowlarr';
 import { existsSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { ApiError } from '../src/http';
-import { normalizeAgentRequest } from '../src/search/agent-contracts';
 import { seriesListSchema } from '../src/types/sonarr';
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -49,29 +48,6 @@ describe('search-first HTTP contract', () => {
     expect(read.body).not.toContain('never-echo-this');
   });
 
-  it('accepts ordinary Arr episodes without absolute numbering', async () => {
-    const { app, runtime } = await fixture({
-      sonarr: {
-        getSeries: async () => [{ id: 11, tvdbId: 110, title: 'Standard Show', titleSlug: 'standard-show', seriesType: 'standard', monitored: true, seasons: [], alternateTitles: [] }],
-        getEpisodes: async () => [{ id: 111, seriesId: 11, seasonNumber: 2, episodeNumber: 1, absoluteEpisodeNumber: null, title: 'Episode', airDate: '2020-01-01', airDateUtc: null, finaleType: null, monitored: true, hasFile: false }],
-        getQueue: async () => [],
-      },
-    });
-    try {
-      await app.listen({ host: '127.0.0.1', port: 0 });
-      runtime.store.setProviderDeadline('model', Date.now() + 60_000);
-      runtime.saveSettings({ ...runtime.getSettings(), monitoring: { ...runtime.getSettings().monitoring, enabled: true, allowDownloads: true }, safety: { dryRun: false } });
-      await runtime.poll();
-      expect(runtime.activity().items).toHaveLength(0);
-      const id = runtime.automationStatus().items[0]!.targetId;
-      const started = await runtime.startArrSearch(id);
-      expect(await runtime.getSearch(started.searchId)).toMatchObject({ source: 'arr', manualExecutionEligible: false });
-      const prompt = (await runtime.getSearch(started.searchId))!.prompt;
-      expect(prompt).toContain('{"season":2,"episode":1,"title":"Episode","airDate":');
-      expect(prompt).not.toContain('"absoluteEpisode":');
-      expect(prompt).not.toContain(id);
-    } finally { await app.close(); await runtime.close(); }
-  });
   it('keeps scheduled automation disabled until explicitly activated', async () => {
     const { runtime, reads } = await fixture();
     await expect(runtime.runAutomation()).resolves.toMatchObject({ ran: false, reason: 'automation-disabled' });
@@ -280,103 +256,6 @@ describe('search-first HTTP contract', () => {
     }
   });
 
-  it('drains in-flight Arr preparation and refuses enqueue after quiesce', async () => {
-    let block = false, release!: () => void, began!: () => void;
-    const entered = new Promise<void>(resolve => { began = resolve; });
-    const pendingRead = new Promise<void>(resolve => { release = resolve; });
-    const { app, runtime } = await fixture({
-      sonarr: {
-        getSeries: async () => {
-          if (block) { began(); await pendingRead; }
-          return [{ id: 11, tvdbId: 110, title: 'Standard Show', titleSlug: 'standard-show', seriesType: 'standard', monitored: true, seasons: [], alternateTitles: [] }];
-        },
-        getEpisodes: async () => [{ id: 111, seriesId: 11, seasonNumber: 2, episodeNumber: 1, absoluteEpisodeNumber: 13, title: 'Episode', airDate: '2020-01-01', airDateUtc: null, finaleType: null, monitored: true, hasFile: false }],
-        getQueue: async () => [],
-      },
-    });
-    try {
-      await app.listen({ host: '127.0.0.1', port: 0 });
-      await runtime.poll();
-      const id = runtime.automationStatus().items[0]!.targetId;
-      block = true;
-      const starting = runtime.startArrSearch(id).then(
-        value => ({ value, error: undefined }),
-        error => ({ value: undefined, error }),
-      );
-      await entered;
-      runtime.quiesce();
-      let drained = false;
-      const draining = runtime.drain().then(() => { drained = true; });
-      await Promise.resolve(); await Promise.resolve();
-      expect(drained).toBe(false);
-      release();
-      expect((await starting).error?.message).toBe('runtime-closed');
-      await draining;
-      expect(runtime.store.listSearches()).toHaveLength(0);
-    } finally { release(); await app.close(); await runtime.close(); }
-  });
-
-  it('resolves explicit Arr refs fresh, enforces canonical scope, and leaves generic opaque targets unbound', async () => {
-    let targetHasFile = false, targetQueued = false, episodeReads = 0;
-    const series = [
-      { id: 11, tvdbId: 110, title: 'Show One', titleSlug: 'show-one', seriesType: 'standard' as const, monitored: true, seasons: [], alternateTitles: [] },
-      { id: 22, tvdbId: 220, title: 'Show Two', titleSlug: 'show-two', seriesType: 'anime' as const, monitored: true, seasons: [], alternateTitles: [] },
-    ];
-    const clients: RuntimeClients = {
-      prowlarr: { getIndexers: async () => [], getIndexerStatuses: async () => [], search: async () => [] },
-      sonarr: {
-        getSeries: async () => series,
-        getEpisodes: async id => {
-          episodeReads++;
-          const numbers = id === 11 ? [{ id: 111, episodeNumber: 2, absoluteEpisodeNumber: 26 }, { id: 112, episodeNumber: 3, absoluteEpisodeNumber: 27 }] : [{ id: 122, episodeNumber: 2, absoluteEpisodeNumber: 50 }];
-          return numbers.map(number => ({ ...number, seriesId: id, seasonNumber: 1, title: 'Episode', airDate: '2020-01-01', airDateUtc: null, finaleType: null, monitored: true, hasFile: targetHasFile }));
-        },
-        getQueue: async () => targetQueued ? [{ seriesId: 11, episodeId: 111, status: 'downloading' }] : [],
-      },
-    };
-    const { app, runtime } = await fixture(clients);
-    try {
-      await app.listen({ host: '127.0.0.1', port: 0 });
-      runtime.store.setProviderDeadline('model', Date.now() + 60_000);
-      await runtime.poll();
-      const ids = runtime.automationStatus().items.map(item => item.targetId);
-      expect(ids).toHaveLength(3);
-      await expect(runtime.startSearch({ prompt: 'Find', arrTargetIds: ['not-a-real-target'] })).rejects.toThrow('target-not-found');
-      await expect(runtime.startSearch({ prompt: 'Find both', arrTargetIds: ids })).rejects.toThrow('arr-target-scope-conflict');
-      const firstId = ids[0]!;
-      const mismatchedId = await runtime.startSearch({ prompt: 'Find using semantic evidence', arrTargetIds: [firstId], context: { kind: 'tv', externalIds: { tvdb: 999 } } });
-      expect((await runtime.getSearch(mismatchedId.searchId))?.prompt).not.toMatch(/tvdb|999/i);
-      await expect(runtime.startSearch({ prompt: 'Find conflict', arrTargetIds: [firstId], context: { kind: 'tv', scope: { type: 'episode', seasonNumber: 1, episodeNumber: 2, absoluteEpisodeNumber: 99 } } })).rejects.toThrow('arr-target-context-conflict');
-      const readsBeforeArrSearch = episodeReads;
-      const started = await runtime.startArrSearch(firstId);
-      expect(episodeReads - readsBeforeArrSearch).toBe(2); // One fresh observation, not a preflight plus a second resolution.
-      const persistedBindings = runtime.store.getSetting(`search-arr-bindings-v1:${started.searchId}`) as Array<{ key: string; serviceId: number }>;
-      expect(persistedBindings).toHaveLength(1);
-      expect(persistedBindings[0]).toMatchObject({ serviceId: 11 });
-      expect(runtime.store.getSetting(`search-arr:${started.searchId}`)).toBeNull();
-      expect(runtime.store.getSetting(`search-source:${started.searchId}`)).toBe('arr');
-      const stored = await runtime.getSearch(started.searchId);
-      expect(stored?.prompt).toContain('{"season":1,"episode":2,"absoluteEpisode":26,"title":"Episode","airDate":');
-      expect(stored?.prompt).not.toContain(firstId);
-      const multi = await runtime.startSearch({ prompt: 'Find the two missing episodes', arrTargetIds: ids.slice(0, 2) });
-      expect(runtime.store.getSetting(`search-arr-bindings-v1:${multi.searchId}`)).toHaveLength(2);
-      const multiPrompt = (await runtime.getSearch(multi.searchId))?.prompt;
-      expect(multiPrompt).toContain('{"season":1,"episode":2,"absoluteEpisode":26,"title":"Episode","airDate":');
-      expect(multiPrompt).toContain('{"season":1,"episode":3,"absoluteEpisode":27,"title":"Episode","airDate":');
-      targetHasFile = true;
-      await expect(runtime.startSearch({ prompt: 'No longer eligible', arrTargetIds: [firstId] })).rejects.toThrow('target-not-eligible');
-      targetHasFile = false;
-      targetQueued = true;
-      await expect(runtime.startSearch({ prompt: 'Queued already', arrTargetIds: [firstId] })).rejects.toThrow('target-not-eligible');
-      const generic = await runtime.startSearch({ prompt: 'Opaque generic', context: { kind: 'tv', scope: { type: 'episode-set' }, targets: [{ targetId: firstId, seasonNumber: 1, episodeNumber: 2 }] } });
-      expect(runtime.store.getSetting(`search-arr-bindings-v1:${generic.searchId}`)).toBeNull();
-      expect(runtime.store.getSetting(`search-source:${generic.searchId}`)).toBe('manual');
-      expect((await runtime.getSearch(generic.searchId))?.prompt).not.toContain(firstId);
-    } finally {
-      await app.close();
-      await runtime.close();
-    }
-  });
   it('contains no retired engine modules or operator CLI compatibility stub', () => {
     for (const path of [
       'core/runner.ts', 'core/state.ts', 'core/work-queue.ts', 'core/operations.ts', 'core/operator-actions.ts', 'operator-cli.ts',
@@ -404,44 +283,75 @@ describe('search-first HTTP contract', () => {
     expect(start.json()).toMatchObject({ code: 'operation-unavailable' });
     expect(runtime.activity().items).toHaveLength(0);
   });
-  it('preserves date-only episode intent from pre-upgrade queued work and movie scope without a kind', async () => {
-    const inputs: unknown[] = [];
-    const responses = createServer(async (request, response) => {
-      const chunks: Buffer[] = [];
-      for await (const chunk of request) chunks.push(Buffer.from(chunk));
-      inputs.push(JSON.parse(Buffer.concat(chunks).toString()).input);
-      response.writeHead(200, { 'content-type': 'application/json' });
-      response.end(JSON.stringify({
-        id: 'legacy-fixture', object: 'response', created_at: 1, completed_at: 1, status: 'completed',
-        error: null, incomplete_details: null, instructions: null, model: 'fixture/model',
-        output: [{ id: 'legacy-final', type: 'function_call', call_id: 'legacy-final', name: 'finalize_release_set',
-          arguments: JSON.stringify({ status: 'no-match', selections: [], covered: [], gaps: [], deferred: [], broadCoverage: 'none', scopeGaps: [] }), status: 'completed' }],
-        parallel_tool_calls: false, tool_choice: 'auto', tools: [], usage: null, metadata: null,
-        frequency_penalty: null, presence_penalty: null, temperature: null, top_p: null,
-      }));
+  it('projects historical saved model input through prompt without exposing the old field', async () => {
+    const { runtime } = await fixture();
+    runtime.store.createSearch({
+      searchId: 'historical-model-input',
+      prompt: JSON.stringify({ version: 1, request: { prompt: 'Old title', kind: 'tv' } }),
+      status: 'matched',
+      createdAt: Date.now(),
+      result: { version: 1, status: 'matched', modelPrompt: 'Old multiline input\nprivate-model', counts: { decisions: 1, searches: 0, candidates: 0 } },
     });
-    await new Promise<void>(resolve => responses.listen(0, '127.0.0.1', resolve));
-    const address = responses.address();
-    if (!address || typeof address === 'string') throw new Error('Missing scripted provider');
-    const { app, runtime } = await fixture();
+    runtime.store.setSetting('search-source:historical-model-input', 'manual');
+    const result = await runtime.getSearch('historical-model-input');
+    expect(result?.prompt).toBe('Old multiline input\n[redacted]');
+    expect(result).not.toHaveProperty('modelPrompt');
+    expect(JSON.stringify(result)).not.toContain('private-model');
+    await runtime.close();
+  });
+  it('fails previously queued v2 manual and v1 Arr work during normal startup dispatch without upstream calls', async () => {
+    let modelCalls = 0, providerCalls = 0;
+    const sentinel = createServer((_request, response) => {
+      modelCalls++;
+      response.writeHead(500, { 'content-type': 'application/json' });
+      response.end('{"error":"model must not be called"}');
+    });
+    await new Promise<void>(resolve => sentinel.listen(0, '127.0.0.1', resolve));
+    const address = sentinel.address();
+    if (!address || typeof address === 'string') throw new Error('Missing sentinel model server');
+    const { app, runtime } = await fixture({
+      prowlarr: {
+        getIndexers: async () => { providerCalls++; return []; },
+        getIndexerStatuses: async () => { providerCalls++; return []; },
+        search: async () => { providerCalls++; return []; },
+      },
+    });
     try {
-      const request = normalizeAgentRequest({ prompt: 'Find the listed broadcast', context: {
-        scope: { type: 'episode-set' }, externalIds: { tvdb: 111223 }, targets: [{ targetId: 'legacy-private-target', airDateUtc: '2025-03-08T20:00:00.000Z' }],
-      } });
-      runtime.store.enqueueSearch({ searchId: 'legacy-queued', now: Date.now(), prompt: JSON.stringify({ version: 1, request }) });
-      runtime.saveSettings({ ...runtime.getSettings(), ai: { ...runtime.getSettings().ai, baseUrl: `http://127.0.0.1:${address.port}` } });
+      runtime.saveSettings({ ...runtime.getSettings(), ai: { ...runtime.getSettings().ai, baseUrl: `http://127.0.0.1:${address.port}/v1` } });
+      const now = Date.now();
+      runtime.store.enqueueSearch({
+        searchId: 'queued-old-manual-v2',
+        prompt: JSON.stringify({ version: 2, prompt: 'Previously rendered structured request', kind: 'tv' }),
+        now,
+      });
+      runtime.store.enqueueSearch({
+        searchId: 'queued-old-arr',
+        prompt: JSON.stringify({ version: 1, request: { prompt: 'legacy', arrTargetIds: ['must-not-resolve'] } }),
+        source: 'arr',
+        now: now + 1,
+      });
       await app.listen({ host: '127.0.0.1', port: 0 });
       await runtime.drain();
-      expect(inputs[0]).toEqual(expect.stringContaining('{"airDate":"2025-03-08T20:00:00.000Z"}'));
-      expect(inputs[0]).not.toMatch(/111223|legacy-private-target/);
-      expect((await runtime.getSearch('legacy-queued'))?.modelPrompt).toBe(inputs[0]);
-      const { searchId } = (await app.inject({ method: 'POST', url: '/api/v2/searches', payload: { prompt: 'Find the listed work', context: { scope: { type: 'movie' } } } })).json();
-      await runtime.drain();
-      expect(inputs[1]).toEqual(expect.stringContaining('"kind":"movie"'));
-      expect((await runtime.getSearch(searchId))?.prompt).toBe(inputs[1]);
+      const manual = await runtime.getSearch('queued-old-manual-v2');
+      const arr = await runtime.getSearch('queued-old-arr');
+      expect(manual).toMatchObject({
+        status: 'failed',
+        source: 'manual',
+        message: 'This saved search uses a retired request format; resubmit it as a prompt-only search.',
+      });
+      expect(arr).toMatchObject({
+        status: 'failed',
+        source: 'arr',
+        manualExecutionEligible: false,
+        message: 'This saved search uses a retired request format; resubmit it as a prompt-only search.',
+      });
+      expect(arr?.prompt).toBe('legacy');
+      expect(JSON.stringify(arr)).not.toContain('must-not-resolve');
+      expect(modelCalls).toBe(0);
+      expect(providerCalls).toBe(0);
     } finally {
       await app.close(); await runtime.close();
-      await new Promise<void>(resolve => { responses.close(() => resolve()); responses.closeAllConnections(); });
+      await new Promise<void>(resolve => { sentinel.close(() => resolve()); sentinel.closeAllConnections(); });
     }
   });
   it.each(['empty', 'outage', 'cooldown'] as const)('distinguishes successful empty results from unavailable Prowlarr research (%s)', async (scenario) => {
@@ -478,10 +388,11 @@ describe('search-first HTTP contract', () => {
     try {
       runtime.saveSettings({ ...runtime.getSettings(), ai: { ...runtime.getSettings().ai, baseUrl: `http://127.0.0.1:${upstream.port}` } });
       await app.listen({ host: '127.0.0.1', port: 0 });
-      const start = await app.inject({ method: 'POST', url: '/api/v2/searches', payload: { prompt: 'Find a film', preferredDownloadClientId: 987654, context: { kind: 'movie', titles: ['Arrival'], year: 2016, scope: { type: 'movie' } } } });
+      const exactPrompt = '  {"version":1,\n"request":{"prompt":"Find a film"}}  ';
+      const start = await app.inject({ method: 'POST', url: '/api/v2/searches', payload: { prompt: exactPrompt } });
       expect(start.statusCode).toBe(202);
       const { searchId } = start.json() as { searchId: string };
-      expect(runtime.store.searchWorkContext(searchId)).toMatchObject({preferredDownloadClientId:987654});
+      expect((await runtime.getSearch(searchId))?.prompt).toBe(exactPrompt);
       await runtime.drain();
       const instruction = JSON.stringify(modelInputs);
       expect(instruction).toContain('typed finalize_release_set');
@@ -499,7 +410,7 @@ describe('search-first HTTP contract', () => {
       const status = await app.inject(`/api/v2/searches/${searchId}`);
       expect(status.statusCode).toBe(200);
       expect(modelInputs[0]?.input).toBe(status.json().prompt);
-      expect(modelInputs[0]?.input).not.toContain('987654');
+      expect(modelInputs[0]?.input).toBe(exactPrompt);
       if (scenario !== 'empty') {
         expect(instruction).toContain(scenario === 'outage' ? 'Prowlarr search unavailable' : 'coolingUntil');
         expect(status.json()).toMatchObject({ searchId, status: 'failed', message: 'Prowlarr research failed before a search could complete' });
@@ -510,11 +421,9 @@ describe('search-first HTTP contract', () => {
       expect(status.json(), JSON.stringify(status.json())).toMatchObject({
         searchId, status: 'no-match', diagnostics: { modelTurns: 2, stopReason: 'release-set-finalized', elapsedMs: expect.any(Number), usage: { inputTokens: 120, outputTokens: 30, totalTokens: 150, cost: 0.004 } },
         counts: { decisions: 2, searches: 1 },
-        preferredDownloadClientId: 987654,
         plan: { version: 2, status: 'no-match', selections: [], coverage: { broad: { status: 'none' } } },
       });
       expect(status.body).not.toContain('private-model');
-      expect(JSON.stringify(modelInputs)).not.toContain('987654');
       expect(grabs()).toBe(0);
     } finally {
       await app.close();
@@ -573,9 +482,7 @@ describe('search-first HTTP contract', () => {
     try {
       runtime.saveSettings({ ...runtime.getSettings(), ai: { ...runtime.getSettings().ai, baseUrl: `http://127.0.0.1:${address.port}` } });
       await app.listen({ host: '127.0.0.1', port: 0 });
-      const start = await app.inject({ method: 'POST', url: '/api/v2/searches', payload: {
-        prompt: 'Find film', context: { kind: 'movie', titles: ['Film'], externalIds: { tmdb: 123 }, targets: [{ targetId: 'opaque-target' }] },
-      } });
+      const start = await app.inject({ method: 'POST', url: '/api/v2/searches', payload: { prompt: 'Find film' } });
       const { searchId } = start.json() as { searchId: string };
       await runtime.drain();
       const result = await runtime.getSearch(searchId);

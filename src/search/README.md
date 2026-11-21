@@ -7,24 +7,17 @@ HTTP, public MCP, and scheduled Arr automation share one search domain. The Open
 `POST /api/v2/searches` and public MCP `ma_search_v2` accept the same request.
 Creation returns HTTP 202 / `{searchId,status:"queued"}`; read the persisted result
 with `GET /api/v2/searches/:id` or `ma_search_status_v2`.
-An optional positive integer `preferredDownloadClientId` is retained in durable
-search metadata and returned by search status. It is not sent to the research model
-and does not validate or select a client during search.
-
 ```json
 {"prompt":"Find seasons 1–4 of Example. Prefer original audio with English subtitles; useful partial sets are welcome."}
 ```
 
-Manual searches need only a prompt. Existing callers can still supply `context`,
-`preferences`, or `arrTargetIds`. The backend renders useful semantic context into
-the prompt; it does not forward target references, provider identity IDs, or
-related episode inventories. Explicit Arr selectors are resolved locally from
-fresh observations. Generic target references never grant Arr authority.
+Creation accepts exactly one field, `prompt`, a non-empty string. Former metadata
+fields and unknown fields are rejected. The saved prompt is the exact safe
+multiline text sent as model input; system guidance is separate.
 
-New search details return the exact redacted model input as `prompt`. Older
-records retain their original short `prompt` and can return the saved full input
-as `modelPrompt`. System guidance is separate from the saved per-search prompt.
-No database format change is needed.
+Historical results and receipts remain available. Old queued request formats are
+not translated or sent to a model; they fail with a resubmit message. Historical
+Arr-sourced work is never executable.
 
 A completed result has one `plan`, not `options`. New plans are version 2:
 
@@ -68,10 +61,8 @@ mappings, the allowlisted `fields[].name == "category"` value is exposed as
 For qBittorrent, this is its configured fallback category. A change to that value
 requires fresh confirmation.
 
-Search requests may include a positive `preferredDownloadClientId`. It is persisted
-as search metadata and returned in status but is not sent to the model, does not
-validate the client during search, and never triggers automatic execution.
 Manual execution endpoints do not accept automation-owned plans. The scheduler may execute only the selected set from its own search, and only under saved monitoring, explicit automatic-download permission, and dry-run off.
+Confirmation always requires an explicit download-client choice.
 Activity filters accept search statuses and submission/execution outcomes, including
 `partial` and `not-attempted`.
 
@@ -144,16 +135,10 @@ This release requires a fresh `DB_PATH` when migrating from the retired database
 
 The public Media Scout stdio adapter remains available and uses SDK v2. It is separate from this read-only internal server and does not expose recursive agent tools.
 
-`arrTargetIds` explicitly requests fresh Arr resolution; arbitrary generic
-`context.targets` remain opaque request references and never gain Arr authority
-from their shape or a coincidental ID match. Arr-backed requests bind only fresh,
-eligible targets from one show or one movie, and persist their canonical bindings
-as a versioned array separate from historical single-binding settings.
-
 Implementation map:
 
 - `agent.ts`, `agent-contracts.ts`: SDK orchestration and ledger-validated finalization.
-- `prompt.ts`, `workload.ts`: system research guidance, semantic request rendering and bounded scheduled prompts.
+- `prompt.ts`, `workload.ts`: system research guidance and bounded scheduled prompts.
 - `contracts.ts`, `arr.ts`: public request contracts and Arr observation.
 - `store.ts`, `settings.ts`: SQLite persistence.
 - `runtime.ts`, `mcp.ts`, `prowlarr-mcp.ts`: runtime wiring and MCP adapters/capabilities.

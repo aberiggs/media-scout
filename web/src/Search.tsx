@@ -10,7 +10,7 @@ type Receipt = { executionId: string; searchId: string; planId?: string; outcome
 type Confirmation = { confirmationId: string; expiresAt: string; searchId: string; planId: string; version: number; client: { id: number; name: string; protocol: string; defaultCategory?: string | null; configuredCategories: Array<{ clientCategory: string | null; categories: number[] | null }> }; dryRun: boolean; children: Child[] }
 type DownloadClient = { id: number; name: string; protocol: string; defaultCategory?: string | null; categoryMap: Array<{ clientCategory: string | null; categories: number[] | null }> }
 type CommitRequest = { confirmationId: string; searchId: string; planId: string; version: number; idempotencyKey: string }
-type SearchResult = { searchId: string; status: string; source?: 'manual' | 'arr' | 'automation'; manualExecutionEligible?: boolean; automationPending?: boolean; automationWorkload?: { deferredTargets: number; omittedRelatedEpisodes: number }; normalizedRequest?: unknown; prompt?: string; modelPrompt?: string; preferredDownloadClientId?: number; plan?: Plan; candidates?: Candidate[]; events?: Array<{ type: string; data: Record<string, unknown> }>; receipts?: Receipt[]; counts?: { decisions: number; searches: number; candidates: number }; queuePosition?: number; waitingReason?: string; retryAt?: string; message?: string; researchWarnings?: string[]; diagnostics?: { modelTurns: number; stopReason: string; elapsedMs?: number; usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cost?: number } } }
+type SearchResult = { searchId: string; status: string; source?: 'manual' | 'arr' | 'automation'; manualExecutionEligible?: boolean; automationPending?: boolean; automationWorkload?: { deferredTargets: number }; prompt?: string; plan?: Plan; candidates?: Candidate[]; events?: Array<{ type: string; data: Record<string, unknown> }>; receipts?: Receipt[]; counts?: { decisions: number; searches: number; candidates: number }; queuePosition?: number; waitingReason?: string; retryAt?: string; message?: string; researchWarnings?: string[]; diagnostics?: { modelTurns: number; stopReason: string; elapsedMs?: number; usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cost?: number } } }
 const running = (status?: string) => status === 'queued' || status === 'running'
 const safeBody = async (response: Response) => { try { return await response.json() } catch { return {} } }
 const idempotencyKey = () => {
@@ -135,7 +135,7 @@ export function SearchPage({ settings, searchId, searchRevision, active = true, 
     controller.current?.abort(); window.clearTimeout(timer.current)
     setError(''); setNotice(''); setResult(null); setReceipt(null); setBusy(true)
     try {
-      const body = { prompt: prompt.trim() }
+      const body = { prompt }
       const response = await fetch('/api/v2/searches', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       const data = await safeBody(response)
       if (!response.ok || !data.searchId) throw new Error(errorMessage(data, 'Search could not start. Check your search settings.'))
@@ -157,10 +157,9 @@ export function SearchPage({ settings, searchId, searchRevision, active = true, 
       if (!isCurrent(id, token) || !activeNow.current) return
       const available = (data.items ?? []) as DownloadClient[]
       setClients(available)
-      const preferred = available.some(client => client.id === result.preferredDownloadClientId) ? String(result.preferredDownloadClientId) : ''
       setConfirmation(null)
       setExecError(available.length ? '' : 'No enabled download clients are available in Prowlarr.')
-      setClientId(preferred)
+      setClientId('')
       setNotice('Choose a Prowlarr download client, then prepare this complete release set.')
     } catch (failure) { if (isCurrent(id, token) && activeNow.current) setExecError(failure instanceof Error ? failure.message : 'Download clients could not be loaded.') }
     finally { opLock.current = false; setExecBusy(false) }
@@ -245,7 +244,7 @@ export function SearchPage({ settings, searchId, searchRevision, active = true, 
        {!!result.researchWarnings?.length && <div className="research-result-warnings" role="status"><strong>Research service notice</strong>{result.researchWarnings.map((warning, index) => <p key={index}>{warning}</p>)}</div>}
       {result.automationPending && <p role="status" className="ops-info-box">Automation is checking whether it can submit this set.</p>}
       {!!result.automationWorkload?.deferredTargets && <p className="ops-info-box">{result.automationWorkload.deferredTargets} other due episodes were outside this search. They remain unsearched for a later pass.</p>}
-      {(result.modelPrompt ?? result.prompt) && <details className="saved-prompt"><summary>Saved search prompt</summary><pre tabIndex={0} aria-label="Exact saved search prompt">{result.modelPrompt ?? result.prompt}</pre></details>}
+      {result.prompt && <details className="saved-prompt"><summary>Saved search prompt</summary><pre tabIndex={0} aria-label="Exact saved search prompt">{result.prompt}</pre></details>}
       {result.status === 'queued' ? <p role="status" className="ops-state-panel"><LoaderCircle className="spin"/>Search queued{result.queuePosition ? ` · ${Math.max(0, result.queuePosition - 1)} ahead` : ''}. It has not started yet.</p> : result.status === 'running' ? <p role="status" className="ops-state-panel"><LoaderCircle className="spin"/>Checking indexers and comparing releases…</p> : <>
          {plan?.status === 'matched' && <section className="release-set" aria-labelledby="selected-set"><div className="release-section-heading"><div><h3 id="selected-set">Selected release set</h3><p>{plan.selections.length} release{plan.selections.length === 1 ? '' : 's'} · whole set only</p></div>{receipt && <span className={`ops-status status-${receipt.outcome === 'submitted' ? 'mint' : receipt.outcome === 'uncertain' || receipt.outcome === 'partial' ? 'amber' : 'quiet'}`}>{receipt.outcome}</span>}</div>
           {plan.selections.map((selection, index) => { const evidence = byId.get(selection.candidateId)?.observations?.[0]; return <article className="ranked-option" key={`${selection.candidateId}-${index}`}><h4>{evidence?.title ?? `Selected release ${index + 1}`}</h4><p>{selection.reason}</p><p className="field-hint">{selection.coverage ?? 'Coverage is inferred from release metadata.'}{evidence?.indexer ? ` · ${evidence.indexer}` : ''}{evidence?.size ? ` · ${formatSize(evidence.size)}` : ''}{evidence?.seeders != null ? ` · ${evidence.seeders} seeders` : ''}</p>{selection.uncertainty && <p className="option-uncertainty">Worth checking: {selection.uncertainty}</p>}</article> })}

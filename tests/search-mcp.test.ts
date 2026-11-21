@@ -31,7 +31,7 @@ describe('search MCP adapter', () => {
   it('exposes only the search-first tools, and unknown status lookup is a stored safe 404', async () => {
     const mcp = await connect();
     const tools = await mcp.listTools();
-    expect(tools.tools.map(t => t.name).sort()).toEqual(['ma_activity_v2','ma_automation_poll_v2','ma_automation_search_v2','ma_automation_status_v2','ma_search_status_v2','ma_search_v2','ma_status'].sort());
+    expect(tools.tools.map(t => t.name).sort()).toEqual(['ma_activity_v2','ma_automation_poll_v2','ma_automation_status_v2','ma_search_status_v2','ma_search_v2','ma_status'].sort());
     const result = await mcp.callTool({ name: 'ma_search_status_v2', arguments: { searchId: 'missing-id' } });
     expect(result.isError).toBe(true);
     expect(JSON.stringify(result)).toContain('404');

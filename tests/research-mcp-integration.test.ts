@@ -125,7 +125,7 @@ async function fixture() {
     return { input, path, server: created.json() as { id: string; toolNames: string[] } };
   }
   async function search() {
-    const started = await app.inject({ method: 'POST', url: '/api/v2/searches', payload: { prompt: 'Find all episodes of Example Anime, including separate cours', context: { kind: 'tv', titles: ['Example Anime'], seriesType: 'anime' } } });
+    const started = await app.inject({ method: 'POST', url: '/api/v2/searches', payload: { prompt: 'Find all episodes of Example Anime, including separate cours' } });
     expect(started.statusCode, started.body).toBe(202);
     await runtime.drain();
     return app.inject(`/api/v2/searches/${started.json().searchId}`);

@@ -17,7 +17,7 @@ export const settingsSchema = z.object({
     enabled: z.boolean(), allowDownloads: z.boolean(), intervalMinutes: z.number().int().min(1).max(35_791), searchRetryMinutes: z.number().int().min(1).max(525_600),
     failureBackoffMinMinutes: z.number().int().min(1).max(35_791), failureBackoffMaxMinutes: z.number().int().min(1).max(35_791), queueGraceMinutes: z.number().int().min(1).max(1440),
   }).strict().refine((value) => value.failureBackoffMaxMinutes >= value.failureBackoffMinMinutes, { path: ['failureBackoffMaxMinutes'], message: 'must be at least failureBackoffMinMinutes' }),
-  search: z.object({ maxDecisions: z.number().int().min(1).max(100), maxSearches: z.number().int().min(1).max(100), deadlineMinutes: z.number().int().min(1).max(30) }).strict(),
+  search: z.object({ maxDecisions: z.number().int().min(1).max(100), maxSearches: z.number().int().min(1).max(100), deadlineMinutes: z.number().int().min(1).max(30), concurrentSearches: z.number().int().min(1).max(10).default(3) }).strict(),
   safety: z.object({ dryRun: z.boolean() }).strict(),
 }).strict();
 
@@ -27,7 +27,7 @@ export const defaultSettings: Settings = {
   integrations: { prowlarr: { url: '', apiKey: '', tvClientId: null, movieClientId: null }, sonarr: { url: '', apiKey: '' }, radarr: { url: '', apiKey: '' } },
   ai: { apiKey: '', model: 'openai/gpt-6.1-sol', baseUrl: 'https://openrouter.ai/api/v1', preferences: '' },
   monitoring: { enabled: false, allowDownloads: false, intervalMinutes: 5, searchRetryMinutes: 30, failureBackoffMinMinutes: 5, failureBackoffMaxMinutes: 60, queueGraceMinutes: 30 },
-  search: { maxDecisions: 100, maxSearches: 100, deadlineMinutes: 30 }, safety: { dryRun: true },
+  search: { maxDecisions: 100, maxSearches: 100, deadlineMinutes: 30, concurrentSearches: 3 }, safety: { dryRun: true },
 };
 
 export function missingSettings(settings: Settings): string[] {

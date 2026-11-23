@@ -3,6 +3,7 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { SearchStatus } from './contracts';
+import { defaultSettings, settingsSchema } from './settings';
 
 export const LEGACY_DATABASE_ERROR = 'Unsupported database format. Set DB_PATH to a new file; the existing database was not modified.';
 const DATABASE_VERSION = 2;
@@ -36,6 +37,11 @@ export interface SearchWork { searchId: string; prompt: string; source: 'manual'
 export interface CandidateRecord { searchId: string; candidateId: string; safe: unknown; privateData: unknown; expiresAt: number }
 export interface ExecutionChild { candidateId: string; physicalKey: string; state: 'prepared'|'sending'|'submitted'|'rejected'|'uncertain'|'not-attempted'|'dry-run'; effectiveCategory?:string|null; categoryRouting?:'direct'|'configured-mapping'|'default-category'; categoryNote?:string; releaseCategoryIds?:number[]; message?: string }
 export interface ExecutionRecord { id:string; key:string; hash:string; searchId:string; planId:string; version:number; outcome:string; owner:string; leaseUntil:number; children:ExecutionChild[]; receipt:unknown; payload:unknown; updatedAt:number }
+type AutomationGrace = { mediaKey:string; graceUntil:number; passOwner?:string; attempt?:{startedAt:number;targetKeys:string[];failureBackoffMinMs:number;failureBackoffMaxMs:number} };
+type AutomationSendUndo = {
+  mediaKey:string; priorGraceUntil:number|undefined; provisionalUntil:number;
+  attempts?: {startedAt:number; deadlines:Array<{target:string;deadline:number}>};
+};
 
 export function openSearchStore(path: string): SearchStore {
   if (path !== ':memory:' && existsSync(path)) {
@@ -84,11 +90,27 @@ export class SearchStore {
   releaseSearch(searchId:string,owner:string):void { this.db.prepare('UPDATE search_work SET owner=NULL,lease_expires_at=NULL WHERE search_id=? AND owner=?').run(searchId,owner); }
   saveExecutionPreparation(id:string,searchId:string,expiresAt:number,payload:unknown):void { this.db.prepare('INSERT INTO execution_preparations VALUES(?,?,?,?)').run(id,searchId,expiresAt,json(payload)); }
   getExecutionPreparation(id:string):{searchId:string;expiresAt:number;payload:any}|null { const r=this.db.prepare('SELECT * FROM execution_preparations WHERE id=?').get(id) as any; return r?{searchId:r.search_id,expiresAt:r.expires_at,payload:parse(r.payload_json)}:null; }
-  createExecution(input:{id:string;key:string;hash:string;searchId:string;planId:string;version:number;payload:any;children:ExecutionChild[];owner:string;now:number;leaseUntil:number}, claimTime:()=>number=()=>input.now):'created'|'replay'|'busy'|'conflict'|'confirmation-expired' {
+  automationManualBlock(searchId:string,planId:string,version:number,now:number):'automation-pass-active'|'execution-active'|'execution-send-risk'|'plan-changed'|null {
+    const search=this.getSearch(searchId), plan=(search?.result as {plan?:{planId?:string;version?:number;status?:string}}|undefined)?.plan;
+    const context=this.searchWorkContext(searchId) as {passOwner?:string;manualSendRisk?:string[]}|undefined;
+    if(!search || search.status!=='matched' || plan?.status!=='matched' || plan.planId!==planId || plan.version!==version || !context?.passOwner || this.getSetting(`search-source:${searchId}`)!=='automation') return 'plan-changed';
+    if(this.ownsLease('automation-pass',context.passOwner,now)) return 'automation-pass-active';
+    if(context.manualSendRisk?.includes(JSON.stringify([planId,version]))) return 'execution-send-risk';
+    const executions=this.executionsForSearch(searchId);
+    if(executions.some(item=>item.outcome==='running')) return 'execution-active';
+    const prior=executions.filter(item=>item.planId===planId&&item.version===version);
+    if(prior.some(item=>item.children.some(child=>['sending','submitted','uncertain'].includes(child.state)))) return 'execution-send-risk';
+    return null;
+  }
+  createExecution(input:{id:string;key:string;hash:string;searchId:string;planId:string;version:number;payload:any;children:ExecutionChild[];owner:string;now:number;leaseUntil:number;guardAutomationManual?:boolean}, claimTime:()=>number=()=>input.now):'created'|'replay'|'busy'|'conflict'|'confirmation-expired'|'automation-pass-active'|'execution-active'|'execution-send-risk'|'plan-changed' {
     return this.db.transaction(() => {
       const prior=this.executionByKey(input.key);
       if(prior) return prior.hash===input.hash?'replay':'conflict';
       if(this.db.prepare('SELECT 1 FROM execution_idempotency WHERE idem_key=?').get(input.key)) return 'conflict';
+      if(input.guardAutomationManual) {
+        const blocked=this.automationManualBlock(input.searchId,input.planId,input.version,claimTime());
+        if(blocked)return blocked;
+      }
       const physical=[...new Set(input.children.map(c=>c.physicalKey))];
       if(physical.length!==input.children.length) return 'conflict';
       this.db.prepare('DELETE FROM execution_holds WHERE expires_at<=?').run(input.now);
@@ -109,11 +131,45 @@ export class SearchStore {
   ownsExecution(id:string,owner:string,now:number):boolean { const row=this.execution(id);return !!row&&row.owner===owner&&row.leaseUntil>now&&row.outcome==='running'; }
   updateExecution(id:string,owner:string,now:number,change:(r:ExecutionRecord)=>ExecutionRecord):boolean { return this.db.transaction(()=>{const prior=this.execution(id); if(!prior || prior.owner!==owner || prior.leaseUntil<=now) return false; const next=change(prior); this.db.prepare('UPDATE executions SET outcome=?,lease_until=?,payload_json=?,updated_at=? WHERE id=?').run(next.outcome,next.leaseUntil,json(next),now,id); return true; }).immediate(); }
   renewExecution(id:string,owner:string,now:number,ttl:number):boolean { return this.db.transaction(()=>{const prior=this.execution(id); if(!prior||prior.owner!==owner||prior.leaseUntil<=now)return false; prior.leaseUntil=now+ttl; prior.updatedAt=now; this.db.prepare('UPDATE executions SET lease_until=?,payload_json=?,updated_at=? WHERE id=?').run(prior.leaseUntil,json(prior),now,id); this.db.prepare('UPDATE execution_holds SET expires_at=? WHERE execution_id=?').run(now+3_600_000,id); return true; }).immediate(); }
-  updateExecutionChild(id:string,owner:string,now:number,index:number,state:ExecutionChild['state'],message?:string,grace?:{mediaKey:string;graceUntil:number;passOwner?:string;attempt?:{startedAt:number;targetKeys:string[];failureBackoffMinMs:number;failureBackoffMaxMs:number}}):boolean {
+  beginAutomationSend(id:string,owner:string,index:number,clock:()=>number,freshUntil:number,guard:(now:number)=>string|undefined,grace:(now:number)=>AutomationGrace):{started:AutomationSendUndo}|'stale'|'lost'|{blocked:string} {
     return this.db.transaction(()=>{
+      const now=clock();
+      if(!this.ownsExecution(id,owner,now))return 'lost';
+      if(now>freshUntil)return 'stale';
+      const blocked=guard(now);
+      if(blocked)return {blocked};
+      const marker=grace(now);
+      const prior = this.db.prepare("SELECT expires_at FROM grace WHERE kind='media' AND identity=? AND submission_key=?").get(marker.mediaKey,id) as {expires_at:number}|undefined;
+      const attempt=marker.attempt;
+      const deadlines=attempt ? this.db.prepare('SELECT target, deadline FROM automation_attempts WHERE last_attempt=? AND target IN (SELECT value FROM json_each(?))').all(attempt.startedAt,json(attempt.targetKeys)) as Array<{target:string;deadline:number}> : [];
+      if(!this.transitionExecutionChild(id,owner,now,index,'sending',undefined,marker))return 'lost';
+      return {started:{mediaKey:marker.mediaKey,priorGraceUntil:prior?.expires_at,provisionalUntil:marker.graceUntil,...(attempt?{attempts:{startedAt:attempt.startedAt,deadlines}}:{})}};
+    }).immediate();
+  }
+  /** Only before calling grab; retain the hold. An orphaned sending intent is still uncertain. */
+  resetUnsentAutomationChild(id:string,owner:string,index:number,clock:()=>number,undo:AutomationSendUndo):boolean {
+    return this.db.transaction(()=>{
+      if(!this.transitionExecutionChild(id,owner,clock(),index,'prepared',undefined,undefined,true))return false;
+      if(undo.priorGraceUntil===undefined) {
+        this.db.prepare("DELETE FROM grace WHERE kind='media' AND identity=? AND submission_key=? AND expires_at=?").run(undo.mediaKey,id,undo.provisionalUntil);
+      } else {
+        this.db.prepare("UPDATE grace SET expires_at=? WHERE kind='media' AND identity=? AND submission_key=? AND expires_at=?").run(undo.priorGraceUntil,undo.mediaKey,id,Math.max(undo.priorGraceUntil,undo.provisionalUntil));
+      }
+      if(undo.attempts?.deadlines.length) {
+        const restore=this.db.prepare('UPDATE automation_attempts SET deadline=? WHERE target=? AND last_attempt=? AND deadline=?');
+        for(const {target,deadline} of undo.attempts.deadlines) restore.run(deadline,target,undo.attempts.startedAt,undo.provisionalUntil);
+      }
+      return true;
+    }).immediate();
+  }
+  updateExecutionChild(id:string,owner:string,now:number,index:number,state:ExecutionChild['state'],message?:string,grace?:AutomationGrace):boolean {
+    return this.db.transaction(()=>this.transitionExecutionChild(id,owner,now,index,state,message,grace)).immediate();
+  }
+  private transitionExecutionChild(id:string,owner:string,now:number,index:number,state:ExecutionChild['state'],message?:string,grace?:AutomationGrace,resetUnsent=false):boolean {
       const prior=this.execution(id), child=prior?.children[index];
       if(!prior||!child||prior.owner!==owner||prior.leaseUntil<=now||prior.outcome!=='running')return false;
-      const legal=(child.state==='prepared'&&['sending','not-attempted','dry-run'].includes(state))||(child.state==='sending'&&['submitted','rejected','uncertain'].includes(state));
+      const legal=resetUnsent ? child.state==='sending' && state==='prepared'
+        : (child.state==='prepared'&&['sending','not-attempted','dry-run'].includes(state))||(child.state==='sending'&&['submitted','rejected','uncertain'].includes(state));
       if(!legal||(state==='sending'&&grace?.passOwner&&!this.ownsLease('automation-pass',grace.passOwner,now)))return false;
       prior.children[index]={...child,state,...(message?{message}:{})}; prior.updatedAt=now;
       this.db.prepare('UPDATE executions SET payload_json=?,updated_at=? WHERE id=?').run(json(prior),now,id);
@@ -132,7 +188,6 @@ export class SearchStore {
         }
       }
       return true;
-    }).immediate();
   }
   finishExecution(id:string,owner:string,now:number,outcome:string,receipt:unknown):boolean { return this.db.transaction(()=>{const prior=this.execution(id); if(!prior||prior.owner!==owner||prior.leaseUntil<=now)return false; prior.outcome=outcome; prior.receipt=receipt; prior.updatedAt=now; const payload=prior.payload as Record<string,unknown>; delete payload.boundReleases; prior.payload=payload; if(typeof payload.confirmationId==='string')this.db.prepare('DELETE FROM execution_preparations WHERE id=?').run(payload.confirmationId); this.db.prepare('UPDATE executions SET outcome=?,payload_json=?,updated_at=? WHERE id=?').run(outcome,json(prior),now,id); if(typeof payload.automationMediaKey==='string')this.alignAutomationHolds(id,payload.automationMediaKey,now); return true; }).immediate(); }
   private alignAutomationHolds(executionId:string,key:string,now:number):void {
@@ -172,11 +227,10 @@ export class SearchStore {
     this.db.prepare("INSERT INTO search_events(search_id,event_json,created_at) VALUES(?,?,?)").run(input.searchId,json({type:'queued',data:{source}}),input.now);
     this.setSetting(`search-source:${input.searchId}`,source);
   }
-  claimNextSearch(owner: string, now: number, ttl: number, maxActive = 3): SearchWork | null {
+  claimNextSearch(owner: string, now: number, ttl: number): SearchWork | null {
     return this.db.transaction((): SearchWork | null => {
       this.recoverExpiredSearchWork(now);
-      const active = (this.db.prepare("SELECT COUNT(*) AS n FROM search_work WHERE owner IS NOT NULL AND lease_expires_at>?").get(now) as {n:number}).n;
-      if (active >= maxActive) return null;
+      if (this.activeForegroundSearchCount(now) >= this.savedSearchCap()) return null;
        const row = this.db.prepare("SELECT w.search_id,w.source,w.context_json,s.prompt FROM search_work w JOIN searches s ON s.id=w.search_id WHERE s.status='queued' AND w.owner IS NULL AND w.source!='automation' ORDER BY CASE w.source WHEN 'manual' THEN 0 WHEN 'acquisition' THEN 0 ELSE 1 END,w.sequence LIMIT 1").get() as {search_id:string;source:'manual'|'automation'|'arr'|'acquisition';context_json:string;prompt:string}|undefined;
       if (!row) return null;
       const changed = this.db.prepare("UPDATE searches SET status='running' WHERE id=? AND status='queued'").run(row.search_id).changes;
@@ -186,10 +240,10 @@ export class SearchStore {
       return {searchId:row.search_id,prompt:row.prompt,source:row.source,context:parse(row.context_json),owner};
   }).immediate();
   }
-  claimAutomationSearchById(searchId:string,owner:string,now:number,ttl:number,maxActive=3):SearchWork|null {
+  claimAutomationSearchById(searchId:string,owner:string,now:number,ttl:number):SearchWork|null {
     return this.db.transaction(():SearchWork|null=>{
       this.recoverExpiredSearchWork(now);
-      if((this.db.prepare("SELECT COUNT(*) AS n FROM search_work WHERE owner IS NOT NULL AND lease_expires_at>?").get(now) as {n:number}).n>=maxActive)return null;
+      if(this.activeForegroundSearchCount(now)>=this.savedSearchCap() || this.hasQueuedForeground())return null;
       const row=this.db.prepare("SELECT w.source,w.context_json,s.prompt FROM search_work w JOIN searches s ON s.id=w.search_id WHERE w.search_id=? AND w.source='automation' AND s.status='queued' AND w.owner IS NULL").get(searchId) as {source:'automation';context_json:string;prompt:string}|undefined;
       if(!row)return null;
       if(this.db.prepare("UPDATE searches SET status='running' WHERE id=? AND status='queued'").run(searchId).changes!==1)return null;
@@ -203,7 +257,11 @@ export class SearchStore {
     const row = this.db.prepare("SELECT sequence,source FROM search_work WHERE search_id=? AND owner IS NULL AND (SELECT status FROM searches WHERE id=search_id)='queued'").get(searchId) as {sequence:number;source:'manual'|'automation'|'arr'|'acquisition'}|undefined;
      return row ? (this.db.prepare("SELECT COUNT(*) AS n FROM search_work w JOIN searches s ON s.id=w.search_id WHERE s.status='queued' AND (CASE w.source WHEN 'manual' THEN 0 WHEN 'acquisition' THEN 0 ELSE 1 END < CASE ? WHEN 'manual' THEN 0 WHEN 'acquisition' THEN 0 ELSE 1 END OR (CASE w.source WHEN 'manual' THEN 0 WHEN 'acquisition' THEN 0 ELSE 1 END=CASE ? WHEN 'manual' THEN 0 WHEN 'acquisition' THEN 0 ELSE 1 END AND w.sequence<=?))").get(row.source,row.source,row.sequence) as {n:number}).n : null;
   }
-  activeSearchCount(now:number): number { return (this.db.prepare('SELECT COUNT(*) AS n FROM search_work WHERE owner IS NOT NULL AND lease_expires_at>?').get(now) as {n:number}).n; }
+  activeForegroundSearchCount(now:number): number { return (this.db.prepare("SELECT COUNT(*) AS n FROM search_work WHERE source!='automation' AND owner IS NOT NULL AND lease_expires_at>?").get(now) as {n:number}).n; }
+  private savedSearchCap():number {
+    return settingsSchema.parse(this.getSetting('application-settings') ?? defaultSettings).search.concurrentSearches;
+  }
+  hasQueuedForeground(): boolean { return !!this.db.prepare("SELECT 1 FROM search_work w JOIN searches s ON s.id=w.search_id WHERE w.source IN ('manual','acquisition') AND w.owner IS NULL AND s.status='queued' LIMIT 1").get(); }
   ownsSearch(searchId:string,owner:string,now:number):boolean { return !!this.db.prepare('SELECT 1 FROM search_work WHERE search_id=? AND owner=? AND lease_expires_at>?').get(searchId,owner,now); }
   renewSearchWork(searchId:string,owner:string,now:number,ttl:number):boolean { return this.db.prepare('UPDATE search_work SET lease_expires_at=? WHERE search_id=? AND owner=? AND lease_expires_at>?').run(now+ttl,searchId,owner,now).changes===1; }
   renewLease(resource:string,owner:string,now:number,ttl:number):boolean { return this.db.prepare('UPDATE leases SET expires_at=? WHERE resource=? AND owner=? AND expires_at>?').run(now+ttl,resource,owner,now).changes===1; }
@@ -262,6 +320,7 @@ export class SearchStore {
   hasLiveLease(resource: string, now: number): boolean { return !!this.db.prepare('SELECT 1 FROM leases WHERE resource=? AND expires_at>?').get(resource, now); }
   releaseLease(resource: string, owner: string): void { this.db.prepare('DELETE FROM leases WHERE resource=? AND owner=?').run(resource, owner); }
   expireCandidatesAt(searchId: string, expiresAt: number): void { this.db.prepare('UPDATE candidates SET expires_at=? WHERE search_id=?').run(expiresAt, searchId); }
+  expireCandidateAt(searchId:string,id:string,expiresAt:number):void { this.db.prepare('UPDATE candidates SET expires_at=MIN(expires_at,?) WHERE search_id=? AND id=?').run(expiresAt,searchId,id); }
   maintain(now: number): void {
     this.db.transaction(() => {
       this.db.prepare("DELETE FROM grace WHERE kind='media' AND expires_at<=?").run(now);
@@ -276,6 +335,15 @@ export class SearchStore {
       for(const [index,row] of oldExecutions.entries()){
         if(index<10_000&&row.created_at>=now-30*86_400_000)continue;
         if(row.idem_key===`!acquisition:${row.search_id}`)archiveOutcome.run(row.outcome,row.search_id);
+        const execution=this.execution(row.id);
+        if(execution && execution.children.some(child=>['sending','submitted','uncertain'].includes(child.state))) {
+          const context=this.searchWorkContext(row.search_id) as Record<string,unknown>|undefined;
+          if(context && this.getSetting(`search-source:${row.search_id}`)==='automation') {
+            const key=JSON.stringify([execution.planId,execution.version]);
+            const risks=Array.isArray(context.manualSendRisk)?context.manualSendRisk.filter((item):item is string=>typeof item==='string'):[];
+            if(!risks.includes(key))this.db.prepare('UPDATE search_work SET context_json=? WHERE search_id=?').run(json({...context,manualSendRisk:[...risks,key]}),row.search_id);
+          }
+        }
         archiveKey.run(row.idem_key,row.payload_hash,now+30*86_400_000);
         deleteHolds.run(row.id);
         deleteExecution.run(row.id);

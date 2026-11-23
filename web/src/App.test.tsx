@@ -20,6 +20,28 @@ afterEach(() => { cleanup(); window.history.replaceState(null, '', '/'); session
 const semanticSearch = { ...matched, searchId: 'life', plan: { version: 2, planId: 'plan-life', status: 'matched', selections: [{ candidateId: 'c1', coverage: 'Season one', reason: 'Complete release set', uncertainty: '' }], covered: ['Season one'], gaps: [], deferred: [], scopeGaps: [], extras: [], usefulOverlap: [], broadCoverage: 'complete', coverage: { covered: ['Season one'], gaps: [], deferred: [], broad: { status: 'complete', gaps: [] } } }, candidates: [{ candidateId: 'c1', observations: [{ title: 'Season One Pack' }] }] }
 const preparedConfirmation = { confirmationId: 'confirm-life', expiresAt: '2099-01-01T00:00:00Z', searchId: 'life', planId: 'plan-life', version: 2, client: { id: 8, name: 'qBittorrent', protocol: 'torrent', configuredCategories: [], defaultCategory: 'tv' }, dryRun: true, children: [{ candidateId: 'c1', title: 'Season One Pack', effectiveCategory: 'tv', categoryRouting: 'default', categoryNote: 'Client default category: tv', releaseCategoryIds: [5000] }] }
 
+it('loads search and receipt without newer AbortSignal static methods', async () => {
+  const any = AbortSignal.any, timeout = AbortSignal.timeout
+  Object.defineProperty(AbortSignal, 'any', { configurable: true, value: undefined })
+  Object.defineProperty(AbortSignal, 'timeout', { configurable: true, value: undefined })
+  try {
+    const receipt={executionId:'old-browser',searchId:'life',outcome:'running',dryRun:false,updatedAt:'2026-01-01',children:[{candidateId:'c1',outcome:'prepared'}]}
+    let reads=0
+    lifecycleFetch(url => {
+      if(url==='/api/v2/searches/life') return Response.json({...semanticSearch,receipts:[receipt]})
+      if(url==='/api/v2/executions/old-browser') { reads++; return Response.json(receipt) }
+      return Response.json({})
+    })
+    const { SearchPage } = await import('./Search')
+    render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={()=>{}} />)
+    await waitFor(()=>assert.equal(reads,1))
+    assert.ok(screen.getByText('Execution receipt'))
+  } finally {
+    Object.defineProperty(AbortSignal, 'any', { configurable: true, value: any })
+    Object.defineProperty(AbortSignal, 'timeout', { configurable: true, value: timeout })
+  }
+})
+
 function lifecycleFetch(handler: (url: string, init?: RequestInit) => Response | Promise<Response>) {
   globalThis.fetch = async (input, init) => {
     const url = String(input)
@@ -32,6 +54,125 @@ async function selectConfirmationClient(id = '8') {
   const select = await screen.findByLabelText('Prowlarr download client') as HTMLSelectElement
   if (select.value !== id) fireEvent.change(select, { target: { value: id } })
 }
+it('offers explicit confirmation for a safe failed automation receipt and reuses an expired prompt without sending', async () => {
+  let detail:any={...semanticSearch,source:'automation',manualExecutionEligible:true,receipts:[{executionId:'failed',searchId:'life',outcome:'rejected',children:[{candidateId:'c1',outcome:'rejected'}]}]}
+  let mutations=0
+  lifecycleFetch((url,init)=>{if(init?.method==='POST')mutations++;if(url==='/api/v2/searches/life')return Response.json(detail);if(url==='/api/v2/download-clients')return Response.json({items:[{id:8,name:'Client',protocol:'torrent'}]});return Response.json({})})
+  const { SearchPage } = await import('./Search')
+  const view=render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={()=>{}} />)
+  assert.ok(await screen.findByText('Execution receipt'))
+  assert.ok(await screen.findByRole('button',{name:'Choose Prowlarr client'}))
+  assert.equal(mutations,0)
+  detail={...detail,manualExecutionEligible:false,manualExecutionBlockedReason:'candidate-expired',prompt:'First line\nSecond line'}
+  view.rerender(<SearchPage settings={defaults} searchId="life" searchRevision={2} onSearchStarted={()=>{}} />)
+  fireEvent.click(await screen.findByRole('button',{name:'Reuse saved prompt'}))
+  const prompt=screen.getByLabelText('What are you looking for?') as HTMLTextAreaElement
+  assert.equal(prompt.value,'First line\nSecond line')
+  assert.equal(document.activeElement,prompt)
+  assert.equal(mutations,0)
+})
+it('blocks new automation preparation for an uncertain receipt but keeps exact-key recovery available', async () => {
+  const pending={confirmationId:'old-confirm',searchId:'life',planId:'plan-life',version:2,idempotencyKey:'old-key'}
+  sessionStorage.setItem('media-scout-execution-pending:life',JSON.stringify(pending))
+  const calls:Array<{url:string;body?:string}>=[]
+  lifecycleFetch((url,init)=>{
+    calls.push({url,body:init?.body?.toString()})
+    if(url==='/api/v2/searches/life')return Response.json({...semanticSearch,source:'automation',manualExecutionEligible:false,manualExecutionBlockedReason:'execution-send-risk',receipts:[{executionId:'uncertain',searchId:'life',outcome:'uncertain',dryRun:false,updatedAt:'2026-01-01',children:[{candidateId:'c1',outcome:'uncertain'}]}]})
+    if(url==='/api/v2/executions/commit')return Response.json({executionId:'uncertain',searchId:'life',outcome:'uncertain',dryRun:false,updatedAt:'2026-01-01',children:[{candidateId:'c1',outcome:'uncertain'}]})
+    return Response.json({})
+  })
+  const { SearchPage }=await import('./Search')
+  render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={()=>{}} />)
+  assert.ok(await screen.findByText(/may have been accepted/))
+  assert.equal(screen.queryByRole('button',{name:'Choose Prowlarr client'}),null)
+  fireEvent.click(screen.getByRole('button',{name:'Retry same confirmation'}))
+  await waitFor(()=>assert.deepEqual(JSON.parse(calls.find(call=>call.url==='/api/v2/executions/commit')!.body!),pending))
+})
+it('keeps the receipt request alive while polling for an automation pass to finish', async () => {
+  let detailReads=0, receiptReads=0, wasAborted=false, resolveReceipt!:(response:Response)=>void
+  const runningReceipt={executionId:'running-exec',searchId:'life',outcome:'running',dryRun:false,updatedAt:'2026-01-01',children:[{candidateId:'c1',outcome:'prepared'}]}
+  lifecycleFetch((url,init)=>{
+    if(url==='/api/v2/searches/life'){detailReads++;return Response.json({...semanticSearch,source:'automation',manualExecutionEligible:false,manualExecutionBlockedReason:'automation-pass-active',automationPending:true,receipts:[runningReceipt]})}
+    if(url==='/api/v2/executions/running-exec'){receiptReads++;init?.signal?.addEventListener('abort',()=>{wasAborted=true});return new Promise<Response>(resolve=>{resolveReceipt=resolve})}
+    return Response.json({})
+  })
+  const { SearchPage }=await import('./Search')
+  render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={()=>{}} />)
+  await waitFor(()=>assert.equal(receiptReads,1))
+  await waitFor(()=>assert.ok(detailReads>=2),{timeout:3000})
+  assert.equal(receiptReads,1)
+  assert.equal(wasAborted,false)
+  resolveReceipt(Response.json(runningReceipt))
+})
+it('explains queued capacity, provider cooldown and incomplete settings', async () => {
+  let detail = {searchId:'waiting',status:'queued',queuePosition:2,waitingReason:'capacity',retryAt:undefined as string | undefined}
+  lifecycleFetch(() => Response.json(detail))
+  const { SearchPage } = await import('./Search')
+  const view = render(<SearchPage settings={defaults} searchId="waiting" searchRevision={1} onSearchStarted={() => {}} />)
+  assert.ok(await screen.findByText(/Waiting for search capacity/))
+  detail = {...detail,waitingReason:'provider-cooldown',retryAt:'2099-01-01T00:00:00Z'}
+  view.rerender(<SearchPage settings={defaults} searchId="waiting" searchRevision={2} onSearchStarted={() => {}} />)
+  assert.ok(await screen.findByText(/Provider cooldown.*retry/))
+  detail = {...detail,waitingReason:'settings-incomplete',retryAt:undefined}
+  view.rerender(<SearchPage settings={defaults} searchId="waiting" searchRevision={3} onSearchStarted={() => {}} />)
+  assert.ok(await screen.findByText(/Waiting for required settings/))
+})
+it('recovers a search status GET after a transient failure without reposting the search', async () => {
+  let reads = 0, posts = 0
+  lifecycleFetch((url, init) => {
+    if (init?.method === 'POST') posts++
+    if (url === '/api/v2/searches/life') {
+      reads++
+      return reads === 1 ? new Response('', {status:503}) : Response.json(semanticSearch)
+    }
+    return Response.json({})
+  })
+  const { SearchPage } = await import('./Search')
+  render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
+  assert.ok(await screen.findByText(/temporarily unavailable/i))
+  assert.ok(await screen.findByText(/Complete release set/, {}, {timeout:5000}))
+  assert.equal(reads, 2)
+  assert.equal(posts, 0)
+})
+it('treats a missing search status as terminal', async () => {
+  let reads = 0
+  lifecycleFetch(() => { reads++; return new Response('', {status:404}) })
+  const { SearchPage } = await import('./Search')
+  render(<SearchPage settings={defaults} searchId="missing" searchRevision={1} onSearchStarted={() => {}} />)
+  assert.ok(await screen.findByText(/Search not found/))
+  assert.equal(screen.queryAllByRole('button', { name: 'Retry' }).length, 0)
+  await new Promise(resolve => setTimeout(resolve, 3200))
+  assert.equal(reads, 1)
+})
+
+it('refreshes an automation plan whose latest eligibility read sees an active execution before its receipt arrives', async () => {
+  let reads = 0
+  lifecycleFetch(url => {
+    assert.equal(url, '/api/v2/searches/life')
+    return Response.json({ ...semanticSearch, source: 'automation', ...(++reads === 1
+      ? { manualExecutionEligible: false, manualExecutionBlockedReason: 'execution-active', receipts: [] }
+      : { manualExecutionEligible: true, receipts: [] }) })
+  })
+  const { SearchPage } = await import('./Search')
+  render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => {}} />)
+  assert.ok(await screen.findByText(/An execution is still running/))
+  assert.ok(await screen.findByRole('button', { name: 'Choose Prowlarr client' }, { timeout: 3000 }))
+  assert.equal(reads, 2)
+})
+
+it('reuses an over-limit automation prompt without silently truncating its request', async () => {
+  const savedPrompt = `Find the requested episodes\n${'Season and episode notes. '.repeat(200)}`
+  lifecycleFetch(url => {
+    assert.equal(url, '/api/v2/searches/life')
+    return Response.json({ ...semanticSearch, prompt: savedPrompt, source: 'automation', manualExecutionEligible: false, manualExecutionBlockedReason: 'candidate-expired' })
+  })
+  const { SearchPage } = await import('./Search')
+  render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => assert.fail('a search must not start')} />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Reuse saved prompt' }))
+  assert.equal((screen.getByLabelText('What are you looking for?') as HTMLTextAreaElement).value, savedPrompt)
+  assert.ok(screen.getByText(/Shorten it before starting a new search/))
+  assert.ok((screen.getByRole('button', { name: 'Search releases' }) as HTMLButtonElement).disabled)
+})
 
 it('prepares and commits the complete semantic v2 release set and shows its receipt', async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = []
@@ -444,6 +585,26 @@ it('shows a queued search and lets another request be submitted', async () => {
   assert.equal(posts, 2)
 })
 
+it('preserves an existing search when acceptance of a new search is unknown', async () => {
+  let posts = 0
+  let reads = 0
+  lifecycleFetch((url, init) => {
+    if (url === '/api/v2/searches/life') return Response.json(++reads === 1 ? { ...semanticSearch, status: 'running', plan: undefined } : semanticSearch)
+    if (url === '/api/v2/searches' && init?.method === 'POST') { posts++; throw new TypeError('Failed to fetch') }
+    throw new Error(`Unexpected request: ${url}`)
+  })
+  const { SearchPage } = await import('./Search')
+  render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={() => assert.fail('a new search was not confirmed')} />)
+  await screen.findByText(/Checking indexers/)
+  fireEvent.change(screen.getByLabelText('What are you looking for?'), { target: { value: 'Another search' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
+  const notice = await screen.findByRole('alert')
+  assert.match(notice.textContent ?? '', /could not confirm.*check Activity/i)
+  assert.equal(within(notice).queryByRole('button'), null)
+  assert.ok(await screen.findByRole('heading', { name: 'Search plan' }, { timeout: 3000 }))
+  assert.equal(posts, 1)
+})
+
 it('opens saved search details from Activity after navigating to Search', async () => {
   window.history.replaceState(null, '', '/#activity')
   globalThis.fetch = async input => {
@@ -605,11 +766,11 @@ it('reloads an explicitly reopened history result when its ID is already selecte
   fireEvent.change(await screen.findByLabelText('What are you looking for?'), { target: { value: 'Manual request' } })
   fireEvent.click(screen.getByRole('button', { name: 'Search releases' }))
   await screen.findByRole('alert')
-  assert.equal(screen.queryByText('History A evidence'), null)
+  assert.ok(screen.queryByText('History A evidence'))
   fireEvent.click(document.querySelector('a[href="#activity"]')!); fireEvent(window, new dom.window.Event('hashchange'))
   fireEvent.click(await screen.findByRole('button', { name: 'View search details' }))
   assert.ok(await screen.findByText('History A evidence'))
-  assert.equal(historyReads, 2)
+  await waitFor(() => assert.equal(historyReads, 2))
 })
 
 it('filters Activity by media and inclusive local dates and offers every submission outcome', async () => {

@@ -14,11 +14,12 @@ import { releaseSchema } from '../src/types/prowlarr';
 import { physicalRelease } from '../src/search/release-observation';
 import { Http } from '../src/http';
 import { ProwlarrClient } from '../src/clients/prowlarr';
+import Database from 'better-sqlite3';
 
 const cleanups:Array<()=>Promise<void>>=[];
 afterEach(async()=>{for(const close of cleanups.splice(0))await close();});
 
-async function fixture(postMode:'accept'|'reject'|'timeout'|'hang'|'second-reject'|'delay-first'='accept',dryRun=false,disableGrab=false,options:{databasePath?:string;httpTimeoutMs?:number}={}) {
+async function fixture(postMode:'accept'|'reject'|'timeout'|'hang'|'second-reject'|'delay-first'|'cache-miss'|'generic-404'|'second-cache-miss'='accept',dryRun=false,disableGrab=false,options:{databasePath?:string;httpTimeoutMs?:number;automation?:boolean}={}) {
   const posts:Array<unknown>=[];
   let clientName='TV client',defaultCategory='tv',categoryMappings:Array<{clientCategory:string;categories:number[]}>=[{clientCategory:'tv',categories:[5000]},{clientCategory:'anime',categories:[5010]}];
   let currentTime=Date.now(), releaseDelayedPost:(()=>void)|undefined, signalPost!:()=>void;
@@ -39,7 +40,7 @@ async function fixture(postMode:'accept'|'reject'|'timeout'|'hang'|'second-rejec
     if(req.method==='GET'&&req.url==='/api/v1/indexerstatus'){res.writeHead(200,{'content-type':'application/json'});res.end('[]');return;}
     if(req.method==='GET'&&req.url?.startsWith('/api/v1/search?')){res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify([releaseSchema.parse({guid:'research-guid',indexerId:5,indexer:'Indexer',title:'Research result',publishDate:'2026-01-01T00:00:00Z',protocol:'torrent',downloadUrl:'https://private.invalid/research'})]));return;}
     if(req.method==='POST'&&req.url==='/api/v1/search') {
-      let body='';req.on('data',part=>body+=part);req.on('end',()=>{posts.push(JSON.parse(body));signalPost();if(postMode==='timeout'){res.destroy();return;}if(postMode==='hang'){res.writeHead(202,{'content-type':'application/json'});return;}const finish=()=>{const reject=postMode==='reject'||(postMode==='second-reject'&&posts.length===2);res.writeHead(reject?400:200,{'content-type':'application/json'});res.end('{}');};if(postMode==='delay-first'&&posts.length===1)releaseDelayedPost=finish;else finish();});return;
+      let body='';req.on('data',part=>body+=part);req.on('end',()=>{posts.push(JSON.parse(body));signalPost();if(postMode==='timeout'){res.destroy();return;}if(postMode==='hang'){res.writeHead(202,{'content-type':'application/json'});return;}const finish=()=>{const miss=postMode==='cache-miss'||(postMode==='second-cache-miss'&&posts.length===2);const reject=postMode==='reject'||(postMode==='second-reject'&&posts.length===2);res.writeHead(miss||postMode==='generic-404'?404:reject?400:200,{'content-type':'application/json'});res.end(JSON.stringify(miss?{message:"Couldn't find requested release in cache, try searching again",description:'private source'}:postMode==='generic-404'?{message:'Not found'}:{}));};if(postMode==='delay-first'&&posts.length===1)releaseDelayedPost=finish;else finish();});return;
     }
     res.writeHead(404);res.end();
   });
@@ -52,8 +53,15 @@ async function fixture(postMode:'accept'|'reject'|'timeout'|'hang'|'second-rejec
   cleanups.push(async()=>{await app.close();await runtime.close();await new Promise<void>(resolve=>upstream.close(()=>resolve()));});
   const searchId='search-one',candidateIds=['candidate-a','candidate-b'];
   const plan={version:2,planId:'plan-one',status:'matched',selections:candidateIds.map(candidateId=>({candidateId,coverage:'Observed release',reason:'Useful observed pack',uncertainty:''})),covered:['Observed release'],gaps:[],deferred:[],broadCoverage:'complete',scopeGaps:[],coverage:{covered:['Observed release'],gaps:[],deferred:[],broad:{status:'complete',gaps:[]}}};
-  runtime.store.createSearch({searchId,prompt:JSON.stringify({request:{prompt:'Find a release',kind:'movie'}}),status:'matched',createdAt:Date.now(),result:{version:1,status:'matched',plan,counts:{decisions:1,searches:1,candidates:2}}});
-  runtime.store.setSetting(`search-source:${searchId}`,'manual');
+  const result={version:1,status:'matched',plan,counts:{decisions:1,searches:1,candidates:2}};
+  if(options.automation){
+    runtime.store.enqueueSearch({searchId,prompt:JSON.stringify({version:3,prompt:'Find a release'}),now:currentTime,source:'automation',context:{passOwner:'fixture-pass'}});
+    expect(runtime.store.claimAutomationSearchById(searchId,'fixture-worker',currentTime,900_000)).not.toBeNull();
+    expect(runtime.store.finishOwnedSearch(searchId,'fixture-worker','matched',result,currentTime)).toBe(true);
+  } else {
+    runtime.store.createSearch({searchId,prompt:JSON.stringify({request:{prompt:'Find a release',kind:'movie'}}),status:'matched',createdAt:Date.now(),result});
+    runtime.store.setSetting(`search-source:${searchId}`,'manual');
+  }
   const source=createHash('sha256').update(`prowlarr\0${url}\0private-key`).digest('hex');
   candidateIds.forEach((candidateId,index)=>{
     const release=releaseSchema.parse({guid:`guid-${index}`,indexerId:5,indexer:'Indexer',title:`Title ${index} guid-${index}`,publishDate:'2026-01-01T00:00:00Z',protocol:'torrent',downloadUrl:`https://private.invalid/${index}`,size:1000,age:0,categories:[{id:index===0?5000:5999,name:index===0?'TV':'Anime'}]});
@@ -63,6 +71,192 @@ async function fixture(postMode:'accept'|'reject'|'timeout'|'hang'|'second-rejec
 }
 
 describe('execution API through real Prowlarr HTTP adapter',()=>{
+  it.each(['cache-miss','generic-404','second-cache-miss'] as const)('persists %s with appropriate automation recovery',async mode=>{
+    const f=await fixture(mode,false,false,{automation:true});
+    const input={searchId:f.searchId,planId:'plan-one',version:2,candidateIds:f.candidateIds,downloadClientId:7};
+    const confirmation=await f.runtime.prepareExecution(input);
+    const request={confirmationId:confirmation.confirmationId,searchId:f.searchId,planId:'plan-one',version:2,idempotencyKey:`cache-test-${mode}`};
+    const receipt=await f.runtime.commitExecution(request);
+    expect(receipt.outcome).toBe(mode==='second-cache-miss'?'partial':'rejected');
+    expect(await f.runtime.commitExecution(request)).toEqual(receipt);
+    expect(f.posts).toHaveLength(mode==='second-cache-miss'?2:1);
+    const detail=await f.runtime.getSearch(f.searchId);
+    expect(detail?.manualExecutionBlockedReason).toBe(mode==='cache-miss'?'candidate-expired':mode==='second-cache-miss'?'execution-send-risk':undefined);
+    expect(f.runtime.store.getCandidate(f.searchId,mode==='second-cache-miss'?'candidate-b':'candidate-a',f.now())===null).toBe(mode!=='generic-404');
+    expect(JSON.stringify(detail)).not.toContain('private source');
+  });
+  it('leaves the ordinary manual-search rejection flow unchanged on a Prowlarr cache miss',async()=>{
+    const f=await fixture('cache-miss');
+    const input={searchId:f.searchId,planId:'plan-one',version:2,candidateIds:f.candidateIds,downloadClientId:7};
+    const confirmation=await f.runtime.prepareExecution(input);
+    const request={confirmationId:confirmation.confirmationId,searchId:f.searchId,planId:'plan-one',version:2,idempotencyKey:'manual-cache-miss'};
+    const receipt=await f.runtime.commitExecution(request);
+    expect(receipt).toMatchObject({outcome:'rejected',children:[{outcome:'rejected',message:'Prowlarr rejected the submission'},{outcome:'not-attempted'}]});
+    expect(await f.runtime.commitExecution(request)).toEqual(receipt);
+    expect(f.posts).toHaveLength(1);
+    expect(f.runtime.store.getCandidate(f.searchId,f.candidateIds[0]!,f.now())).not.toBeNull();
+  });
+  it('samples automation freshness after acquiring the SQLite write lock and does not mark stale work sending',()=>{
+    const directory=mkdtempSync(join(tmpdir(),'automation-send-lock-')),path=join(directory,'state.sqlite');
+    const store=openSearchStore(path),other=new Database(path);
+    other.pragma('busy_timeout = 0');
+    try {
+      expect(store.createExecution({id:'e',key:'key',hash:'hash',searchId:'s',planId:'p',version:2,payload:{},children:[{candidateId:'c',physicalKey:'physical',state:'prepared'}],owner:'owner',now:1,leaseUntil:100})).toBe('created');
+      let lockObserved=false;
+      const result=store.beginAutomationSend('e','owner',0,()=>{
+        try { other.prepare("INSERT INTO settings(key,value_json) VALUES('probe','1')").run(); }
+        catch(error){lockObserved=(error as {code?:string}).code==='SQLITE_BUSY';}
+        return 17;
+      },16,()=>undefined,()=>({mediaKey:'m',graceUntil:100}));
+      expect(lockObserved).toBe(true);
+      expect(result).toBe('stale');
+      expect(store.execution('e')?.children[0]?.state).toBe('prepared');
+    } finally {other.close();store.close();rmSync(directory,{recursive:true,force:true});}
+  });
+  it.each(['client','candidate'] as const)('replays the winning public same-key commit when %s changes during a competing validation',async change=>{
+    const f=await fixture();
+    const confirmation=await f.runtime.prepareExecution({searchId:f.searchId,planId:'plan-one',version:2,candidateIds:f.candidateIds,downloadClientId:7});
+    const body={confirmationId:confirmation.confirmationId,searchId:f.searchId,planId:'plan-one',version:2,idempotencyKey:`same-key-${change}`};
+    const held=f.holdNextClientList();
+    const slow=f.app.inject({method:'POST',url:'/api/v2/executions/commit',payload:body});
+    const release=await held;
+    const winner=await f.app.inject({method:'POST',url:'/api/v2/executions/commit',payload:body});
+    expect(winner.statusCode).toBe(200);
+    if(change==='client')f.setClientName('Changed client');
+    else f.runtime.store.expireCandidatesAt(f.searchId,f.now());
+    release();
+    const replay=await slow;
+    expect(replay.statusCode).toBe(200);
+    expect(replay.json()).toEqual(winner.json());
+    expect(f.posts).toHaveLength(2);
+  });
+  it('returns conflict, not a competing receipt, when the same key wins with different confirmation',async()=>{
+    const f=await fixture();
+    const input={searchId:f.searchId,planId:'plan-one',version:2,candidateIds:f.candidateIds,downloadClientId:7};
+    const first=await f.runtime.prepareExecution(input),second=await f.runtime.prepareExecution(input);
+    const body=(confirmationId:string)=>({confirmationId,searchId:f.searchId,planId:'plan-one',version:2,idempotencyKey:'same-key-other-confirm'});
+    const held=f.holdNextClientList();
+    const slow=f.app.inject({method:'POST',url:'/api/v2/executions/commit',payload:body(first.confirmationId)});
+    const release=await held;
+    expect((await f.app.inject({method:'POST',url:'/api/v2/executions/commit',payload:body(second.confirmationId)})).statusCode).toBe(200);
+    f.setClientName('Changed client');release();
+    const result=await slow;
+    expect(result.statusCode).toBe(409);
+    expect(result.json().code).toBe('idempotency-conflict');
+    expect(f.posts).toHaveLength(2);
+  });
+  it('does not expose an automatic execution through public exact-key replay',async()=>{
+    const f=await fixture();
+    const body={confirmationId:'auto-confirm',searchId:f.searchId,planId:'plan-one',version:2,idempotencyKey:'automation:private'};
+    const hash=createHash('sha256').update(JSON.stringify({confirmationId:body.confirmationId,searchId:body.searchId,planId:body.planId,version:body.version})).digest('hex');
+    expect(f.runtime.store.createExecution({id:'automatic-execution',key:body.idempotencyKey,hash,searchId:body.searchId,planId:body.planId,version:body.version,payload:{automationMediaKey:'private',dryRun:false},children:[{candidateId:'candidate-a',physicalKey:'auto-private',state:'prepared'}],owner:'auto-owner',now:f.now(),leaseUntil:f.now()+30_000})).toBe('created');
+    const response=await f.app.inject({method:'POST',url:'/api/v2/executions/commit',payload:body});
+    expect(response.statusCode).toBe(409);
+    expect(response.body).not.toContain('automatic-execution');
+    expect(f.posts).toHaveLength(0);
+  });
+  it('permits explicit manual confirmation of a finished automation plan but not while its pass is active',async()=>{
+    const f=await fixture('reject',false,false,{automation:true});
+    const input={searchId:f.searchId,planId:'plan-one',version:2,candidateIds:f.candidateIds,downloadClientId:7};
+    expect(f.runtime.store.acquireLease('automation-pass','fixture-pass',f.now(),100_000)).toBe(true);
+    expect(await f.runtime.getSearch(f.searchId)).toMatchObject({manualExecutionEligible:false,manualExecutionBlockedReason:'automation-pass-active',automationPending:true});
+    await expect(f.runtime.prepareExecution(input)).rejects.toThrow('automation-pass-active');
+    expect(f.posts).toHaveLength(0);
+    f.runtime.store.releaseLease('automation-pass','fixture-pass');
+    const confirmation=await f.runtime.prepareExecution(input);
+    expect(f.posts).toHaveLength(0);
+    const body={confirmationId:confirmation.confirmationId,searchId:f.searchId,planId:'plan-one',version:2,idempotencyKey:'retry-automation-one'};
+    expect(await f.runtime.commitExecution(body)).toMatchObject({outcome:'rejected'});
+    expect(f.posts).toHaveLength(1);
+    expect(await f.runtime.prepareExecution(input)).toMatchObject({searchId:f.searchId});
+    expect(await f.runtime.getSearch(f.searchId)).toMatchObject({manualExecutionEligible:true});
+    expect(f.runtime.store.acquireLease('automation-pass','fixture-pass',f.now(),100_000)).toBe(true);
+    expect(await f.runtime.getSearch(f.searchId)).toMatchObject({manualExecutionEligible:false,manualExecutionBlockedReason:'automation-pass-active',automationPending:true,receipts:[{outcome:'rejected'}]});
+  });
+  it.each(['accept','timeout'] as const)('blocks a fresh automation-plan attempt after %s even when physical holds expire, but replays the same key',async mode=>{
+    const f=await fixture(mode,false,false,{automation:true});
+    const input={searchId:f.searchId,planId:'plan-one',version:2,candidateIds:f.candidateIds,downloadClientId:7};
+    const confirmation=await f.runtime.prepareExecution(input);
+    const body={confirmationId:confirmation.confirmationId,searchId:f.searchId,planId:'plan-one',version:2,idempotencyKey:`automation-${mode}`};
+    const receipt=await f.runtime.commitExecution(body);
+    expect(receipt.outcome).toBe(mode==='accept'?'submitted':'uncertain');
+    expect(await f.runtime.getSearch(f.searchId)).toMatchObject({manualExecutionEligible:false,manualExecutionBlockedReason:'execution-send-risk'});
+    for(const id of f.candidateIds){const candidate=f.runtime.store.getCandidate(f.searchId,id,f.now())!;f.runtime.store.updateCandidate({...candidate,searchId:f.searchId,candidateId:id,expiresAt:f.now()+7_200_000});}
+    f.advance(3_700_000);
+    await expect(f.runtime.prepareExecution(input)).rejects.toThrow('execution-send-risk');
+    expect(await f.runtime.commitExecution(body)).toEqual(receipt);
+    expect(f.posts).toHaveLength(mode==='accept'?2:1);
+  });
+  it('blocks retry for an automation plan with an accepted child and rejected tail',async()=>{
+    const f=await fixture('second-reject',false,false,{automation:true});
+    const input={searchId:f.searchId,planId:'plan-one',version:2,candidateIds:f.candidateIds,downloadClientId:7};
+    const c=await f.runtime.prepareExecution(input);
+    expect(await f.runtime.commitExecution({confirmationId:c.confirmationId,searchId:f.searchId,planId:'plan-one',version:2,idempotencyKey:'automation-partial'})).toMatchObject({outcome:'partial',children:[{outcome:'submitted'},{outcome:'rejected'}]});
+    await expect(f.runtime.prepareExecution(input)).rejects.toThrow('execution-send-risk');
+    expect(f.posts).toHaveLength(2);
+  });
+  it('enforces expiry, source, and dry-run fences for manual authority over automation',async()=>{
+    const f=await fixture('accept',true,false,{automation:true});
+    const input={searchId:f.searchId,planId:'plan-one',version:2,candidateIds:f.candidateIds,downloadClientId:7};
+    const dry=await f.runtime.prepareExecution(input);
+    expect(dry.dryRun).toBe(true);
+    expect((await f.runtime.commitExecution({confirmationId:dry.confirmationId,searchId:f.searchId,planId:'plan-one',version:2,idempotencyKey:'automation-dry'})).outcome).toBe('dry-run');
+    expect(f.posts).toHaveLength(0);
+    const stale=await f.runtime.prepareExecution(input);
+    f.runtime.saveSettings({...f.runtime.getSettings(),safety:{dryRun:false}});
+    await expect(f.runtime.commitExecution({confirmationId:stale.confirmationId,searchId:f.searchId,planId:'plan-one',version:2,idempotencyKey:'automation-safety'})).rejects.toThrow('safety-changed');
+    const settings=f.runtime.getSettings();
+    f.runtime.saveSettings({...settings,integrations:{...settings.integrations,prowlarr:{...settings.integrations.prowlarr,url:'http://127.0.0.1:1'}}});
+    await expect(f.runtime.prepareExecution(input)).rejects.toThrow('source-changed');
+    f.runtime.store.expireCandidatesAt(f.searchId,f.now());
+    expect(await f.runtime.getSearch(f.searchId)).toMatchObject({manualExecutionEligible:false,manualExecutionBlockedReason:'candidate-expired'});
+    expect(f.posts).toHaveLength(0);
+  });
+  it('serializes two separately prepared automation retries at the execution journal boundary',async()=>{
+    const f=await fixture('delay-first',false,false,{automation:true});
+    const input={searchId:f.searchId,planId:'plan-one',version:2,candidateIds:f.candidateIds,downloadClientId:7};
+    const a=await f.runtime.prepareExecution(input),b=await f.runtime.prepareExecution(input);
+    const request=(confirmationId:string,idempotencyKey:string)=>({confirmationId,searchId:f.searchId,planId:'plan-one',version:2,idempotencyKey});
+    const first=f.runtime.commitExecution(request(a.confirmationId,'auto-concurrent-a'));
+    await f.postSeen;
+    await expect(f.runtime.commitExecution(request(b.confirmationId,'auto-concurrent-b'))).rejects.toThrow('execution-active');
+    expect(f.posts).toHaveLength(1);
+    f.releaseDelayedPost();
+    expect((await first).outcome).toBe('submitted');
+    await expect(f.runtime.commitExecution(request(b.confirmationId,'auto-concurrent-b'))).rejects.toThrow('execution-send-risk');
+    expect(f.posts).toHaveLength(2);
+  });
+  it('rechecks plan send risk transactionally after a competing commit wins during client discovery',async()=>{
+    const f=await fixture('accept',false,false,{automation:true});
+    const input={searchId:f.searchId,planId:'plan-one',version:2,candidateIds:f.candidateIds,downloadClientId:7};
+    const a=await f.runtime.prepareExecution(input),b=await f.runtime.prepareExecution(input);
+    const request=(confirmationId:string,idempotencyKey:string)=>({confirmationId,searchId:f.searchId,planId:'plan-one',version:2,idempotencyKey});
+    const held=f.holdNextClientList();
+    const later=f.runtime.commitExecution(request(b.confirmationId,'auto-race-later'));
+    const release=await held;
+    expect((await f.runtime.commitExecution(request(a.confirmationId,'auto-race-first'))).outcome).toBe('submitted');
+    release();
+    await expect(later).rejects.toThrow('execution-send-risk');
+    expect(f.posts).toHaveLength(2);
+  });
+  it('retains automation send risk when receipt-cap maintenance prunes the journal',async()=>{
+    const directory=mkdtempSync(join(tmpdir(),'automation-risk-')),path=join(directory,'state.sqlite');
+    const f=await fixture('accept',false,false,{automation:true,databasePath:path});
+    cleanups.push(async()=>rmSync(directory,{recursive:true,force:true}));
+    const input={searchId:f.searchId,planId:'plan-one',version:2,candidateIds:f.candidateIds,downloadClientId:7};
+    const c=await f.runtime.prepareExecution(input);
+    const receipt=await f.runtime.commitExecution({confirmationId:c.confirmationId,searchId:f.searchId,planId:'plan-one',version:2,idempotencyKey:'archive-automation-risk'});
+    expect(receipt.outcome).toBe('submitted');
+    const db=new Database(path);
+    db.prepare(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<10000)
+      INSERT INTO executions SELECT 'fixture-'||i,'fixture-key-'||i,'hash','other','submitted','owner',100,'[]','{}',?,? FROM n`).run(f.now()+1,f.now()+1);
+    db.close();
+    f.runtime.store.maintain(f.now());
+    expect(f.runtime.store.execution(receipt.executionId)).toBeNull();
+    expect(f.runtime.store.automationManualBlock(f.searchId,'plan-one',2,f.now())).toBe('execution-send-risk');
+    await expect(f.runtime.prepareExecution(input)).rejects.toThrow('execution-send-risk');
+    expect(f.posts).toHaveLength(2);
+  });
   it('confirms a whole set, routes explicit client ID, records durable receipt, and idempotently replays',async()=>{
     const f=await fixture('accept');const confirmation=await f.runtime.prepareExecution({searchId:f.searchId,planId:'plan-one',version:2,candidateIds:[...f.candidateIds].reverse(),downloadClientId:7});
     expect(confirmation).toMatchObject({client:{id:7,protocol:'torrent',configuredCategories:[{clientCategory:'tv',categories:[5000]},{clientCategory:'anime',categories:[5010]}]},dryRun:false,children:[{candidateId:'candidate-a',effectiveCategory:'tv',categoryRouting:'direct'},{candidateId:'candidate-b',effectiveCategory:null,categoryRouting:'configured-mapping',categoryNote:'Prowlarr configured mapping may apply parent-category fallback; final category is unknown.'}]});

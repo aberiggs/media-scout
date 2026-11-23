@@ -7,6 +7,12 @@ describe('search-first settings', () => {
     expect(settingsSchema.parse(defaultSettings)).toMatchObject({ version: 5, safety: { dryRun: true }, monitoring: { enabled: false, allowDownloads: false, searchRetryMinutes: 30 }, search: { maxDecisions: 100, maxSearches: 100, deadlineMinutes: 30 } });
     expect(defaultSettings.ai.model).toBe('openai/gpt-6.1-sol');
   });
+  it('defaults missing v5 concurrency without losing settings and validates the saved bound', () => {
+    const saved = { ...defaultSettings, ai: { ...defaultSettings.ai, model: 'saved-model' }, search: { maxDecisions: 20, maxSearches: 12, deadlineMinutes: 10 } };
+    expect(settingsSchema.parse(saved)).toMatchObject({ai:{model:'saved-model'},search:{...saved.search,concurrentSearches:3}});
+    for (const concurrentSearches of [0, 11, 1.5]) expect(settingsSchema.safeParse({...saved,search:{...saved.search,concurrentSearches}}).success).toBe(false);
+    expect(settingsSchema.parse({...saved,search:{...saved.search,concurrentSearches:10}}).search.concurrentSearches).toBe(10);
+  });
   it('only accepts explicit numeric client IDs or no selection', () => {
     const settings = structuredClone(defaultSettings);
     const withId = (tvClientId: unknown) => ({ ...settings, integrations: { ...settings.integrations, prowlarr: { ...settings.integrations.prowlarr, tvClientId } } });
@@ -47,12 +53,12 @@ describe('search-first settings', () => {
     expect(settingsSchema.safeParse({ ...defaultSettings, version: 1 }).success).toBe(false);
     expect(settingsSchema.safeParse({ ...defaultSettings, search: { ...defaultSettings.search, maxSearches: 999 } }).success).toBe(false);
     expect(settingsSchema.safeParse({ ...defaultSettings, search: { ...defaultSettings.search, maxDecisions: 101 } }).success).toBe(false);
-    expect(settingsSchema.parse({ ...defaultSettings, search: { maxDecisions: 100, maxSearches: 100, deadlineMinutes: 30 } }).search).toEqual({ maxDecisions: 100, maxSearches: 100, deadlineMinutes: 30 });
+    expect(settingsSchema.parse({ ...defaultSettings, search: { maxDecisions: 100, maxSearches: 100, deadlineMinutes: 30 } }).search).toEqual({ maxDecisions: 100, maxSearches: 100, deadlineMinutes: 30, concurrentSearches: 3 });
     expect(settingsSchema.safeParse({ ...defaultSettings, ai: { ...defaultSettings.ai, baseUrl: 'https://user:password@example.test' } }).success).toBe(false);
   });
   it('round-trips existing lower search budgets without rewriting them', () => {
     const existing = { ...defaultSettings, search: { maxDecisions: 20, maxSearches: 12, deadlineMinutes: 10 } };
-    expect(settingsSchema.parse(existing)).toEqual(existing);
+    expect(settingsSchema.parse(existing)).toEqual({...existing,search:{...existing.search,concurrentSearches:3}});
   });
   it('saves larger accepted budgets and reads them back without mutating existing saved values', async () => {
     const store = openSearchStore(':memory:');
@@ -60,10 +66,10 @@ describe('search-first settings', () => {
     try {
       const larger = { ...defaultSettings, search: { maxDecisions: 100, maxSearches: 100, deadlineMinutes: 30 } };
       expect(runtime.saveSettings(larger)).toMatchObject({ ok: true, settings: { search: larger.search } });
-      expect(runtime.getSettings().search).toEqual(larger.search);
+      expect(runtime.getSettings().search).toEqual({...larger.search,concurrentSearches:3});
       const old = { ...defaultSettings, search: { maxDecisions: 20, maxSearches: 12, deadlineMinutes: 10 } };
       store.setSetting('application-settings', old);
-      expect(runtime.getSettings().search).toEqual(old.search);
+      expect(runtime.getSettings().search).toEqual({...old.search,concurrentSearches:3});
       expect(store.getSetting('application-settings')).toEqual(old);
     } finally { await runtime.close(); }
   });

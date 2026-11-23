@@ -11,7 +11,7 @@ const stores: ReturnType<typeof openSearchStore>[] = [];
 afterEach(() => { for (const store of stores.splice(0)) store.close(); });
 function setup() {
   const store = openSearchStore(':memory:'); stores.push(store);
-  const settings = { ...defaultSettings, integrations: { ...defaultSettings.integrations, prowlarr: { ...defaultSettings.integrations.prowlarr, url: 'http://localhost:9696', apiKey: 'private' } }, ai: { apiKey: 'private-ai', model: 'test/model', baseUrl: 'https://example.test/v1', preferences: '' }, search: { maxDecisions: 20, maxSearches: 12, deadlineMinutes: 10 } } satisfies Settings;
+  const settings = { ...defaultSettings, integrations: { ...defaultSettings.integrations, prowlarr: { ...defaultSettings.integrations.prowlarr, url: 'http://localhost:9696', apiKey: 'private' } }, ai: { apiKey: 'private-ai', model: 'test/model', baseUrl: 'https://example.test/v1', preferences: '' }, search: { maxDecisions: 20, maxSearches: 12, deadlineMinutes: 10, concurrentSearches: 3 } } satisfies Settings;
   let indexerReads = 0;
   let now = 1_800_000_000_000;
   const runtime = new SearchRuntime({ store, now: () => now, clients: () => ({ prowlarr: { getIndexers: async () => { indexerReads++; return [{ id: 1, name: 'Test', enable: true }]; }, getIndexerStatuses: async () => [], search: async () => [], getDownloadClients: async () => [{ id: 7, name: 'TV', enable: true, protocol: 'torrent', supportsCategories: false, categories: [] }], grab: async () => {} } }), initialSettings: settings });

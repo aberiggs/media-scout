@@ -41,6 +41,35 @@ describe('search store persistence and ownership', () => {
     expect(store.ownsLease('target:t1', 'owner-b', 110)).toBe(true);
     store.close();
   });
+  it('excludes a running scheduled search from foreground capacity and yields scheduled claims to queued foreground work across connections', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'search-capacity-')), path = join(directory, 'state.sqlite');
+    const first = openSearchStore(path), second = openSearchStore(path);
+    try {
+      first.setSetting('application-settings', {...defaultSettings,search:{...defaultSettings.search,concurrentSearches:1}});
+      first.enqueueSearch({searchId:'auto-1',prompt:'scheduled',now:1,source:'automation'});
+      expect(first.claimAutomationSearchById('auto-1','auto-owner',2,100)?.searchId).toBe('auto-1');
+      first.enqueueSearch({searchId:'manual',prompt:'manual',now:3});
+      first.enqueueSearch({searchId:'auto-2',prompt:'scheduled',now:4,source:'automation'});
+      expect(second.claimAutomationSearchById('auto-2','auto-owner-2',5,100)).toBeNull();
+      expect(second.claimNextSearch('manual-owner',5,100)?.searchId).toBe('manual');
+      first.enqueueSearch({searchId:'next',prompt:'next',now:6});
+      expect(first.claimNextSearch('next-owner',6,100)).toBeNull();
+      expect(first.claimAutomationSearchById('auto-2','auto-owner-2',6,100)).toBeNull();
+    } finally { first.close(); second.close(); rmSync(directory,{recursive:true,force:true}); }
+  });
+  it('uses the current saved cap for claims across independent connections', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'search-cap-setting-')), path = join(directory, 'state.sqlite');
+    const first = openSearchStore(path), second = openSearchStore(path);
+    try {
+      first.setSetting('application-settings', {...defaultSettings,search:{...defaultSettings.search,concurrentSearches:1}});
+      first.enqueueSearch({searchId:'one',prompt:'one',now:1});
+      first.enqueueSearch({searchId:'two',prompt:'two',now:2});
+      expect(first.claimNextSearch('one-owner',3,100)?.searchId).toBe('one');
+      expect(second.claimNextSearch('two-owner',3,100)).toBeNull();
+      first.setSetting('application-settings', {...defaultSettings,search:{...defaultSettings.search,concurrentSearches:2}});
+      expect(second.claimNextSearch('two-owner',4,100)?.searchId).toBe('two');
+    } finally { first.close(); second.close(); rmSync(directory,{recursive:true,force:true}); }
+  });
   it('persists acquisition idempotency and interleaves acquisition FIFO with manual work',()=>{
     const directory=mkdtempSync(join(tmpdir(),'acquisition-queue-')),path=join(directory,'state.sqlite');
     let store=openSearchStore(path);
@@ -57,7 +86,7 @@ describe('search store persistence and ownership', () => {
     expect(store.claimNextSearch('owner-1',10,100)?.searchId).toBe('manual-1');
     expect(store.claimNextSearch('owner-2',10,100)?.searchId).toBe(first.searchId);
     expect(store.claimNextSearch('owner-3',10,100)?.searchId).toBe('manual-2');
-    expect(store.activeSearchCount(10)).toBe(3);
+    expect(store.activeForegroundSearchCount(10)).toBe(3);
     expect(store.claimNextSearch('owner-4',10,100)).toBeNull();
     store.finishOwnedSearch('manual-1','owner-1','failed',{},11);
     expect(store.claimNextSearch('owner-4',12,100)?.searchId).toBe(second.searchId);

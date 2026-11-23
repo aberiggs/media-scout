@@ -1,13 +1,34 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ArrObserver } from '../src/search/arr';
-import type { SonarrClient } from '../src/clients/sonarr';
 import type { RadarrClient } from '../src/clients/radarr';
+import { SonarrClient } from '../src/clients/sonarr';
+import { ApiError, Http } from '../src/http';
+import { createServer } from 'node:http';
 
 const series = { id: 1, tvdbId: 10, title: 'Show', titleSlug: 'show', seriesType: 'standard' as const, monitored: true, seasons: [], alternateTitles: [], overview: 'overview', originalLanguage: { id: 1, name: 'English' } };
 const episodes = [1,2].map(id => ({ id, seriesId: 1, seasonNumber: 1, episodeNumber: id, absoluteEpisodeNumber: null, title: `E${id}`, airDate: '2020-01-01', airDateUtc: null, finaleType: null, monitored: true, hasFile: false }));
 const sources = { radarr: { id: 'r', url: 'http://r', apiKey: 'k' } };
 
 describe('ArrObserver', () => {
+  it('keeps scheduled observation sanitized but exposes typed focused HTTP failures and records Arr cooldown', async () => {
+    let status = 503, calls = 0, retry = 0;
+    const server = createServer((_request,response) => { calls++; response.writeHead(status, status===429?{'retry-after':'37'}:{}); response.end('private upstream body'); });
+    await new Promise<void>(resolve=>server.listen(0,'127.0.0.1',resolve));
+    const address=server.address(); if(!address || typeof address==='string') throw new Error('fixture listener unavailable');
+    const url=`http://127.0.0.1:${address.port}`;
+    const observer=new ArrObserver({sonarr:new SonarrClient(new Http({baseUrl:url,apiKey:'fixture'})),source:{sonarr:{id:'s',url,apiKey:'fixture'}},onRetryAfter:(_provider,seconds)=>{retry=seconds;}});
+    try {
+      const scheduled=await observer.observe();
+      expect(scheduled.sonarr).toMatchObject({known:false,error:'source-unavailable'});
+      expect(JSON.stringify(scheduled)).not.toContain('private upstream');
+      await expect(observer.observeMedia('sonarr',1)).rejects.toMatchObject({status:503});
+      await expect(observer.queueStillClear('sonarr',1,[],()=>false)).rejects.toBeInstanceOf(ApiError);
+      status=429;
+      await expect(observer.observeMedia('sonarr',1)).rejects.toMatchObject({status:429,retryAfter:37});
+      expect(retry).toBe(37);
+      expect(calls).toBe(4);
+    } finally { await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve())); }
+  });
   it.each([
     ['date-only before UTC midnight', '2020-01-01', null, Date.parse('2020-01-01T23:59:59Z'), false],
     ['date-only at following UTC midnight', '2020-01-01', null, Date.parse('2020-01-02T00:00:00Z'), true],

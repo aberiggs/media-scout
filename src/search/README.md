@@ -7,6 +7,11 @@ HTTP, public MCP, and scheduled Arr automation share one search domain. The Open
 `POST /api/v2/searches` and public MCP `ma_search_v2` accept the same request.
 Creation returns HTTP 202 / `{searchId,status:"queued"}`; read the persisted result
 with `GET /api/v2/searches/:id` or `ma_search_status_v2`.
+
+UI, public MCP, and API acquisitions share a durable FIFO queue. **Concurrent
+searches** in Settings limits on-demand work (1–10, default 3). Changing the
+limit does not interrupt running work. A provider cooldown delays dispatch
+without dropping jobs; search detail reports why a request is waiting.
 ```json
 {"prompt":"Find seasons 1–4 of Example. Prefer original audio with English subtitles; useful partial sets are welcome."}
 ```
@@ -69,7 +74,13 @@ mappings, the allowlisted `fields[].name == "category"` value is exposed as
 For qBittorrent, this is its configured fallback category. A change to that value
 requires fresh confirmation.
 
-Manual execution endpoints do not accept automation-owned plans. The scheduler may execute only the selected set from its own search, and only under saved monitoring, explicit automatic-download permission, and dry-run off.
+After its own scheduled pass ends, an automation match can be manually prepared
+with an explicit client and whole-set confirmation. A running execution or a
+prior accepted or possibly accepted grab blocks resubmission of that set even
+after physical holds expire. Rejection, dry-run, and not-attempted outcomes alone
+do not block it. The same idempotency key can still reconcile an existing
+execution. Expired candidates require a fresh search. Historical Arr-only and
+API acquisition searches cannot be manually submitted.
 Confirmation always requires an explicit download-client choice.
 Activity filters accept search statuses and submission/execution outcomes, including
 `partial` and `not-attempted`.
@@ -80,7 +91,7 @@ the full stored prompt, while search detail retains its exact text.
 
 Trusted callers may `POST /api/v2/acquisitions` with `{"prompt":"Find Example","downloadClientId":7}` and a required `Idempotency-Key` header (1–200 characters from `A-Z a-z 0-9 . _ : -`). The strict body rejects extra fields. HTTP 202 means the accepted request and its queue entry were atomically persisted; the response contains `searchId`, `status:"queued"` and `statusUrl` for `GET /api/v2/searches/:id`. Repeating the same key and request returns the same ID even after the job finishes; different content conflicts with 409. Intake keys are retained for at least 60 days from acceptance, and longer while their search remains retained. Completed acquisition history is retained for up to 30 days from search completion, subject to the shared 10,000-entry cap. A replay can return the original ID after its detail endpoint has expired. If detailed execution receipts are pruned first, search detail still shows the acquisition outcome.
 
-Acquisitions share the manual FIFO queue and the three-worker limit, use the ordinary planner, and execute the entire validated plan. Once matched, the backend uses the requested client ID, with no fallback, and rechecks the Prowlarr connection, client configuration and dry-run setting before execution and before every send. Dry-run sends no grabs. Manual preparation/commit cannot take ownership of the job. Search detail reports `manualExecutionEligible: false` and includes `acquisition.status`; for a clean miss the search is `no-match` and the acquisition is `not-attempted`.
+Acquisitions share the on-demand FIFO queue and its configured worker limit, use the ordinary planner, and execute the entire validated plan. Once matched, the backend uses the requested client ID, with no fallback, and rechecks the Prowlarr connection, client configuration and dry-run setting before execution and before every send. Dry-run sends no grabs. Manual preparation/commit cannot take ownership of the job. Search detail reports `manualExecutionEligible: false` and includes `acquisition.status`; for a clean miss the search is `no-match` and the acquisition is `not-attempted`.
 
 Unclaimed requests survive a restart. A started job is not replayed: a match interrupted before journaling is reported as `interrupted`, and an in-flight send is recovered as `uncertain`, with no resubmission. Use this endpoint only from trusted servers, not cross-origin browser code.
 
@@ -88,7 +99,9 @@ If Prowlarr rate-limits a download-client check, Scout pauses queued work accord
 
 ## Scheduled Arr automation
 
-The scheduler uses one lease and selects one fair title per pass. Sonarr workloads
+The scheduler uses one lease and selects one fair title per pass, separately from
+the on-demand slots. It does not start a title while the on-demand queue is
+backlogged or its slots are full. Sonarr workloads
 group due missing episodes across seasons; Radarr workloads describe one movie.
 The show prompt includes provider titles as search hints, exact requested episode
 rows, and a preference for healthy, useful packs, including overlapping packs,
@@ -107,10 +120,13 @@ Unknown inventories are not empty. No additional batch
 API or release-to-episode assignment is involved. The explicit poll endpoint only
 refreshes observations and returns promptly when another pass owns the lease.
 
-Execution revalidates the Arr title, configured source/destination, durable selected
-set and current authorization before each release. The final routing read is followed
-by a fresh Arr queue check; a slow verification window stops the set rather than
-sending from stale observations. These reads cannot atomically lock either service.
+The scheduler may execute only its own selected set, with monitoring enabled,
+automatic downloads allowed, and dry-run off. Before each release it revalidates
+the Arr title, configured source/destination, durable selected set and current
+authorization. A transient read failure or a stale verification window gets one
+fresh set of reads, including the final Arr queue check, before any grab. If the
+checks still cannot confirm it is safe to send, remaining releases are not
+attempted. These reads cannot atomically lock either service.
 Changing the saved Prowlarr connection clears automatic client selections; choose the
 IDs again from the new connection. Queue records identifiable as
 earlier grabs in the same set do not veto later releases; unidentified new queue

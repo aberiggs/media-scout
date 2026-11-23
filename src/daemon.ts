@@ -28,9 +28,12 @@ function mutationAllowed(request: { headers: Record<string, string | string[] | 
 }
 function publicExecutionError(error:unknown):{code:string;message:string;action:string} {
   const raw=error instanceof Error?error.message:'execution-unavailable';
-  const known=new Set(['plan-unavailable','plan-changed','whole-plan-selection-required','dry-run-enabled','search-source-not-manual','prowlarr-source-unavailable','source-changed','candidate-not-selected','candidate-expired','candidate-source-unverified','invalid-candidate-set','download-client-unavailable','download-client-protocol-mismatch','grab-adapter-unavailable','invalid-idempotency-key','confirmation-expired','safety-changed','client-changed','idempotency-conflict','physical-release-busy','execution-ownership-lost']);
+  const known=new Set(['plan-unavailable','plan-changed','whole-plan-selection-required','dry-run-enabled','search-source-not-manual','prowlarr-source-unavailable','source-changed','candidate-not-selected','candidate-expired','candidate-source-unverified','invalid-candidate-set','download-client-unavailable','download-client-protocol-mismatch','grab-adapter-unavailable','invalid-idempotency-key','confirmation-expired','safety-changed','client-changed','idempotency-conflict','physical-release-busy','execution-ownership-lost','automation-pass-active','execution-active','execution-send-risk']);
   const code=known.has(raw)?raw:'execution-unavailable';
   const message=code==='physical-release-busy'?'A selected release is temporarily reserved; inspect its receipt or retry after the hold expires.'
+    :code==='automation-pass-active'?'The automation pass is still active; wait for it to finish.'
+    :code==='execution-active'?'An execution for this plan is still running; inspect its receipt.'
+    :code==='execution-send-risk'?'This plan has a previously accepted or uncertain submission and cannot be submitted again.'
     :code==='idempotency-conflict'?'This idempotency key is already bound to a different confirmation; use a new key after checking the receipt.'
     :['source-changed','client-changed','safety-changed','plan-changed','candidate-expired','candidate-source-unverified','confirmation-expired'].includes(code)?'The source, plan, candidate, client, or safety settings changed; review current search details and confirm again.'
     :code==='execution-unavailable'?'Execution is unavailable; review the current search and configuration.':'Review the selected plan and current client configuration, then prepare a new confirmation.';

@@ -7,6 +7,7 @@ import type { Movie } from '../types/radarr';
 import { safeText } from './release-observation';
 import type { SearchStore } from './store';
 import { summarizeProfile } from '../types/quality-profile';
+import { ApiError } from '../http';
 
 export type ArrProvider = 'sonarr' | 'radarr';
 export interface ArrTarget {
@@ -84,7 +85,7 @@ export class ArrObserver {
   /** Focused, uncached revalidation; prior same-execution downloads can be identified without episode mappings. */
   observeMedia(provider: ArrProvider, serviceId: number, ignoreQueue?: (row: QueueIdentity) => boolean): Promise<ProviderObservation> {
     const now = (this.deps.clock ?? Date.now)();
-    return provider === 'sonarr' ? this.readSonarr(now, serviceId, ignoreQueue) : this.readRadarr(now, serviceId, ignoreQueue);
+    return provider === 'sonarr' ? this.readSonarr(now, serviceId, ignoreQueue, undefined, true) : this.readRadarr(now, serviceId, ignoreQueue, true);
   }
 
   /** Read the queue again after routing validation, without rereading the library. */
@@ -105,7 +106,7 @@ export class ArrObserver {
       return this.sourceFingerprint(provider) === fingerprint && !rows.some(row => row.movieId === serviceId && !isTerminal(row) && !ignoreQueue(row));
     } catch (error) {
       this.reportRetry(provider, error);
-      return false;
+      throw error;
     }
   }
 
@@ -120,7 +121,7 @@ export class ArrObserver {
     return snapshot.targets.some(current => current.key === target.key && current.eligible && current.available && current.monitored && !current.hasFile);
   }
 
-  private async readSonarr(at: number, serviceId?: number, ignoreQueue?: (row: QueueIdentity) => boolean, signal?: AbortSignal): Promise<ProviderObservation> {
+  private async readSonarr(at: number, serviceId?: number, ignoreQueue?: (row: QueueIdentity) => boolean, signal?: AbortSignal, focused = false): Promise<ProviderObservation> {
     const client = this.deps.sonarr, sources = typeof this.deps.source === 'function' ? this.deps.source() : this.deps.source, src = sources.sonarr;
     if (!client || !src) return unknown(at, 'not-configured');
     if (Math.max(this.throttledUntil.sonarr ?? 0, this.deps.store?.getProviderDeadline('sonarr') ?? 0) > at) return unknown(at, 'source-throttled');
@@ -136,7 +137,7 @@ export class ArrObserver {
         if (serviceId !== undefined && series.id !== serviceId) continue;
         if ((this.throttledUntil.sonarr ?? 0) > at) { unknownSeriesIds.push(series.id); continue; }
         let episodes: Episode[];
-        try { episodes = await client.getEpisodes(series.id); } catch (error) { this.reportRetry('sonarr', error); unknownSeriesIds.push(series.id); continue; }
+        try { episodes = await client.getEpisodes(series.id); } catch (error) { if (focused) throw error; this.reportRetry('sonarr', error); unknownSeriesIds.push(series.id); continue; }
         inventories.push({series,episodes});
       }
       if (signal?.aborted) return unknown(at, 'observation-interrupted');
@@ -162,10 +163,10 @@ export class ArrObserver {
       }
       if (this.sourceFingerprint('sonarr') !== fp) return unknown(at, 'source-changed');
       return { known: true, observedAt: at, targets, queue: queue.map(row => ({ ...(row.seriesId == null ? {} : { serviceId: row.seriesId }), ...(row.episodeId == null ? {} : { itemId: row.episodeId }), ...(row.seasonNumber == null ? {} : { seasonNumber: row.seasonNumber }), ...(row.status ? { status: safeText(row.status) } : {}), ...(row.trackedDownloadStatus ? { trackedStatus: safeText(row.trackedDownloadStatus) } : {}), ...(row.trackedDownloadState ? { trackedState: safeText(row.trackedDownloadState) } : {}) })), diagnostics: { unidentifiedQueueRows: queue.filter(row => row.seriesId == null).length, ...(unknownSeriesIds.length ? { unknownSeriesIds } : {}) } };
-    } catch (error) { this.reportRetry('sonarr', error); return unknown(at); }
+    } catch (error) { this.reportRetry('sonarr', error); if (focused) throw error; return unknown(at); }
   }
 
-  private async readRadarr(at: number, serviceId?: number, ignoreQueue?: (row: QueueIdentity) => boolean): Promise<ProviderObservation> {
+  private async readRadarr(at: number, serviceId?: number, ignoreQueue?: (row: QueueIdentity) => boolean, focused = false): Promise<ProviderObservation> {
     const client = this.deps.radarr, sources = typeof this.deps.source === 'function' ? this.deps.source() : this.deps.source, src = sources.radarr;
     if (!client || !src) return unknown(at, 'not-configured');
     if (Math.max(this.throttledUntil.radarr ?? 0, this.deps.store?.getProviderDeadline('radarr') ?? 0) > at) return unknown(at, 'source-throttled');
@@ -184,13 +185,14 @@ export class ArrObserver {
       });
       if (this.sourceFingerprint('radarr') !== fp) return unknown(at, 'source-changed');
       return { known: true, observedAt: at, targets, queue: queue.map(row => ({ ...(row.movieId == null ? {} : { itemId: row.movieId }), ...(row.status ? { status: safeText(row.status) } : {}), ...(row.trackedDownloadStatus ? { trackedStatus: safeText(row.trackedDownloadStatus) } : {}), ...(row.trackedDownloadState ? { trackedState: safeText(row.trackedDownloadState) } : {}) })), diagnostics: { unidentifiedQueueRows: queue.filter(row => row.movieId == null).length } };
-    } catch (error) { this.reportRetry('radarr', error); return unknown(at); }
+    } catch (error) { this.reportRetry('radarr', error); if (focused) throw error; return unknown(at); }
   }
 
   private reportRetry(source: ArrProvider, error: unknown): void {
-    if (error && typeof error === 'object' && 'retryAfter' in error && typeof error.retryAfter === 'number') {
-      this.throttledUntil[source] = (this.deps.clock ?? Date.now)() + error.retryAfter * 1000;
-      this.deps.onRetryAfter?.(source, error.retryAfter);
+    const seconds = error instanceof ApiError && error.status === 429 ? error.retryAfter ?? 60 : error && typeof error === 'object' && 'retryAfter' in error && typeof error.retryAfter === 'number' ? error.retryAfter : undefined;
+    if (seconds !== undefined) {
+      this.throttledUntil[source] = (this.deps.clock ?? Date.now)() + seconds * 1000;
+      this.deps.onRetryAfter?.(source, seconds);
     }
   }
 }

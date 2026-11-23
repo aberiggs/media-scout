@@ -84,16 +84,17 @@ describe('search-first HTTP contract', () => {
     expect((await app.inject({method:'POST',url:'/api/v2/acquisitions',headers,payload})).json().searchId).toBe(searchId);
     expect((await app.inject({method:'POST',url:'/api/v2/acquisitions',headers,payload:{...payload,prompt:'Different'}})).statusCode).toBe(409);
   });
-  it('accepts a socket burst into the shared three-worker FIFO and dispatches the durable tail',async()=>{
-    let started=0,releaseFirst!:()=>void,releaseTail!:()=>void,firstThree!:()=>void,allFive!:()=>void;
+  it('queues a mixed socket burst in FIFO order and applies a new saved capacity without restarting',async()=>{
+    let started=0,releaseFirst!:()=>void,releaseTail!:()=>void,firstTwo!:()=>void,firstThree!:()=>void,allFive!:()=>void;
     const firstGate=new Promise<void>(resolve=>{releaseFirst=resolve;}),tailGate=new Promise<void>(resolve=>{releaseTail=resolve;});
+    const initialCapacityReached=new Promise<void>(resolve=>{firstTwo=resolve;});
     const firstStarted=new Promise<void>(resolve=>{firstThree=resolve;}),tailStarted=new Promise<void>(resolve=>{allFive=resolve;});
     const startedPrompts:string[]=[];
     const model=createServer(async(req,res)=>{
       const chunks:Buffer[]=[];for await(const chunk of req)chunks.push(Buffer.from(chunk));
       const body=JSON.parse(Buffer.concat(chunks).toString()) as {input:string};
       started++;startedPrompts.push(body.input);
-      if(started===3)firstThree();if(started===5)allFive();
+      if(started===2)firstTwo();if(started===3)firstThree();if(started===5)allFive();
       await(started<=3?firstGate:tailGate);
       res.writeHead(200,{'content-type':'application/json'});
       res.end(JSON.stringify({id:`burst-${started}`,object:'response',created_at:1,completed_at:1,status:'completed',error:null,incomplete_details:null,instructions:null,model:'fixture/model',output:[{id:`final-${started}`,type:'function_call',call_id:`final-${started}`,name:'finalize_release_set',arguments:JSON.stringify({status:'no-match',selections:[],covered:[],gaps:['No release observed'],deferred:[],broadCoverage:'none',scopeGaps:[]}),status:'completed'}],parallel_tool_calls:false,tool_choice:'auto',tools:[],usage:null,metadata:null,frequency_penalty:null,presence_penalty:null,temperature:null,top_p:null}));
@@ -101,17 +102,25 @@ describe('search-first HTTP contract', () => {
     await new Promise<void>(resolve=>model.listen(0,'127.0.0.1',resolve));const modelAddress=model.address();if(!modelAddress||typeof modelAddress==='string')throw new Error('No gated model listener');
     const {app,runtime}=await fixture();
     try{
-      runtime.saveSettings({...runtime.getSettings(),ai:{...runtime.getSettings().ai,baseUrl:`http://127.0.0.1:${modelAddress.port}`}});
+      const settings=runtime.getSettings();
+      runtime.saveSettings({...settings,search:{...settings.search,concurrentSearches:2},ai:{...settings.ai,baseUrl:`http://127.0.0.1:${modelAddress.port}`}});
       await app.listen({host:'127.0.0.1',port:0});const listener=app.server.address();if(!listener||typeof listener==='string')throw new Error('No daemon listener');
       const base=`http://127.0.0.1:${listener.port}`;
       const ids:string[]=[];
       for(let i=0;i<5;i++){
         // Order HTTP acceptance, but don't release any of the search workers.
-        const response=await fetch(`${base}/api/v2/acquisitions`,{method:'POST',headers:{'content-type':'application/json','idempotency-key':`burst-${i}`},body:JSON.stringify({prompt:`Burst prompt ${i}`,downloadClientId:7})});
+        const acquisition=i%2===1;
+        const response=await fetch(`${base}/api/v2/${acquisition?'acquisitions':'searches'}`,{method:'POST',headers:{'content-type':'application/json',...(acquisition?{'idempotency-key':`burst-${i}`}:{})},body:JSON.stringify({prompt:`Burst prompt ${i}`,...(acquisition?{downloadClientId:7}:{})})});
         expect(response.status).toBe(202);
         ids.push((await response.json() as {searchId:string}).searchId);
       }
-      await Promise.race([firstStarted,new Promise((_,reject)=>setTimeout(()=>reject(new Error('first three workers did not start')),10_000))]);
+      await Promise.race([initialCapacityReached,new Promise((_,reject)=>setTimeout(()=>reject(new Error('first two workers did not start')),10_000))]);
+      const queued=await Promise.all(ids.map(async id=>(await (await fetch(`${base}/api/v2/searches/${id}`)).json() as {status:string;queuePosition?:number;waitingReason?:string})));
+      expect(queued.map(job=>job.status)).toEqual(['running','running','queued','queued','queued']);
+      expect(queued.slice(2).map(job=>[job.queuePosition,job.waitingReason])).toEqual([[1,'capacity'],[2,'capacity'],[3,'capacity']]);
+      const liveSettings=runtime.getSettings();
+      expect((await fetch(`${base}/api/settings`,{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({...liveSettings,search:{...liveSettings.search,concurrentSearches:3}})})).status).toBe(200);
+      await Promise.race([firstStarted,new Promise((_,reject)=>setTimeout(()=>reject(new Error('third worker did not start after raising capacity')),10_000))]);
       const before=await Promise.all(ids.map(async id=>(await (await fetch(`${base}/api/v2/searches/${id}`)).json() as {status:string}).status));
       expect(before.filter(status=>status==='running')).toHaveLength(3);
       expect(before.filter(status=>status==='queued')).toHaveLength(2);
@@ -458,11 +467,11 @@ describe('search-first HTTP contract', () => {
       await new Promise<void>((resolve,reject)=>responses.close(error=>error?reject(error):resolve()));
     }
   });
-  it.each(['route','route-during-arr','new-queue','late-queue','stale-observation','same-plan-tail','external-tail','identity-mismatch-same-title','grab-429','dry-run'] as const)('fences automatic sending at the %s boundary', async mode => {
-    let calls=0,lists=0,runtimeRef:SearchRuntime|undefined,grabs=0,queued=false,categoryChanged=false;
+  it.each(['route','route-during-arr','new-queue','late-queue','stale-observation','stale-once','stale-queue','stale-settings','retry-settings','arr-transient','episode-transient','queue-transient','arr-exhausted','routing-transient','routing-exhausted','routing-429','arr-429','same-plan-tail','tail-transient-exhausted','external-tail','identity-mismatch-same-title','grab-429','dry-run','journal-stale','post-journal-stale','post-journal-stale-tail'] as const)('fences automatic sending at the %s boundary', async mode => {
+    let calls=0,lists=0,scopeReads=0,queueReads=0,runtimeRef:SearchRuntime|undefined,grabs=0,queued=false,categoryChanged=false;
     let now = Date.now();
     const release=releaseSchema.parse({guid:'client-race-release',age:1,size:100,files:null,grabs:null,indexerId:1,indexer:'Index',subGroup:null,title:'Show 4 S01 1080p',tvdbId:40,tmdbId:null,publishDate:'',downloadUrl:null,indexerFlags:[],categories:[],magnetUrl:null,infoHash:'b'.repeat(40),seeders:1,leechers:0,protocol:'torrent',downloadClientId:null});
-    const tail=mode==='same-plan-tail'||mode==='external-tail'||mode==='identity-mismatch-same-title';
+    const tail=mode==='same-plan-tail'||mode==='tail-transient-exhausted'||mode==='external-tail'||mode==='identity-mismatch-same-title'||mode==='post-journal-stale-tail';
     const responses=createServer(async(request,response)=>{
       const chunks:Buffer[]=[];for await(const chunk of request)chunks.push(Buffer.from(chunk));
       const body=JSON.parse(Buffer.concat(chunks).toString()) as {tools?:Array<{name?:string}>};
@@ -480,15 +489,34 @@ describe('search-first HTTP contract', () => {
       prowlarr:{getIndexers:async()=>[{id:1,name:'Index',enable:true}],getIndexerStatuses:async()=>[],search:async()=>tail?[(mode==='identity-mismatch-same-title'?{...release,infoHash:null}:release),{...release,guid:'tail-release',infoHash:'c'.repeat(40),title:'Show 4 E02 1080p'}]:[release],getDownloadClients:async()=>{
         lists++;
         if(lists===3&&mode==='route')runtimeRef!.saveSettings({...runtimeRef!.getSettings(),integrations:{...runtimeRef!.getSettings().integrations,prowlarr:{...runtimeRef!.getSettings().integrations.prowlarr,tvClientId:8}}});
-        if(lists===3&&mode==='new-queue')queued=true;
-        if(lists===4&&mode==='late-queue')queued=true;
-        if(lists===4&&mode==='stale-observation')now+=16_000;
+        if(lists===3&&mode==='late-queue')queued=true;
+        if(lists>=3&&(mode==='stale-observation'||(lists===3&&(mode==='stale-once'||mode==='stale-queue'||mode==='stale-settings'))))now+=16_000;
+        if(lists===3&&mode==='stale-queue')queued=true;
+        if(lists===3&&mode==='stale-settings')runtimeRef!.saveSettings({...runtimeRef!.getSettings(),safety:{dryRun:true}});
+        if(lists>=3&&(mode==='routing-exhausted'||(lists===3&&(mode==='routing-transient'||mode==='retry-settings'))))throw new ApiError(503,'http://indexer.test','private');
+        if(lists===3&&mode==='routing-429')throw new ApiError(429,'http://indexer.test','private',37);
         if(mode==='route-during-arr'&&categoryChanged)return [{id:7,name:'TV',protocol:'torrent',enable:true,supportsCategories:true,categories:[{clientCategory:'changed',categories:[5000]}]}];
         return [{id:7,name:'TV',protocol:'torrent',enable:true,supportsCategories:true,categories:[]}];
       },grab:async()=>{grabs++;if(mode==='grab-429')throw new ApiError(429,'http://indexer.test/api/v1/indexer/grab','rate limited',37);if(tail)queued=true;}},
-       sonarr:{getSeries:async()=>[{id:4,tvdbId:40,title:'Show 4',titleSlug:'show-4',seriesType:'standard',monitored:true,seasons:[],alternateTitles:[]}],getEpisodes:async id=>(tail?[1,2]:[1]).map(n=>({id:40+n,seriesId:id,seasonNumber:n,episodeNumber:n,absoluteEpisodeNumber:n,title:'Episode',airDate:'2020-01-01',airDateUtc:null,finaleType:null,monitored:true,hasFile:false})),getQueue:async()=>{if(mode==='route-during-arr'&&calls>=2)categoryChanged=true;return queued?[{seriesId:4,status:'downloading',downloadId:mode==='same-plan-tail'?release.infoHash:mode==='identity-mismatch-same-title'?'c'.repeat(40):'d'.repeat(40),...(mode==='identity-mismatch-same-title'?{title:release.title}:{})}]:[];}},
+       sonarr:{getSeries:async()=>{if(calls>=2){scopeReads++;if(mode==='new-queue'&&scopeReads===1)queued=true;if(mode==='retry-settings'&&scopeReads===2)runtimeRef!.saveSettings({...runtimeRef!.getSettings(),safety:{dryRun:true}});if(mode==='arr-exhausted'||(mode==='tail-transient-exhausted'&&grabs>0)||(scopeReads===1&&mode==='arr-transient'))throw new ApiError(0,'http://sonarr.test','private');if(scopeReads===1&&mode==='arr-429')throw new ApiError(429,'http://sonarr.test','private',37);}return [{id:4,tvdbId:40,title:'Show 4',titleSlug:'show-4',seriesType:'standard',monitored:true,seasons:[],alternateTitles:[]}];},getEpisodes:async id=>{if(mode==='episode-transient'&&scopeReads===1)throw new ApiError(503,'http://sonarr.test','private');return (tail?[1,2]:[1]).map(n=>({id:40+n,seriesId:id,seasonNumber:n,episodeNumber:n,absoluteEpisodeNumber:n,title:'Episode',airDate:'2020-01-01',airDateUtc:null,finaleType:null,monitored:true,hasFile:false}));},getQueue:async()=>{if(calls>=2)queueReads++;if(mode==='queue-transient'&&queueReads===2)throw new ApiError(0,'http://sonarr.test','private');if(mode==='route-during-arr'&&calls>=2)categoryChanged=true;return queued?[{seriesId:4,status:'downloading',downloadId:mode==='same-plan-tail'||mode==='post-journal-stale-tail'?release.infoHash:mode==='identity-mismatch-same-title'?'c'.repeat(40):'d'.repeat(40),...(mode==='identity-mismatch-same-title'?{title:release.title}:{})}]:[];}},
     },()=>now);
     runtimeRef=runtime;
+    if(mode==='journal-stale') {
+      const renew=runtime.store.renewExecution.bind(runtime.store);
+      let delayed=false;
+      runtime.store.renewExecution=(...args)=>{const result=renew(...args);if(!delayed&&queueReads===2){delayed=true;now+=16_000;}return result;};
+    }
+    if(mode==='post-journal-stale'||mode==='post-journal-stale-tail') {
+      const begin=runtime.store.beginAutomationSend.bind(runtime.store);
+      runtime.store.beginAutomationSend=(...args)=>{
+        const result=begin(...args);
+        if(result==='started'&&args[2]===(mode==='post-journal-stale'?0:1)) {
+          expect(runtime.store.execution(args[0])?.children[args[2]]?.state).toBe('sending');
+          now+=16_000;
+        }
+        return result;
+      };
+    }
     try{
       runtime.saveSettings({...runtime.getSettings(),ai:{...runtime.getSettings().ai,baseUrl:`http://127.0.0.1:${address.port}`,model:'fixture-model'},integrations:{...runtime.getSettings().integrations,prowlarr:{...runtime.getSettings().integrations.prowlarr,tvClientId:7}},monitoring:{...runtime.getSettings().monitoring,enabled:true,allowDownloads:true},safety:{dryRun:mode==='dry-run'}});
       await app.listen({host:'127.0.0.1',port:0});
@@ -497,8 +525,22 @@ describe('search-first HTTP contract', () => {
       await expect(runtime.runAutomation()).resolves.toMatchObject({ran:true,reason:mode==='grab-429'?'rejected':'matched'});
       const search=await runtime.getSearch(runtime.activity().items[0]!.searchId);
       if(mode==='route-during-arr') expect(categoryChanged).toBe(true);
-      expect(grabs).toBe(mode==='same-plan-tail'?2:mode==='external-tail'||mode==='identity-mismatch-same-title'||mode==='grab-429'?1:0);
-      expect(search?.receipts?.map(receipt=>receipt.outcome)).toEqual(mode==='dry-run'?[]:[mode==='same-plan-tail'?'submitted':mode==='external-tail'||mode==='identity-mismatch-same-title'?'partial':mode==='grab-429'?'rejected':'not-attempted']);
+      const succeeds=mode==='stale-once'||mode==='arr-transient'||mode==='episode-transient'||mode==='queue-transient'||mode==='routing-transient';
+      const partial=['external-tail','tail-transient-exhausted','identity-mismatch-same-title','post-journal-stale-tail'].includes(mode);
+      expect(grabs).toBe(mode==='same-plan-tail'?2:partial||mode==='grab-429'||succeeds?1:0);
+      expect(search?.receipts?.map(receipt=>receipt.outcome)).toEqual(mode==='dry-run'?[]:[mode==='same-plan-tail'||succeeds?'submitted':partial?'partial':mode==='grab-429'?'rejected':'not-attempted']);
+      if(mode==='tail-transient-exhausted')expect(search?.receipts?.[0]?.children.map(child=>child.outcome)).toEqual(['submitted','not-attempted']);
+      if(mode==='journal-stale')expect(search?.receipts?.[0]).toMatchObject({outcome:'not-attempted',children:[{outcome:'not-attempted'}]});
+      if(mode==='post-journal-stale'||mode==='post-journal-stale-tail') {
+        expect(search?.receipts?.[0]?.children.map(child=>child.outcome)).toEqual(mode==='post-journal-stale'?['not-attempted']:['submitted','not-attempted']);
+        expect(runtime.store.activeMediaGrace(now).size).toBe(mode==='post-journal-stale'?0:1);
+      }
+      if(mode==='stale-observation'||mode==='arr-exhausted'||mode==='routing-exhausted') expect(search?.receipts?.[0]?.message).toMatch(/temporarily unavailable/i);
+      if(mode==='routing-429'){expect(runtime.store.getProviderDeadline('prowlarr')).toBe(now+37_000);expect(runtime.store.getProviderDeadline('sonarr')).toBeNull();}
+      if(mode==='arr-429'){expect(runtime.store.getProviderDeadline('sonarr')).toBe(now+37_000);expect(runtime.store.getProviderDeadline('prowlarr')).toBeNull();}
+      if(['stale-once','stale-queue','retry-settings','arr-transient','episode-transient','queue-transient','arr-exhausted','routing-transient','routing-exhausted'].includes(mode))expect(scopeReads).toBe(2);
+      if(['new-queue','late-queue','route','route-during-arr','routing-429','arr-429','stale-settings'].includes(mode))expect(scopeReads).toBe(1);
+      if(['stale-observation','arr-exhausted','routing-exhausted'].includes(mode))expect(JSON.stringify(search?.receipts)).not.toContain('private');
       if(mode==='grab-429')expect(runtime.store.getProviderDeadline('prowlarr')).toBeGreaterThan(Date.now());
       expect(search?.automationPending).toBeUndefined();
     }finally{

@@ -10,8 +10,10 @@ type Receipt = { executionId: string; searchId: string; planId?: string; outcome
 type Confirmation = { confirmationId: string; expiresAt: string; searchId: string; planId: string; version: number; client: { id: number; name: string; protocol: string; defaultCategory?: string | null; configuredCategories: Array<{ clientCategory: string | null; categories: number[] | null }> }; dryRun: boolean; children: Child[] }
 type DownloadClient = { id: number; name: string; protocol: string; defaultCategory?: string | null; categoryMap: Array<{ clientCategory: string | null; categories: number[] | null }> }
 type CommitRequest = { confirmationId: string; searchId: string; planId: string; version: number; idempotencyKey: string }
-type SearchResult = { searchId: string; status: string; source?: 'manual' | 'arr' | 'automation'; manualExecutionEligible?: boolean; automationPending?: boolean; automationWorkload?: { deferredTargets: number }; acquisition?: { status: string; code?: string }; prompt?: string; plan?: Plan; candidates?: Candidate[]; events?: Array<{ type: string; data: Record<string, unknown> }>; receipts?: Receipt[]; counts?: { decisions: number; searches: number; candidates: number }; queuePosition?: number; waitingReason?: string; retryAt?: string; message?: string; researchWarnings?: string[]; diagnostics?: { modelTurns: number; stopReason: string; elapsedMs?: number; usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cost?: number } } }
+type SearchResult = { searchId: string; status: string; source?: 'manual' | 'arr' | 'automation'; manualExecutionEligible?: boolean; manualExecutionBlockedReason?: string; automationPending?: boolean; automationWorkload?: { deferredTargets: number }; acquisition?: { status: string; code?: string }; prompt?: string; plan?: Plan; candidates?: Candidate[]; events?: Array<{ type: string; data: Record<string, unknown> }>; receipts?: Receipt[]; counts?: { decisions: number; searches: number; candidates: number }; queuePosition?: number; waitingReason?: string; retryAt?: string; message?: string; researchWarnings?: string[]; diagnostics?: { modelTurns: number; stopReason: string; elapsedMs?: number; usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cost?: number } } }
 const running = (status?: string) => status === 'queued' || status === 'running'
+const MAX_SEARCH_PROMPT_LENGTH = 4000
+const readSignal = (controller: AbortController) => AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)])
 const safeBody = async (response: Response) => { try { return await response.json() } catch { return {} } }
 const idempotencyKey = () => {
   const bytes = new Uint8Array(20)
@@ -28,6 +30,7 @@ function readPending(searchId: string): CommitRequest | null {
 function savePending(request: CommitRequest) { try { sessionStorage.setItem(`media-scout-execution-pending:${request.searchId}`, JSON.stringify(request)); return true } catch { return false } }
 function clearPending(searchId: string) { try { sessionStorage.removeItem(`media-scout-execution-pending:${searchId}`) } catch { /* no-op */ } }
 const SAFE_RECONFIRM_CODES = new Set(['plan-unavailable', 'plan-changed', 'whole-plan-selection-required', 'dry-run-enabled', 'search-source-not-manual', 'prowlarr-source-unavailable', 'source-changed', 'candidate-not-selected', 'candidate-expired', 'candidate-source-unverified', 'invalid-candidate-set', 'download-client-unavailable', 'download-client-protocol-mismatch', 'grab-adapter-unavailable', 'confirmation-expired', 'safety-changed', 'client-changed'])
+const AUTOMATION_CONFIRMATION_BLOCKS = new Set(['automation-pass-active', 'execution-active', 'execution-send-risk'])
 function errorMessage(payload: any, fallback: string) { return typeof payload?.message === 'string' ? payload.message : typeof payload?.error === 'string' ? payload.error : fallback }
 function validReceipt(value: any): value is Receipt {
   return Boolean(value && typeof value.executionId === 'string' && typeof value.searchId === 'string'
@@ -54,14 +57,17 @@ function items(values?: string[]) { return values?.length ? <ul className="seman
 
 export function SearchPage({ settings, searchId, searchRevision, active = true, onSearchStarted }: { settings: Settings; searchId?: string; searchRevision: number; active?: boolean; onSearchStarted(id: string, startingRevision: number): void }) {
   const [prompt, setPrompt] = useState('')
+  const promptTooLong = prompt.length > MAX_SEARCH_PROMPT_LENGTH
   const [result, setResult] = useState<SearchResult | null>(null), [busy, setBusy] = useState(false)
-  const [error, setError] = useState(''), [notice, setNotice] = useState('')
+  const [error, setError] = useState(''), [startError, setStartError] = useState(''), [notice, setNotice] = useState('')
+  const [searchMissing, setSearchMissing] = useState(false)
   const [clients, setClients] = useState<DownloadClient[]>([]), [clientId, setClientId] = useState('')
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null), [execError, setExecError] = useState('')
   const [pendingCommit, setPendingCommit] = useState<CommitRequest | null>(null)
   const [execBusy, setExecBusy] = useState(false), [receipt, setReceipt] = useState<Receipt | null>(null)
   const timer = useRef<number>(), receiptTimer = useRef<number>(), controller = useRef<AbortController | null>(null), receiptController = useRef<AbortController | null>(null), opLock = useRef(false)
   const opener = useRef<HTMLButtonElement | null>(null), dialog = useRef<HTMLDivElement>(null), firstFocus = useRef<HTMLButtonElement>(null), prepareButton = useRef<HTMLButtonElement>(null)
+  const promptInput = useRef<HTMLTextAreaElement>(null), receiptPollingId = useRef<string | null>(null)
   const generation = useRef(0), currentSearch = useRef(searchId), activeNow = useRef(active)
   currentSearch.current = searchId; activeNow.current = active
   const isCurrent = (id: string, token: number) => generation.current === token && currentSearch.current === id
@@ -69,12 +75,11 @@ export function SearchPage({ settings, searchId, searchRevision, active = true, 
   useEffect(() => {
     const token = ++generation.current
     window.clearTimeout(timer.current); window.clearTimeout(receiptTimer.current)
-    controller.current?.abort(); receiptController.current?.abort()
-    setResult(null); setError(''); setNotice(''); setConfirmation(null); setReceipt(null); setExecError(''); setPendingCommit(searchId ? readPending(searchId) : null); setClients([]); setClientId('')
+    controller.current?.abort(); receiptController.current?.abort(); receiptPollingId.current = null
+    setResult(null); setError(''); setStartError(''); setSearchMissing(false); setNotice(''); setConfirmation(null); setReceipt(null); setExecError(''); setPendingCommit(searchId ? readPending(searchId) : null); setClients([]); setClientId('')
     if (searchId) void loadResult(searchId, token)
-    return () => { window.clearTimeout(timer.current); window.clearTimeout(receiptTimer.current); controller.current?.abort(); receiptController.current?.abort() }
+    return () => { ++generation.current; window.clearTimeout(timer.current); window.clearTimeout(receiptTimer.current); controller.current?.abort(); receiptController.current?.abort() }
   }, [searchId, searchRevision])
-  useEffect(() => () => { controller.current?.abort(); window.clearTimeout(timer.current); window.clearTimeout(receiptTimer.current) }, [])
   useEffect(() => {
     if (active) return
     setConfirmation(null)
@@ -100,47 +105,73 @@ export function SearchPage({ settings, searchId, searchRevision, active = true, 
     if (!isCurrent(id, token)) return
     window.clearTimeout(timer.current); controller.current?.abort()
     const current = new AbortController(); controller.current = current
+    const signal = readSignal(current)
     try {
-      const response = await fetch(`/api/v2/searches/${encodeURIComponent(id)}`, { signal: current.signal })
-      if (!response.ok) throw new Error('This search is unavailable. Start a new search or check Activity.')
+      const response = await fetch(`/api/v2/searches/${encodeURIComponent(id)}`, { signal })
+      if (response.status === 404) {
+        if (!current.signal.aborted && isCurrent(id, token)) {
+          window.clearTimeout(receiptTimer.current); receiptController.current?.abort(); receiptPollingId.current = null
+          setResult(null); setReceipt(null); setSearchMissing(true); setError('Search not found. Check Activity or start a new search.')
+        }
+        return
+      }
+      if (response.status >= 500) throw new Error('temporary')
+      if (!response.ok) {
+        if (!current.signal.aborted && isCurrent(id, token)) setError('Search status could not be loaded.')
+        return
+      }
       const data = await response.json() as SearchResult
+      if (!data || data.searchId !== id || typeof data.status !== 'string') throw new Error('Invalid search status')
       if (current.signal.aborted || !isCurrent(id, token)) return
-      setResult(data); setError('')
+      setResult(data); setError(''); setSearchMissing(false)
       setPendingCommit(readPending(id))
       const durable = data.receipts?.at(-1)
-      if (durable) setReceipt(durable)
-      if (running(data.status) || data.automationPending || data.acquisition?.status === 'pending') timer.current = window.setTimeout(() => void loadResult(id, token), 1200)
-      if (durable?.outcome === 'running') pollReceipt(durable.executionId, id, token)
-    } catch (failure) { if (!current.signal.aborted && isCurrent(id, token)) setError(failure instanceof Error ? failure.message : 'Search could not be loaded.') }
+      if (durable) setReceipt(previous => previous?.executionId === durable.executionId && (Date.parse(previous.updatedAt) > Date.parse(durable.updatedAt) || (previous.outcome !== 'running' && durable.outcome === 'running')) ? previous : durable)
+      const automationAwaitingReceipt = data.manualExecutionBlockedReason === 'execution-active' && durable?.outcome !== 'running'
+      if (running(data.status) || data.automationPending || data.manualExecutionBlockedReason === 'automation-pass-active' || automationAwaitingReceipt || data.acquisition?.status === 'pending') timer.current = window.setTimeout(() => void loadResult(id, token), 1200)
+      if (durable?.outcome === 'running' && receiptPollingId.current !== durable.executionId) void pollReceipt(durable.executionId, id, token)
+    } catch {
+      if (!current.signal.aborted && isCurrent(id, token) && controller.current === current) {
+        setError('Search status is temporarily unavailable. Retrying…')
+        timer.current = window.setTimeout(() => void loadResult(id, token), 3000)
+      }
+    }
   }
   async function pollReceipt(executionId: string, id: string, token = generation.current) {
     if (!isCurrent(id, token)) return
+    receiptPollingId.current = executionId
+    window.clearTimeout(receiptTimer.current)
     receiptController.current?.abort()
     const current = new AbortController(); receiptController.current = current
     try {
-      const response = await fetch(`/api/v2/executions/${encodeURIComponent(executionId)}`, { signal: current.signal })
+      const response = await fetch(`/api/v2/executions/${encodeURIComponent(executionId)}`, { signal: readSignal(current) })
       if (!response.ok) throw new Error()
       const next = await response.json() as Receipt
       if (!validReceipt(next) || next.searchId !== id) throw new Error('Receipt response was incomplete')
       if (current.signal.aborted || !isCurrent(id, token)) return
       setReceipt(next)
       if (next.outcome === 'running') receiptTimer.current = window.setTimeout(() => void pollReceipt(executionId, id, token), 1200)
-      else void loadResult(id, token)
+      else { receiptPollingId.current = null; void loadResult(id, token) }
     } catch { if (!current.signal.aborted && isCurrent(id, token)) receiptTimer.current = window.setTimeout(() => void pollReceipt(executionId, id, token), 3000) }
   }
   async function search(event: FormEvent) {
     event.preventDefault()
-    if (!prompt.trim() || busy) return
-    const startingRevision = searchRevision
-    controller.current?.abort(); window.clearTimeout(timer.current)
-    setError(''); setNotice(''); setResult(null); setReceipt(null); setBusy(true)
+    if (!prompt.trim() || promptTooLong || busy) return
+    const startingRevision = searchRevision, token = generation.current
+    setStartError(''); setBusy(true)
     try {
       const body = { prompt }
       const response = await fetch('/api/v2/searches', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       const data = await safeBody(response)
-      if (!response.ok || !data.searchId) throw new Error(errorMessage(data, 'Search could not start. Check your search settings.'))
+      if (response.status >= 400 && response.status < 500) {
+        if (generation.current === token) setStartError(errorMessage(data, 'Search could not start. Check your search settings.'))
+        return
+      }
+      if (!response.ok || typeof data.searchId !== 'string' || !data.searchId) throw new Error('Search acceptance not confirmed')
       onSearchStarted(data.searchId, startingRevision)
-    } catch (failure) { setError(failure instanceof Error ? failure.message : 'Search could not start.') }
+    } catch {
+      if (generation.current === token) setStartError('Could not confirm the new search was accepted. Check Activity before submitting it again.')
+    }
     finally { setBusy(false) }
   }
   async function prepare() {
@@ -174,7 +205,10 @@ export function SearchPage({ settings, searchId, searchRevision, active = true, 
       const body = { searchId: result.searchId, planId: result.plan.planId, version: result.plan.version, candidateIds: result.plan.selections.map(selection => selection.candidateId), downloadClientId: Number(clientId) }
       const response = await fetch('/api/v2/executions/prepare', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       const data = await safeBody(response)
-      if (!response.ok) throw new Error(errorMessage(data, 'The plan could not be prepared. Review current client and safety settings.'))
+      if (!response.ok) {
+        if (data.code === 'candidate-expired' || AUTOMATION_CONFIRMATION_BLOCKS.has(data.code)) void loadResult(id, token)
+        throw new Error(errorMessage(data, 'The plan could not be prepared. Review current client and safety settings.'))
+      }
       if (!validConfirmation(data) || data.searchId !== id || data.planId !== result.plan.planId || data.version !== result.plan.version) throw new Error('Preparation response was incomplete. No download was sent; prepare again.')
       if (!isCurrent(id, token) || !activeNow.current) return
       const confirmation = data as Confirmation
@@ -197,9 +231,15 @@ export function SearchPage({ settings, searchId, searchRevision, active = true, 
       const data = await safeBody(response)
       if (!response.ok) {
         const code = typeof data.code === 'string' ? data.code : ''
-        if (SAFE_RECONFIRM_CODES.has(code)) {
+        if (SAFE_RECONFIRM_CODES.has(code) || AUTOMATION_CONFIRMATION_BLOCKS.has(code)) {
           clearPending(request.searchId)
-          if (isCurrent(request.searchId, token)) { setPendingCommit(null); setConfirmation(null); setExecError(`${errorMessage(data, 'The confirmation is no longer valid.')} Prepare a fresh confirmation to continue.`) }
+          if (isCurrent(request.searchId, token)) {
+            setPendingCommit(null); setConfirmation(null)
+            const message = errorMessage(data, 'The confirmation is no longer valid.')
+            const refresh = code === 'candidate-expired' || AUTOMATION_CONFIRMATION_BLOCKS.has(code)
+            setExecError(refresh ? message : `${message} Prepare a fresh confirmation to continue.`)
+            if (refresh) void loadResult(request.searchId, token)
+          }
           return
         }
         throw new Error(errorMessage(data, 'Submission could not be confirmed. Check Activity before trying again.'))
@@ -226,19 +266,23 @@ export function SearchPage({ settings, searchId, searchRevision, active = true, 
   const plan = result?.plan
   const receipts = (result?.receipts ?? []).map(item => receipt?.executionId === item.executionId ? receipt : item)
   if (receipt && !receipts.some(item => item.executionId === receipt.executionId)) receipts.push(receipt)
+  const localAutomationBlock = result?.source === 'automation' ? result.automationPending ? 'automation-pass-active' : receipts.some(item => item.outcome === 'running') ? 'execution-active' : receipts.some(item => ['submitted','uncertain','partial'].includes(item.outcome) || item.children.some(child => ['sending','submitted','uncertain'].includes(child.outcome))) ? 'execution-send-risk' : undefined : undefined
+  const manualBlock = localAutomationBlock ?? result?.manualExecutionBlockedReason
   const searchReady = Boolean(settings.integrations.prowlarr.url && settings.integrations.prowlarr.apiKey && settings.ai.apiKey)
   const coverage = plan?.coverage
   return <div className="search-layout"><div className="search-main">
     <div className="page-heading"><div><h1>Search<span className="heading-period">.</span></h1><p className="page-intro">Describe what you’re looking for. Scout researches one best-effort release-set plan.</p></div></div>
      <form className="search-composer" onSubmit={search}>
-       <label className="field" htmlFor="search-prompt">What are you looking for?<textarea id="search-prompt" aria-label="What are you looking for?" rows={4} value={prompt} onChange={event => setPrompt(event.target.value)} placeholder={'Describe a film, episode, or season. Add preferences in the same prompt, e.g. “original audio, English subtitles, preferably 1080p.”'} maxLength={4000}/><span className="field-hint">Include media preferences or useful context in the same message.</span></label>
-       <div className="search-form-actions"><button className="button button-primary" type="submit" disabled={busy || !prompt.trim()}>{busy ? <LoaderCircle className="spin" size={16}/> : <SearchIcon size={16}/>}Search releases</button></div>
+       <label className="field" htmlFor="search-prompt">What are you looking for?<textarea ref={promptInput} id="search-prompt" aria-label="What are you looking for?" rows={4} value={prompt} onChange={event => setPrompt(event.target.value)} placeholder={'Describe a film, episode, or season. Add preferences in the same prompt, e.g. “original audio, English subtitles, preferably 1080p.”'} maxLength={MAX_SEARCH_PROMPT_LENGTH}/><span className="field-hint">Include media preferences or useful context in the same message.</span></label>
+       {promptTooLong && <p role="status" className="field-hint">This saved prompt exceeds the 4,000-character manual search limit. Shorten it before starting a new search.</p>}
+       <div className="search-form-actions"><button className="button button-primary" type="submit" disabled={busy || promptTooLong || !prompt.trim()}>{busy ? <LoaderCircle className="spin" size={16}/> : <SearchIcon size={16}/>}Search releases</button></div>
       <p className="field-hint">Searching can incur model and indexer costs. Search never downloads automatically. Don’t include passwords or private links.</p>
     </form>
-    {error && <div role="alert" className="notice notice-error">{error}<button className="text-button" onClick={() => searchId && void loadResult(searchId)}>Retry</button></div>}
+    {startError && <div role="alert" className="notice notice-error">{startError}</div>}
+    {error && <div role="alert" className="notice notice-error">{error}{!searchMissing && <button className="text-button" onClick={() => searchId && void loadResult(searchId)}>Retry</button>}</div>}
     {execError && <div role="alert" className="notice notice-error">{execError}</div>}
     {notice && <div role="status" className="notice">{notice}</div>}
-    {pendingCommit && pendingCommit.searchId === searchId && <div className="ops-warning-box pending-execution" role="status"><strong>Confirmation outcome not yet reconciled</strong><p>Retrying sends the same saved confirmation and idempotency key. It will not create a new submission identity.</p>{result && (result.source === 'automation' || result.manualExecutionEligible === false) ? <p>This automated search is read-only here; inspect Activity for the durable outcome.</p> : <button className="button button-secondary" type="button" disabled={execBusy || !active} onClick={() => void sendCommit(pendingCommit)}>{execBusy ? 'Checking saved confirmation…' : 'Retry same confirmation'}</button>}</div>}
+    {pendingCommit && pendingCommit.searchId === searchId && <div className="ops-warning-box pending-execution" role="status"><strong>Confirmation outcome not yet reconciled</strong><p>Retrying sends the same saved confirmation and idempotency key. It will not create a new submission identity.</p><button className="button button-secondary" type="button" disabled={execBusy || !active} onClick={() => void sendCommit(pendingCommit)}>{execBusy ? 'Checking saved confirmation…' : 'Retry same confirmation'}</button></div>}
     {result && <section className="search-results" aria-live="polite">
         <div className="search-result-heading"><div><h2>{result.status === 'matched' ? 'Search plan' : result.status === 'queued' ? 'Search queued' : result.status === 'running' ? 'Searching…' : result.status === 'no-match' ? 'No suitable match' : `Search ${result.status}`}</h2>{result.prompt && <p className="result-title prompt-preview">{result.prompt}</p>}{result.message && <p>{result.message}</p>}</div><span className="ops-status">{result.status}</span></div>
        {!!result.researchWarnings?.length && <div className="research-result-warnings" role="status"><strong>Research service notice</strong>{result.researchWarnings.map((warning, index) => <p key={index}>{warning}</p>)}</div>}
@@ -247,15 +291,15 @@ export function SearchPage({ settings, searchId, searchRevision, active = true, 
       {result.acquisition?.code === 'prowlarr-rate-limited' && <p role="status" className="ops-info-box">Prowlarr rate-limited the download-client check. No releases were submitted.</p>}
       {!!result.automationWorkload?.deferredTargets && <p className="ops-info-box">{result.automationWorkload.deferredTargets} other due episodes were outside this search. They remain unsearched for a later pass.</p>}
       {result.prompt && <details className="saved-prompt"><summary>Saved search prompt</summary><pre tabIndex={0} aria-label="Exact saved search prompt">{result.prompt}</pre></details>}
-      {result.status === 'queued' ? <p role="status" className="ops-state-panel"><LoaderCircle className="spin"/>Search queued{result.queuePosition ? ` · ${Math.max(0, result.queuePosition - 1)} ahead` : ''}. It has not started yet.</p> : result.status === 'running' ? <p role="status" className="ops-state-panel"><LoaderCircle className="spin"/>Checking indexers and comparing releases…</p> : <>
+      {result.status === 'queued' ? <p role="status" className="ops-state-panel"><LoaderCircle className="spin"/>{result.waitingReason === 'capacity' ? 'Waiting for search capacity' : result.waitingReason === 'settings-incomplete' ? 'Waiting for required settings' : result.waitingReason === 'provider-cooldown' ? `Provider cooldown${result.retryAt ? ` · retry after ${new Date(result.retryAt).toLocaleString()}` : ''}` : 'Search queued'}{result.queuePosition ? ` · ${Math.max(0, result.queuePosition - 1)} ahead` : ''}. It has not started yet.</p> : result.status === 'running' ? <p role="status" className="ops-state-panel"><LoaderCircle className="spin"/>Checking indexers and comparing releases…</p> : <>
          {plan?.status === 'matched' && <section className="release-set" aria-labelledby="selected-set"><div className="release-section-heading"><div><h3 id="selected-set">Selected release set</h3><p>{plan.selections.length} release{plan.selections.length === 1 ? '' : 's'} · whole set only</p></div>{receipt && <span className={`ops-status status-${receipt.outcome === 'submitted' ? 'mint' : receipt.outcome === 'uncertain' || receipt.outcome === 'partial' ? 'amber' : 'quiet'}`}>{receipt.outcome}</span>}</div>
           {plan.selections.map((selection, index) => { const evidence = byId.get(selection.candidateId)?.observations?.[0]; return <article className="ranked-option" key={`${selection.candidateId}-${index}`}><h4>{evidence?.title ?? `Selected release ${index + 1}`}</h4><p>{selection.reason}</p><p className="field-hint">{selection.coverage ?? 'Coverage is inferred from release metadata.'}{evidence?.indexer ? ` · ${evidence.indexer}` : ''}{evidence?.size ? ` · ${formatSize(evidence.size)}` : ''}{evidence?.seeders != null ? ` · ${evidence.seeders} seeders` : ''}</p>{selection.uncertainty && <p className="option-uncertainty">Worth checking: {selection.uncertainty}</p>}</article> })}
           <div className="coverage-grid"><Coverage title="Covered" values={plan.covered ?? coverage?.covered}/><Coverage title="Gaps" values={plan.gaps ?? coverage?.gaps}/><Coverage title="Deferred" values={plan.deferred ?? coverage?.deferred}/><Coverage title="Requested scope not covered" values={plan.scopeGaps ?? coverage?.broad?.gaps}/><Coverage title="Extras" values={plan.extras}/><Coverage title="Useful overlap" values={plan.usefulOverlap}/></div>
           <p className="coverage-note">Coverage is inferred from release names and indexer metadata, not verified file contents.</p>
           {!!plan.warnings?.length && <div className="plan-warnings">{plan.warnings.map((warning, i) => <p key={i}>{warning}</p>)}</div>}
-            {(result.source === 'automation' || result.manualExecutionEligible === false) ? (
-              <p className="ops-info-box">This {result.source === 'arr' ? 'Arr-backed' : 'automated'} search is read-only here and cannot be manually submitted.</p>
-            ) : (!pendingCommit && !receipts.length) ? (
+             {(!!localAutomationBlock || result.manualExecutionEligible === false || (result.source === 'automation' && result.manualExecutionEligible !== true)) ? (
+               <div className="ops-info-box"><p>{manualBlock === 'candidate-expired' ? 'The selected releases have expired. Reuse the saved prompt to search again.' : manualBlock === 'automation-pass-active' ? 'The automation pass is still active; wait for it to finish.' : manualBlock === 'execution-active' ? 'An execution is still running; review its receipt.' : manualBlock === 'execution-send-risk' ? 'A prior submission was accepted or may have been accepted; this set cannot be submitted again.' : manualBlock === 'source-changed' ? 'The Prowlarr source changed; search again for current releases.' : `This ${result.source === 'arr' ? 'Arr-backed' : 'automated'} search is read-only here and cannot be manually submitted.`}</p>{manualBlock === 'candidate-expired' && result.prompt && <button type="button" className="button button-secondary" onClick={() => { setPrompt(result.prompt!); promptInput.current?.focus() }}>Reuse saved prompt</button>}</div>
+             ) : (!pendingCommit && (result.source === 'automation' || !receipts.length)) ? (
               <div className="execution-entry">
                 <p>Review the complete set, then explicitly confirm the Prowlarr destination. No download happens from search alone.</p>
                 {clients.length === 0 ? (

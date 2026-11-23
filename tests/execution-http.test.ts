@@ -19,7 +19,7 @@ import Database from 'better-sqlite3';
 const cleanups:Array<()=>Promise<void>>=[];
 afterEach(async()=>{for(const close of cleanups.splice(0))await close();});
 
-async function fixture(postMode:'accept'|'reject'|'timeout'|'hang'|'second-reject'|'delay-first'='accept',dryRun=false,disableGrab=false,options:{databasePath?:string;httpTimeoutMs?:number;automation?:boolean}={}) {
+async function fixture(postMode:'accept'|'reject'|'timeout'|'hang'|'second-reject'|'delay-first'|'cache-miss'|'generic-404'|'second-cache-miss'='accept',dryRun=false,disableGrab=false,options:{databasePath?:string;httpTimeoutMs?:number;automation?:boolean}={}) {
   const posts:Array<unknown>=[];
   let clientName='TV client',defaultCategory='tv',categoryMappings:Array<{clientCategory:string;categories:number[]}>=[{clientCategory:'tv',categories:[5000]},{clientCategory:'anime',categories:[5010]}];
   let currentTime=Date.now(), releaseDelayedPost:(()=>void)|undefined, signalPost!:()=>void;
@@ -40,7 +40,7 @@ async function fixture(postMode:'accept'|'reject'|'timeout'|'hang'|'second-rejec
     if(req.method==='GET'&&req.url==='/api/v1/indexerstatus'){res.writeHead(200,{'content-type':'application/json'});res.end('[]');return;}
     if(req.method==='GET'&&req.url?.startsWith('/api/v1/search?')){res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify([releaseSchema.parse({guid:'research-guid',indexerId:5,indexer:'Indexer',title:'Research result',publishDate:'2026-01-01T00:00:00Z',protocol:'torrent',downloadUrl:'https://private.invalid/research'})]));return;}
     if(req.method==='POST'&&req.url==='/api/v1/search') {
-      let body='';req.on('data',part=>body+=part);req.on('end',()=>{posts.push(JSON.parse(body));signalPost();if(postMode==='timeout'){res.destroy();return;}if(postMode==='hang'){res.writeHead(202,{'content-type':'application/json'});return;}const finish=()=>{const reject=postMode==='reject'||(postMode==='second-reject'&&posts.length===2);res.writeHead(reject?400:200,{'content-type':'application/json'});res.end('{}');};if(postMode==='delay-first'&&posts.length===1)releaseDelayedPost=finish;else finish();});return;
+      let body='';req.on('data',part=>body+=part);req.on('end',()=>{posts.push(JSON.parse(body));signalPost();if(postMode==='timeout'){res.destroy();return;}if(postMode==='hang'){res.writeHead(202,{'content-type':'application/json'});return;}const finish=()=>{const miss=postMode==='cache-miss'||(postMode==='second-cache-miss'&&posts.length===2);const reject=postMode==='reject'||(postMode==='second-reject'&&posts.length===2);res.writeHead(miss||postMode==='generic-404'?404:reject?400:200,{'content-type':'application/json'});res.end(JSON.stringify(miss?{message:"Couldn't find requested release in cache, try searching again",description:'private source'}:postMode==='generic-404'?{message:'Not found'}:{}));};if(postMode==='delay-first'&&posts.length===1)releaseDelayedPost=finish;else finish();});return;
     }
     res.writeHead(404);res.end();
   });
@@ -71,6 +71,31 @@ async function fixture(postMode:'accept'|'reject'|'timeout'|'hang'|'second-rejec
 }
 
 describe('execution API through real Prowlarr HTTP adapter',()=>{
+  it.each(['cache-miss','generic-404','second-cache-miss'] as const)('persists %s with appropriate automation recovery',async mode=>{
+    const f=await fixture(mode,false,false,{automation:true});
+    const input={searchId:f.searchId,planId:'plan-one',version:2,candidateIds:f.candidateIds,downloadClientId:7};
+    const confirmation=await f.runtime.prepareExecution(input);
+    const request={confirmationId:confirmation.confirmationId,searchId:f.searchId,planId:'plan-one',version:2,idempotencyKey:`cache-test-${mode}`};
+    const receipt=await f.runtime.commitExecution(request);
+    expect(receipt.outcome).toBe(mode==='second-cache-miss'?'partial':'rejected');
+    expect(await f.runtime.commitExecution(request)).toEqual(receipt);
+    expect(f.posts).toHaveLength(mode==='second-cache-miss'?2:1);
+    const detail=await f.runtime.getSearch(f.searchId);
+    expect(detail?.manualExecutionBlockedReason).toBe(mode==='cache-miss'?'candidate-expired':mode==='second-cache-miss'?'execution-send-risk':undefined);
+    expect(f.runtime.store.getCandidate(f.searchId,mode==='second-cache-miss'?'candidate-b':'candidate-a',f.now())===null).toBe(mode!=='generic-404');
+    expect(JSON.stringify(detail)).not.toContain('private source');
+  });
+  it('leaves the ordinary manual-search rejection flow unchanged on a Prowlarr cache miss',async()=>{
+    const f=await fixture('cache-miss');
+    const input={searchId:f.searchId,planId:'plan-one',version:2,candidateIds:f.candidateIds,downloadClientId:7};
+    const confirmation=await f.runtime.prepareExecution(input);
+    const request={confirmationId:confirmation.confirmationId,searchId:f.searchId,planId:'plan-one',version:2,idempotencyKey:'manual-cache-miss'};
+    const receipt=await f.runtime.commitExecution(request);
+    expect(receipt).toMatchObject({outcome:'rejected',children:[{outcome:'rejected',message:'Prowlarr rejected the submission'},{outcome:'not-attempted'}]});
+    expect(await f.runtime.commitExecution(request)).toEqual(receipt);
+    expect(f.posts).toHaveLength(1);
+    expect(f.runtime.store.getCandidate(f.searchId,f.candidateIds[0]!,f.now())).not.toBeNull();
+  });
   it('samples automation freshness after acquiring the SQLite write lock and does not mark stale work sending',()=>{
     const directory=mkdtempSync(join(tmpdir(),'automation-send-lock-')),path=join(directory,'state.sqlite');
     const store=openSearchStore(path),other=new Database(path);

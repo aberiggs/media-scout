@@ -38,6 +38,33 @@ describe('execution journal', () => {
       expect(store.getAutomationAttempt('movie-7')?.deadline).toBe(180_000);
     } finally {store.close();rmSync(dir,{recursive:true,force:true});}
   });
+  it.each([false,true])('undoes only the unsent child’s scheduling changes (earlier submission: %s)', priorSend => {
+    const store = openSearchStore(':memory:');
+    try {
+      const now=1_000, leaseUntil=31_000, initialDeadline=61_000;
+      const attempt={startedAt:now,targetKeys:['target'],failureBackoffMinMs:60_000,failureBackoffMaxMs:600_000};
+      const grace={mediaKey:'movie',passOwner:'pass',graceUntil:181_000,attempt};
+      const children=Array.from({length:priorSend?2:1},(_,i)=>({candidateId:`c${i}`,physicalKey:`physical${i}`,state:'prepared' as const}));
+      expect(store.acquireLease('automation-pass','pass',now,900_000)).toBe(true);
+      store.setAutomationAttempt('target',{lastAttempt:now,failCount:1,deadline:initialDeadline,graceUntil:0});
+      expect(store.createExecution({id:'exec',key:'key',hash:'hash',searchId:'search',planId:'plan',version:2,payload:{automationMediaKey:grace.mediaKey},children,owner:'owner',now,leaseUntil})).toBe('created');
+      if(priorSend) {
+        expect(store.updateExecutionChild('exec','owner',now+1,0,'sending',undefined,grace)).toBe(true);
+        expect(store.updateExecutionChild('exec','owner',now+2,0,'submitted',undefined,grace)).toBe(true);
+      }
+      const index=priorSend?1:0, provisional={...grace,graceUntil:200_000};
+      const marked=store.beginAutomationSend('exec','owner',index,()=>now+3,now+15_000,()=>undefined,()=>provisional);
+      if(typeof marked!=='object'||!('started' in marked))throw new Error('Sending intent was not recorded with an undo checkpoint');
+      expect(store.getAutomationAttempt('target')?.deadline).toBe(provisional.graceUntil);
+      expect(store.resetUnsentAutomationChild('exec','owner',index,()=>now+16_000,marked.started)).toBe(true);
+      expect(store.execution('exec')?.children[index]?.state).toBe('prepared');
+      expect(store.createExecution({id:'other',key:'other',hash:'hash',searchId:'other',planId:'plan',version:2,payload:{},children:[children[index]!],owner:'other',now:now+16_000,leaseUntil})).toBe('busy');
+      expect(store.recoverExecutions(leaseUntil)).toBe(1);
+      expect(store.execution('exec')?.outcome).toBe(priorSend?'partial':'not-attempted');
+      expect(store.getMediaGrace(grace.mediaKey,leaseUntil)).toBe(priorSend?grace.graceUntil:null);
+      expect(store.getAutomationAttempt('target')).toMatchObject({deadline:priorSend?grace.graceUntil:initialDeadline,failCount:1});
+    } finally { store.close(); }
+  });
   it('recovers only expired operation ownership and never replays sending children', () => {
     const dir=mkdtempSync(join(tmpdir(),'execution-journal-')),path=join(dir,'search.db');
     let store = openSearchStore(path);

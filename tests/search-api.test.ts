@@ -467,18 +467,20 @@ describe('search-first HTTP contract', () => {
       await new Promise<void>((resolve,reject)=>responses.close(error=>error?reject(error):resolve()));
     }
   });
-  it.each(['route','route-during-arr','new-queue','late-queue','stale-observation','stale-once','stale-queue','stale-settings','retry-settings','arr-transient','episode-transient','queue-transient','arr-exhausted','routing-transient','routing-exhausted','routing-429','arr-429','same-plan-tail','tail-transient-exhausted','external-tail','identity-mismatch-same-title','grab-429','dry-run','journal-stale','post-journal-stale','post-journal-stale-tail'] as const)('fences automatic sending at the %s boundary', async mode => {
+  it.each(['early-first-transient','early-second-transient','early-cooldown','early-retry-cooldown','early-429','journal-stale-once','post-journal-stale-once','post-journal-stale-tail-once','route','route-during-arr','new-queue','late-queue','stale-observation','stale-once','stale-queue','stale-settings','retry-settings','arr-transient','episode-transient','queue-transient','arr-exhausted','routing-transient','routing-exhausted','routing-429','arr-429','same-plan-tail','tail-transient-exhausted','external-tail','identity-mismatch-same-title','grab-429','dry-run','journal-stale','post-journal-stale','post-journal-stale-tail'] as const)('fences automatic sending at the %s boundary', async mode => {
     let calls=0,lists=0,scopeReads=0,queueReads=0,runtimeRef:SearchRuntime|undefined,grabs=0,queued=false,categoryChanged=false;
+    const grabbedGuids:string[]=[];
     let now = Date.now();
     const release=releaseSchema.parse({guid:'client-race-release',age:1,size:100,files:null,grabs:null,indexerId:1,indexer:'Index',subGroup:null,title:'Show 4 S01 1080p',tvdbId:40,tmdbId:null,publishDate:'',downloadUrl:null,indexerFlags:[],categories:[],magnetUrl:null,infoHash:'b'.repeat(40),seeders:1,leechers:0,protocol:'torrent',downloadClientId:null});
-    const tail=mode==='same-plan-tail'||mode==='tail-transient-exhausted'||mode==='external-tail'||mode==='identity-mismatch-same-title'||mode==='post-journal-stale-tail';
+    const tail=mode==='same-plan-tail'||mode==='tail-transient-exhausted'||mode==='external-tail'||mode==='identity-mismatch-same-title'||mode==='post-journal-stale-tail'||mode==='post-journal-stale-tail-once';
     const responses=createServer(async(request,response)=>{
       const chunks:Buffer[]=[];for await(const chunk of request)chunks.push(Buffer.from(chunk));
       const body=JSON.parse(Buffer.concat(chunks).toString()) as {tools?:Array<{name?:string}>};
       calls++;
       const name=calls===1?(body.tools?.find(tool=>tool.name?.includes('prowlarr_search'))?.name??'prowlarr_search'):'finalize_release_set';
-      const candidates=runtimeRef?.store.listCandidates(runtimeRef.activity().items[0]?.searchId??'')??[];
-      if(mode==='dry-run'&&name==='finalize_release_set')runtimeRef!.saveSettings({...runtimeRef!.getSettings(),safety:{dryRun:false}});
+       const candidates=runtimeRef?.store.listCandidates(runtimeRef.activity().items[0]?.searchId??'')??[];
+       if(mode==='dry-run'&&name==='finalize_release_set')runtimeRef!.saveSettings({...runtimeRef!.getSettings(),safety:{dryRun:false}});
+       if(mode==='early-cooldown'&&name==='finalize_release_set')runtimeRef!.store.setProviderDeadline('prowlarr',now+37_000);
       const args=name==='prowlarr_search'?{query:'Show 4'}:{status:'matched',selections:candidates.map(({candidateId})=>({candidateId,coverage:'The requested episode',reason:'Observed release',uncertainty:''})),covered:['The requested episode'],gaps:[],deferred:[],broadCoverage:'complete',scopeGaps:[]};
       response.writeHead(200,{'content-type':'application/json'});
       response.end(JSON.stringify({id:`client-race-${calls}`,object:'response',created_at:1,completed_at:1,status:'completed',error:null,incomplete_details:null,instructions:null,model:'fixture/model',output:[{id:`call-${calls}`,type:'function_call',call_id:`call-${calls}`,name,arguments:JSON.stringify(args),status:'completed'}],parallel_tool_calls:false,tool_choice:'auto',tools:[],usage:null,metadata:null,frequency_penalty:null,presence_penalty:null,temperature:null,top_p:null}));
@@ -488,6 +490,12 @@ describe('search-first HTTP contract', () => {
     const {app,runtime}=await fixture({
       prowlarr:{getIndexers:async()=>[{id:1,name:'Index',enable:true}],getIndexerStatuses:async()=>[],search:async()=>tail?[(mode==='identity-mismatch-same-title'?{...release,infoHash:null}:release),{...release,guid:'tail-release',infoHash:'c'.repeat(40),title:'Show 4 E02 1080p'}]:[release],getDownloadClients:async()=>{
         lists++;
+        if (lists===1&&mode==='early-retry-cooldown') {
+          runtimeRef!.store.setProviderDeadline('prowlarr',now+37_000);
+          throw new ApiError(503,'http://indexer.test','private');
+        }
+        if (lists===1&&mode==='early-429') throw new ApiError(429,'http://indexer.test','private',37);
+        if ((mode==='early-first-transient'&&lists===1)||(mode==='early-second-transient'&&lists===2)) throw new ApiError(503,'http://indexer.test','private');
         if(lists===3&&mode==='route')runtimeRef!.saveSettings({...runtimeRef!.getSettings(),integrations:{...runtimeRef!.getSettings().integrations,prowlarr:{...runtimeRef!.getSettings().integrations.prowlarr,tvClientId:8}}});
         if(lists===3&&mode==='late-queue')queued=true;
         if(lists>=3&&(mode==='stale-observation'||(lists===3&&(mode==='stale-once'||mode==='stale-queue'||mode==='stale-settings'))))now+=16_000;
@@ -497,20 +505,22 @@ describe('search-first HTTP contract', () => {
         if(lists===3&&mode==='routing-429')throw new ApiError(429,'http://indexer.test','private',37);
         if(mode==='route-during-arr'&&categoryChanged)return [{id:7,name:'TV',protocol:'torrent',enable:true,supportsCategories:true,categories:[{clientCategory:'changed',categories:[5000]}]}];
         return [{id:7,name:'TV',protocol:'torrent',enable:true,supportsCategories:true,categories:[]}];
-      },grab:async()=>{grabs++;if(mode==='grab-429')throw new ApiError(429,'http://indexer.test/api/v1/indexer/grab','rate limited',37);if(tail)queued=true;}},
-       sonarr:{getSeries:async()=>{if(calls>=2){scopeReads++;if(mode==='new-queue'&&scopeReads===1)queued=true;if(mode==='retry-settings'&&scopeReads===2)runtimeRef!.saveSettings({...runtimeRef!.getSettings(),safety:{dryRun:true}});if(mode==='arr-exhausted'||(mode==='tail-transient-exhausted'&&grabs>0)||(scopeReads===1&&mode==='arr-transient'))throw new ApiError(0,'http://sonarr.test','private');if(scopeReads===1&&mode==='arr-429')throw new ApiError(429,'http://sonarr.test','private',37);}return [{id:4,tvdbId:40,title:'Show 4',titleSlug:'show-4',seriesType:'standard',monitored:true,seasons:[],alternateTitles:[]}];},getEpisodes:async id=>{if(mode==='episode-transient'&&scopeReads===1)throw new ApiError(503,'http://sonarr.test','private');return (tail?[1,2]:[1]).map(n=>({id:40+n,seriesId:id,seasonNumber:n,episodeNumber:n,absoluteEpisodeNumber:n,title:'Episode',airDate:'2020-01-01',airDateUtc:null,finaleType:null,monitored:true,hasFile:false}));},getQueue:async()=>{if(calls>=2)queueReads++;if(mode==='queue-transient'&&queueReads===2)throw new ApiError(0,'http://sonarr.test','private');if(mode==='route-during-arr'&&calls>=2)categoryChanged=true;return queued?[{seriesId:4,status:'downloading',downloadId:mode==='same-plan-tail'||mode==='post-journal-stale-tail'?release.infoHash:mode==='identity-mismatch-same-title'?'c'.repeat(40):'d'.repeat(40),...(mode==='identity-mismatch-same-title'?{title:release.title}:{})}]:[];}},
+      },grab:async grabbed=>{grabs++;grabbedGuids.push(grabbed.guid);if(mode==='grab-429')throw new ApiError(429,'http://indexer.test/api/v1/indexer/grab','rate limited',37);if(tail)queued=true;}},
+       sonarr:{getSeries:async()=>{if(calls>=2){scopeReads++;if(mode==='new-queue'&&scopeReads===1)queued=true;if(mode==='retry-settings'&&scopeReads===2)runtimeRef!.saveSettings({...runtimeRef!.getSettings(),safety:{dryRun:true}});if(mode==='arr-exhausted'||(mode==='tail-transient-exhausted'&&grabs>0)||(scopeReads===1&&mode==='arr-transient'))throw new ApiError(0,'http://sonarr.test','private');if(scopeReads===1&&mode==='arr-429')throw new ApiError(429,'http://sonarr.test','private',37);}return [{id:4,tvdbId:40,title:'Show 4',titleSlug:'show-4',seriesType:'standard',monitored:true,seasons:[],alternateTitles:[]}];},getEpisodes:async id=>{if(mode==='episode-transient'&&scopeReads===1)throw new ApiError(503,'http://sonarr.test','private');return (tail?[1,2]:[1]).map(n=>({id:40+n,seriesId:id,seasonNumber:n,episodeNumber:n,absoluteEpisodeNumber:n,title:'Episode',airDate:'2020-01-01',airDateUtc:null,finaleType:null,monitored:true,hasFile:false}));},getQueue:async()=>{if(calls>=2)queueReads++;if(mode==='queue-transient'&&queueReads===2)throw new ApiError(0,'http://sonarr.test','private');if(mode==='route-during-arr'&&calls>=2)categoryChanged=true;return queued?[{seriesId:4,status:'downloading',downloadId:mode==='same-plan-tail'||mode==='post-journal-stale-tail'||mode==='post-journal-stale-tail-once'?release.infoHash:mode==='identity-mismatch-same-title'?'c'.repeat(40):'d'.repeat(40),...(mode==='identity-mismatch-same-title'?{title:release.title}:{})}]:[];}},
     },()=>now);
     runtimeRef=runtime;
-    if(mode==='journal-stale') {
+    if(mode==='journal-stale'||mode==='journal-stale-once') {
       const renew=runtime.store.renewExecution.bind(runtime.store);
-      let delayed=false;
-      runtime.store.renewExecution=(...args)=>{const result=renew(...args);if(!delayed&&queueReads===2){delayed=true;now+=16_000;}return result;};
+      let lastDelayed=0;
+      runtime.store.renewExecution=(...args)=>{const result=renew(...args);if(queueReads>=2&&queueReads%2===0&&queueReads!==lastDelayed&&(mode==='journal-stale'||lastDelayed===0)){lastDelayed=queueReads;now+=16_000;}return result;};
     }
-    if(mode==='post-journal-stale'||mode==='post-journal-stale-tail') {
+    if(mode==='post-journal-stale'||mode==='post-journal-stale-tail'||mode==='post-journal-stale-once'||mode==='post-journal-stale-tail-once') {
       const begin=runtime.store.beginAutomationSend.bind(runtime.store);
+      let delayed=false;
       runtime.store.beginAutomationSend=(...args)=>{
         const result=begin(...args);
-        if(result==='started'&&args[2]===(mode==='post-journal-stale'?0:1)) {
+        if(typeof result==='object'&&'started' in result&&args[2]===(mode==='post-journal-stale'||mode==='post-journal-stale-once'?0:1)&&(!mode.endsWith('-once')||!delayed)) {
+          delayed=true;
           expect(runtime.store.execution(args[0])?.children[args[2]]?.state).toBe('sending');
           now+=16_000;
         }
@@ -525,10 +535,17 @@ describe('search-first HTTP contract', () => {
       await expect(runtime.runAutomation()).resolves.toMatchObject({ran:true,reason:mode==='grab-429'?'rejected':'matched'});
       const search=await runtime.getSearch(runtime.activity().items[0]!.searchId);
       if(mode==='route-during-arr') expect(categoryChanged).toBe(true);
-      const succeeds=mode==='stale-once'||mode==='arr-transient'||mode==='episode-transient'||mode==='queue-transient'||mode==='routing-transient';
+      const earlyStop=mode==='early-cooldown'||mode==='early-retry-cooldown'||mode==='early-429';
+      if(earlyStop) {
+        expect(lists).toBe(mode==='early-cooldown'?0:1);
+        expect(runtime.store.getProviderDeadline('prowlarr')).toBe(now+37_000);
+        expect(search?.events).toContainEqual(expect.objectContaining({type:'submission',data:expect.objectContaining({outcome:'deferred'})}));
+      }
+      const succeeds=mode==='early-first-transient'||mode==='early-second-transient'||mode==='journal-stale-once'||mode==='post-journal-stale-once'||mode==='post-journal-stale-tail-once'||mode==='stale-once'||mode==='arr-transient'||mode==='episode-transient'||mode==='queue-transient'||mode==='routing-transient';
       const partial=['external-tail','tail-transient-exhausted','identity-mismatch-same-title','post-journal-stale-tail'].includes(mode);
-      expect(grabs).toBe(mode==='same-plan-tail'?2:partial||mode==='grab-429'||succeeds?1:0);
-      expect(search?.receipts?.map(receipt=>receipt.outcome)).toEqual(mode==='dry-run'?[]:[mode==='same-plan-tail'||succeeds?'submitted':partial?'partial':mode==='grab-429'?'rejected':'not-attempted']);
+      expect(grabs).toBe(mode==='same-plan-tail'||mode==='post-journal-stale-tail-once'?2:partial||mode==='grab-429'||succeeds?1:0);
+      expect(search?.receipts?.map(receipt=>receipt.outcome)).toEqual(mode==='dry-run'||earlyStop?[]:[mode==='same-plan-tail'||succeeds?'submitted':partial?'partial':mode==='grab-429'?'rejected':'not-attempted']);
+      if(mode==='post-journal-stale-tail-once')expect(grabbedGuids).toEqual([release.guid,'tail-release']);
       if(mode==='tail-transient-exhausted')expect(search?.receipts?.[0]?.children.map(child=>child.outcome)).toEqual(['submitted','not-attempted']);
       if(mode==='journal-stale')expect(search?.receipts?.[0]).toMatchObject({outcome:'not-attempted',children:[{outcome:'not-attempted'}]});
       if(mode==='post-journal-stale'||mode==='post-journal-stale-tail') {

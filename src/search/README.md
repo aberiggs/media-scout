@@ -79,7 +79,8 @@ with an explicit client and whole-set confirmation. A running execution or a
 prior accepted or possibly accepted grab blocks resubmission of that set even
 after physical holds expire. Rejection, dry-run, and not-attempted outcomes alone
 do not block it. The same idempotency key can still reconcile an existing
-execution. Expired candidates require a fresh search. Historical Arr-only and
+execution. Expired candidates, including confirmed Prowlarr cache misses,
+require a fresh search. Historical Arr-only and
 API acquisition searches cannot be manually submitted.
 Confirmation always requires an explicit download-client choice.
 Activity filters accept search statuses and submission/execution outcomes, including
@@ -123,10 +124,11 @@ refreshes observations and returns promptly when another pass owns the lease.
 The scheduler may execute only its own selected set, with monitoring enabled,
 automatic downloads allowed, and dry-run off. Before each release it revalidates
 the Arr title, configured source/destination, durable selected set and current
-authorization. A transient read failure or a stale verification window gets one
-fresh set of reads, including the final Arr queue check, before any grab. If the
-checks still cannot confirm it is safe to send, remaining releases are not
-attempted. These reads cannot atomically lock either service.
+authorization. Scheduled client discovery and pre-journal validation each retry a
+transient read once, unless Prowlarr is cooling down. For each release, a transient
+read or a window that goes stale through the send journal gets one fresh set of
+reads before any grab. If the checks still cannot confirm it is safe to send,
+remaining releases are not attempted. These reads cannot atomically lock either service.
 Changing the saved Prowlarr connection clears automatic client selections; choose the
 IDs again from the new connection. Queue records identifiable as
 earlier grabs in the same set do not veto later releases; unidentified new queue

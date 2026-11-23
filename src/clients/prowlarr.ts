@@ -1,4 +1,4 @@
-import { Http, type HttpRequestOptions } from '../http';
+import { ApiError, Http, type HttpRequestOptions } from '../http';
 import {
   type DownloadClient,
   downloadClientListSchema,
@@ -9,6 +9,9 @@ import {
   type Release,
   releaseListSchema,
 } from '../types/prowlarr';
+
+/** The grab reached Prowlarr, but its cached locator had already expired. */
+export class ProwlarrCacheMiss extends ApiError {}
 
 /** Thin Prowlarr v1 adapter: search, indexer status, download-client entries, single-release grab (D6). */
 export class ProwlarrClient {
@@ -57,10 +60,20 @@ export class ProwlarrClient {
 
   /** Pushes one cached release via Prowlarr to the given download-client entry (D6). Throws ApiError on failure (404 cache-miss, 429 limit). */
   async grab(release: Release, downloadClientId: number): Promise<void> {
-    await this.http.postJson('/api/v1/search', {
-      indexerId: release.indexerId,
-      guid: release.guid,
-      downloadClientId,
-    });
+    try {
+      await this.http.postJson('/api/v1/search', {
+        indexerId: release.indexerId,
+        guid: release.guid,
+        downloadClientId,
+      });
+    } catch (error) {
+      if(error instanceof ApiError && error.status===404) {
+        let message:unknown;
+        try { message=JSON.parse(error.body)?.message; } catch { /* not a Prowlarr error payload */ }
+        if(message==="Couldn't find requested release in cache, try searching again")
+          throw new ProwlarrCacheMiss(error.status,error.url,error.body,error.retryAfter,error.timedOut);
+      }
+      throw error;
+    }
   }
 }

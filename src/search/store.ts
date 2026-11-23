@@ -38,6 +38,10 @@ export interface CandidateRecord { searchId: string; candidateId: string; safe: 
 export interface ExecutionChild { candidateId: string; physicalKey: string; state: 'prepared'|'sending'|'submitted'|'rejected'|'uncertain'|'not-attempted'|'dry-run'; effectiveCategory?:string|null; categoryRouting?:'direct'|'configured-mapping'|'default-category'; categoryNote?:string; releaseCategoryIds?:number[]; message?: string }
 export interface ExecutionRecord { id:string; key:string; hash:string; searchId:string; planId:string; version:number; outcome:string; owner:string; leaseUntil:number; children:ExecutionChild[]; receipt:unknown; payload:unknown; updatedAt:number }
 type AutomationGrace = { mediaKey:string; graceUntil:number; passOwner?:string; attempt?:{startedAt:number;targetKeys:string[];failureBackoffMinMs:number;failureBackoffMaxMs:number} };
+type AutomationSendUndo = {
+  mediaKey:string; priorGraceUntil:number|undefined; provisionalUntil:number;
+  attempts?: {startedAt:number; deadlines:Array<{target:string;deadline:number}>};
+};
 
 export function openSearchStore(path: string): SearchStore {
   if (path !== ':memory:' && existsSync(path)) {
@@ -127,27 +131,44 @@ export class SearchStore {
   ownsExecution(id:string,owner:string,now:number):boolean { const row=this.execution(id);return !!row&&row.owner===owner&&row.leaseUntil>now&&row.outcome==='running'; }
   updateExecution(id:string,owner:string,now:number,change:(r:ExecutionRecord)=>ExecutionRecord):boolean { return this.db.transaction(()=>{const prior=this.execution(id); if(!prior || prior.owner!==owner || prior.leaseUntil<=now) return false; const next=change(prior); this.db.prepare('UPDATE executions SET outcome=?,lease_until=?,payload_json=?,updated_at=? WHERE id=?').run(next.outcome,next.leaseUntil,json(next),now,id); return true; }).immediate(); }
   renewExecution(id:string,owner:string,now:number,ttl:number):boolean { return this.db.transaction(()=>{const prior=this.execution(id); if(!prior||prior.owner!==owner||prior.leaseUntil<=now)return false; prior.leaseUntil=now+ttl; prior.updatedAt=now; this.db.prepare('UPDATE executions SET lease_until=?,payload_json=?,updated_at=? WHERE id=?').run(prior.leaseUntil,json(prior),now,id); this.db.prepare('UPDATE execution_holds SET expires_at=? WHERE execution_id=?').run(now+3_600_000,id); return true; }).immediate(); }
-  beginAutomationSend(id:string,owner:string,index:number,clock:()=>number,freshUntil:number,guard:(now:number)=>string|undefined,grace:(now:number)=>AutomationGrace):'started'|'stale'|'lost'|{blocked:string} {
+  beginAutomationSend(id:string,owner:string,index:number,clock:()=>number,freshUntil:number,guard:(now:number)=>string|undefined,grace:(now:number)=>AutomationGrace):{started:AutomationSendUndo}|'stale'|'lost'|{blocked:string} {
     return this.db.transaction(()=>{
       const now=clock();
       if(!this.ownsExecution(id,owner,now))return 'lost';
       if(now>freshUntil)return 'stale';
       const blocked=guard(now);
       if(blocked)return {blocked};
-      return this.transitionExecutionChild(id,owner,now,index,'sending',undefined,grace(now))?'started':'lost';
+      const marker=grace(now);
+      const prior = this.db.prepare("SELECT expires_at FROM grace WHERE kind='media' AND identity=? AND submission_key=?").get(marker.mediaKey,id) as {expires_at:number}|undefined;
+      const attempt=marker.attempt;
+      const deadlines=attempt ? this.db.prepare('SELECT target, deadline FROM automation_attempts WHERE last_attempt=? AND target IN (SELECT value FROM json_each(?))').all(attempt.startedAt,json(attempt.targetKeys)) as Array<{target:string;deadline:number}> : [];
+      if(!this.transitionExecutionChild(id,owner,now,index,'sending',undefined,marker))return 'lost';
+      return {started:{mediaKey:marker.mediaKey,priorGraceUntil:prior?.expires_at,provisionalUntil:marker.graceUntil,...(attempt?{attempts:{startedAt:attempt.startedAt,deadlines}}:{})}};
     }).immediate();
   }
-  /** Only before calling the provider. If the worker dies first, recover a sending intent as uncertain. */
-  cancelUnsentAutomationChild(id:string,owner:string,index:number,clock:()=>number,message:string,grace:AutomationGrace):boolean {
-    return this.db.transaction(()=>this.transitionExecutionChild(id,owner,clock(),index,'not-attempted',message,grace,true)).immediate();
+  /** Only before calling grab; retain the hold. An orphaned sending intent is still uncertain. */
+  resetUnsentAutomationChild(id:string,owner:string,index:number,clock:()=>number,undo:AutomationSendUndo):boolean {
+    return this.db.transaction(()=>{
+      if(!this.transitionExecutionChild(id,owner,clock(),index,'prepared',undefined,undefined,true))return false;
+      if(undo.priorGraceUntil===undefined) {
+        this.db.prepare("DELETE FROM grace WHERE kind='media' AND identity=? AND submission_key=? AND expires_at=?").run(undo.mediaKey,id,undo.provisionalUntil);
+      } else {
+        this.db.prepare("UPDATE grace SET expires_at=? WHERE kind='media' AND identity=? AND submission_key=? AND expires_at=?").run(undo.priorGraceUntil,undo.mediaKey,id,Math.max(undo.priorGraceUntil,undo.provisionalUntil));
+      }
+      if(undo.attempts?.deadlines.length) {
+        const restore=this.db.prepare('UPDATE automation_attempts SET deadline=? WHERE target=? AND last_attempt=? AND deadline=?');
+        for(const {target,deadline} of undo.attempts.deadlines) restore.run(deadline,target,undo.attempts.startedAt,undo.provisionalUntil);
+      }
+      return true;
+    }).immediate();
   }
   updateExecutionChild(id:string,owner:string,now:number,index:number,state:ExecutionChild['state'],message?:string,grace?:AutomationGrace):boolean {
     return this.db.transaction(()=>this.transitionExecutionChild(id,owner,now,index,state,message,grace)).immediate();
   }
-  private transitionExecutionChild(id:string,owner:string,now:number,index:number,state:ExecutionChild['state'],message?:string,grace?:AutomationGrace,cancelUnsent=false):boolean {
+  private transitionExecutionChild(id:string,owner:string,now:number,index:number,state:ExecutionChild['state'],message?:string,grace?:AutomationGrace,resetUnsent=false):boolean {
       const prior=this.execution(id), child=prior?.children[index];
       if(!prior||!child||prior.owner!==owner||prior.leaseUntil<=now||prior.outcome!=='running')return false;
-      const legal=cancelUnsent ? child.state==='sending' && state==='not-attempted'
+      const legal=resetUnsent ? child.state==='sending' && state==='prepared'
         : (child.state==='prepared'&&['sending','not-attempted','dry-run'].includes(state))||(child.state==='sending'&&['submitted','rejected','uncertain'].includes(state));
       if(!legal||(state==='sending'&&grace?.passOwner&&!this.ownsLease('automation-pass',grace.passOwner,now)))return false;
       prior.children[index]={...child,state,...(message?{message}:{})}; prior.updatedAt=now;
@@ -157,9 +178,6 @@ export class SearchStore {
       if(grace&&['sending','submitted','uncertain'].includes(state)) {
         this.db.prepare("INSERT INTO grace VALUES('media',?,?,?) ON CONFLICT(kind,identity) DO UPDATE SET submission_key=excluded.submission_key,expires_at=MAX(grace.expires_at,excluded.expires_at) WHERE grace.submission_key=excluded.submission_key OR grace.expires_at<=?").run(grace.mediaKey,id,grace.graceUntil,now);
         if(grace.attempt) this.db.prepare('UPDATE automation_attempts SET deadline=? WHERE last_attempt=? AND target IN (SELECT value FROM json_each(?))').run(grace.graceUntil,grace.attempt.startedAt,json(grace.attempt.targetKeys));
-      }
-      if(grace&&cancelUnsent&&!prior.children.some(c=>['sending','submitted','uncertain'].includes(c.state))) {
-        this.db.prepare("DELETE FROM grace WHERE kind='media' AND submission_key=?").run(id);
       }
       if(grace&&state==='rejected'&&!prior.children.some(c=>c.state==='submitted'||c.state==='uncertain')) {
         this.db.prepare("DELETE FROM grace WHERE kind='media' AND submission_key=?").run(id);
@@ -302,6 +320,7 @@ export class SearchStore {
   hasLiveLease(resource: string, now: number): boolean { return !!this.db.prepare('SELECT 1 FROM leases WHERE resource=? AND expires_at>?').get(resource, now); }
   releaseLease(resource: string, owner: string): void { this.db.prepare('DELETE FROM leases WHERE resource=? AND owner=?').run(resource, owner); }
   expireCandidatesAt(searchId: string, expiresAt: number): void { this.db.prepare('UPDATE candidates SET expires_at=? WHERE search_id=?').run(expiresAt, searchId); }
+  expireCandidateAt(searchId:string,id:string,expiresAt:number):void { this.db.prepare('UPDATE candidates SET expires_at=MIN(expires_at,?) WHERE search_id=? AND id=?').run(expiresAt,searchId,id); }
   maintain(now: number): void {
     this.db.transaction(() => {
       this.db.prepare("DELETE FROM grace WHERE kind='media' AND expires_at<=?").run(now);

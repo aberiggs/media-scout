@@ -20,6 +20,28 @@ afterEach(() => { cleanup(); window.history.replaceState(null, '', '/'); session
 const semanticSearch = { ...matched, searchId: 'life', plan: { version: 2, planId: 'plan-life', status: 'matched', selections: [{ candidateId: 'c1', coverage: 'Season one', reason: 'Complete release set', uncertainty: '' }], covered: ['Season one'], gaps: [], deferred: [], scopeGaps: [], extras: [], usefulOverlap: [], broadCoverage: 'complete', coverage: { covered: ['Season one'], gaps: [], deferred: [], broad: { status: 'complete', gaps: [] } } }, candidates: [{ candidateId: 'c1', observations: [{ title: 'Season One Pack' }] }] }
 const preparedConfirmation = { confirmationId: 'confirm-life', expiresAt: '2099-01-01T00:00:00Z', searchId: 'life', planId: 'plan-life', version: 2, client: { id: 8, name: 'qBittorrent', protocol: 'torrent', configuredCategories: [], defaultCategory: 'tv' }, dryRun: true, children: [{ candidateId: 'c1', title: 'Season One Pack', effectiveCategory: 'tv', categoryRouting: 'default', categoryNote: 'Client default category: tv', releaseCategoryIds: [5000] }] }
 
+it('loads search and receipt without newer AbortSignal static methods', async () => {
+  const any = AbortSignal.any, timeout = AbortSignal.timeout
+  Object.defineProperty(AbortSignal, 'any', { configurable: true, value: undefined })
+  Object.defineProperty(AbortSignal, 'timeout', { configurable: true, value: undefined })
+  try {
+    const receipt={executionId:'old-browser',searchId:'life',outcome:'running',dryRun:false,updatedAt:'2026-01-01',children:[{candidateId:'c1',outcome:'prepared'}]}
+    let reads=0
+    lifecycleFetch(url => {
+      if(url==='/api/v2/searches/life') return Response.json({...semanticSearch,receipts:[receipt]})
+      if(url==='/api/v2/executions/old-browser') { reads++; return Response.json(receipt) }
+      return Response.json({})
+    })
+    const { SearchPage } = await import('./Search')
+    render(<SearchPage settings={defaults} searchId="life" searchRevision={1} onSearchStarted={()=>{}} />)
+    await waitFor(()=>assert.equal(reads,1))
+    assert.ok(screen.getByText('Execution receipt'))
+  } finally {
+    Object.defineProperty(AbortSignal, 'any', { configurable: true, value: any })
+    Object.defineProperty(AbortSignal, 'timeout', { configurable: true, value: timeout })
+  }
+})
+
 function lifecycleFetch(handler: (url: string, init?: RequestInit) => Response | Promise<Response>) {
   globalThis.fetch = async (input, init) => {
     const url = String(input)

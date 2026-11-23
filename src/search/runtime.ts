@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { OpenRouter } from '@openrouter/sdk';
-import { ProwlarrClient } from '../clients/prowlarr';
+import { ProwlarrCacheMiss, ProwlarrClient } from '../clients/prowlarr';
 import { SonarrClient } from '../clients/sonarr';
 import { RadarrClient } from '../clients/radarr';
 import { Http } from '../http';
@@ -55,6 +55,8 @@ const mediaKey = (target: ArrTarget) => `${target.provider}:${target.sourceFinge
 const automationClientId = (settings: Settings, provider: ArrProvider) =>
   provider === 'sonarr' ? settings.integrations.prowlarr.tvClientId : settings.integrations.prowlarr.movieClientId;
 const AUTOMATION_REVALIDATION_MAX_MS = 15_000;
+const isTransientVerificationError = (error: unknown): boolean =>
+  error instanceof ApiError && (error.status === 0 || (error.status >= 500 && error.status <= 599));
 export interface ArrObservationPass { observedAt: number; ran: boolean; reason?: string }
 export const MAX_PROWLARR_MCP_CAPABILITY_TTL_MS = 35 * 60_000;
 function sanitizePrivateText<T>(value: T, secrets: string[]): T {
@@ -323,6 +325,18 @@ export class SearchRuntime {
     if (!(error instanceof ApiError) || error.status !== 429) return false;
     this.store.setProviderDeadline('prowlarr', this.clock() + (error.retryAfter ?? 60) * 1000);
     return true;
+  }
+  private async scheduledProwlarrRead<T>(read:()=>Promise<T>):Promise<T> {
+    const checkCooldown=()=>{
+      if((this.store.getProviderDeadline('prowlarr')??0)>this.clock()) throw new Error('provider-cooldown');
+    };
+    checkCooldown();
+    try { return await read(); }
+    catch(error) {
+      if(!isTransientVerificationError(error))throw error;
+      checkCooldown();
+      return read();
+    }
   }
   private trackMcpOperation<T>(operation: Promise<T>): Promise<T> {
     this.mcpOperations.add(operation);
@@ -606,7 +620,12 @@ export class SearchRuntime {
     if((bound.executionSource??'manual')!==authorizedSource || (authorizedSource==='automation'&&(!automation||!passOwner||automation.passOwner!==passOwner||!this.automationAuthorized(automation))) || (authorizedSource==='acquisition'&&(!passOwner||bound.acquisitionOwner!==passOwner||!this.store.ownsSearch(input.searchId,passOwner,this.clock())||!this.store.acquisition(input.searchId))))throw new Error('automation-not-authorized');
     const plan=this.currentPlan(input.searchId,bound.planId,bound.version,authorizedSource);
     if(JSON.stringify(plan.selections.map(selection=>selection.candidateId))!==JSON.stringify(bound.candidates.map(candidate=>candidate.candidateId))) throw new Error('plan-changed');
-    await this.validateExecutionSnapshot(input.searchId,input.planId,input.version,bound.snapshot,bound.candidates,authorizedSource);
+    const validate=()=>this.validateExecutionSnapshot(input.searchId,input.planId,input.version,bound.snapshot,bound.candidates,authorizedSource);
+    if(automation) await this.scheduledProwlarrRead(()=>{
+      if(!this.automationAuthorized(automation))throw new Error('automation-not-authorized');
+      return validate();
+    });
+    else await validate();
     if(authorizedSource==='acquisition'&&(!passOwner||bound.acquisitionOwner!==passOwner||!this.store.ownsSearch(input.searchId,passOwner,this.clock())))throw new Error('execution-ownership-lost');
     if(automation&&!this.automationAuthorized(automation))throw new Error('automation-not-authorized');
     const settings=this.getSettings(),secrets=[settings.integrations.prowlarr.apiKey,settings.integrations.prowlarr.url];
@@ -644,7 +663,9 @@ export class SearchRuntime {
         if(leaseLost||!this.store.renewExecution(id,owner,this.clock(),30_000)) throw new Error('execution-ownership-lost');
        if(this.closing||this.closed) return stoppedReceipt(i,'Runtime is shutting down; remaining releases were not attempted.');
        if(authorizedSource==='acquisition'&&(!passOwner||!this.store.ownsSearch(input.searchId,passOwner,this.clock())))return stoppedReceipt(i,'Acquisition ownership lease was lost; remaining releases were not attempted.');
-        let sendClient:NonNullable<RuntimeClients['prowlarr']>|undefined, freshUntil:number|undefined;
+        const release=(op.payload as {boundReleases?:Release[]}).boundReleases?.[i];
+        if(!release) throw new Error('execution-ownership-lost');
+        let sendClient:NonNullable<RuntimeClients['prowlarr']>|undefined;
         try { if (!automation) sendClient=await this.validateExecutionSnapshot(input.searchId,input.planId,input.version,bound.snapshot,bound.candidates,authorizedSource); }
         catch (error) {
           if (authorizedSource === 'acquisition' && this.recordProwlarrFailure(error))
@@ -659,6 +680,7 @@ export class SearchRuntime {
             if ((this.store.getProviderDeadline(automation.provider) ?? 0)>this.clock() || (this.store.getProviderDeadline('prowlarr') ?? 0)>this.clock())
               return stoppedReceipt(i,'Provider cooldown prevents verification; remaining releases were not attempted.');
             const started = this.clock();
+            const freshUntil = started + AUTOMATION_REVALIDATION_MAX_MS;
             let provider: 'arr'|'prowlarr' = 'arr';
             try {
               const checkQueue = await this.checkAutomationScope(automation,bound.candidates.slice(0,i).map(c=>c.release));
@@ -666,47 +688,48 @@ export class SearchRuntime {
               provider = 'prowlarr';
               sendClient=await this.validateExecutionSnapshot(input.searchId,input.planId,input.version,bound.snapshot,bound.candidates,authorizedSource);
               if (!this.automationAuthorized(automation)) return stoppedReceipt(i,'Automation pass, source, or routing settings changed; remaining releases were not attempted.');
-              if (this.clock()-started <= AUTOMATION_REVALIDATION_MAX_MS) {
-                provider = 'arr';
-                if (!await checkQueue()) return stoppedReceipt(i,'Arr queue or source changed; remaining releases were not attempted.');
-                if (this.clock()-started <= AUTOMATION_REVALIDATION_MAX_MS) { verified = true; freshUntil=started+AUTOMATION_REVALIDATION_MAX_MS; break; }
-              }
+              if (this.clock()>freshUntil) continue;
+              provider = 'arr';
+              if (!await checkQueue()) return stoppedReceipt(i,'Arr queue or source changed; remaining releases were not attempted.');
+              if (this.clock()>freshUntil) continue;
             } catch (error) {
+              if(error instanceof Error&&error.message==='execution-ownership-lost')throw error;
               if(provider==='prowlarr' && this.recordProwlarrFailure(error)) return stoppedReceipt(i,'Prowlarr rate-limited verification; remaining releases were not attempted.');
               if(error instanceof ApiError && error.status===429) return stoppedReceipt(i,'Arr rate-limited verification; remaining releases were not attempted.');
-              if (!(error instanceof ApiError && (error.status===0 || error.status>=500 && error.status<=599)))
+              if (!isTransientVerificationError(error))
                 return stoppedReceipt(i,'Source, plan, candidate, client, or safety settings changed; remaining releases were not attempted.');
               if ((this.store.getProviderDeadline(automation.provider) ?? 0)>this.clock() || (this.store.getProviderDeadline('prowlarr') ?? 0)>this.clock())
                 return stoppedReceipt(i,'Provider cooldown prevents verification; remaining releases were not attempted.');
+              continue;
             }
+            if(leaseLost||!this.store.renewExecution(id,owner,this.clock(),30_000))throw new Error('execution-ownership-lost');
+            const marked=this.store.beginAutomationSend(id,owner,i,this.clock,freshUntil,at=>{
+              if(this.closing||this.closed)return 'Runtime is shutting down; remaining releases were not attempted.';
+              if(!this.automationAuthorized(automation,at))return 'Automation pass or routing settings changed before submission.';
+              if((this.store.getProviderDeadline(automation.provider)??0)>at||(this.store.getProviderDeadline('prowlarr')??0)>at)return 'Provider cooldown prevents submission; remaining releases were not attempted.';
+              if(bound.candidates.some(c=>!this.store.getCandidate(input.searchId,c.candidateId,at)))return 'Candidate expired before submission.';
+              return undefined;
+            },at=>grace(at)!);
+            if(marked==='lost')throw new Error('execution-ownership-lost');
+            if(marked==='stale')continue;
+            if('blocked' in marked)return stoppedReceipt(i,marked.blocked);
+            // SQLite readers can delay the commit. Undo this intent only here,
+            // where this worker knows it has not called grab.
+            if(this.clock()>freshUntil) {
+              if(!this.store.resetUnsentAutomationChild(id,owner,i,this.clock,marked.started))throw new Error('execution-ownership-lost');
+              continue;
+            }
+            verified=true; break;
           }
           if (!verified) return stoppedReceipt(i,'Arr or routing verification temporarily unavailable; remaining releases were not attempted.');
         }
-       if(this.closing||this.closed) return stoppedReceipt(i,'Runtime is shutting down; remaining releases were not attempted.');
-       if(authorizedSource==='acquisition'&&(!passOwner||!this.store.ownsSearch(input.searchId,passOwner,this.clock())))return stoppedReceipt(i,'Acquisition ownership lease was lost; remaining releases were not attempted.');
-       if(leaseLost||!this.store.renewExecution(id,owner,this.clock(),30_000)) throw new Error('execution-ownership-lost');
+       if(!automation) {
+         if(this.closing||this.closed) return stoppedReceipt(i,'Runtime is shutting down; remaining releases were not attempted.');
+         if(authorizedSource==='acquisition'&&(!passOwner||!this.store.ownsSearch(input.searchId,passOwner,this.clock())))return stoppedReceipt(i,'Acquisition ownership lease was lost; remaining releases were not attempted.');
+         if(leaseLost||!this.store.renewExecution(id,owner,this.clock(),30_000)) throw new Error('execution-ownership-lost');
+       }
        if(!sendClient) return stoppedReceipt(i,'Download client verification was unavailable; remaining releases were not attempted.');
-       const release=(op.payload as {boundReleases?:Release[]}).boundReleases?.[i];
-      if(!release) throw new Error('execution-ownership-lost');
-       if(automation) {
-         const staleMessage='Arr or routing verification temporarily unavailable; remaining releases were not attempted.';
-         const marked=this.store.beginAutomationSend(id,owner,i,this.clock,freshUntil!,at=>{
-          if(this.closing||this.closed)return 'Runtime is shutting down; remaining releases were not attempted.';
-          if(!this.automationAuthorized(automation,at))return 'Automation pass or routing settings changed before submission.';
-          if((this.store.getProviderDeadline(automation.provider)??0)>at||(this.store.getProviderDeadline('prowlarr')??0)>at)return 'Provider cooldown prevents submission; remaining releases were not attempted.';
-          if(bound.candidates.some(c=>!this.store.getCandidate(input.searchId,c.candidateId,at)))return 'Candidate expired before submission.';
-          return undefined;
-         },at=>grace(at)!);
-         if(marked==='lost')throw new Error('execution-ownership-lost');
-         if(marked==='stale')return stoppedReceipt(i,staleMessage);
-         if(marked!=='started')return stoppedReceipt(i,marked.blocked);
-         // Even after the write reservation is acquired, committing can wait on
-         // SQLite readers. Don't use a snapshot that aged out before the POST.
-         if(this.clock()>freshUntil!) {
-           if(!this.store.cancelUnsentAutomationChild(id,owner,i,this.clock,staleMessage,grace()!))throw new Error('execution-ownership-lost');
-           return stoppedReceipt(i+1,staleMessage);
-         }
-       } else if(!this.store.updateExecutionChild(id,owner,this.clock(),i,'sending',undefined,grace())) throw new Error('execution-ownership-lost');
+       if(!automation && !this.store.updateExecutionChild(id,owner,this.clock(),i,'sending',undefined,grace())) throw new Error('execution-ownership-lost');
       try {
         await sendClient.grab!(release,bound.snapshot.client.id);
         if(leaseLost||!this.store.renewExecution(id,owner,this.clock(),30_000)||!this.store.updateExecutionChild(id,owner,this.clock(),i,'submitted',undefined,grace())) throw new Error('execution-ownership-lost');
@@ -714,9 +737,11 @@ export class SearchRuntime {
         if(error instanceof Error&&error.message==='execution-ownership-lost') throw error;
         if(leaseLost||!this.store.ownsExecution(id,owner,this.clock())) throw new Error('execution-ownership-lost');
         this.recordProwlarrFailure(error);
+        const cacheMiss=(authorizedSource==='automation'||automationManual)&&error instanceof ProwlarrCacheMiss;
+        if(cacheMiss)this.store.expireCandidateAt(input.searchId,op.children[i]!.candidateId,this.clock());
         const rejected=error instanceof ApiError&&error.status>=400&&error.status<500;
         const state=rejected?'rejected':'uncertain';
-        if(!this.store.updateExecutionChild(id,owner,this.clock(),i,state,rejected?'Prowlarr rejected the submission':'Submission outcome is uncertain',grace())) throw new Error('execution-ownership-lost');
+        if(!this.store.updateExecutionChild(id,owner,this.clock(),i,state,cacheMiss?'Prowlarr no longer has this release cached. Search again for current releases.':rejected?'Prowlarr rejected the submission':'Submission outcome is uncertain',grace())) throw new Error('execution-ownership-lost');
         const current=this.store.execution(id)!;
         for(let j=i+1;j<op.children.length;j++) if(current.children[j]!.state==='prepared'&&!this.store.updateExecutionChild(id,owner,this.clock(),j,'not-attempted')) throw new Error('execution-ownership-lost');
         const final=this.store.execution(id)!,outcome=this.executionOutcome(final.children),receipt=this.publicExecution(final,outcome);
@@ -846,7 +871,8 @@ export class SearchRuntime {
         const code = error instanceof Error ? error.message : '';
         const message = code==='download-client-unavailable' ? 'Choose an enabled download client for this media type in Settings.'
           : code==='download-client-protocol-mismatch' ? 'The configured download client is incompatible with this release set.'
-          : code==='physical-release-busy' ? 'A release in this set is still held by another execution.' : 'Automatic execution could not start safely.';
+          : code==='physical-release-busy' ? 'A release in this set is still held by another execution.'
+          : code==='provider-cooldown' ? 'Prowlarr cooldown prevented automatic execution.' : 'Automatic execution could not start safely.';
         this.store.appendEvent(searchId,{type:'submission',data:{outcome:'deferred',candidateIds:[],outcomes:[],message}},this.clock());
       }
     }
@@ -955,7 +981,7 @@ export class SearchRuntime {
     const search=this.store.getSearch(searchId),result=search?.result as AgentSearchResult|undefined,plan=result?.plan;
     if(!search||search.status!=='matched'||!plan||plan.version!==2||!plan.selections.length)return null;
     const input={searchId,planId:plan.planId,version:plan.version,candidateIds:plan.selections.map(selection=>selection.candidateId),downloadClientId:auth.downloadClientId};
-    const confirmation=await this.prepareExecutionAuthorized(input,'automation',auth);
+    const confirmation=await this.scheduledProwlarrRead(()=>this.prepareExecutionAuthorized(input,'automation',auth));
     const commit={confirmationId:confirmation.confirmationId,searchId,planId:plan.planId,version:plan.version,idempotencyKey:`automation:${searchId}`};
     const operation=this.performExecution(commit,'automation',auth.passOwner);
     this.executionOperations.add(operation);

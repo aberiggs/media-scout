@@ -13,7 +13,14 @@ type CommitRequest = { confirmationId: string; searchId: string; planId: string;
 type SearchResult = { searchId: string; status: string; source?: 'manual' | 'arr' | 'automation'; manualExecutionEligible?: boolean; manualExecutionBlockedReason?: string; automationPending?: boolean; automationWorkload?: { deferredTargets: number }; acquisition?: { status: string; code?: string }; prompt?: string; plan?: Plan; candidates?: Candidate[]; events?: Array<{ type: string; data: Record<string, unknown> }>; receipts?: Receipt[]; counts?: { decisions: number; searches: number; candidates: number }; queuePosition?: number; waitingReason?: string; retryAt?: string; message?: string; researchWarnings?: string[]; diagnostics?: { modelTurns: number; stopReason: string; elapsedMs?: number; usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cost?: number } } }
 const running = (status?: string) => status === 'queued' || status === 'running'
 const MAX_SEARCH_PROMPT_LENGTH = 4000
-const readSignal = (controller: AbortController) => AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)])
+function readSignal(parent: AbortController) {
+  const controller = new AbortController()
+  const abort = () => controller.abort()
+  if (parent.signal.aborted) abort()
+  else parent.signal.addEventListener('abort', abort, { once: true })
+  const timer = window.setTimeout(abort, 15_000)
+  return { signal: controller.signal, clear: () => { window.clearTimeout(timer); parent.signal.removeEventListener('abort', abort) } }
+}
 const safeBody = async (response: Response) => { try { return await response.json() } catch { return {} } }
 const idempotencyKey = () => {
   const bytes = new Uint8Array(20)
@@ -105,9 +112,9 @@ export function SearchPage({ settings, searchId, searchRevision, active = true, 
     if (!isCurrent(id, token)) return
     window.clearTimeout(timer.current); controller.current?.abort()
     const current = new AbortController(); controller.current = current
-    const signal = readSignal(current)
+    const read = readSignal(current)
     try {
-      const response = await fetch(`/api/v2/searches/${encodeURIComponent(id)}`, { signal })
+      const response = await fetch(`/api/v2/searches/${encodeURIComponent(id)}`, { signal: read.signal })
       if (response.status === 404) {
         if (!current.signal.aborted && isCurrent(id, token)) {
           window.clearTimeout(receiptTimer.current); receiptController.current?.abort(); receiptPollingId.current = null
@@ -122,6 +129,7 @@ export function SearchPage({ settings, searchId, searchRevision, active = true, 
       }
       const data = await response.json() as SearchResult
       if (!data || data.searchId !== id || typeof data.status !== 'string') throw new Error('Invalid search status')
+      if (read.signal.aborted && !current.signal.aborted) throw new Error('timeout')
       if (current.signal.aborted || !isCurrent(id, token)) return
       setResult(data); setError(''); setSearchMissing(false)
       setPendingCommit(readPending(id))
@@ -135,7 +143,7 @@ export function SearchPage({ settings, searchId, searchRevision, active = true, 
         setError('Search status is temporarily unavailable. Retrying…')
         timer.current = window.setTimeout(() => void loadResult(id, token), 3000)
       }
-    }
+    } finally { read.clear() }
   }
   async function pollReceipt(executionId: string, id: string, token = generation.current) {
     if (!isCurrent(id, token)) return
@@ -143,16 +151,19 @@ export function SearchPage({ settings, searchId, searchRevision, active = true, 
     window.clearTimeout(receiptTimer.current)
     receiptController.current?.abort()
     const current = new AbortController(); receiptController.current = current
+    const read = readSignal(current)
     try {
-      const response = await fetch(`/api/v2/executions/${encodeURIComponent(executionId)}`, { signal: readSignal(current) })
+      const response = await fetch(`/api/v2/executions/${encodeURIComponent(executionId)}`, { signal: read.signal })
       if (!response.ok) throw new Error()
       const next = await response.json() as Receipt
       if (!validReceipt(next) || next.searchId !== id) throw new Error('Receipt response was incomplete')
+      if (read.signal.aborted && !current.signal.aborted) throw new Error('timeout')
       if (current.signal.aborted || !isCurrent(id, token)) return
       setReceipt(next)
       if (next.outcome === 'running') receiptTimer.current = window.setTimeout(() => void pollReceipt(executionId, id, token), 1200)
       else { receiptPollingId.current = null; void loadResult(id, token) }
     } catch { if (!current.signal.aborted && isCurrent(id, token)) receiptTimer.current = window.setTimeout(() => void pollReceipt(executionId, id, token), 3000) }
+    finally { read.clear() }
   }
   async function search(event: FormEvent) {
     event.preventDefault()

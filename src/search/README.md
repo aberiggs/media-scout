@@ -44,6 +44,14 @@ download or import completion.
 `POST /api/v2/executions/prepare` confirms the complete selected set and an explicit
 `downloadClientId`; `POST /api/v2/executions/commit` sends it only after rechecking
 the plan, source settings, safety mode, client configuration, and candidate validity.
+Prepare accepts:
+```json
+{"searchId":"search-id","planId":"plan-id","version":2,"candidateIds":["candidate-id"],"downloadClientId":7}
+```
+Commit accepts:
+```json
+{"confirmationId":"confirmation-id","searchId":"search-id","planId":"plan-id","version":2,"idempotencyKey":"caller-key"}
+```
 `GET /api/v2/executions/:id` and search detail expose durable receipts. A repeated
 idempotency key with the same confirmation replays its receipt; reuse with a
 different confirmation conflicts. Physical releases are held against overlapping
@@ -67,6 +75,16 @@ Activity filters accept search statuses and submission/execution outcomes, inclu
 `partial` and `not-attempted`.
 Activity prompt previews are capped at 240 Unicode code points; `q` still searches
 the full stored prompt, while search detail retains its exact text.
+
+## Trusted server-to-server acquisition
+
+Trusted callers may `POST /api/v2/acquisitions` with `{"prompt":"Find Example","downloadClientId":7}` and a required `Idempotency-Key` header (1–200 characters from `A-Z a-z 0-9 . _ : -`). The strict body rejects extra fields. HTTP 202 means the accepted request and its queue entry were atomically persisted; the response contains `searchId`, `status:"queued"` and `statusUrl` for `GET /api/v2/searches/:id`. Repeating the same key and request returns the same ID even after the job finishes; different content conflicts with 409. Intake keys are retained for at least 60 days from acceptance, and longer while their search remains retained. Completed acquisition history is retained for up to 30 days from search completion, subject to the shared 10,000-entry cap. A replay can return the original ID after its detail endpoint has expired. If detailed execution receipts are pruned first, search detail still shows the acquisition outcome.
+
+Acquisitions share the manual FIFO queue and the three-worker limit, use the ordinary planner, and execute the entire validated plan. Once matched, the backend uses the requested client ID, with no fallback, and rechecks the Prowlarr connection, client configuration and dry-run setting before execution and before every send. Dry-run sends no grabs. Manual preparation/commit cannot take ownership of the job. Search detail reports `manualExecutionEligible: false` and includes `acquisition.status`; for a clean miss the search is `no-match` and the acquisition is `not-attempted`.
+
+Unclaimed requests survive a restart. A started job is not replayed: a match interrupted before journaling is reported as `interrupted`, and an in-flight send is recovered as `uncertain`, with no resubmission. Use this endpoint only from trusted servers, not cross-origin browser code.
+
+If Prowlarr rate-limits a download-client check, Scout pauses queued work according to `Retry-After` (60 seconds if absent) without retrying the stopped acquisition. Search detail reports `prowlarr-rate-limited` before an execution starts, or records the rate limit in the receipt if execution has already started.
 
 ## Scheduled Arr automation
 

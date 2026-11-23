@@ -10,6 +10,7 @@ const schema = `
 CREATE TABLE IF NOT EXISTS search_meta (version INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS searches (id TEXT PRIMARY KEY, prompt TEXT NOT NULL, status TEXT NOT NULL, created_at INTEGER NOT NULL, finished_at INTEGER, result_json TEXT);
 CREATE TABLE IF NOT EXISTS search_work (search_id TEXT PRIMARY KEY, sequence INTEGER NOT NULL UNIQUE, source TEXT NOT NULL, context_json TEXT NOT NULL, owner TEXT, lease_expires_at INTEGER, started_at INTEGER);
+CREATE TABLE IF NOT EXISTS acquisitions (idem_key TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, search_id TEXT NOT NULL UNIQUE, client_id INTEGER NOT NULL, source_fingerprint TEXT NOT NULL, dry_run INTEGER NOT NULL, created_at INTEGER NOT NULL, stop_code TEXT, archived_outcome TEXT);
 CREATE TABLE IF NOT EXISTS candidates (search_id TEXT NOT NULL, id TEXT NOT NULL, safe_json TEXT NOT NULL, private_json TEXT NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY(search_id,id));
 CREATE TABLE IF NOT EXISTS search_events (id INTEGER PRIMARY KEY, search_id TEXT NOT NULL, event_json TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value_json TEXT NOT NULL);
@@ -31,7 +32,7 @@ const json = (v: unknown): string => JSON.stringify(v);
 const parse = <T>(s: string): T => JSON.parse(s) as T;
 
 export interface SearchRecord { searchId: string; prompt: string; status: SearchStatus; createdAt: number; finishedAt?: number; result?: unknown }
-export interface SearchWork { searchId: string; prompt: string; source: 'manual' | 'automation' | 'arr'; context: unknown; owner: string }
+export interface SearchWork { searchId: string; prompt: string; source: 'manual' | 'automation' | 'arr'|'acquisition'; context: unknown; owner: string }
 export interface CandidateRecord { searchId: string; candidateId: string; safe: unknown; privateData: unknown; expiresAt: number }
 export interface ExecutionChild { candidateId: string; physicalKey: string; state: 'prepared'|'sending'|'submitted'|'rejected'|'uncertain'|'not-attempted'|'dry-run'; effectiveCategory?:string|null; categoryRouting?:'direct'|'configured-mapping'|'default-category'; categoryNote?:string; releaseCategoryIds?:number[]; message?: string }
 export interface ExecutionRecord { id:string; key:string; hash:string; searchId:string; planId:string; version:number; outcome:string; owner:string; leaseUntil:number; children:ExecutionChild[]; receipt:unknown; payload:unknown; updatedAt:number }
@@ -57,6 +58,30 @@ export function openSearchStore(path: string): SearchStore {
 
 export class SearchStore {
   constructor(private readonly db: Database.Database) {}
+  acceptAcquisition(input:{key:string;hash:string;now:number;snapshot:()=>{prompt:string;clientId:number;sourceFingerprint:string;dryRun:boolean}}):{status:'created'|'replay'|'conflict';searchId:string} {
+    return this.db.transaction(()=>{
+      const prior=this.db.prepare('SELECT payload_hash,search_id FROM acquisitions WHERE idem_key=?').get(input.key) as {payload_hash:string;search_id:string}|undefined;
+      if(prior)return {status:prior.payload_hash===input.hash?'replay' as const:'conflict' as const,searchId:prior.search_id};
+      const snapshot=input.snapshot(),searchId=randomUUID();
+      this.enqueueSearchInTransaction({searchId,prompt:json({version:3,prompt:snapshot.prompt}),now:input.now,source:'acquisition',context:{}});
+      this.db.prepare('INSERT INTO acquisitions(idem_key,payload_hash,search_id,client_id,source_fingerprint,dry_run,created_at) VALUES(?,?,?,?,?,?,?)').run(input.key,input.hash,searchId,snapshot.clientId,snapshot.sourceFingerprint,+snapshot.dryRun,input.now);
+      return {status:'created' as const,searchId};
+    }).immediate();
+  }
+  acquisition(searchId:string):{clientId:number;sourceFingerprint:string;dryRun:boolean;stopCode:string|null;archivedOutcome:string|null}|null {
+    const r=this.db.prepare('SELECT client_id,source_fingerprint,dry_run,stop_code,archived_outcome FROM acquisitions WHERE search_id=?').get(searchId) as {client_id:number;source_fingerprint:string;dry_run:number;stop_code:string|null;archived_outcome:string|null}|undefined;
+    return r?{clientId:r.client_id,sourceFingerprint:r.source_fingerprint,dryRun:!!r.dry_run,stopCode:r.stop_code,archivedOutcome:r.archived_outcome}:null;
+  }
+  stopAcquisition(searchId:string,code:string,at:number):boolean {
+    return this.db.transaction(()=>{
+      const changed=this.db.prepare(`UPDATE acquisitions SET stop_code=? WHERE search_id=? AND stop_code IS NULL AND archived_outcome IS NULL
+        AND EXISTS(SELECT 1 FROM searches WHERE searches.id=acquisitions.search_id)
+        AND NOT EXISTS(SELECT 1 FROM executions WHERE executions.search_id=acquisitions.search_id)`).run(code,searchId).changes;
+      if(changed)this.db.prepare('INSERT INTO search_events(search_id,event_json,created_at) VALUES(?,?,?)').run(searchId,json({type:'acquisition-stopped',data:{code}}),at);
+      return changed===1;
+    }).immediate();
+  }
+  releaseSearch(searchId:string,owner:string):void { this.db.prepare('UPDATE search_work SET owner=NULL,lease_expires_at=NULL WHERE search_id=? AND owner=?').run(searchId,owner); }
   saveExecutionPreparation(id:string,searchId:string,expiresAt:number,payload:unknown):void { this.db.prepare('INSERT INTO execution_preparations VALUES(?,?,?,?)').run(id,searchId,expiresAt,json(payload)); }
   getExecutionPreparation(id:string):{searchId:string;expiresAt:number;payload:any}|null { const r=this.db.prepare('SELECT * FROM execution_preparations WHERE id=?').get(id) as any; return r?{searchId:r.search_id,expiresAt:r.expires_at,payload:parse(r.payload_json)}:null; }
   createExecution(input:{id:string;key:string;hash:string;searchId:string;planId:string;version:number;payload:any;children:ExecutionChild[];owner:string;now:number;leaseUntil:number}, claimTime:()=>number=()=>input.now):'created'|'replay'|'busy'|'conflict'|'confirmation-expired' {
@@ -137,20 +162,22 @@ export class SearchStore {
     }).immediate();
   }
   close(): void { this.db.close(); }
-  enqueueSearch(input: { searchId: string; prompt: string; now: number; source?: 'manual' | 'automation' | 'arr'; context?: unknown }): void {
-    this.db.transaction(() => {
-      this.db.prepare("INSERT INTO searches(id,prompt,status,created_at) VALUES(?,?,'queued',?)").run(input.searchId,input.prompt,input.now);
-      this.db.prepare('INSERT INTO search_work(search_id,sequence,source,context_json) VALUES(?,?,?,?)').run(input.searchId, Number((this.db.prepare('SELECT COALESCE(MAX(sequence),0)+1 AS n FROM search_work').get() as {n:number}).n), input.source ?? 'manual', json(input.context ?? {}));
-      this.db.prepare("INSERT INTO search_events(search_id,event_json,created_at) VALUES(?,?,?)").run(input.searchId,json({type:'queued',data:{source:input.source ?? 'manual'}}),input.now);
-      this.setSetting(`search-source:${input.searchId}`, input.source ?? 'manual');
-    }).immediate();
+  enqueueSearch(input: { searchId: string; prompt: string; now: number; source?: 'manual' | 'automation' | 'arr'|'acquisition'; context?: unknown }): void {
+    this.db.transaction(() => this.enqueueSearchInTransaction(input)).immediate();
+  }
+  private enqueueSearchInTransaction(input:{searchId:string;prompt:string;now:number;source?:'manual'|'automation'|'arr'|'acquisition';context?:unknown}):void {
+    const source=input.source??'manual';
+    this.db.prepare("INSERT INTO searches(id,prompt,status,created_at) VALUES(?,?,'queued',?)").run(input.searchId,input.prompt,input.now);
+    this.db.prepare('INSERT INTO search_work(search_id,sequence,source,context_json) VALUES(?,?,?,?)').run(input.searchId,Number((this.db.prepare('SELECT COALESCE(MAX(sequence),0)+1 AS n FROM search_work').get() as {n:number}).n),source,json(input.context??{}));
+    this.db.prepare("INSERT INTO search_events(search_id,event_json,created_at) VALUES(?,?,?)").run(input.searchId,json({type:'queued',data:{source}}),input.now);
+    this.setSetting(`search-source:${input.searchId}`,source);
   }
   claimNextSearch(owner: string, now: number, ttl: number, maxActive = 3): SearchWork | null {
     return this.db.transaction((): SearchWork | null => {
       this.recoverExpiredSearchWork(now);
       const active = (this.db.prepare("SELECT COUNT(*) AS n FROM search_work WHERE owner IS NOT NULL AND lease_expires_at>?").get(now) as {n:number}).n;
       if (active >= maxActive) return null;
-       const row = this.db.prepare("SELECT w.search_id,w.source,w.context_json,s.prompt FROM search_work w JOIN searches s ON s.id=w.search_id WHERE s.status='queued' AND w.owner IS NULL AND w.source!='automation' ORDER BY CASE w.source WHEN 'manual' THEN 0 ELSE 1 END,w.sequence LIMIT 1").get() as {search_id:string;source:'manual'|'automation'|'arr';context_json:string;prompt:string}|undefined;
+       const row = this.db.prepare("SELECT w.search_id,w.source,w.context_json,s.prompt FROM search_work w JOIN searches s ON s.id=w.search_id WHERE s.status='queued' AND w.owner IS NULL AND w.source!='automation' ORDER BY CASE w.source WHEN 'manual' THEN 0 WHEN 'acquisition' THEN 0 ELSE 1 END,w.sequence LIMIT 1").get() as {search_id:string;source:'manual'|'automation'|'arr'|'acquisition';context_json:string;prompt:string}|undefined;
       if (!row) return null;
       const changed = this.db.prepare("UPDATE searches SET status='running' WHERE id=? AND status='queued'").run(row.search_id).changes;
       if (!changed) return null;
@@ -173,8 +200,8 @@ export class SearchStore {
   }
   interruptAutomationSearch(searchId:string,at:number):void { this.db.transaction(()=>{const changed=this.db.prepare("UPDATE searches SET status='interrupted',finished_at=? WHERE id=? AND status='queued' AND EXISTS(SELECT 1 FROM search_work WHERE search_id=? AND source='automation')").run(at,searchId,searchId).changes;if(changed)this.db.prepare("INSERT INTO search_events(search_id,event_json,created_at) VALUES(?,?,?)").run(searchId,json({type:'error',data:{code:'automation-deferred',message:'Automation search was not started because capacity was unavailable.'}}),at);}).immediate(); }
   queuePosition(searchId: string): number | null {
-    const row = this.db.prepare("SELECT sequence,source FROM search_work WHERE search_id=? AND owner IS NULL AND (SELECT status FROM searches WHERE id=search_id)='queued'").get(searchId) as {sequence:number;source:'manual'|'automation'|'arr'}|undefined;
-    return row ? (this.db.prepare("SELECT COUNT(*) AS n FROM search_work w JOIN searches s ON s.id=w.search_id WHERE s.status='queued' AND (CASE w.source WHEN 'manual' THEN 0 ELSE 1 END < CASE ? WHEN 'manual' THEN 0 ELSE 1 END OR (w.source=? AND w.sequence<=?))").get(row.source,row.source,row.sequence) as {n:number}).n : null;
+    const row = this.db.prepare("SELECT sequence,source FROM search_work WHERE search_id=? AND owner IS NULL AND (SELECT status FROM searches WHERE id=search_id)='queued'").get(searchId) as {sequence:number;source:'manual'|'automation'|'arr'|'acquisition'}|undefined;
+     return row ? (this.db.prepare("SELECT COUNT(*) AS n FROM search_work w JOIN searches s ON s.id=w.search_id WHERE s.status='queued' AND (CASE w.source WHEN 'manual' THEN 0 WHEN 'acquisition' THEN 0 ELSE 1 END < CASE ? WHEN 'manual' THEN 0 WHEN 'acquisition' THEN 0 ELSE 1 END OR (CASE w.source WHEN 'manual' THEN 0 WHEN 'acquisition' THEN 0 ELSE 1 END=CASE ? WHEN 'manual' THEN 0 WHEN 'acquisition' THEN 0 ELSE 1 END AND w.sequence<=?))").get(row.source,row.source,row.sequence) as {n:number}).n : null;
   }
   activeSearchCount(now:number): number { return (this.db.prepare('SELECT COUNT(*) AS n FROM search_work WHERE owner IS NOT NULL AND lease_expires_at>?').get(now) as {n:number}).n; }
   ownsSearch(searchId:string,owner:string,now:number):boolean { return !!this.db.prepare('SELECT 1 FROM search_work WHERE search_id=? AND owner=? AND lease_expires_at>?').get(searchId,owner,now); }
@@ -193,16 +220,17 @@ export class SearchStore {
       return expired.length;
     }).immediate();
   }
-  finishOwnedSearch(searchId:string,owner:string,status:SearchStatus,result:unknown,at:number):boolean {
+  finishOwnedSearch(searchId:string,owner:string,status:SearchStatus,result:unknown,at:number,keepOwner=false):boolean {
     return this.db.transaction(() => {
       const changed=this.db.prepare("UPDATE searches SET status=?,finished_at=?,result_json=? WHERE id=? AND status='running' AND EXISTS (SELECT 1 FROM search_work WHERE search_id=? AND owner=? AND lease_expires_at>?)").run(status,at,json(result),searchId,searchId,owner,at).changes;
-      if (changed) this.db.prepare('UPDATE search_work SET owner=NULL,lease_expires_at=NULL WHERE search_id=? AND owner=?').run(searchId,owner);
+      if (changed&&!keepOwner) this.db.prepare('UPDATE search_work SET owner=NULL,lease_expires_at=NULL WHERE search_id=? AND owner=?').run(searchId,owner);
       return changed===1;
     }).immediate();
   }
   createSearch(r: SearchRecord): void { this.db.prepare('INSERT INTO searches(id,prompt,status,created_at,finished_at,result_json) VALUES(?,?,?,?,?,?)').run(r.searchId,r.prompt,r.status,r.createdAt,r.finishedAt ?? null,r.result === undefined ? null : json(r.result)); }
   getSearch(id: string): SearchRecord | null { const r = this.db.prepare('SELECT * FROM searches WHERE id=?').get(id) as {id:string;prompt:string;status:SearchStatus;created_at:number;finished_at:number|null;result_json:string|null}|undefined; return r ? {searchId:r.id,prompt:r.prompt,status:r.status,createdAt:r.created_at,...(r.finished_at === null ? {} : {finishedAt:r.finished_at}),...(r.result_json === null ? {} : {result:parse(r.result_json)})} : null; }
   searchWorkContext(id:string):unknown { const row=this.db.prepare('SELECT context_json FROM search_work WHERE search_id=?').get(id) as {context_json:string}|undefined;return row?parse(row.context_json):undefined; }
+  searchWorkLive(id:string,now:number):boolean { return !!this.db.prepare('SELECT 1 FROM search_work WHERE search_id=? AND owner IS NOT NULL AND lease_expires_at>?').get(id,now); }
   listSearches(limit=100, full=true): SearchRecord[] {
     if (full) return (this.db.prepare('SELECT id FROM searches ORDER BY created_at DESC LIMIT ?').all(Math.max(0,limit)) as Array<{id:string}>).map(r=>this.getSearch(r.id)!).filter(Boolean);
     const rows = this.db.prepare(`SELECT id,prompt,status,created_at,finished_at,json_extract(result_json,'$.counts') AS counts
@@ -240,17 +268,25 @@ export class SearchStore {
       this.db.prepare('DELETE FROM execution_preparations WHERE expires_at<=?').run(now);
       this.db.prepare('DELETE FROM execution_holds WHERE expires_at<=?').run(now);
       this.db.prepare('DELETE FROM execution_idempotency WHERE expires_at<=?').run(now);
-      const oldExecutions=this.db.prepare("SELECT id,idem_key,payload_hash FROM executions WHERE outcome!='running' ORDER BY created_at DESC,rowid DESC").all() as Array<{id:string;idem_key:string;payload_hash:string}>;
-      const prunable=oldExecutions.slice(10_000);
+      const oldExecutions=this.db.prepare("SELECT id,search_id,outcome,idem_key,payload_hash,created_at FROM executions WHERE outcome!='running' ORDER BY created_at DESC,rowid DESC").all() as Array<{id:string;search_id:string;outcome:string;idem_key:string;payload_hash:string;created_at:number}>;
       const archiveKey=this.db.prepare('INSERT OR REPLACE INTO execution_idempotency VALUES(?,?,?)');
+      const archiveOutcome=this.db.prepare('UPDATE acquisitions SET archived_outcome=? WHERE search_id=?');
       const deleteHolds=this.db.prepare('DELETE FROM execution_holds WHERE execution_id=?');
       const deleteExecution=this.db.prepare('DELETE FROM executions WHERE id=?');
-      for(const row of prunable){archiveKey.run(row.idem_key,row.payload_hash,now+30*86_400_000);deleteHolds.run(row.id);deleteExecution.run(row.id);}
-      const expiredExecutions=this.db.prepare("SELECT id,idem_key,payload_hash FROM executions WHERE outcome!='running' AND created_at<?").all(now-30*86_400_000) as Array<{id:string;idem_key:string;payload_hash:string}>;
-      for(const row of expiredExecutions){archiveKey.run(row.idem_key,row.payload_hash,now+30*86_400_000);deleteHolds.run(row.id);deleteExecution.run(row.id);}
+      for(const [index,row] of oldExecutions.entries()){
+        if(index<10_000&&row.created_at>=now-30*86_400_000)continue;
+        if(row.idem_key===`!acquisition:${row.search_id}`)archiveOutcome.run(row.outcome,row.search_id);
+        archiveKey.run(row.idem_key,row.payload_hash,now+30*86_400_000);
+        deleteHolds.run(row.id);
+        deleteExecution.run(row.id);
+      }
       this.db.prepare('DELETE FROM candidates WHERE expires_at<=?').run(now);
-         const records = this.db.prepare("SELECT id,created_at FROM searches WHERE status NOT IN ('queued','running') ORDER BY created_at DESC,rowid DESC").all() as Array<{id:string;created_at:number}>;
-      const remove = records.filter((row, index) => index >= 10_000 || row.created_at < now - 30 * 86_400_000);
+      this.db.prepare('DELETE FROM acquisitions WHERE created_at<? AND NOT EXISTS(SELECT 1 FROM searches WHERE searches.id=acquisitions.search_id)').run(now-60*86_400_000);
+      const records = this.db.prepare(`SELECT s.id, CASE WHEN w.source='acquisition' THEN COALESCE(s.finished_at,s.created_at) ELSE s.created_at END AS retention_at
+        FROM searches s LEFT JOIN search_work w ON w.search_id=s.id
+        WHERE s.status NOT IN ('queued','running') AND (w.owner IS NULL OR w.lease_expires_at<=?)
+        ORDER BY retention_at DESC,s.rowid DESC`).all(now) as Array<{id:string;retention_at:number}>;
+      const remove = records.filter((row, index) => index >= 10_000 || row.retention_at < now - 30 * 86_400_000);
       for (const row of remove) {
         this.db.prepare('DELETE FROM candidates WHERE search_id=?').run(row.id);
         this.db.prepare('DELETE FROM search_events WHERE search_id=?').run(row.id);

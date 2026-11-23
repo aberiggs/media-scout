@@ -13,7 +13,7 @@ import { RESEARCH_INSTRUCTIONS } from './prompt';
 import { openSearchStore, type SearchStore, type SearchRecord } from './store';
 import { enabledResearchServerConfigs } from './research-mcp';
 import { defaultSettings, missingSettings, settingsSchema, type Settings } from './settings';
-import { searchRequestSchema, type SearchRequest, type SearchStatus } from './contracts';
+import { acquisitionRequestSchema, idempotencyKeySchema, searchRequestSchema, type SearchRequest, type SearchStatus } from './contracts';
 import type { Release } from '../types/prowlarr';
 import { ApiError } from '../http';
 
@@ -31,6 +31,7 @@ export interface SearchRuntimeOptions {
 }
 export interface ActivityQuery { limit?: number; offset?: number; q?: string; status?: string; source?: 'manual' | 'automation' | 'arr'; kind?: 'tv' | 'movie' | 'other'; createdAtFrom?: string; createdAtTo?: string }
 export interface ActivityItem { searchId: string; prompt: string; status: string; createdAt: string; finishedAt?: string; source: 'manual' | 'automation' | 'arr'; kind?: 'tv' | 'movie'; counts?: AgentSearchResult['counts']; submission?: { outcome: string; outcomes?: Array<{candidateId:string;outcome:string}> } }
+export type AcquisitionStatus='queued'|'running'|'pending'|'submitted'|'partial'|'rejected'|'uncertain'|'dry-run'|'not-attempted'|'interrupted';
 export interface EffectiveCategory { effectiveCategory:string|null;categoryRouting:'direct'|'configured-mapping'|'default-category';categoryNote:string;releaseCategoryIds:number[] }
 export interface ExecutionConfirmation { confirmationId:string; searchId:string; planId:string; version:number; expiresAt:string; client:{id:number;name:string;protocol:string;defaultCategory:string|null;configuredCategories:Array<{clientCategory:string|null;categories:number[]|null}>}; dryRun:boolean; children:Array<{candidateId:string;title:string}&EffectiveCategory> }
 export type ExecutionChildOutcome='prepared'|'sending'|'submitted'|'rejected'|'uncertain'|'not-attempted'|'dry-run';
@@ -41,7 +42,7 @@ export interface ExecutionReceipt {
   dryRun:boolean;children:Array<{candidateId:string;outcome:ExecutionChildOutcome;message?:string}&Partial<EffectiveCategory>>;message?:string;
 }
 interface BoundExecution {
-  planId:string; version:number; executionSource?:'manual'|'automation'; automation?:AutomationAuthorization;
+  planId:string; version:number; executionSource?:'manual'|'automation'|'acquisition'; automation?:AutomationAuthorization; acquisitionOwner?:string;
   snapshot:{source:string;client:import('../types/prowlarr').DownloadClient;dryRun:boolean};
   candidates:Array<{candidateId:string;release:Release;physicalKey:string;title:string;effectiveCategory:string|null;categoryRouting:'direct'|'configured-mapping'|'default-category';categoryNote:string;releaseCategoryIds:number[]}>;
 }
@@ -66,8 +67,17 @@ export interface PublicSearchStatus {
   searchId: string; status: string; createdAt: string; finishedAt?: string; prompt: string; source: 'manual' | 'arr' | 'automation'; manualExecutionEligible: boolean;
   automationWorkload?: {selectedTargets:number;deferredTargets:number};
   automationPending?: boolean;
+  acquisition?: { downloadClientId:number; status:AcquisitionStatus; code?:string };
   plan?: ReleaseSet; candidates: unknown[]; events: unknown[]; receipts?: ExecutionReceipt[]; queuePosition?: number; waitingReason?: string; retryAt?: string;
   counts: { decisions: number; searches: number; candidates: number }; diagnostics?: { modelTurns: number; stopReason: string; elapsedMs?: number; usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cost?: number } }; message?: string; researchWarnings?: string[];
+}
+function acquisitionProjectionStatus(searchStatus:string,journalOutcome:ExecutionOutcome|undefined,stopCode:string|null|undefined,workLive:boolean):AcquisitionStatus {
+  if(journalOutcome)return journalOutcome;
+  if(stopCode)return 'not-attempted';
+  if(searchStatus==='queued')return 'queued';
+  if(searchStatus==='running')return 'running';
+  if(searchStatus==='matched')return workLive?'pending':'interrupted';
+  return 'not-attempted';
 }
 interface AgentSearchResult { version: 1; modelPrompt?: string; plan?: ReleaseSet; candidateEvidence?: unknown[]; status: string; message?: string; researchWarnings?: string[]; counts: { decisions: number; searches: number; candidates: number }; diagnostics?: { modelTurns: number; stopReason: string; elapsedMs?: number; usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cost?: number } } }
 const iso = (time: number | undefined): string | undefined => time === undefined || !Number.isFinite(new Date(time).getTime()) ? undefined : new Date(time).toISOString();
@@ -309,8 +319,10 @@ export class SearchRuntime {
     }
     return [...byKey.values()];
   }
-  private recordProwlarrFailure(error: unknown) {
-    if (error instanceof ApiError && error.status === 429) this.store.setProviderDeadline('prowlarr', this.clock() + (error.retryAfter ?? 60) * 1000);
+  private recordProwlarrFailure(error: unknown): boolean {
+    if (!(error instanceof ApiError) || error.status !== 429) return false;
+    this.store.setProviderDeadline('prowlarr', this.clock() + (error.retryAfter ?? 60) * 1000);
+    return true;
   }
   private trackMcpOperation<T>(operation: Promise<T>): Promise<T> {
     this.mcpOperations.add(operation);
@@ -341,6 +353,19 @@ export class SearchRuntime {
     this.dispatchQueued();
     return { searchId, status: 'queued' };
   }
+  async startAcquisition(input:{prompt:string;downloadClientId:number;idempotencyKey:string}):Promise<{searchId:string;status:'queued'}>{
+    if(this.closed||this.closing)throw new Error('runtime-closed');
+    const request=acquisitionRequestSchema.parse({prompt:input.prompt,downloadClientId:input.downloadClientId}),key=idempotencyKeySchema.parse(input.idempotencyKey);
+    const hash=createHash('sha256').update(JSON.stringify({prompt:request.prompt,downloadClientId:request.downloadClientId})).digest('hex');
+    const accepted=this.store.acceptAcquisition({key,hash,now:this.clock(),snapshot:()=>{
+      const settings=this.getSettings(),source=sourceFingerprint('prowlarr',settings);
+      if(!source)throw new Error('prowlarr-source-unavailable');
+      return {prompt:safeText(request.prompt,promptSecrets(settings),true),clientId:request.downloadClientId,sourceFingerprint:source,dryRun:settings.safety.dryRun};
+    }});
+    if(accepted.status==='conflict')throw new Error('idempotency-conflict');
+    if(accepted.status==='created')setImmediate(()=>{try{this.dispatchQueued();}catch{/* Durable acceptance is independent of dispatcher health. */}});
+    return {searchId:accepted.searchId,status:'queued'};
+  }
 
   async getSearch(searchId: string): Promise<PublicSearchStatus | null> {
     this.maintain();
@@ -364,10 +389,15 @@ export class SearchRuntime {
     const cooldown = queued ? ['prowlarr','model'].map(provider => this.store.getProviderDeadline(provider) ?? 0).reduce((a,b)=>Math.max(a,b),0) : 0;
     const waitingReason = queued ? this.missingSettings(settings).length ? 'settings-incomplete' : cooldown > this.clock() ? 'provider-cooldown' : this.store.activeSearchCount(this.clock()) >= 3 ? 'capacity' : undefined : undefined;
     const executions=this.store.executionsForSearch(searchId);
+    const acquisition=this.store.acquisition(searchId);
+    const workOwner=!!acquisition&&this.store.searchWorkLive(searchId,this.clock());
+    const journalOutcome=(executions[0]?.outcome??acquisition?.archivedOutcome??undefined) as ExecutionOutcome|undefined;
+    const acquisitionStatus=acquisition?acquisitionProjectionStatus(record.status,journalOutcome,acquisition.stopCode,workOwner):undefined;
     return {
       searchId, status: record.status, createdAt: new Date(record.createdAt).toISOString(),
       source: savedSource === 'automation' ? 'automation' : savedSource === 'arr' ? 'arr' : 'manual',
       manualExecutionEligible: savedSource === 'manual',
+      ...(acquisition&&acquisitionStatus?{acquisition:{downloadClientId:acquisition.clientId,status:acquisitionStatus,...(!journalOutcome&&acquisition.stopCode?{code:acquisition.stopCode}:{})}}:{}),
       ...(record.finishedAt === undefined ? {} : { finishedAt: new Date(record.finishedAt).toISOString() }), prompt,
       ...(savedSource === 'automation' && workload ? { automationWorkload: {
         selectedTargets: workload.selectedTargets, deferredTargets: workload.deferredTargets,
@@ -417,16 +447,17 @@ export class SearchRuntime {
   private publicCategoryMap(client:import('../types/prowlarr').DownloadClient,secrets:string[]) {
     return client.categories.map(row=>({clientCategory:row.clientCategory===null?null:safeText(row.clientCategory,secrets),categories:row.categories}));
   }
-  private currentPlan(searchId:string,planId:string,version:number,source:'manual'|'automation'='manual'):ReleaseSet {
+  private currentPlan(searchId:string,planId:string,version:number,source:'manual'|'automation'|'acquisition'='manual'):ReleaseSet {
     const record=this.store.getSearch(searchId),plan=(record?.result as AgentSearchResult|undefined)?.plan;
     if(!record||record.status!=='matched'||plan?.planId!==planId||plan.version!==version||this.store.getSetting(`search-source:${searchId}`)!==source) throw new Error('plan-changed');
     return plan;
   }
-  private async validateExecutionSnapshot(searchId:string,planId:string,version:number,snapshot:{source:string;client:import('../types/prowlarr').DownloadClient;dryRun:boolean},candidates:Array<{candidateId:string;release:Release;physicalKey:string}>,source:'manual'|'automation'='manual'):Promise<NonNullable<RuntimeClients['prowlarr']>> {
+  private async validateExecutionSnapshot(searchId:string,planId:string,version:number,snapshot:{source:string;client:import('../types/prowlarr').DownloadClient;dryRun:boolean},candidates:Array<{candidateId:string;release:Release;physicalKey:string}>,source:'manual'|'automation'|'acquisition'='manual'):Promise<NonNullable<RuntimeClients['prowlarr']>> {
     this.currentPlan(searchId,planId,version,source);
     const before=this.getSettings();
     if(before.safety.dryRun!==snapshot.dryRun) throw new Error('safety-changed');
     if(source==='automation'&&(!before.monitoring.enabled||!before.monitoring.allowDownloads))throw new Error('automation-not-authorized');
+    if(source==='acquisition'&&(this.store.acquisition(searchId)?.sourceFingerprint!==snapshot.source||this.store.acquisition(searchId)?.dryRun!==snapshot.dryRun))throw new Error('source-changed');
     if(sourceFingerprint('prowlarr',before)!==snapshot.source) throw new Error('source-changed');
     for(const c of candidates) if(!this.store.getCandidate(searchId,c.candidateId,this.clock())) throw new Error('candidate-expired');
     const client=this.clients(before).prowlarr;
@@ -438,6 +469,7 @@ export class SearchRuntime {
     const after=this.getSettings();
     if(after.safety.dryRun!==snapshot.dryRun) throw new Error('safety-changed');
     if(source==='automation'&&(!after.monitoring.enabled||!after.monitoring.allowDownloads))throw new Error('automation-not-authorized');
+    if(source==='acquisition'&&(this.store.acquisition(searchId)?.sourceFingerprint!==snapshot.source||this.store.acquisition(searchId)?.dryRun!==snapshot.dryRun))throw new Error('source-changed');
     if(sourceFingerprint('prowlarr',after)!==snapshot.source) throw new Error('source-changed');
     this.currentPlan(searchId,planId,version,source);
     for(const c of candidates) if(!this.store.getCandidate(searchId,c.candidateId,this.clock())) throw new Error('candidate-expired');
@@ -463,12 +495,13 @@ export class SearchRuntime {
   async prepareExecution(input:{searchId:string;planId:string;version:number;candidateIds:string[];downloadClientId:number}):Promise<ExecutionConfirmation> {
     return this.prepareExecutionAuthorized(input,'manual');
   }
-  private async prepareExecutionAuthorized(input:{searchId:string;planId:string;version:number;candidateIds:string[];downloadClientId:number},executionSource:'manual'|'automation',automation?:AutomationAuthorization):Promise<ExecutionConfirmation> {
+  private async prepareExecutionAuthorized(input:{searchId:string;planId:string;version:number;candidateIds:string[];downloadClientId:number},executionSource:'manual'|'automation'|'acquisition',automation?:AutomationAuthorization,acquisitionOwner?:string):Promise<ExecutionConfirmation> {
     if(this.closed||this.closing) throw new Error('runtime-closing');
     const record=this.store.getSearch(input.searchId),result=record?.result as AgentSearchResult|undefined,plan=result?.plan;
     if(!record||record.status!=='matched'||!plan||plan.version!==2) throw new Error('plan-unavailable');
     if(this.store.getSetting(`search-source:${input.searchId}`)!==executionSource) throw new Error('search-source-not-manual');
     if(executionSource==='automation'&&(!automation||!this.automationAuthorized(automation))) throw new Error('automation-not-authorized');
+    if(executionSource==='acquisition'&&(!acquisitionOwner||!this.store.ownsSearch(input.searchId,acquisitionOwner,this.clock())||!this.store.acquisition(input.searchId)))throw new Error('execution-ownership-lost');
     if(plan.planId!==input.planId||plan.version!==input.version) throw new Error('plan-changed');
     const selectedIds=plan.selections.map(selection=>selection.candidateId);
     if(new Set(input.candidateIds).size!==input.candidateIds.length||selectedIds.length!==input.candidateIds.length||selectedIds.some(id=>!input.candidateIds.includes(id))) throw new Error('whole-plan-selection-required');
@@ -493,13 +526,15 @@ export class SearchRuntime {
     if(sourceFingerprint('prowlarr',after)!==sourceFp) throw new Error('source-changed');
     if(after.safety.dryRun!==settings.safety.dryRun) throw new Error('safety-changed');
     if(automation&&(!this.automationAuthorized(automation)||automation.downloadClientId!==input.downloadClientId))throw new Error('automation-not-authorized');
+    const acquisition=executionSource==='acquisition'?this.store.acquisition(input.searchId):null;
+    if(executionSource==='acquisition'&&(!acquisition||acquisition.clientId!==input.downloadClientId||acquisition.sourceFingerprint!==sourceFp||acquisition.dryRun!==settings.safety.dryRun||!acquisitionOwner||!this.store.ownsSearch(input.searchId,acquisitionOwner,this.clock())))throw new Error('source-changed');
     const selected=entries.find(item=>item.id===input.downloadClientId&&item.enable&&item.protocol!=='unknown');
     if(!selected) throw new Error('download-client-unavailable');
     if(candidates.some(candidate=>candidate.release.protocol!==selected.protocol)) throw new Error('download-client-protocol-mismatch');
     const snapshot={source:sourceFp,client:selected,dryRun:settings.safety.dryRun};
     const boundCandidates=candidates.map(candidate=>({...candidate,...this.categoryForRelease(candidate.release,selected,secrets)}));
     const confirmationId=randomUUID(),expiresAt=this.clock()+5*60_000;
-    this.store.saveExecutionPreparation(confirmationId,input.searchId,expiresAt,{searchId:input.searchId,planId:plan.planId,version:plan.version,snapshot,candidates:boundCandidates,executionSource,automation});
+    this.store.saveExecutionPreparation(confirmationId,input.searchId,expiresAt,{searchId:input.searchId,planId:plan.planId,version:plan.version,snapshot,candidates:boundCandidates,executionSource,automation,...(acquisitionOwner?{acquisitionOwner}:{})});
     return {confirmationId,searchId:input.searchId,planId:plan.planId,version:plan.version,expiresAt:new Date(expiresAt).toISOString(),client:{id:selected.id,name:safeText(selected.name,secrets),protocol:selected.protocol,defaultCategory:selected.defaultCategory==null?null:safeText(selected.defaultCategory,secrets),configuredCategories:this.publicCategoryMap(selected,secrets)},dryRun:settings.safety.dryRun,children:boundCandidates.map(({candidateId,title,effectiveCategory,categoryRouting,categoryNote,releaseCategoryIds})=>({candidateId,title,effectiveCategory,categoryRouting,categoryNote,releaseCategoryIds}))};
   }
 
@@ -508,8 +543,9 @@ export class SearchRuntime {
     this.executionOperations.add(operation);
     try { return await operation; } finally { this.executionOperations.delete(operation); }
   }
-  private async performExecution(input:{confirmationId:string;searchId:string;planId:string;version:number;idempotencyKey:string},authorizedSource:'manual'|'automation'='manual',passOwner?:string):Promise<ExecutionReceipt> {
-    if(!/^[A-Za-z0-9._:-]{1,200}$/.test(input.idempotencyKey)) throw new Error('invalid-idempotency-key');
+  private async performExecution(input:{confirmationId:string;searchId:string;planId:string;version:number;idempotencyKey:string},authorizedSource:'manual'|'automation'|'acquisition'='manual',passOwner?:string):Promise<ExecutionReceipt> {
+    const validKey=authorizedSource==='acquisition'?input.idempotencyKey===`!acquisition:${input.searchId}`:idempotencyKeySchema.safeParse(input.idempotencyKey).success;
+    if(!validKey) throw new Error('invalid-idempotency-key');
     this.store.recoverExecutions(this.clock());
     const requestHash=createHash('sha256').update(JSON.stringify({confirmationId:input.confirmationId,searchId:input.searchId,planId:input.planId,version:input.version})).digest('hex');
     const prior=this.store.executionByKey(input.idempotencyKey);
@@ -520,10 +556,11 @@ export class SearchRuntime {
     const bound=prep.payload as BoundExecution;
     if(bound.planId!==input.planId||bound.version!==input.version) throw new Error('plan-changed');
     const automation=bound.automation;
-    if((bound.executionSource??'manual')!==authorizedSource || (authorizedSource==='automation'&&(!automation||!passOwner||automation.passOwner!==passOwner||!this.automationAuthorized(automation))))throw new Error('automation-not-authorized');
+    if((bound.executionSource??'manual')!==authorizedSource || (authorizedSource==='automation'&&(!automation||!passOwner||automation.passOwner!==passOwner||!this.automationAuthorized(automation))) || (authorizedSource==='acquisition'&&(!passOwner||bound.acquisitionOwner!==passOwner||!this.store.ownsSearch(input.searchId,passOwner,this.clock())||!this.store.acquisition(input.searchId))))throw new Error('automation-not-authorized');
     const plan=this.currentPlan(input.searchId,bound.planId,bound.version,authorizedSource);
     if(JSON.stringify(plan.selections.map(selection=>selection.candidateId))!==JSON.stringify(bound.candidates.map(candidate=>candidate.candidateId))) throw new Error('plan-changed');
     await this.validateExecutionSnapshot(input.searchId,input.planId,input.version,bound.snapshot,bound.candidates,authorizedSource);
+    if(authorizedSource==='acquisition'&&(!passOwner||bound.acquisitionOwner!==passOwner||!this.store.ownsSearch(input.searchId,passOwner,this.clock())))throw new Error('execution-ownership-lost');
     if(automation&&!this.automationAuthorized(automation))throw new Error('automation-not-authorized');
     const settings=this.getSettings(),secrets=[settings.integrations.prowlarr.apiKey,settings.integrations.prowlarr.url];
     const payload={confirmationId:input.confirmationId,searchId:input.searchId,planId:input.planId,version:input.version,sourceFingerprint:bound.snapshot.source,client:bound.snapshot.client,clientName:safeText(bound.snapshot.client.name,secrets),defaultCategory:bound.snapshot.client.defaultCategory==null?null:safeText(bound.snapshot.client.defaultCategory,secrets),configuredCategories:this.publicCategoryMap(bound.snapshot.client,secrets),dryRun:bound.snapshot.dryRun,candidateIds:bound.candidates.map(c=>c.candidateId),...(automation?{automationMediaKey:automation.mediaKey}:{})};
@@ -556,10 +593,15 @@ export class SearchRuntime {
     };
     try { for(let i=0;i<op.children.length;i++) {
         if(leaseLost||!this.store.renewExecution(id,owner,this.clock(),30_000)) throw new Error('execution-ownership-lost');
-        if(this.closing||this.closed) return stoppedReceipt(i,'Runtime is shutting down; remaining releases were not attempted.');
+       if(this.closing||this.closed) return stoppedReceipt(i,'Runtime is shutting down; remaining releases were not attempted.');
+       if(authorizedSource==='acquisition'&&(!passOwner||!this.store.ownsSearch(input.searchId,passOwner,this.clock())))return stoppedReceipt(i,'Acquisition ownership lease was lost; remaining releases were not attempted.');
         let sendClient:NonNullable<RuntimeClients['prowlarr']>;
         try { sendClient=await this.validateExecutionSnapshot(input.searchId,input.planId,input.version,bound.snapshot,bound.candidates,authorizedSource); }
-        catch { return stoppedReceipt(i,'Source, plan, candidate, client, or safety settings changed; remaining releases were not attempted.'); }
+        catch (error) {
+          if (authorizedSource === 'acquisition' && this.recordProwlarrFailure(error))
+            return stoppedReceipt(i, 'Prowlarr rate-limited the download-client check; remaining releases were not attempted.');
+          return stoppedReceipt(i, 'Source, plan, candidate, client, or safety settings changed; remaining releases were not attempted.');
+        }
         if(automation) {
           const started = this.clock();
           const checkQueue = this.automationAuthorized(automation)
@@ -573,8 +615,9 @@ export class SearchRuntime {
             || !await checkQueue() || this.clock()-started > AUTOMATION_REVALIDATION_MAX_MS)
             return stoppedReceipt(i,'Arr queue or routing could not be confirmed promptly; remaining releases were not attempted.');
         }
-      if(this.closing||this.closed) return stoppedReceipt(i,'Runtime is shutting down; remaining releases were not attempted.');
-      if(leaseLost||!this.store.renewExecution(id,owner,this.clock(),30_000)) throw new Error('execution-ownership-lost');
+       if(this.closing||this.closed) return stoppedReceipt(i,'Runtime is shutting down; remaining releases were not attempted.');
+       if(authorizedSource==='acquisition'&&(!passOwner||!this.store.ownsSearch(input.searchId,passOwner,this.clock())))return stoppedReceipt(i,'Acquisition ownership lease was lost; remaining releases were not attempted.');
+       if(leaseLost||!this.store.renewExecution(id,owner,this.clock(),30_000)) throw new Error('execution-ownership-lost');
       if(automation&&!this.automationAuthorized(automation))return stoppedReceipt(i,'Automation pass or routing settings changed before submission.');
       if(automation&&bound.candidates.some(c=>!this.store.getCandidate(input.searchId,c.candidateId,this.clock())))return stoppedReceipt(i,'Candidate expired before submission.');
       const release=(op.payload as {boundReleases?:Release[]}).boundReleases?.[i];
@@ -923,6 +966,11 @@ export class SearchRuntime {
       const privateValues = promptSecrets(settings);
       if (work.source === 'arr' || stored.version !== 3 || typeof stored.prompt !== 'string')
         throw new Error('legacy-search-prompt');
+      if(work.source==='acquisition'){
+        const accepted=this.store.acquisition(work.searchId);
+        if(!accepted||accepted.sourceFingerprint!==sourceFingerprint('prowlarr',settings))throw new Error('source-changed');
+        if(accepted.dryRun!==settings.safety.dryRun)throw new Error('safety-changed');
+      }
       const modelInput = stored.prompt;
       if (!modelInput.trim()) throw new Error('legacy-search-prompt');
       if (!this.store.ownsSearch(work.searchId, work.owner, this.clock())) throw new Error('search-ownership-lost');
@@ -963,7 +1011,21 @@ export class SearchRuntime {
         throw new ProwlarrResearchUnavailableError();
       const candidateEvidence = this.store.listCandidates(work.searchId, this.clock()).map(row => row.safe);
       const result: AgentSearchResult = { version: 1, plan, candidateEvidence, status: plan.status, ...(researchWarnings.length ? { researchWarnings } : {}), counts: { decisions: modelTurns, searches, candidates: candidateEvidence.length }, diagnostics: { modelTurns, stopReason: 'release-set-finalized', elapsedMs: Math.max(0, this.clock() - startedAt), ...(hasUsage ? { usage: modelUsage } : {}) } };
-      if (!this.store.finishOwnedSearch(work.searchId, work.owner, plan.status, result, this.clock())) throw new Error('search-ownership-lost');
+      const acquisition=work.source==='acquisition'?this.store.acquisition(work.searchId):null;
+      if (!this.store.finishOwnedSearch(work.searchId, work.owner, plan.status, result, this.clock(),!!acquisition&&plan.status==='matched')) throw new Error('search-ownership-lost');
+      if(acquisition&&plan.status==='matched') {
+        try {
+          const confirmed=await this.prepareExecutionAuthorized({searchId:work.searchId,planId:plan.planId,version:plan.version,candidateIds:plan.selections.map(item=>item.candidateId),downloadClientId:acquisition.clientId},'acquisition',undefined,work.owner);
+          if(this.store.acquisition(work.searchId)?.dryRun!==this.getSettings().safety.dryRun)throw new Error('safety-changed');
+          const execution=this.performExecution({confirmationId:confirmed.confirmationId,searchId:work.searchId,planId:plan.planId,version:plan.version,idempotencyKey:`!acquisition:${work.searchId}`},'acquisition',work.owner);
+          this.executionOperations.add(execution);
+          try { await execution; } finally { this.executionOperations.delete(execution); }
+        } catch(error) {
+          const code = this.recordProwlarrFailure(error) ? 'prowlarr-rate-limited'
+            : error instanceof Error&&['source-changed','safety-changed','candidate-expired','download-client-unavailable','download-client-protocol-mismatch','prowlarr-source-unavailable','execution-ownership-lost','plan-changed'].includes(error.message)?error.message:'acquisition-preparation-failed';
+          this.store.stopAcquisition(work.searchId,code,this.clock());
+        } finally { this.store.releaseSearch(work.searchId,work.owner); }
+      } else if(acquisition) this.store.releaseSearch(work.searchId,work.owner);
       return result;
     } catch (error) {
       const status = error instanceof AgentBudgetExhaustedError || (controller.signal.aborted && this.clock() >= deadline) ? 'budget-exhausted' : controller.signal.aborted ? 'interrupted' : 'failed';
@@ -972,6 +1034,10 @@ export class SearchRuntime {
       const candidateEvidence = this.store.listCandidates(work.searchId, this.clock()).map(row => row.safe);
       const result: AgentSearchResult = { version: 1, candidateEvidence, status, message, ...(researchWarnings.length ? { researchWarnings } : {}), counts: { decisions: modelTurns, searches: capability ? this.prowlarrCapabilities.get(capability.token)?.searches ?? 0 : 0, candidates: candidateEvidence.length }, diagnostics: { modelTurns, stopReason: status, elapsedMs: Math.max(0, this.clock() - startedAt), ...(hasUsage ? { usage: modelUsage } : {}) } };
       this.store.finishOwnedSearch(work.searchId, work.owner, status as SearchStatus, result, this.clock());
+      if(work.source==='acquisition'){
+        const code=error instanceof Error&&['source-changed','safety-changed'].includes(error.message)?error.message:'';
+        if(code)this.store.stopAcquisition(work.searchId,code,this.clock());
+      }
       return result;
     } finally {
       clearInterval(heartbeat);

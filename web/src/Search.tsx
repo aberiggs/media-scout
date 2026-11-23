@@ -10,7 +10,7 @@ type Receipt = { executionId: string; searchId: string; planId?: string; outcome
 type Confirmation = { confirmationId: string; expiresAt: string; searchId: string; planId: string; version: number; client: { id: number; name: string; protocol: string; defaultCategory?: string | null; configuredCategories: Array<{ clientCategory: string | null; categories: number[] | null }> }; dryRun: boolean; children: Child[] }
 type DownloadClient = { id: number; name: string; protocol: string; defaultCategory?: string | null; categoryMap: Array<{ clientCategory: string | null; categories: number[] | null }> }
 type CommitRequest = { confirmationId: string; searchId: string; planId: string; version: number; idempotencyKey: string }
-type SearchResult = { searchId: string; status: string; source?: 'manual' | 'arr' | 'automation'; manualExecutionEligible?: boolean; automationPending?: boolean; automationWorkload?: { deferredTargets: number }; prompt?: string; plan?: Plan; candidates?: Candidate[]; events?: Array<{ type: string; data: Record<string, unknown> }>; receipts?: Receipt[]; counts?: { decisions: number; searches: number; candidates: number }; queuePosition?: number; waitingReason?: string; retryAt?: string; message?: string; researchWarnings?: string[]; diagnostics?: { modelTurns: number; stopReason: string; elapsedMs?: number; usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cost?: number } } }
+type SearchResult = { searchId: string; status: string; source?: 'manual' | 'arr' | 'automation'; manualExecutionEligible?: boolean; automationPending?: boolean; automationWorkload?: { deferredTargets: number }; acquisition?: { status: string; code?: string }; prompt?: string; plan?: Plan; candidates?: Candidate[]; events?: Array<{ type: string; data: Record<string, unknown> }>; receipts?: Receipt[]; counts?: { decisions: number; searches: number; candidates: number }; queuePosition?: number; waitingReason?: string; retryAt?: string; message?: string; researchWarnings?: string[]; diagnostics?: { modelTurns: number; stopReason: string; elapsedMs?: number; usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cost?: number } } }
 const running = (status?: string) => status === 'queued' || status === 'running'
 const safeBody = async (response: Response) => { try { return await response.json() } catch { return {} } }
 const idempotencyKey = () => {
@@ -109,7 +109,7 @@ export function SearchPage({ settings, searchId, searchRevision, active = true, 
       setPendingCommit(readPending(id))
       const durable = data.receipts?.at(-1)
       if (durable) setReceipt(durable)
-      if (running(data.status) || data.automationPending) timer.current = window.setTimeout(() => void loadResult(id, token), 1200)
+      if (running(data.status) || data.automationPending || data.acquisition?.status === 'pending') timer.current = window.setTimeout(() => void loadResult(id, token), 1200)
       if (durable?.outcome === 'running') pollReceipt(durable.executionId, id, token)
     } catch (failure) { if (!current.signal.aborted && isCurrent(id, token)) setError(failure instanceof Error ? failure.message : 'Search could not be loaded.') }
   }
@@ -243,6 +243,8 @@ export function SearchPage({ settings, searchId, searchRevision, active = true, 
         <div className="search-result-heading"><div><h2>{result.status === 'matched' ? 'Search plan' : result.status === 'queued' ? 'Search queued' : result.status === 'running' ? 'Searching…' : result.status === 'no-match' ? 'No suitable match' : `Search ${result.status}`}</h2>{result.prompt && <p className="result-title prompt-preview">{result.prompt}</p>}{result.message && <p>{result.message}</p>}</div><span className="ops-status">{result.status}</span></div>
        {!!result.researchWarnings?.length && <div className="research-result-warnings" role="status"><strong>Research service notice</strong>{result.researchWarnings.map((warning, index) => <p key={index}>{warning}</p>)}</div>}
       {result.automationPending && <p role="status" className="ops-info-box">Automation is checking whether it can submit this set.</p>}
+      {result.acquisition?.status === 'pending' && <p role="status" className="ops-info-box">Checking the download client for this acquisition.</p>}
+      {result.acquisition?.code === 'prowlarr-rate-limited' && <p role="status" className="ops-info-box">Prowlarr rate-limited the download-client check. No releases were submitted.</p>}
       {!!result.automationWorkload?.deferredTargets && <p className="ops-info-box">{result.automationWorkload.deferredTargets} other due episodes were outside this search. They remain unsearched for a later pass.</p>}
       {result.prompt && <details className="saved-prompt"><summary>Saved search prompt</summary><pre tabIndex={0} aria-label="Exact saved search prompt">{result.prompt}</pre></details>}
       {result.status === 'queued' ? <p role="status" className="ops-state-panel"><LoaderCircle className="spin"/>Search queued{result.queuePosition ? ` · ${Math.max(0, result.queuePosition - 1)} ahead` : ''}. It has not started yet.</p> : result.status === 'running' ? <p role="status" className="ops-state-panel"><LoaderCircle className="spin"/>Checking indexers and comparing releases…</p> : <>

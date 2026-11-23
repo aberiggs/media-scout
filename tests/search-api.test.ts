@@ -158,8 +158,8 @@ describe('search-first HTTP contract', () => {
       expect(grabs).toBe(dryRun?0:2);
     }finally{await app.close();await runtime.close();await new Promise<void>(resolve=>model.close(()=>resolve()));}
   });
-  it.each(['submitted','no-match','disabled-client','protocol-mismatch','routing-changed'] as const)('uses the real Prowlarr HTTP adapter for acquisition outcome %s',async scenario=>{
-    let runtimeRef:SearchRuntime|undefined,modelCalls=0;const grabs:Array<{downloadClientId:number;guid:string}>=[];
+  it.each(['submitted','no-match','disabled-client','protocol-mismatch','routing-changed','rate-limited','rate-limited-validation','rate-limited-tail'] as const)('uses the real Prowlarr HTTP adapter for acquisition outcome %s',async scenario=>{
+    let runtimeRef:SearchRuntime|undefined,modelCalls=0,clientReads=0;const grabs:Array<{downloadClientId:number;guid:string}>=[];
     const release=releaseSchema.parse({guid:'real-http-grab',age:1,size:100,files:null,grabs:null,indexerId:1,indexer:'Index',subGroup:null,title:'Film 2020',tvdbId:null,tmdbId:null,publishDate:'',downloadUrl:'http://prowlarr.test/download',indexerFlags:[],categories:[],magnetUrl:null,infoHash:'e'.repeat(40),seeders:1,leechers:0,protocol:'torrent',downloadClientId:null});
     const releases=[release,{...release,guid:'real-http-grab-2',title:'Film 2021',infoHash:'f'.repeat(40)}];
     const prowlarrServer=createServer(async(req,res)=>{
@@ -167,7 +167,13 @@ describe('search-first HTTP contract', () => {
       if(req.method==='GET'&&url.pathname==='/api/v1/indexer')return res.end(JSON.stringify([{id:1,name:'Index',enable:true}]));
       if(req.method==='GET'&&url.pathname==='/api/v1/indexerstatus')return res.end('[]');
       if(req.method==='GET'&&url.pathname==='/api/v1/search')return res.end(JSON.stringify(releases));
-      if(req.method==='GET'&&url.pathname==='/api/v1/downloadclient')return res.end(JSON.stringify([{id:7,name:'Selected',enable:scenario!=='disabled-client'&&!(scenario==='routing-changed'&&grabs.length),protocol:scenario==='protocol-mismatch'?'usenet':'torrent',supportsCategories:true,categories:[]}]));
+      if(req.method==='GET'&&url.pathname==='/api/v1/downloadclient'){
+        clientReads++;
+        if(scenario==='rate-limited'||(scenario==='rate-limited-validation'&&clientReads===2)||(scenario==='rate-limited-tail'&&grabs.length)){
+          res.writeHead(429,{'retry-after':'37'});return res.end('{"error":"PRIVATE-UPSTREAM-CANARY"}');
+        }
+        return res.end(JSON.stringify([{id:7,name:'Selected',enable:scenario!=='disabled-client'&&!(scenario==='routing-changed'&&grabs.length),protocol:scenario==='protocol-mismatch'?'usenet':'torrent',supportsCategories:true,categories:[]}]));
+      }
       if(req.method==='POST'&&url.pathname==='/api/v1/search'){
         const chunks:Buffer[]=[];for await(const chunk of req)chunks.push(Buffer.from(chunk));
         grabs.push(JSON.parse(Buffer.concat(chunks).toString()));res.writeHead(200,{'content-type':'application/json'});return res.end('{}');
@@ -184,14 +190,31 @@ describe('search-first HTTP contract', () => {
     });
     await new Promise<void>(resolve=>model.listen(0,'127.0.0.1',resolve));const mAddress=model.address();if(!mAddress||typeof mAddress==='string')throw new Error('No model fixture');
     const adapter=new ProwlarrClient(new Http({baseUrl:`http://127.0.0.1:${pAddress.port}`,apiKey:'fixture-key'}));
-    const {app,runtime}=await fixture({prowlarr:adapter as unknown as RuntimeClients['prowlarr']});runtimeRef=runtime;
+    const now=Date.now();
+    const {app,runtime}=await fixture({prowlarr:adapter as unknown as RuntimeClients['prowlarr']},()=>now);runtimeRef=runtime;
     try{
       runtime.saveSettings({...runtime.getSettings(),ai:{...runtime.getSettings().ai,baseUrl:`http://127.0.0.1:${mAddress.port}`},safety:{dryRun:false}});
       await app.listen({host:'127.0.0.1',port:0});
       const response=await app.inject({method:'POST',url:'/api/v2/acquisitions',headers:{'idempotency-key':`real-${scenario}`},payload:{prompt:'Find Film',downloadClientId:7}});
       expect(response.statusCode).toBe(202);await drainScheduled(runtime);
       const detail=await runtime.getSearch(response.json().searchId);
-      if(scenario==='no-match'){
+      if(scenario==='rate-limited'||scenario==='rate-limited-validation'||scenario==='rate-limited-tail'){
+        if(scenario!=='rate-limited-tail'){
+          expect(detail).toMatchObject({status:'matched',acquisition:{status:'not-attempted',code:'prowlarr-rate-limited'},receipts:[]});
+          expect(grabs).toHaveLength(0);
+        }else{
+          expect(detail).toMatchObject({status:'matched',acquisition:{status:'partial'},receipts:[{children:[
+            {outcome:'submitted'}, {outcome:'not-attempted',message:expect.stringMatching(/Prowlarr rate-limited/)}
+          ]}]});
+          expect(grabs).toEqual([{indexerId:1,downloadClientId:7,guid:release.guid}]);
+        }
+        expect(JSON.stringify(detail)).not.toContain('PRIVATE-UPSTREAM-CANARY');
+        const next=await app.inject({method:'POST',url:'/api/v2/acquisitions',headers:{'idempotency-key':'queued-during-prowlarr-cooldown'},payload:{prompt:'Find another film',downloadClientId:7}});
+        expect(next.statusCode).toBe(202);
+        await drainScheduled(runtime);
+        expect((await app.inject(next.json().statusUrl)).json()).toMatchObject({status:'queued',waitingReason:'provider-cooldown',retryAt:new Date(now+37_000).toISOString()});
+        expect(modelCalls).toBe(2);
+      }else if(scenario==='no-match'){
         expect(detail).toMatchObject({status:'no-match',acquisition:{status:'not-attempted'}});
         expect(grabs).toHaveLength(0);
       }else if(scenario==='disabled-client'||scenario==='protocol-mismatch'){

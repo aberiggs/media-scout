@@ -748,6 +748,29 @@ it('renders a nested read-only plan without acquisition controls or submission r
   assert.equal(requests.some(url => /submissions|download-clients/.test(url)), false)
 })
 
+for (const outcome of ['submitted', 'rate-limited'] as const) {
+  it(`polls pending acquisition detail from Activity until ${outcome}`, async () => {
+    window.history.replaceState(null, '', '/#activity')
+    let reads = 0
+    lifecycleFetch(url => {
+      if (url.startsWith('/api/v2/activity')) return Response.json({ items: [{ searchId: 's1', prompt: 'Saved acquisition', status: 'matched', source: 'manual', createdAt: matched.createdAt }], total: 1 })
+      if (url !== '/api/v2/searches/s1') throw new Error(`Unexpected request: ${url}`)
+      const result = { ...matched, source: 'manual', manualExecutionEligible: false }
+      if (++reads === 1) return Response.json({ ...result, acquisition: { downloadClientId: 7, status: 'pending' }, receipts: [] })
+      if (outcome === 'rate-limited') return Response.json({ ...result, acquisition: { downloadClientId: 7, status: 'not-attempted', code: 'prowlarr-rate-limited' }, receipts: [] })
+      return Response.json({ ...result, acquisition: { downloadClientId: 7, status: 'submitted' }, receipts: [{ executionId: 'e1', searchId: 's1', outcome: 'submitted', dryRun: false, updatedAt: matched.createdAt, children: [{ candidateId: 'c1', outcome: 'submitted' }] }] })
+    })
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: 'View search details' }))
+    await screen.findByText('Best evidence')
+    const pending = screen.queryByText(/checking the download client for this acquisition/i)
+    const terminal = outcome === 'submitted' ? /durable execution receipts/i : /Prowlarr rate-limited the download-client check/i
+    assert.ok(await screen.findByText(terminal, {}, { timeout: 3000 }))
+    assert.ok(pending)
+    assert.equal(screen.queryByText(/checking the download client for this acquisition/i), null)
+  })
+}
+
 it('keeps search available in dry-run and distinguishes a saved refresh from a live poll', async () => {
   window.history.replaceState(null, '', '/#automation')
   const calls: Array<{ url: string; method?: string }> = []

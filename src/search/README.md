@@ -84,6 +84,8 @@ Acquisitions share the manual FIFO queue and the three-worker limit, use the ord
 
 Unclaimed requests survive a restart. A started job is not replayed: a match interrupted before journaling is reported as `interrupted`, and an in-flight send is recovered as `uncertain`, with no resubmission. Use this endpoint only from trusted servers, not cross-origin browser code.
 
+If Prowlarr rate-limits a download-client check, Scout pauses queued work according to `Retry-After` (60 seconds if absent) without retrying the stopped acquisition. Search detail reports `prowlarr-rate-limited` before an execution starts, or records the rate limit in the receipt if execution has already started.
+
 ## Scheduled Arr automation
 
 The scheduler uses one lease and selects one fair title per pass. Sonarr workloads

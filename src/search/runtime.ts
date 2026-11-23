@@ -319,8 +319,10 @@ export class SearchRuntime {
     }
     return [...byKey.values()];
   }
-  private recordProwlarrFailure(error: unknown) {
-    if (error instanceof ApiError && error.status === 429) this.store.setProviderDeadline('prowlarr', this.clock() + (error.retryAfter ?? 60) * 1000);
+  private recordProwlarrFailure(error: unknown): boolean {
+    if (!(error instanceof ApiError) || error.status !== 429) return false;
+    this.store.setProviderDeadline('prowlarr', this.clock() + (error.retryAfter ?? 60) * 1000);
+    return true;
   }
   private trackMcpOperation<T>(operation: Promise<T>): Promise<T> {
     this.mcpOperations.add(operation);
@@ -595,7 +597,11 @@ export class SearchRuntime {
        if(authorizedSource==='acquisition'&&(!passOwner||!this.store.ownsSearch(input.searchId,passOwner,this.clock())))return stoppedReceipt(i,'Acquisition ownership lease was lost; remaining releases were not attempted.');
         let sendClient:NonNullable<RuntimeClients['prowlarr']>;
         try { sendClient=await this.validateExecutionSnapshot(input.searchId,input.planId,input.version,bound.snapshot,bound.candidates,authorizedSource); }
-        catch { return stoppedReceipt(i,'Source, plan, candidate, client, or safety settings changed; remaining releases were not attempted.'); }
+        catch (error) {
+          if (authorizedSource === 'acquisition' && this.recordProwlarrFailure(error))
+            return stoppedReceipt(i, 'Prowlarr rate-limited the download-client check; remaining releases were not attempted.');
+          return stoppedReceipt(i, 'Source, plan, candidate, client, or safety settings changed; remaining releases were not attempted.');
+        }
         if(automation) {
           const started = this.clock();
           const checkQueue = this.automationAuthorized(automation)
@@ -1015,7 +1021,8 @@ export class SearchRuntime {
           this.executionOperations.add(execution);
           try { await execution; } finally { this.executionOperations.delete(execution); }
         } catch(error) {
-          const code=error instanceof Error&&['source-changed','safety-changed','candidate-expired','download-client-unavailable','download-client-protocol-mismatch','prowlarr-source-unavailable','execution-ownership-lost','plan-changed'].includes(error.message)?error.message:'acquisition-preparation-failed';
+          const code = this.recordProwlarrFailure(error) ? 'prowlarr-rate-limited'
+            : error instanceof Error&&['source-changed','safety-changed','candidate-expired','download-client-unavailable','download-client-protocol-mismatch','prowlarr-source-unavailable','execution-ownership-lost','plan-changed'].includes(error.message)?error.message:'acquisition-preparation-failed';
           this.store.stopAcquisition(work.searchId,code,this.clock());
         } finally { this.store.releaseSearch(work.searchId,work.owner); }
       } else if(acquisition) this.store.releaseSearch(work.searchId,work.owner);

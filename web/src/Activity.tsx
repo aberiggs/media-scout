@@ -1,11 +1,19 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { Activity as ActivityIcon, ArrowRight, CheckCircle2, Clock3, Database, Film, Radio, RefreshCw, Search as SearchIcon, ShieldCheck, Tv } from 'lucide-react'
+import { Activity as ActivityIcon, ArrowRight, CheckCircle2, ChevronRight, Clock3, Database, Film, Radio, RefreshCw, Search as SearchIcon, Settings as Gear, ShieldCheck, Tv } from 'lucide-react'
 import type { Settings } from './types'
 
 type ActivityItem = { searchId: string; prompt: string; status: string; createdAt: string; source: 'manual' | 'automation'; kind?: 'tv' | 'movie'; counts?: { candidates: number }; submission?: { outcome: string } }
 type AutomationItem = { targetId: string; titleId: string; title: string; kind: 'tv' | 'movie'; seasonNumber?: number; episodeNumber?: number; status: string; eligible: boolean; observedAt?: string; metadataAirDate?: string; eligibleAt?: string; nextAttemptAt?: string; lastAttemptAt?: string }
 type Automation = { enabled: boolean; allowDownloads?: boolean; dryRun: boolean; running: boolean; executionBlocked?: boolean; executionBlockedReason?: 'automation-disabled' | 'downloads-not-activated' | 'dry-run' | string; providers: Array<{ provider: string; known: boolean; observedAt?: string; error?: string; unidentifiedQueueRows: number; unknownSeriesIds?: string[] }>; items: AutomationItem[]; airingOffsets: Array<{ titleId: string; title: string; hoursEarly: number }> }
 const date = (value?: string) => value && Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString() : 'Not observed yet'
+const watchTimeOptions = { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' } as const
+const watchTime = new Intl.DateTimeFormat(undefined, watchTimeOptions)
+const watchTimeWithYear = new Intl.DateTimeFormat(undefined, { ...watchTimeOptions, year: 'numeric' })
+function shortWatchDate(value: string) {
+  const time = new Date(value)
+  if (!Number.isFinite(time.getTime())) return 'Unknown time'
+  return (time.getFullYear() === new Date().getFullYear() ? watchTime : watchTimeWithYear).format(time)
+}
 const automationStatusLabel: Record<string, string> = {
   missing: 'Missing', downloading: 'Downloading', grace: 'Waiting for import', cooldown: 'Retry cooldown',
   backoff: 'Retry backoff', upcoming: 'Upcoming', 'no-air-date': 'No air date', 'waiting-for-radarr': 'Waiting for Radarr',
@@ -125,21 +133,13 @@ export function AutomationPage({ settings, onOpenSearch }: { settings: Settings;
      {data && !data.enabled && <p className="field-hint">Item eligibility reflects Arr state. Nothing is scheduled while monitoring is off.</p>}
     {!data ? <p role="status" className="ops-state-panel">Loading saved observations…</p> : <>
       <section className="settings-card"><div className="section-heading"><div className="section-icon"><Database size={17}/></div><div className="section-title"><h2>Arr observations</h2><p>Refresh saved view reads local data. Refresh Arr observations explicitly reads upstream without searching or downloading.</p></div></div><div className="section-body provider-grid">{data.providers.map(provider => { const stale = Boolean(provider.observedAt && Date.now() - Date.parse(provider.observedAt) > 86_400_000); return <article className="provider-card" key={provider.provider}><div className={`provider-icon ${provider.known && !stale ? 'known' : 'unknown'}`}>{provider.provider.toLowerCase().includes('sonarr') ? <Tv size={17}/> : <Film size={17}/>}</div><div className="provider-main"><div className="provider-heading"><h3>{provider.provider}</h3><span className={`ops-status ${!provider.known || stale ? 'status-amber' : 'status-mint'}`}>{!provider.known ? 'Unknown' : stale ? 'Stale' : 'Current'}</span></div><p>Observed {date(provider.observedAt)}</p>{provider.error && <p className="provider-error">{provider.error}</p>}{!!provider.unknownSeriesIds?.length && <p>Some episode inventories are unknown ({provider.unknownSeriesIds.join(', ')}).</p>}<p>{provider.unidentifiedQueueRows} unidentified queue rows</p></div></article> })}</div></section>
-      <section className="settings-card"><div className="section-heading"><div className="section-icon"><Film size={17}/></div><div className="section-title"><h2 ref={watchHeading} tabIndex={-1}>Items to watch</h2><p>Arr observation list. Search and download execution follows the saved permissions above.</p></div></div>
+      <section className="settings-card automation-watch"><div className="section-heading"><div className="section-icon"><Film size={17}/></div><div className="section-title"><h2 ref={watchHeading} tabIndex={-1}>Items to watch</h2><p>Monitored shows and movies that are missing files.</p></div></div>
         {!observationsComplete && orderedGroups.length > 0 && <p className="automation-incomplete field-hint">One or more sources could not be fully checked, so this list may be incomplete. Check Arr observations or Settings, then refresh observations.</p>}
-        {!orderedGroups.length ? <div className="ops-state-panel ops-empty"><span className="ops-empty-mark"><CheckCircle2 size={19}/></span><h2>{observationsComplete ? 'No items to watch right now' : 'No items to show'}</h2><p>{observationsComplete ? 'No missing items or pending checks in the saved observations. Refresh observations later.' : 'One or more sources could not be fully checked, so this list may be incomplete. Check Arr observations or Settings, then poll again.'}</p></div> : orderedGroups.map(([id, group]) => {
-          const ordered = [...group.items].sort((a, b) => Number(b.eligible) - Number(a.eligible) || (a.nextAttemptAt ?? a.eligibleAt ?? '9999').localeCompare(b.nextAttemptAt ?? b.eligibleAt ?? '9999'))
-          const futureOnly = ordered.length > 0 && ordered.every(item => item.status === 'upcoming' || item.status === 'no-air-date')
-          const next = ordered.find(item => item.eligible) ? 'Next eligible poll' : ordered.map(item => item.nextAttemptAt ?? (item.status === 'upcoming' ? item.eligibleAt : undefined)).filter((value): value is string => !!value).sort()[0]
-          return <article className={`automation-group ${group.kind === 'tv' ? 'has-options' : ''}`} key={id}>
-            <details open={!futureOnly}>
-              <summary><span className="automation-group-title">{group.kind === 'tv' ? <Tv size={17}/> : <Film size={17}/>}<strong>{group.title}</strong></span><span className="field-hint">{ordered.length} {group.kind === 'tv' ? 'episode(s)' : 'movie'}{next ? ` · ${next === 'Next eligible poll' ? next : `Next: ${date(next)}`}` : futureOnly ? ' · Waiting for air date' : ''}</span></summary>
-              {!ordered.length ? <p className="automation-incomplete field-hint">No missing episodes in the saved observations.</p> : <div className="ops-work-list">{ordered.map(item => <article className="ops-work-row" key={item.targetId}><div className="ops-media-icon">{item.kind === 'tv' ? <Tv size={16}/> : <Film size={16}/>}</div><div className="ops-work-main"><div className="ops-work-title"><h3>{item.kind === 'tv' ? `Season ${item.seasonNumber ?? '?'} · Episode ${item.episodeNumber ?? '?'}` : item.title}</h3><span className={`ops-status ${item.eligible ? 'status-mint' : 'status-amber'}`}>{automationStatusLabel[item.status] ?? item.status}</span></div><p className="ops-work-meta">Observed {date(item.observedAt)} · {item.eligible ? 'Eligible' : 'Not currently eligible'}</p>
-                <p className="ops-work-meta">Next attempt: {item.nextAttemptAt ? date(item.nextAttemptAt) : item.eligible ? 'Next eligible poll' : item.status === 'upcoming' && item.eligibleAt ? `After ${date(item.eligibleAt)}` : item.status === 'no-air-date' ? 'Waiting for air date' : item.status === 'waiting-for-radarr' ? 'Waiting for Radarr' : item.status === 'downloading' ? 'In Arr queue' : 'Waiting for next check'}{item.lastAttemptAt && ` · Last attempt ${date(item.lastAttemptAt)}`}</p></div></article>)}</div>}
-            </details>
-            {group.kind === 'tv' && <button type="button" className="button button-secondary show-options" aria-haspopup="dialog" aria-label={`Options for ${group.title}`} disabled={saving || busy} onClick={event => { opener.current = event.currentTarget; setSelected({ id, title: group.title, saved: group.hoursEarly, items: ordered }) }}>Options</button>}
-          </article>
-        })}
+        {!orderedGroups.length ? <div className="ops-state-panel ops-empty"><span className="ops-empty-mark"><CheckCircle2 size={19}/></span><h2>{observationsComplete ? 'No items to watch right now' : 'No items to show'}</h2><p>{observationsComplete ? 'No missing items or pending checks in the saved observations. Refresh observations later.' : 'One or more sources could not be fully checked, so this list may be incomplete. Check Arr observations or Settings, then poll again.'}</p></div> : <>
+          <div className="watch-title-row watch-column-head" aria-hidden="true"><div className="watch-title-grid"><span className="watch-title">Title</span><span className="watch-count">Missing</span><span className="watch-next">Next check</span></div></div>
+          {orderedGroups.map(([id, group]) => <WatchGroup key={id} id={id} group={group} optionsDisabled={saving || busy}
+            onOptions={group.kind === 'tv' ? (button, items) => { opener.current = button; setSelected({ id, title: group.title, saved: group.hoursEarly, items }) } : undefined}/>)}
+        </>}
       </section>
        <section className="settings-card"><div className="section-heading"><div className="section-icon"><ActivityIcon size={17}/></div><div className="section-title"><h2>Recent automated searches</h2><p>Open a saved search to inspect its plan and durable receipt.</p></div></div>{historyLoading ? <p role="status" className="ops-state-panel">Loading automated search history…</p> : historyError ? <p role="alert" className="ops-state-panel">{historyError}</p> : history.length ? <div className="ops-activity-list">{history.map(item => <article className="ops-activity-row" key={item.searchId}><div className="ops-activity-top"><strong className="prompt-preview">{item.prompt}</strong><span className="ops-status">{item.status}</span></div><button className="text-button activity-open" type="button" onClick={() => onOpenSearch?.(item.searchId)}>View search details</button></article>)}</div> : <p className="ops-state-panel">No automated searches recorded yet.</p>}</section>
     </>}
@@ -150,6 +150,41 @@ export function AutomationPage({ settings, onOpenSearch }: { settings: Settings;
     {selected && <ConfigureShow key={selected.id} show={selected} saving={saving} onClose={() => setSelected(null)} onSave={async hours => { await saveOffset(selected.id, hours); setNotice(hours === 0 ? `Sonarr timing restored for ${selected.title}.` : `Options saved for ${selected.title}.`); setSelected(null) }}/>}
   </>
 }
+
+function WatchGroup({ id, group, optionsDisabled, onOptions }: {
+  id: string; group: { title: string; kind: 'tv' | 'movie'; items: AutomationItem[] }; optionsDisabled: boolean;
+  onOptions?(button: HTMLButtonElement, items: AutomationItem[]): void;
+}) {
+  const [expandedChoice, setExpanded] = useState<boolean>()
+  const ordered = [...group.items].sort((a, b) => Number(b.eligible) - Number(a.eligible) || (a.nextAttemptAt ?? a.eligibleAt ?? '9999').localeCompare(b.nextAttemptAt ?? b.eligibleAt ?? '9999'))
+  const futureOnly = ordered.length > 0 && ordered.every(item => item.status === 'upcoming' || item.status === 'no-air-date')
+  const expanded = expandedChoice ?? !futureOnly
+  const ready = ordered.some(item => item.eligible)
+  const nextAt = ready ? undefined : ordered.map(item => item.nextAttemptAt ?? (item.status === 'upcoming' ? item.eligibleAt : undefined)).filter((value): value is string => !!value).sort()[0]
+  const next = ready ? 'Next eligible poll' : nextAt ? shortWatchDate(nextAt) : futureOnly ? 'Waiting for air date' : undefined
+  const unit = group.kind === 'movie' ? 'movie' : 'episode'
+  const labelId = `watch-title-${id}`, detailsId = `watch-details-${id}`
+  return <article className="automation-group">
+    <div className="watch-title-row">
+      <button type="button" className="watch-title-grid watch-disclosure" aria-labelledby={labelId} aria-describedby={`${labelId}-count${next ? ` ${labelId}-next` : ''}`}
+        aria-controls={detailsId} aria-expanded={expanded} onClick={() => setExpanded(!expanded)}>
+        <ChevronRight className="watch-chevron" aria-hidden="true" size={15}/>
+        <span className="watch-title" id={labelId}>{group.title}</span>
+        <span className="watch-count" id={`${labelId}-count`}>{ordered.length} {unit}{ordered.length === 1 ? '' : 's'}</span>
+        <span className="watch-next" id={`${labelId}-next`} title={nextAt ? date(nextAt) : undefined}>
+          {next ? <>{nextAt && <span className="watch-next-prefix">Next: </span>}{next}</> : <span className="watch-next-empty" aria-hidden="true">—</span>}
+        </span>
+      </button>
+      {onOptions && <button type="button" className="icon-button show-options" aria-haspopup="dialog" aria-label={`Options for ${group.title}`}
+        title="Options" disabled={optionsDisabled} onClick={event => onOptions(event.currentTarget, ordered)}><Gear size={17} aria-hidden="true"/></button>}
+    </div>
+    <div id={detailsId} hidden={!expanded}>
+      {!ordered.length ? <p className="automation-incomplete field-hint">No missing episodes in the saved observations.</p> : <div className="ops-work-list">{ordered.map(item => <article className="ops-work-row" key={item.targetId}><div className="ops-media-icon">{item.kind === 'tv' ? <Tv size={16}/> : <Film size={16}/>}</div><div className="ops-work-main"><div className="ops-work-title"><h3>{item.kind === 'tv' ? `Season ${item.seasonNumber ?? '?'} · Episode ${item.episodeNumber ?? '?'}` : item.title}</h3><span className={`ops-status ${item.eligible ? 'status-mint' : 'status-amber'}`}>{automationStatusLabel[item.status] ?? item.status}</span></div><p className="ops-work-meta">Observed {date(item.observedAt)} · {item.eligible ? 'Eligible' : 'Not currently eligible'}</p>
+        <p className="ops-work-meta">Next attempt: {item.nextAttemptAt ? date(item.nextAttemptAt) : item.eligible ? 'Next eligible poll' : item.status === 'upcoming' && item.eligibleAt ? `After ${date(item.eligibleAt)}` : item.status === 'no-air-date' ? 'Waiting for air date' : item.status === 'waiting-for-radarr' ? 'Waiting for Radarr' : item.status === 'downloading' ? 'In Arr queue' : 'Waiting for next check'}{item.lastAttemptAt && ` · Last attempt ${date(item.lastAttemptAt)}`}</p></div></article>)}</div>}
+    </div>
+  </article>
+}
+
 function ConfigureShow({ show, saving, onClose, onSave }: { show: { title: string; saved: number; items: AutomationItem[] }; saving: boolean; onClose(): void; onSave(hours: number): Promise<void> }) {
   const [draft, setDraft] = useState(String(show.saved)), [error, setError] = useState('')
   const dialog = useRef<HTMLDivElement>(null), input = useRef<HTMLInputElement>(null), submitting = useRef(false)

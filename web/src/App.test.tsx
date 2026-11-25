@@ -956,7 +956,7 @@ it('keeps search available in dry-run and distinguishes a saved refresh from a l
 it('groups observations by title and saves or resets Sonarr airing policy without polling', async () => {
   const { AutomationPage } = await import('./Activity')
   const calls: Array<{ url: string; method?: string; body?: string }> = []
-  let fail = true, hours = 0, caughtHours = 24
+  let fail = true, hours = 0, caughtHours = 24, undatedReady = false
   let failSave!: (response: Response) => void
   const pendingFailure = new Promise<Response>(resolve => { failSave = resolve })
   const snapshot = () => ({
@@ -965,8 +965,8 @@ it('groups observations by title and saves or resets Sonarr airing policy withou
     items: [
       { targetId: 'future', titleId: 'show', title: 'Shared title', kind: 'tv', seasonNumber: 1, episodeNumber: 2, status: 'upcoming', eligible: false, metadataAirDate: '2026-12-20', eligibleAt: '2026-12-21T00:00:00.000Z' },
       { targetId: 'movie', titleId: 'movie', title: 'Shared title', kind: 'movie', status: 'waiting-for-radarr', eligible: false },
-      { targetId: 'ready', titleId: 'show', title: 'Shared title', kind: 'tv', seasonNumber: 1, episodeNumber: 1, status: 'missing', eligible: true },
-      { targetId: 'undated', titleId: 'undated-show', title: 'Undated', kind: 'tv', status: 'no-air-date', eligible: false },
+      { targetId: 'ready', titleId: 'show', title: 'Shared title', kind: 'tv', seasonNumber: 1, episodeNumber: 1, status: undatedReady ? 'cooldown' : 'missing', eligible: !undatedReady },
+      { targetId: 'undated', titleId: 'undated-show', title: 'Undated', kind: 'tv', status: undatedReady ? 'missing' : 'no-air-date', eligible: undatedReady },
     ],
     airingOffsets: [...(caughtHours ? [{ titleId: 'caught', title: 'Saved show', hoursEarly: caughtHours }] : []), ...(hours ? [{ titleId: 'show', title: 'Shared title', hoursEarly: hours }] : [])],
   })
@@ -985,17 +985,25 @@ it('groups observations by title and saves or resets Sonarr airing policy withou
   await screen.findByText('Items to watch')
   const groups = [...document.querySelectorAll('.automation-group')]
   assert.equal(screen.queryAllByRole('spinbutton').length, 0)
-  assert.ok(screen.getByRole('button', { name: 'Options for Undated' }))
+  assert.equal(screen.getByRole('button', { name: 'Options for Undated' }).textContent, '', 'options should be icon-only')
   assert.equal(groups.length, 4)
   assert.match(groups[0]!.textContent!, /Shared title/)
   assert.match(groups[0]!.textContent!, /Season 1 · Episode 1/)
+  assert.ok(screen.getByText('2 episodes'))
+  assert.ok(screen.getByText('1 episode'))
   assert.equal(screen.queryByText(/Provider air date|Scout eligibility|Airing offset|Hours early/i), null)
   assert.ok(screen.getByText('Waiting for Radarr'))
   const undatedButton = screen.getByRole('button', { name: 'Options for Undated' })
-  assert.equal(undatedButton.closest('.automation-group')!.querySelector('details')!.open, false)
-  const movie = groups.find(group => group.querySelector('summary')?.textContent?.includes('movie')) as HTMLElement
+  const undatedDisclosure = screen.getByRole('button', { name: 'Undated' })
+  assert.equal(undatedDisclosure.getAttribute('aria-expanded'), 'false')
+  fireEvent.click(undatedDisclosure)
+  assert.equal(undatedDisclosure.getAttribute('aria-expanded'), 'true')
+  assert.ok(screen.getByText('No air date'))
+  fireEvent.click(undatedDisclosure)
+  const movie = groups.find(group => within(group as HTMLElement).queryByText('1 movie', { exact: true })) as HTMLElement
   assert.equal(within(movie).queryByRole('button', { name: /Options/ }), null)
   fireEvent.click(undatedButton)
+  assert.equal(undatedDisclosure.getAttribute('aria-expanded'), 'false', 'the gear must not expand the episode list')
   let dialog = screen.getByRole('dialog', { name: 'Configure show' })
   assert.ok(within(dialog).getByText('Undated'))
   assert.ok(document.activeElement === within(dialog).getByRole('spinbutton', { name: 'Hours early' }))
@@ -1010,6 +1018,10 @@ it('groups observations by title and saves or resets Sonarr airing policy withou
   fireEvent.change(within(dialog).getByRole('spinbutton'), { target: { value: '10' } })
   fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
   assert.equal(calls.filter(c => c.method === 'PUT').length, 0)
+  undatedReady = true
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh saved view' }))
+  await waitFor(() => assert.equal(document.querySelector('.automation-group .watch-title')?.textContent, 'Undated'))
+  assert.equal(undatedDisclosure.getAttribute('aria-expanded'), 'false', 'a manual choice survives a refresh that reorders the groups')
   const showButton = screen.getByRole('button', { name: 'Options for Shared title' })
   fireEvent.click(showButton)
   dialog = screen.getByRole('dialog', { name: 'Configure show' })

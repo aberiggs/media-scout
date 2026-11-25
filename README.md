@@ -37,7 +37,7 @@ Configure Prowlarr, LLM, and optional Arr connections in the web UI. In **Settin
 
 Each scheduled search lists the show's actionable episodes across seasons, or one movie, and adds the saved automation preferences to the prompt. Manual Search uses one prompt for the request and any preferences; open a saved result to see its full prompt. After a submitted or possibly submitted download, Scout waits for Arr to see it before researching that title again (30 minutes by default). Scout does not inspect or repair qBittorrent downloads or Arr imports.
 
-**Automation → Items to watch** includes monitored missing files, including upcoming episodes and movies Radarr doesn't yet consider available. If a show streams before Sonarr's listed airing, open **Options** for that show and set **Hours early** (0–168 hours; 0 resets it). This changes Scout's eligibility time only, not Sonarr's dates, your retry settings, or your download permissions. Saving doesn't start a search. Undated episodes still wait for a date, and movies still follow Radarr.
+**Automation → Items to watch** includes monitored missing files, including upcoming episodes and movies Radarr doesn't yet consider available. If a show streams before Sonarr's listed airing, open the gear next to that show and set **Hours early** (0–168 hours; 0 resets it). This changes Scout's eligibility time only, not Sonarr's dates, your retry settings, or your download permissions. Saving doesn't start a search. Undated episodes still wait for a date, and movies still follow Radarr.
 
 Manual confirmation uses an explicit Prowlarr download client, its configured
 category routing, and the saved dry-run setting. Expired candidates require a new

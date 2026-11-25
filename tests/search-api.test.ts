@@ -413,6 +413,9 @@ describe('search-first HTTP contract', () => {
         expect(prompt).toMatch(/\["Show [45]","Show [45] S2",\{"title":"Show [45] Cour Two","providerSeasons":\[2\]\}\]/);
         expect(prompt).toContain('{"season":1,"episode":1,"absoluteEpisode":1,"title":"Episode 1"}');
         expect(prompt).toContain('{"season":1,"episode":3,"absoluteEpisode":3,"title":"Episode 3"}');
+        expect(prompt).toMatch(/start [^\n]*S01E20/i);
+        expect(prompt).toMatch(/if needed[^.]*season pack/i);
+        expect(prompt).toMatch(/for (?:a )?large [^\n]*season or batch/i);
         expect(prompt.match(/Original audio, 1080p/g)).toHaveLength(1);
         expect(prompt).toContain('S1+S2 and S2+S3');
         expect(prompt).not.toMatch(/Episode [24]|"season":2|2020-01-01|tvdb|targetId|unmonitored/i);

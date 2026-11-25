@@ -35,8 +35,9 @@ deferred descriptions, and a consistent broad-coverage status. It has no `target
 field and never maps releases to episodes or Arr entities. Coverage, gaps, extras,
 and useful overlap are semantic descriptions; reasonable extras are valid. Earlier
 plan formats are not shown in history.
-An empty **validated** set is
-`no-match`; a Prowlarr failure with no successful search is not a clean miss.
+An empty **validated** set is `no-match`; a Prowlarr failure with no successful
+search or with candidate observations that did not reach the planner is not a
+clean miss. A later empty result cannot hide candidate evidence from a lost reply.
 Failed/interrupted/budget-exhausted research has no executable plan.
 Safe candidate evidence is retained with history independently of private locator
 expiry. Consumers resolve selected IDs through the owning backend ledger, never

@@ -13,7 +13,7 @@ import { AgentBudgetExhaustedError, ProwlarrConnectionError, runAgentSearch } fr
 import { RESEARCH_INSTRUCTIONS } from './prompt';
 import { openSearchStore, type SearchStore, type SearchRecord } from './store';
 import { enabledResearchServerConfigs } from './research-mcp';
-import { PROWLARR_INDEXERS_TIMEOUT_MS, PROWLARR_SEARCH_TIMEOUT_MS, type ProwlarrSearchInput } from './prowlarr-tools';
+import { PROWLARR_INDEXERS_TIMEOUT_MS, PROWLARR_SEARCH_TIMEOUT_MS, prowlarrCandidateSnapshotSchema, type ProwlarrSearchInput } from './prowlarr-tools';
 import { defaultSettings, missingSettings, settingsSchema, type Settings } from './settings';
 import { acquisitionRequestSchema, idempotencyKeySchema, searchRequestSchema, type SearchRequest, type SearchStatus } from './contracts';
 import type { Release } from '../types/prowlarr';
@@ -154,7 +154,7 @@ function retryAfterSeconds(error: unknown, now = Date.now()): number | undefined
 }
 function safeSearchError(error: unknown): string {
   if (error instanceof ProwlarrConnectionError) return error.message;
-  if (error instanceof ProwlarrResearchUnavailableError) return 'Prowlarr research failed before a search could complete';
+  if (error instanceof ProwlarrResearchUnavailableError) return error.message;
   if (error instanceof AgentBudgetExhaustedError) return 'Search step budget exhausted';
   if (error instanceof ApiError) return `Search provider request failed (HTTP ${error.status})`;
   if (error instanceof Error && error.message === 'legacy-search-prompt') return 'This saved search uses a retired request format; resubmit it as a prompt-only search.';
@@ -164,7 +164,13 @@ function safeSearchError(error: unknown): string {
   if (error instanceof Error && SAFE_INTERNAL_ERRORS.has(error.message)) return error.message;
   return 'Search failed; model or provider unavailable';
 }
-class ProwlarrResearchUnavailableError extends Error {}
+class ProwlarrResearchUnavailableError extends Error {
+  constructor(unseenEvidence = false) {
+    super(unseenEvidence
+      ? 'Prowlarr returned candidate evidence that did not reach the search planner. Retry the search.'
+      : 'Prowlarr research failed before a search could complete');
+  }
+}
 
 /** Shared persisted runtime for HTTP/MCP adapters. Read projections never perform upstream calls. */
 export class SearchRuntime {
@@ -1149,6 +1155,7 @@ export class SearchRuntime {
     const researchWarnings: string[] = [];
     let prowlarrTransportFailed = false;
     let receivedProwlarrSearch = false;
+    const receivedObservations = new Map<string, number>();
     try {
       if (!this.internalMcpUrl) throw new Error('daemon-mcp-unavailable');
       const stored = readStoredPrompt(work.prompt);
@@ -1186,8 +1193,12 @@ export class SearchRuntime {
         onProwlarrTransportFailure: () => {
           prowlarrTransportFailed = true;
         },
-        onProwlarrSearchResult: () => {
+        onProwlarrSearchResult: candidates => {
           receivedProwlarrSearch = true;
+          // Each response carries the candidate's cumulative, append-only
+          // observations. Parallel replies may arrive out of order.
+          for (const { candidateId, observations } of candidates)
+            receivedObservations.set(candidateId, Math.max(receivedObservations.get(candidateId) ?? 0, observations.length));
         },
           ledger: (): FinalizationLedger => {
           const candidates = this.store.listCandidates(work.searchId, this.clock()).map(row => {
@@ -1204,9 +1215,16 @@ export class SearchRuntime {
       if (stagedPlan !== plan) throw new Error('finalization-not-staged');
       const research = this.prowlarrCapabilities.get(capability.token);
       searches = research?.searches ?? 0;
-      if (plan.status === 'no-match' && !receivedProwlarrSearch && (searches > 0 || research?.researchFailed || prowlarrTransportFailed))
-        throw new ProwlarrResearchUnavailableError();
       const candidateEvidence = this.store.listCandidates(work.searchId, this.clock()).map(row => row.safe);
+      if (plan.status === 'no-match') {
+        const unseenEvidence = candidateEvidence.some(evidence => {
+          const { candidateId, observations } = prowlarrCandidateSnapshotSchema.parse(evidence);
+          return observations.length > (receivedObservations.get(candidateId) ?? 0);
+        });
+        if (unseenEvidence) throw new ProwlarrResearchUnavailableError(true);
+        if (!receivedProwlarrSearch && (searches > 0 || research?.researchFailed || prowlarrTransportFailed))
+          throw new ProwlarrResearchUnavailableError();
+      }
       const result: AgentSearchResult = { version: 1, plan, candidateEvidence, status: plan.status, ...(researchWarnings.length ? { researchWarnings } : {}), counts: { decisions: modelTurns, searches, candidates: candidateEvidence.length }, diagnostics: { modelTurns, stopReason: 'release-set-finalized', elapsedMs: Math.max(0, this.clock() - startedAt), ...(hasUsage ? { usage: modelUsage } : {}) } };
       const acquisition=work.source==='acquisition'?this.store.acquisition(work.searchId):null;
       if (!this.store.finishOwnedSearch(work.searchId, work.owner, plan.status, result, this.clock(),!!acquisition&&plan.status==='matched')) throw new Error('search-ownership-lost');

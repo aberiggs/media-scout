@@ -833,7 +833,7 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
         return await Promise.race([operation, new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error(`Timed out: ${label}`)), 3_000); })]);
       } finally { clearTimeout(timer); }
     };
-    let mode: 'timeout' | 'expiry' | 'shutdown' | 'rate-limit' = 'timeout';
+    let mode: 'timeout' | 'aggregate' | 'expiry' | 'shutdown' | 'rate-limit' = 'timeout';
     let started!: () => void, aborted!: () => void, posts = 0;
     let upstreamStarted = Promise.resolve(), upstreamAborted = Promise.resolve();
     const begin = (next: typeof mode) => {
@@ -841,11 +841,19 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
       upstreamStarted = new Promise<void>(resolve => { started = resolve; });
       upstreamAborted = new Promise<void>(resolve => { aborted = resolve; });
     };
+    const delayedReply = (response: import('node:http').ServerResponse, value: unknown) => {
+      const timer = setTimeout(() => response.end(JSON.stringify(value)), 300);
+      response.once('close', () => clearTimeout(timer));
+    };
     const upstream = createServer((request, response) => {
       if (request.method !== 'GET') posts++;
       response.setHeader('content-type', 'application/json');
       if (request.url?.startsWith('/api/v1/indexerstatus')) return response.end('[]');
-      if (request.url?.startsWith('/api/v1/indexer')) return response.end(JSON.stringify([{ id: 1, name: 'Fixture', enable: true, supportsSearch: true }]));
+      if (request.url?.startsWith('/api/v1/indexer')) {
+        const indexers = [{ id: 1, name: 'Fixture', enable: true, supportsSearch: true }];
+        if (mode === 'aggregate') return delayedReply(response, indexers);
+        return response.end(JSON.stringify(indexers));
+      }
       if (request.url?.startsWith('/api/v1/search')) {
         started();
         if (mode === 'rate-limit') {
@@ -853,6 +861,9 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
           return response.end('private upstream error');
         }
         response.on('close', () => aborted());
+        if (mode === 'aggregate') delayedReply(response, [{
+          guid: 'aggregate-release', indexerId: 1, indexer: 'Fixture', title: 'Aggregate release', age: 1, publishDate: '', protocol: 'torrent',
+        }]);
         return;
       }
       response.statusCode = 404;
@@ -889,6 +900,17 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
       expect(timeoutResult.isError).toBe(true);
       expect(JSON.stringify(timeoutResult)).toContain('Prowlarr search timed out.');
       await within(upstreamAborted, 'timeout upstream abort');
+      expect(runtime.store.listCandidates('real-upstream')).toEqual([]);
+
+      // Discovery and search each take 300ms; neither exceeds the 500ms
+      // budget alone. Restarting the timer after discovery would accept a result.
+      begin('aggregate');
+      const aggregateCall = timeout.client.callTool({ name: 'prowlarr_search', arguments: { query: 'aggregate', timeoutMs: 500 } });
+      await within(upstreamStarted, 'aggregate search start after discovery');
+      const aggregateResult = await within(aggregateCall, 'aggregate tool settlement');
+      expect(aggregateResult.isError).toBe(true);
+      expect(JSON.stringify(aggregateResult)).toContain('Prowlarr search timed out.');
+      await within(upstreamAborted, 'aggregate upstream abort');
       expect(runtime.store.listCandidates('real-upstream')).toEqual([]);
 
       begin('rate-limit');

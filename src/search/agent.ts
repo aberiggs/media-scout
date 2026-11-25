@@ -2,7 +2,7 @@ import { callModel, stepCountIs, tool } from '@openrouter/agent';
 import { Client, SdkError, SdkErrorCode, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { finalizeReleaseSetInputSchema, type FinalizationLedger, type ReleaseSet, finalizeReleaseSet } from './agent-contracts';
 import { connectResearchTools } from './research-mcp';
-import { PROWLARR_INDEXERS_TIMEOUT_MS, PROWLARR_SEARCH_TIMEOUT_MS, prowlarrIndexerTool, prowlarrSearchTool } from './prowlarr-tools';
+import { PROWLARR_INDEXERS_TIMEOUT_MS, PROWLARR_SEARCH_TIMEOUT_MS, prowlarrIndexerTool, prowlarrSearchTool, prowlarrSearchResultSchema, type ProwlarrCandidateSnapshot } from './prowlarr-tools';
 
 const CONNECT_TIMEOUT_MS = 15_000;
 const SEARCH_TIMEOUT_MS = PROWLARR_SEARCH_TIMEOUT_MS + 10_000;
@@ -41,7 +41,7 @@ export interface AgentSearchOptions {
   onUsage?: (usage: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cost?: number }) => void;
   onResearchWarning?: (message: string) => void;
   onProwlarrTransportFailure?: () => void;
-  onProwlarrSearchResult?: () => void;
+  onProwlarrSearchResult?: (candidates: readonly ProwlarrCandidateSnapshot[]) => void;
 }
 export class AgentBudgetExhaustedError extends Error {
   constructor() { super('Agent step budget exhausted without a validated release set'); this.name = 'AgentBudgetExhaustedError'; }
@@ -119,10 +119,15 @@ export async function runAgentSearch(options: AgentSearchOptions): Promise<Relea
       }
       const signal = callController.signal;
       let result: Awaited<ReturnType<Client['callTool']>>;
+      let text: string;
+      let candidates: ProwlarrCandidateSnapshot[] | undefined;
       try {
         signal.throwIfAborted();
         result = await client.callTool({ name, arguments: args }, { timeout: timeoutMs, signal });
         signal.throwIfAborted();
+        text = result.content.flatMap(item => item.type === 'text' ? [item.text] : []).join('\n');
+        if (!result.isError && name === prowlarrSearchTool.name)
+          candidates = prowlarrSearchResultSchema.parse(JSON.parse(text));
       } catch (error) {
         if (controller.signal.aborted) throw controller.signal.reason;
         options.onProwlarrTransportFailure?.();
@@ -133,7 +138,6 @@ export async function runAgentSearch(options: AgentSearchOptions): Promise<Relea
         options.onResearchWarning?.(message);
         throw new Error(message);
       } finally { clearTimeout(timer); for (const source of sources) source.removeEventListener('abort', cancelCall); }
-      const text = result.content.flatMap(item => item.type === 'text' ? [item.text] : []).join('\n');
       if (result.isError) {
         options.onProwlarrTransportFailure?.();
         const timedOut = text === 'Prowlarr search timed out.' || text === 'Prowlarr indexer discovery timed out.';
@@ -142,7 +146,7 @@ export async function runAgentSearch(options: AgentSearchOptions): Promise<Relea
         throw new Error(safeProwlarrErrors.has(text) ? text : message);
       }
       // Preserve the wrapper's JSON-text result for these internal tools.
-      if (name === prowlarrSearchTool.name) options.onProwlarrSearchResult?.();
+      if (candidates) options.onProwlarrSearchResult?.(candidates);
       return text;
     };
     const prowlarrTools = [

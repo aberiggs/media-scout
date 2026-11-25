@@ -23,3 +23,10 @@ export const prowlarrSearchTool = {
   }).strict(),
 } as const;
 export type ProwlarrSearchInput = z.infer<typeof prowlarrSearchTool.inputSchema>;
+
+export const prowlarrCandidateSnapshotSchema = z.object({
+  candidateId: z.string(),
+  observations: z.array(z.unknown()),
+});
+export const prowlarrSearchResultSchema = z.array(prowlarrCandidateSnapshotSchema);
+export type ProwlarrCandidateSnapshot = z.infer<typeof prowlarrCandidateSnapshotSchema>;

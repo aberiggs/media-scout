@@ -757,8 +757,9 @@ describe('search-first HTTP contract', () => {
       await new Promise<void>(resolve => { sentinel.close(() => resolve()); sentinel.closeAllConnections(); });
     }
   });
-  it.each(['empty', 'outage', 'cooldown', 'transport-timeout', 'transport-failure', 'transport-result-lost', 'transport-recovers'] as const)('distinguishes successful empty results from unavailable Prowlarr research (%s)', async (scenario) => {
-    const dropsSuccessfulResult = scenario === 'transport-result-lost' || scenario === 'transport-recovers';
+  it.each(['empty', 'outage', 'cooldown', 'transport-timeout', 'transport-failure', 'transport-result-lost', 'transport-empty-retry', 'transport-observation-lost', 'transport-recovers', 'transport-recovers-empty'] as const)('distinguishes successful empty results from unavailable Prowlarr research (%s)', async (scenario) => {
+    const retries = ['transport-empty-retry', 'transport-observation-lost', 'transport-recovers', 'transport-recovers-empty'].includes(scenario);
+    const dropsSuccessfulResult = retries || scenario === 'transport-result-lost';
     let responseCalls = 0, prowlarrCalls = 0, lostResults = 0;
     const modelInputs: Array<{ input: unknown; instructions: unknown; tools: unknown }> = [];
     const responses = createServer(async (request, response) => {
@@ -767,7 +768,7 @@ describe('search-first HTTP contract', () => {
       const body = JSON.parse(Buffer.concat(parts).toString()) as { tools?: Array<{ name?: string }>; input?: unknown; instructions?: unknown };
       modelInputs.push({ input: body.input, instructions: body.instructions, tools: body.tools });
       responseCalls++;
-      const name = (responseCalls === 1 || (scenario === 'transport-recovers' && responseCalls === 2)
+      const name = (responseCalls === 1 || (retries && responseCalls === 2)
         ? body.tools?.find(tool => tool.name?.includes(scenario === 'cooldown' ? 'prowlarr_indexers' : 'prowlarr_search'))?.name : undefined) ?? 'finalize_release_set';
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(JSON.stringify({
@@ -788,9 +789,12 @@ describe('search-first HTTP contract', () => {
         getIndexers: async () => [{ id: 1, name: 'Fixture', enable: true, implementation: 'Fixture', protocol: 'torrent' }],
         getIndexerStatuses: async () => scenario === 'cooldown' ? [{ indexerId: 1, disabledTill: '2099-01-01T00:00:00Z', mostRecentFailure: null, initialFailure: null }] : [],
         search: async (_input, options) => {
-          if (dropsSuccessfulResult) return ++prowlarrCalls === 1 ? [releaseSchema.parse({
-            guid: 'lost-release', indexerId: 1, indexer: 'Fixture', title: 'LostResponseRelease.1080p', age: 1, publishDate: '', protocol: 'torrent',
-          })] : [];
+          if (dropsSuccessfulResult) {
+            prowlarrCalls++;
+            if (scenario === 'transport-recovers-empty' || (scenario === 'transport-empty-retry' && prowlarrCalls === 2)) return [];
+            const title = scenario === 'transport-observation-lost' && prowlarrCalls === 1 ? 'VisibleRelease.1080p' : 'LostResponseRelease.1080p';
+            return [releaseSchema.parse({ guid: 'lost-release', indexerId: 1, indexer: 'Fixture', title, age: 1, publishDate: '', protocol: 'torrent' })];
+          }
           if (scenario === 'transport-timeout') await new Promise<void>((_resolve, reject) => options?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
           throw new Error('PRIVATE-UPSTREAM-CANARY');
         },
@@ -822,7 +826,8 @@ describe('search-first HTTP contract', () => {
               method: request.method, headers, ...(body.length ? { body } : {}),
             });
             const output = Buffer.from(await result.arrayBuffer());
-            if (toolCall && dropsSuccessfulResult && output.includes('LostResponseRelease')) {
+            const loseResponse = scenario === 'transport-recovers-empty' || output.includes('LostResponseRelease');
+            if (toolCall && dropsSuccessfulResult && !lostResults && loseResponse) {
               lostResults++;
               response.writeHead(503).end('PRIVATE-TRANSPORT-CANARY');
               return;
@@ -849,7 +854,7 @@ describe('search-first HTTP contract', () => {
       expect(instruction).toContain('Extras are not gaps');
       expect(instruction).toContain('plain language, not IDs');
       expect(JSON.stringify(modelInputs.flatMap(request => request.tools)).match(/targetIds/g)).toBeNull();
-      expect(modelInputs).toHaveLength(scenario === 'transport-recovers' ? 3 : 2);
+      expect(modelInputs).toHaveLength(retries ? 3 : 2);
       for (const request of modelInputs) {
         expect(request.instructions).toEqual(expect.stringContaining('Treat clear, internally consistent release names and indexer metadata as sufficient working evidence'));
         expect(request.instructions).toEqual(expect.stringContaining('Do not add boilerplate uncertainty solely because file contents were not inspected'));
@@ -861,21 +866,31 @@ describe('search-first HTTP contract', () => {
       expect(modelInputs[0]?.input).toBe(exactPrompt);
       if (dropsSuccessfulResult) {
         expect(lostResults).toBe(1);
-        expect(runtime.store.listCandidates(searchId)).toHaveLength(1);
-        expect(instruction).not.toContain('LostResponseRelease');
+        expect(prowlarrCalls).toBe(retries ? 2 : 1);
+        const stored = runtime.store.listCandidates(searchId);
+        if (scenario === 'transport-recovers-empty') expect(stored).toEqual([]);
+        else expect(stored).toMatchObject([{ safe: { observations: [
+          ...(scenario === 'transport-observation-lost' ? [{ title: 'VisibleRelease.1080p' }] : []),
+          { title: 'LostResponseRelease.1080p' },
+        ] } }]);
+        if (scenario === 'transport-recovers') expect(instruction).toContain('LostResponseRelease');
+        else expect(instruction).not.toContain('LostResponseRelease');
+        if (scenario === 'transport-observation-lost') expect(instruction).toContain('VisibleRelease');
         expect(instruction).toContain('Prowlarr tool invocation failed.');
         expect(status.json().researchWarnings).toEqual(['Prowlarr tool invocation failed.']);
       }
-      if (scenario === 'transport-recovers') {
-        expect(prowlarrCalls).toBe(2);
+      if (scenario === 'transport-recovers' || scenario === 'transport-recovers-empty') {
         expect(status.json()).toMatchObject({ status: 'no-match', counts: { searches: 2 } });
         return;
       }
       if (scenario !== 'empty') {
         expect(instruction).toContain(scenario === 'outage' ? 'Prowlarr search unavailable'
           : scenario === 'transport-timeout' ? 'Prowlarr tool invocation timed out.'
-            : scenario === 'transport-failure' || scenario === 'transport-result-lost' ? 'Prowlarr tool invocation failed.' : 'coolingUntil');
-        expect(status.json()).toMatchObject({ searchId, status: 'failed', message: 'Prowlarr research failed before a search could complete' });
+            : scenario === 'transport-failure' || dropsSuccessfulResult ? 'Prowlarr tool invocation failed.' : 'coolingUntil');
+        expect(status.json()).toMatchObject({ searchId, status: 'failed' });
+        expect(status.json().message).toBe(dropsSuccessfulResult
+          ? 'Prowlarr returned candidate evidence that did not reach the search planner. Retry the search.'
+          : 'Prowlarr research failed before a search could complete');
         if (scenario === 'transport-timeout') expect(status.json().researchWarnings).toEqual(['Prowlarr tool invocation timed out.']);
         if (scenario === 'transport-failure' || scenario === 'outage') expect(status.json().researchWarnings).toEqual(['Prowlarr tool invocation failed.']);
         expect(status.json()).not.toHaveProperty('plan');

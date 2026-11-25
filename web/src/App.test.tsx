@@ -435,7 +435,7 @@ it('does not show an old confirmation after selecting another search while prepa
   view.rerender(<SearchPage settings={defaults} searchId="other" searchRevision={2} onSearchStarted={() => {}} />)
   resolvePrepare(Response.json({ ...preparedConfirmation, searchId: 'life' }))
   await waitFor(() => assert.ok(screen.getByText('Selected release set')))
-  assert.equal(screen.queryByRole('dialog'), null)
+  assert.ok(!screen.queryByRole('dialog'))
 })
 
 it('ignores a delayed receipt poll for the previously selected search', async () => {
@@ -492,7 +492,7 @@ it('traps confirmation focus and restores focus to the actual prepare action', a
   fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })
   assert.equal(document.activeElement, confirm)
   fireEvent.keyDown(document, { key: 'Escape' })
-  assert.equal(screen.queryByRole('dialog'), null)
+  assert.ok(!screen.queryByRole('dialog'))
   await new Promise(resolve => window.setTimeout(resolve, 5))
   assert.equal(document.activeElement, prepare)
 })
@@ -956,7 +956,9 @@ it('keeps search available in dry-run and distinguishes a saved refresh from a l
 it('groups observations by title and saves or resets Sonarr airing policy without polling', async () => {
   const { AutomationPage } = await import('./Activity')
   const calls: Array<{ url: string; method?: string; body?: string }> = []
-  let fail = true, hours = 0
+  let fail = true, hours = 0, caughtHours = 24
+  let failSave!: (response: Response) => void
+  const pendingFailure = new Promise<Response>(resolve => { failSave = resolve })
   const snapshot = () => ({
     enabled: true, dryRun: true, running: false,
     providers: [{ provider: 'sonarr', known: false, unidentifiedQueueRows: 0 }, { provider: 'radarr', known: true, unidentifiedQueueRows: 0 }],
@@ -966,14 +968,15 @@ it('groups observations by title and saves or resets Sonarr airing policy withou
       { targetId: 'ready', titleId: 'show', title: 'Shared title', kind: 'tv', seasonNumber: 1, episodeNumber: 1, status: 'missing', eligible: true },
       { targetId: 'undated', titleId: 'undated-show', title: 'Undated', kind: 'tv', status: 'no-air-date', eligible: false },
     ],
-    airingOffsets: [{ titleId: 'caught', title: 'Saved show', hoursEarly: 24 }, ...(hours ? [{ titleId: 'show', title: 'Shared title', hoursEarly: hours }] : [])],
+    airingOffsets: [...(caughtHours ? [{ titleId: 'caught', title: 'Saved show', hoursEarly: caughtHours }] : []), ...(hours ? [{ titleId: 'show', title: 'Shared title', hoursEarly: hours }] : [])],
   })
   globalThis.fetch = async (input, init) => {
     const url = String(input); calls.push({ url, method: init?.method, body: init?.body as string | undefined })
     if (url === '/api/v2/automation') return Response.json(snapshot())
     if (url.includes('/airing-offsets/')) {
-      if (fail) { fail = false; return Response.json({ error: 'Try again later' }, { status: 503 }) }
-      hours = JSON.parse(String(init?.body)).hoursEarly
+      if (fail) { fail = false; return pendingFailure }
+      if (url.endsWith('/caught')) caughtHours = JSON.parse(String(init?.body)).hoursEarly
+      else hours = JSON.parse(String(init?.body)).hoursEarly
       return Response.json(snapshot())
     }
     return Response.json({ items: [] })
@@ -981,37 +984,68 @@ it('groups observations by title and saves or resets Sonarr airing policy withou
   render(<AutomationPage settings={defaults}/>)
   await screen.findByText('Items to watch')
   const groups = [...document.querySelectorAll('.automation-group')]
+  assert.equal(screen.queryAllByRole('spinbutton').length, 0)
+  assert.ok(screen.getByRole('button', { name: 'Options for Undated' }))
   assert.equal(groups.length, 4)
   assert.match(groups[0]!.textContent!, /Shared title/)
   assert.match(groups[0]!.textContent!, /Season 1 · Episode 1/)
-  assert.ok(screen.getByText(/Provider air date: 2026-12-20/))
-  assert.ok(screen.getByText(/Scout eligibility:/))
+  assert.equal(screen.queryByText(/Provider air date|Scout eligibility|Airing offset|Hours early/i), null)
   assert.ok(screen.getByText('Waiting for Radarr'))
-  assert.ok(screen.getByText(/No missing episodes in the saved observations/))
-  assert.equal(screen.getAllByRole('spinbutton').length, 3)
-  const undated = screen.getByRole('spinbutton', { name: /Treat episodes as aired.*Undated/i }).closest('.automation-group') as HTMLElement
-  const undatedDetails = undated.querySelector('details')!
-  assert.equal(undatedDetails.open, false)
-  fireEvent.click(within(undated).getByText('Undated'))
-  assert.equal(undatedDetails.open, true)
-  assert.ok(within(undated).getByText('No air date'))
-  const input = screen.getByRole('spinbutton', { name: /Treat episodes as aired.*Shared title/i }) as HTMLInputElement
-  const show = within(input.closest('.automation-group') as HTMLElement)
+  const undatedButton = screen.getByRole('button', { name: 'Options for Undated' })
+  assert.equal(undatedButton.closest('.automation-group')!.querySelector('details')!.open, false)
+  const movie = groups.find(group => group.querySelector('summary')?.textContent?.includes('movie')) as HTMLElement
+  assert.equal(within(movie).queryByRole('button', { name: /Options/ }), null)
+  fireEvent.click(undatedButton)
+  let dialog = screen.getByRole('dialog', { name: 'Configure show' })
+  assert.ok(within(dialog).getByText('Undated'))
+  assert.ok(document.activeElement === within(dialog).getByRole('spinbutton', { name: 'Hours early' }))
+  fireEvent.keyDown(dialog, { key: 'Tab', shiftKey: true })
+  assert.ok(document.activeElement === within(dialog).getByRole('button', { name: 'Save' }))
+  fireEvent.keyDown(dialog, { key: 'Tab' })
+  assert.ok(document.activeElement === within(dialog).getByRole('spinbutton', { name: 'Hours early' }))
+  fireEvent.keyDown(dialog, { key: 'Escape' })
+  assert.ok(document.activeElement === undatedButton)
+  fireEvent.click(undatedButton)
+  dialog = screen.getByRole('dialog', { name: 'Configure show' })
+  fireEvent.change(within(dialog).getByRole('spinbutton'), { target: { value: '10' } })
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+  assert.equal(calls.filter(c => c.method === 'PUT').length, 0)
+  const showButton = screen.getByRole('button', { name: 'Options for Shared title' })
+  fireEvent.click(showButton)
+  dialog = screen.getByRole('dialog', { name: 'Configure show' })
+  assert.ok(within(dialog).getByText(/Sonarr air date: 2026-12-20/))
+  assert.ok(within(dialog).getByText(/Saved Scout eligibility:/))
+  const input = within(dialog).getByRole('spinbutton', { name: 'Hours early' }) as HTMLInputElement
+  fireEvent.change(input, { target: { value: '' } })
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
+  assert.ok(within(dialog).getByRole('alert'))
   fireEvent.change(input, { target: { value: '169' } })
-  fireEvent.click(screen.getByRole('button', { name: /Save.*Shared title/i }))
-  assert.ok(show.getByText('Enter a whole number from 0 to 168 hours.'))
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
   assert.equal(calls.filter(c => c.method === 'PUT').length, 0)
   fireEvent.change(input, { target: { value: '72' } })
-  fireEvent.click(screen.getByRole('button', { name: /Save.*Shared title/i }))
-  assert.ok(await screen.findByText('Try again later'))
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
+  assert.ok(document.activeElement === dialog, 'dialog keeps focus while its controls are disabled')
+  fireEvent.keyDown(dialog, { key: 'Escape' })
+  assert.ok(screen.getByRole('dialog'))
+  failSave(Response.json({ error: 'Try again later' }, { status: 503 }))
+  assert.ok(await within(dialog).findByText('Try again later'))
   assert.equal(input.value, '72')
-  assert.ok(show.getByText(/Saved: 0 hours early/))
-  fireEvent.click(screen.getByRole('button', { name: /Save.*Shared title/i }))
-  await waitFor(() => assert.ok(show.getByText(/Saved: 72 hours early/)))
-  fireEvent.click(screen.getByRole('button', { name: /Reset.*Shared title/i }))
-  await waitFor(() => assert.ok(show.getByText(/Saved: 0 hours early/)))
-  assert.equal(input.value, '0')
-  assert.deepEqual(calls.filter(c => c.method === 'PUT').map(c => JSON.parse(c.body!).hoursEarly), [72, 72, 0])
+  assert.ok(document.activeElement === input, 'failure returns focus to the editable draft')
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
+  await waitFor(() => assert.ok(!screen.queryByRole('dialog')))
+  assert.ok(document.activeElement === showButton)
+  assert.ok(screen.getByRole('status').textContent?.includes('Options saved'))
+  fireEvent.click(showButton)
+  dialog = screen.getByRole('dialog', { name: 'Configure show' })
+  assert.equal((within(dialog).getByRole('spinbutton') as HTMLInputElement).value, '72')
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Reset to Sonarr timing' }))
+  await waitFor(() => assert.ok(!screen.queryByRole('dialog')))
+  fireEvent.click(screen.getByRole('button', { name: 'Options for Saved show' }))
+  dialog = screen.getByRole('dialog', { name: 'Configure show' })
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Reset to Sonarr timing' }))
+  await waitFor(() => assert.ok(!screen.queryByRole('button', { name: 'Options for Saved show' })))
+  assert.ok(document.activeElement === screen.getByRole('heading', { name: 'Items to watch' }))
+  assert.deepEqual(calls.filter(c => c.method === 'PUT').map(c => JSON.parse(c.body!).hoursEarly), [72, 72, 0, 0])
   assert.equal(calls.some(c => c.url.includes('/poll') || c.url.includes('/search')), false)
 })
 

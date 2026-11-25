@@ -815,11 +815,6 @@ h1 { color: #f0f2ef; font-family: var(--display); font-size: clamp(1.875rem, 3vw
 .automation-group .ops-work-row { align-items: center; }
 .automation-group .ops-work-title h3 { overflow-wrap: break-word; word-break: normal; }
 .automation-incomplete { padding: 12px 18px; }
-.airing-offset { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; padding: 12px 18px 16px; background: #1a201c; }
-.airing-offset .field { flex: 1 1 220px; }
-.airing-offset input { max-width: 110px; }
-.airing-offset-actions { display: flex; flex-wrap: wrap; gap: 8px; }
-.airing-offset > .field-hint, .airing-offset > .notice { flex-basis: 100%; }
 .automation-rail { position: sticky; top: 84px; }
 .automation-rail .cycle-title { flex-wrap: wrap; }
 .automation-rail .activity-key { margin-top: 0; }
@@ -841,4 +836,19 @@ h1 { color: #f0f2ef; font-family: var(--display); font-size: clamp(1.875rem, 3vw
  .automation-layout .ops-page-toolbar > div { width: 100%; justify-content: flex-start; }
  .automation-group .ops-work-row { grid-template-columns: 31px minmax(0,1fr); }
  .automation-group .ops-work-row > .button { grid-column: 2; justify-self: start; }
+}
+
+/* Keep show options available without exposing the setting on the watch list. */
+.automation-group.has-options { position: relative; }
+.automation-group.has-options > details > summary { padding-right: 112px; }
+.show-options { position: absolute; right: 18px; top: 8px; min-height: 36px; padding: 5px 10px; }
+.show-dialog .show-dialog-title { color: #e3ebe4; overflow-wrap: anywhere; }
+.show-dialog .ops-dialog-body > div > h3 { color: #dce5dd; font-size: var(--type-label); margin-bottom: 5px; }
+.show-dialog input { max-width: 130px; }
+.show-timing { border-left: 2px solid #46574b; padding-left: 12px; color: #a5b0a7; font-size: var(--type-small); line-height: 1.6; }
+.show-timing strong { color: #dce5dd; }
+.show-reset { justify-self: start; }
+@media (max-width: 480px) {
+  .automation-group.has-options > details > summary { padding-left: 12px; padding-right: 94px; flex-direction: column; gap: 3px; }
+  .show-options { right: 10px; }
 }

@@ -35,8 +35,9 @@ deferred descriptions, and a consistent broad-coverage status. It has no `target
 field and never maps releases to episodes or Arr entities. Coverage, gaps, extras,
 and useful overlap are semantic descriptions; reasonable extras are valid. Earlier
 plan formats are not shown in history.
-An empty **validated** set is
-`no-match`; a Prowlarr failure with no successful search is not a clean miss.
+An empty **validated** set is `no-match`; a Prowlarr failure with no successful
+search or with candidate observations that did not reach the planner is not a
+clean miss. A later empty result cannot hide candidate evidence from a lost reply.
 Failed/interrupted/budget-exhausted research has no executable plan.
 Safe candidate evidence is retained with history independently of private locator
 expiry. Consumers resolve selected IDs through the owning backend ledger, never
@@ -155,7 +156,10 @@ replays the previous POST or its unsent tail. Retrying later against fresh Arr
 state still carries some duplicate risk. A submitted receipt is not verified import.
 
 Fresh defaults are 100 SDK steps, 100 indexer searches and a 30-minute job deadline;
-model requests have a 10-minute ceiling. Existing saved lower limits are preserved.
+model requests have a 10-minute ceiling. The job deadline starts when the worker
+starts the search, not when it is queued, and can be set to 1–30 minutes. It
+bounds model turns and tool work; deadline expiry or daemon shutdown cancels
+active work. There is no per-search Cancel action. Existing saved limits are preserved.
 Capabilities cover the job plus cleanup within 35 minutes, worker leases renew,
 and private candidates outlive the maximum research deadline. Numeric usage,
 elapsed time and stop reasons are retained when available, not reasoning traces.
@@ -186,9 +190,11 @@ Example calls and abbreviated safe results:
 [{"candidateId":"opaque-uuid","observations":[{"title":"Example.S01.1080p","indexer":"Example","size":1234,"seeders":8,"protocol":"torrent","categories":[{"id":5000,"name":"TV"}]}]}]
 ```
 
-Results are JSON text MCP content; the search result count describes that response batch, not all possible matches. Upstream search timeout defaults to 120 seconds with a 120-second ceiling; discovery uses a 15-second timeout. Omitted indexer IDs select enabled, non-cooling, search-capable indexers; an explicit empty/unavailable selection fails rather than broadening.
+Results are JSON text MCP content; the search result count describes that response batch, not all possible matches. The upstream search defaults to a 240-second aggregate budget, including the initial indexer/status reads. A call can request a shorter timeout. The MCP client waits up to 250 seconds to allow the upstream result to get back to the planner. Standalone indexer discovery uses a 15-second upstream budget. The job deadline and cancellation apply throughout. Omitted indexer IDs select enabled, non-cooling, search-capable indexers; an explicit empty/unavailable selection fails rather than broadening.
 
-The daemon registers its actual bound loopback origin before dispatching work. The job passes its backend-minted capability to the canonical `createMCPTools` import and always closes/revokes it. The caller—not tool arguments—owns the search and lifetime. The public stdio server reuses the daemon architecture and reports unavailable when no HTTP origin is present; it never spawns a second engine/listener. Do not give the token to model prompts, events, public responses, or logs.
+The daemon registers its actual bound loopback origin before dispatching work. The agent uses the MCP SDK client directly for the two built-in tools so the SDK's default 60-second request timeout does not undercut Prowlarr. The worker closes the client and revokes its backend-minted capability. The caller—not tool arguments—owns the search and lifetime. The public stdio server reuses the daemon architecture and reports unavailable when no HTTP origin is present; it never spawns a second engine/listener. Do not give the token to model prompts, events, public responses, or logs.
+
+If Scout reaches the Prowlarr API through a reverse proxy, configure at least **5 minutes** of read/response timeout there. The daemon's internal MCP hop is direct by default; apply the same headroom if that hop is separately proxied. Scout cannot extend a shorter proxy timeout or a timeout enforced by Prowlarr or an indexer.
 
 This release requires a fresh `DB_PATH` when migrating from the retired database. External research MCPs are an additive setting on the current database; they are not required for Prowlarr searches. The retired `/api/v2/submissions` mutation route returns `410`; release-set execution uses `/api/v2/executions/*`.
 
@@ -219,9 +225,11 @@ POST/PUT accept `{name,url,enabled,credential?}`. Credentials are stored under
 a separate SQLite key and never returned; they do not modify v5 application
 settings. Connecting trusts the endpoint: all usable tools it exposes are
 available to the model, and arguments can include search context. Tool output is
-untrusted. Enabled connections are attempted in parallel at job start with a
-bounded connection timeout; tool calls have a separate short timeout. Optional
-failures are warnings and do not block Prowlarr. The SDK exposes tools in the
+untrusted. Enabled connections are attempted in parallel at job start, with
+up to 25 seconds for connection and discovery and up to 50 seconds per tool
+call. Optional work stops waiting when only 25 seconds remain in the search
+job, leaving time for Prowlarr and finalization. Safe job warnings distinguish
+connection timeouts, invocation timeouts and other failures. The SDK exposes tools in the
 existing agent loop under a readable server label plus stable unique ID prefix.
 Redirects and metadata/link-local targets are blocked; localhost and private
 LAN targets are allowed. Auth is sent only to the exact configured URL.

@@ -51,6 +51,8 @@ imported. Interrupted/uncertain sets are never automatically replayed.
 2. Optionally configure bearer auth using the `Authorization` header and `Bearer <token>` value, or a supported custom header. Connecting verifies the server and makes its usable tools available to the planner; there is no separate discovery or per-tool approval step.
 3. The planner uses suitable tools when they can improve search terms or clarify evidence that could change the selection, such as an anime batch with unclear season numbering. Missing or unavailable research tools do not block Prowlarr searches.
 
+For slow self-hosted services, Scout allows up to 25 seconds to connect to an optional research server and 50 seconds per tool call, subject to the search job's remaining time. If Scout reaches Prowlarr through a reverse proxy, give that proxy at least 5 minutes of read timeout. See [search deadlines and proxy headroom](src/search/README.md#internal-prowlarr-mcp).
+
 Connecting trusts the server: every usable tool it exposes may be called by the model, and model-authored tool arguments can include the search request/context. Use only trusted services. Credentials are stored in SQLite and hidden from Settings readbacks. The integration supports Streamable HTTP and static headers, not stdio, OAuth, or credential-bearing URLs. Redirects are rejected; metadata and link-local destinations are blocked while localhost and trusted private LAN endpoints are supported.
 
 ## Search execution

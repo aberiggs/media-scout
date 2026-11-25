@@ -14,6 +14,30 @@ import { OpenRouter } from '@openrouter/sdk';
 import { runAgentSearch } from '../src/search/agent';
 
 describe('internal Prowlarr Streamable HTTP MCP', () => {
+  it('uses the search aggregate budget for discovery and search while keeping standalone discovery at 15 seconds', async () => {
+    const settings = structuredClone(defaultSettings);
+    settings.integrations.prowlarr = { ...settings.integrations.prowlarr, url: 'http://fixture.test', apiKey: 'fixture-key' };
+    const timeouts: Array<number | undefined> = [];
+    const runtime = new SearchRuntime({ initialSettings: settings, store: openSearchStore(':memory:'), clients: () => ({ prowlarr: {
+      getIndexers: async options => { timeouts.push(options?.timeoutMs); return [{ id: 1, name: 'A', enable: true }]; },
+      getIndexerStatuses: async options => { timeouts.push(options?.timeoutMs); return []; },
+      search: async (_input, options) => { timeouts.push(options?.timeoutMs); return []; },
+      getDownloadClients: async () => [], grab: async () => { throw new Error('unexpected grab'); },
+    } }) });
+    try {
+      runtime.store.createSearch({ searchId: 'budgets', prompt: '{}', status: 'running', createdAt: Date.now() });
+      const { token } = runtime.createProwlarrMcpCapability('budgets');
+      await runtime.prowlarrIndexerDiscovery(token);
+      expect(timeouts.splice(0)).toEqual([15_000, 15_000]);
+      await runtime.prowlarrSearch(token, { query: 'default' });
+      expect(timeouts.splice(0)).toEqual([240_000, 240_000, 240_000]);
+      await runtime.prowlarrSearch(token, { query: 'short', timeoutMs: 500 });
+      expect(timeouts.splice(0)).toEqual([500, 500, 500]);
+      await runtime.prowlarrSearch(token, { query: 'ceiling', timeoutMs: 300_000 });
+      expect(timeouts).toEqual([240_000, 240_000, 240_000]);
+    } finally { await runtime.close(); }
+  });
+
   it('never accepts natural-language or empty output as a plan, nor runs a finalizer after lease loss', async () => {
     const scenarios = [
       { name: 'empty completion', output: [], maxSteps: 4, ownsSearch: true },
@@ -171,6 +195,58 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
     }
   }, 15_000);
 
+  it.each(['timeout', 'failure', 'cancel', 'initialized-timeout', 'initialized-cancel'] as const)('sanitizes MCP connection %s diagnostics without mislabeling cancellation', async mode => {
+    let started!: () => void, closed!: () => void;
+    const seen = new Promise<void>(resolve => { started = resolve; });
+    const socketClosed = new Promise<void>(resolve => { closed = resolve; });
+    const server = createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      if (mode.startsWith('initialized-')) {
+        const body = JSON.parse(Buffer.concat(chunks).toString());
+        if (body.method === 'initialize') {
+          response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
+            jsonrpc: '2.0', id: body.id, result: { protocolVersion: '2025-11-25', capabilities: { tools: {} }, serverInfo: { name: 'fixture', version: '1' } },
+          }));
+          return;
+        }
+        if (body.method !== 'notifications/initialized') { response.writeHead(404).end(); return; }
+      }
+      response.once('close', closed);
+      started();
+      if (mode === 'failure') response.writeHead(503).end('private-connection-body');
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Missing listener');
+    const nativeSetTimeout = globalThis.setTimeout;
+    const timer = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: (...args: never[]) => void, delay?: number, ...args: never[]) =>
+      nativeSetTimeout(fn, mode.endsWith('timeout') && delay === 15_000 ? 150 : delay, ...args)) as unknown as typeof setTimeout);
+    const abort = new AbortController();
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const run = runAgentSearch({
+        client: new OpenRouter({ apiKey: 'fixture', serverURL: 'http://127.0.0.1:1', retryConfig: { strategy: 'none' } }),
+        model: 'fixture/model', input: 'test', mcpUrl: `http://127.0.0.1:${address.port}/mcp`, capability: 'private-token',
+        signal: abort.signal, maxSteps: 1, requestTimeoutMs: 5_000,
+        ledger: () => ({ searchId: 'connection', candidates: [] }), ownsSearch: () => true, onFinalize: () => {},
+      });
+      const completed = run.then(() => '', (reason: Error) => reason.message);
+      const within = new Promise<never>((_, reject) => { watchdog = nativeSetTimeout(() => reject(new Error('MCP handshake remained open')), 1_500); });
+      await Promise.race([seen, within]);
+      if (mode.endsWith('cancel')) abort.abort(new Error('job-cancelled'));
+      const error = await Promise.race([completed, within]);
+      await Promise.race([socketClosed, within]);
+      expect(error).toBe(mode.endsWith('timeout') ? 'Prowlarr MCP connection timed out.' : mode === 'failure' ? 'Prowlarr MCP connection failed.' : 'job-cancelled');
+      expect(error).not.toContain('private-');
+    } finally {
+      clearTimeout(watchdog);
+      timer.mockRestore();
+      server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
   it('accepts only one concurrent finalizer and stages once', async () => {
     const responses = createServer(async (request, response) => {
       for await (const _chunk of request) { /* consume request */ }
@@ -282,6 +358,7 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
   });
 
   it('serves real SDK discovery and safe search through a scoped bearer capability', async () => {
+    const wallClockRegression = process.env.MEDIA_SCOUT_LONG_PROWLARR_TEST === '1';
     const settings = structuredClone(defaultSettings);
     settings.integrations.prowlarr = { ...settings.integrations.prowlarr, url: 'http://prowlarr.test', apiKey: 'SECRET-KEY' };
     let grabs = 0;
@@ -291,11 +368,12 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
         getIndexers: async () => [{ id: 1, name: 'SECRET-KEY Indexer', enable: true, supportsSearch: true, supportsRss: false, capabilities: { categories: [{ id: 5000, name: 'SECRET-KEY TV' }] } }],
         getIndexerStatuses: async () => [],
         search: async params => {
+          if (params.query === 'Runner probe') await new Promise(resolve => setTimeout(resolve, wallClockRegression ? 121_000 : 300));
           if (params.query === 'Sample') expect(params.type).toBe('moviesearch');
           const release = {
           guid: 'private-guid', age: 1, size: 42, files: null, grabs: null, indexerId: 1,
           indexer: 'SECRET-KEY Indexer', subGroup: null,
-          title: 'Sample https://private.test/SECRET-KEY?download=1 S01E01 private-guid',
+          title: `${params.query === 'Runner probe' ? 'UniqueRunnerProbe' : 'Sample'} https://private.test/SECRET-KEY?download=1 S01E01 private-guid`,
           tvdbId: null, tmdbId: null, publishDate: '', downloadUrl: 'https://private.test/SECRET-KEY',
           indexerFlags: ['SECRET-KEY magnet:?xt=urn:btih:abcdef0123456789abcdef0123456789'],
           categories: [{ id: 5000, name: 'SECRET-KEY category private-guid' }], magnetUrl: null, infoHash: null,
@@ -320,6 +398,8 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
       client = new Client({ name: 'integration', version: '1.0.0' });
       await client.connect(transport);
       expect((await client.listTools()).tools.map(t => t.name)).toEqual(['prowlarr_indexers', 'prowlarr_search']);
+      const searchDefinition = (await client.listTools()).tools.find(tool => tool.name === 'prowlarr_search')!;
+      expect((searchDefinition.inputSchema.properties?.timeoutMs as { maximum?: number }).maximum).toBe(240_000);
       const indexers = await client.callTool({ name: 'prowlarr_indexers', arguments: {} });
       expect(JSON.parse((indexers.content as Array<{ text: string }>)[0]!.text)).toMatchObject([{ categories: [{ id: 5000, name: '[redacted] TV' }], supportsSearch: true }]);
       expect(JSON.stringify(indexers)).not.toContain('SECRET-KEY');
@@ -367,6 +447,12 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
        await new Promise<void>(resolve => responses.listen(0, '127.0.0.1', resolve));
        const responseAddress = responses.address();
        if (!responseAddress || typeof responseAddress === 'string') throw new Error('No scripted Responses listener');
+       // Shorten only the MCP SDK's legacy 60-second request deadline. The
+       // transport, runner and server remain real; a 300ms upstream response
+       // must survive that old deadline and reach the next model turn.
+       const nativeSetTimeout = globalThis.setTimeout;
+       const timer = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: (...args: never[]) => void, delay?: number, ...args: never[]) =>
+         nativeSetTimeout(fn, !wallClockRegression && delay === 60_000 ? 100 : delay, ...args)) as unknown as typeof setTimeout);
        try {
          const { token: agentToken } = runtime.createProwlarrMcpCapability('owner-search');
          const result = await runAgentSearch({
@@ -381,11 +467,14 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
            ownsSearch: () => true, onFinalize: () => undefined,
          });
          expect(result.status).toBe('no-match');
-          expect(responseRequests).toHaveLength(2);
+         expect(responseRequests).toHaveLength(2);
+         const output = (responseRequests[1]?.input as Array<{ type?: string; output?: string }>)
+           .find(item => item.type === 'function_call_output')?.output;
+         expect(JSON.parse(output ?? 'null')).toEqual(expect.stringContaining('UniqueRunnerProbe'));
          expect(scriptedToolNames).toContain('finalize_release_set');
          expect(scriptedToolNames.some(name => name?.includes('prowlarr_search'))).toBe(true);
          expect((responseRequests[0]!.tools as Array<{ name: string }>).some(tool => tool.name.includes('prowlarr_search'))).toBe(true);
-       } finally { await new Promise<void>((resolve, reject) => responses.close(error => error ? reject(error) : resolve())); }
+       } finally { timer.mockRestore(); await new Promise<void>((resolve, reject) => responses.close(error => error ? reject(error) : resolve())); }
       const unauthorized = await app.inject({ method: 'POST', url: '/internal/mcp/prowlarr', payload: { jsonrpc: '2.0', id: 1, method: 'tools/list' } });
       expect(unauthorized.statusCode).toBe(401);
       const wrongToken = `${created.token[0] === '0' ? '1' : '0'}${created.token.slice(1)}`;
@@ -401,7 +490,7 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
       await app.close();
       await runtime.close();
     }
-  });
+  }, process.env.MEDIA_SCOUT_LONG_PROWLARR_TEST === '1' ? 135_000 : 10_000);
 
   it('honors per-job snapshots, healthy selection, cooldown and sanitized upstream errors', async () => {
     const settings = structuredClone(defaultSettings);
@@ -568,6 +657,101 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
     }
   });
 
+  it.each(['timeout', 'context-timeout', 'cancel', 'job-deadline'] as const)('aborts real upstream work on runner %s and safely reports timeout', async mode => {
+    let started!: () => void, closed!: () => void;
+    const upstreamStarted = new Promise<void>(resolve => { started = resolve; });
+    const upstreamClosed = new Promise<void>(resolve => { closed = resolve; });
+    let posts = 0, turns = 0, clockOffset = 0;
+    const upstream = createServer((request, response) => {
+      if (request.method !== 'GET') posts++;
+      response.setHeader('content-type', 'application/json');
+      if (request.url?.startsWith('/api/v1/indexerstatus')) return response.end('[]');
+      if (request.url?.startsWith('/api/v1/indexer')) return response.end('[{"id":1,"name":"Fixture","enable":true}]');
+      if (request.url?.startsWith('/api/v1/search')) { response.on('close', closed); started(); return; }
+      response.writeHead(404).end('{}');
+    });
+    const modelBodies: string[] = [];
+    const responses = createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      modelBodies.push(Buffer.concat(chunks).toString());
+      turns++;
+      response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
+        id: `turn-${turns}`, object: 'response', created_at: 1, completed_at: 1, status: 'completed',
+        error: null, incomplete_details: null, instructions: null, model: 'fixture/model',
+        output: [{ id: `call-${turns}`, type: 'function_call', call_id: `call-${turns}`, status: 'completed',
+          name: turns === 1 ? 'prowlarr_search' : 'finalize_release_set',
+          arguments: JSON.stringify(turns === 1 ? { query: 'slow' } : { status: 'no-match', selections: [], covered: [], gaps: [], deferred: [], broadCoverage: 'none', scopeGaps: [] }) }],
+        parallel_tool_calls: false, tool_choice: 'auto', tools: [], usage: null, metadata: null,
+        frequency_penalty: null, presence_penalty: null, temperature: null, top_p: null,
+      }));
+    });
+    await Promise.all([new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve)), new Promise<void>(resolve => responses.listen(0, '127.0.0.1', resolve))]);
+    const upstreamAddress = upstream.address(), modelAddress = responses.address();
+    if (!upstreamAddress || typeof upstreamAddress === 'string' || !modelAddress || typeof modelAddress === 'string') throw new Error('Missing listener');
+    const settings = structuredClone(defaultSettings);
+    settings.integrations.prowlarr = { ...settings.integrations.prowlarr, url: `http://127.0.0.1:${upstreamAddress.port}`, apiKey: 'private-fixture-key' };
+    settings.ai = { ...settings.ai, baseUrl: `http://127.0.0.1:${modelAddress.port}`, apiKey: 'fixture', model: 'fixture/model' };
+    settings.search.deadlineMinutes = 1;
+    const runtime = new SearchRuntime({ initialSettings: settings, store: openSearchStore(':memory:'), now: () => Date.now() + clockOffset });
+    const app = await buildApp({ runtime, logger: pino({ level: 'silent' }) } as unknown as Stack, { webRoot: '/missing' });
+    const abort = new AbortController();
+    const warnings: string[] = [];
+    let transportFailures = 0;
+    const nativeSetTimeout = globalThis.setTimeout;
+    const timer = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: (...args: never[]) => void, delay?: number, ...args: never[]) => {
+      if (mode === 'job-deadline' && delay !== undefined && delay >= 59_950 && delay <= 60_000)
+        return nativeSetTimeout(() => { clockOffset += 60_000; fn(...args); }, 1_500);
+      return nativeSetTimeout(fn, (mode === 'timeout' && delay === 250_000) || (mode === 'context-timeout' && delay === 251_000) ? 300 : delay, ...args);
+    }) as unknown as typeof setTimeout);
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await app.listen({ host: '127.0.0.1', port: 0 });
+      if (mode === 'job-deadline') {
+        const response = await app.inject({ method: 'POST', url: '/api/v2/searches', payload: { prompt: 'search for a fixture' } });
+        expect(response.statusCode).toBe(202);
+        const { searchId } = response.json();
+        const within = new Promise<never>((_, reject) => { watchdog = nativeSetTimeout(() => reject(new Error('Worker deadline did not close upstream')), 4_000); });
+        await Promise.race([upstreamStarted, within]);
+        await Promise.race([Promise.all([runtime.drain(), upstreamClosed]), within]);
+        expect(await runtime.getSearch(searchId)).toMatchObject({ status: 'budget-exhausted' });
+        expect(runtime.store.listCandidates(searchId)).toEqual([]);
+        expect(posts).toBe(0);
+        return;
+      }
+      runtime.store.createSearch({ searchId: 'runner-abort', prompt: '{}', status: 'running', createdAt: Date.now() });
+      const { token } = runtime.createProwlarrMcpCapability('runner-abort');
+      const address = app.server.address();
+      if (!address || typeof address === 'string') throw new Error('Missing listener');
+      const run = runAgentSearch({
+        client: new OpenRouter({ apiKey: 'fixture', serverURL: `http://127.0.0.1:${modelAddress.port}`, retryConfig: { strategy: 'none' } }),
+        model: 'fixture/model', input: 'test', mcpUrl: `http://127.0.0.1:${address.port}/internal/mcp/prowlarr`,
+        capability: token, signal: abort.signal, maxSteps: 4, requestTimeoutMs: 5_000,
+        ledger: () => ({ searchId: 'runner-abort', candidates: [] }), ownsSearch: () => true, onFinalize: () => {},
+        onResearchWarning: warning => warnings.push(warning), onProwlarrTransportFailure: () => { transportFailures++; },
+      });
+      await upstreamStarted;
+      if (mode === 'cancel') abort.abort(new Error('job cancelled'));
+      if (mode === 'cancel') await expect(run).rejects.toThrow();
+      else {
+        await expect(run).resolves.toMatchObject({ status: 'no-match' });
+        expect(transportFailures).toBe(1);
+        expect(warnings).toEqual(['Prowlarr tool invocation timed out.']);
+        if (mode === 'timeout') expect(modelBodies[1]).toContain('Prowlarr tool invocation timed out.');
+        expect(modelBodies[1]).not.toContain('private-fixture-key');
+      }
+      await Promise.race([upstreamClosed, new Promise<never>((_, reject) => nativeSetTimeout(() => reject(new Error('upstream still open')), 3_000))]);
+      if (mode === 'cancel') { expect(warnings).toEqual([]); expect(transportFailures).toBe(0); }
+      expect(posts).toBe(0);
+    } finally {
+      clearTimeout(watchdog);
+      timer.mockRestore();
+      await app.close(); await runtime.close();
+      upstream.closeAllConnections(); responses.closeAllConnections();
+      await Promise.all([new Promise<void>(resolve => upstream.close(() => resolve())), new Promise<void>(resolve => responses.close(() => resolve()))]);
+    }
+  }, 15_000);
+
   it('binds independent served MCP sessions and candidate ledgers to their bearer capabilities', async () => {
     const settings = structuredClone(defaultSettings);
     settings.integrations.prowlarr = { ...settings.integrations.prowlarr, url: 'http://source-a.test', apiKey: 'same-key' };
@@ -649,7 +833,7 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
         return await Promise.race([operation, new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error(`Timed out: ${label}`)), 3_000); })]);
       } finally { clearTimeout(timer); }
     };
-    let mode: 'timeout' | 'expiry' | 'shutdown' | 'rate-limit' = 'timeout';
+    let mode: 'timeout' | 'aggregate' | 'expiry' | 'shutdown' | 'rate-limit' = 'timeout';
     let started!: () => void, aborted!: () => void, posts = 0;
     let upstreamStarted = Promise.resolve(), upstreamAborted = Promise.resolve();
     const begin = (next: typeof mode) => {
@@ -657,11 +841,19 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
       upstreamStarted = new Promise<void>(resolve => { started = resolve; });
       upstreamAborted = new Promise<void>(resolve => { aborted = resolve; });
     };
+    const delayedReply = (response: import('node:http').ServerResponse, value: unknown) => {
+      const timer = setTimeout(() => response.end(JSON.stringify(value)), 300);
+      response.once('close', () => clearTimeout(timer));
+    };
     const upstream = createServer((request, response) => {
       if (request.method !== 'GET') posts++;
       response.setHeader('content-type', 'application/json');
       if (request.url?.startsWith('/api/v1/indexerstatus')) return response.end('[]');
-      if (request.url?.startsWith('/api/v1/indexer')) return response.end(JSON.stringify([{ id: 1, name: 'Fixture', enable: true, supportsSearch: true }]));
+      if (request.url?.startsWith('/api/v1/indexer')) {
+        const indexers = [{ id: 1, name: 'Fixture', enable: true, supportsSearch: true }];
+        if (mode === 'aggregate') return delayedReply(response, indexers);
+        return response.end(JSON.stringify(indexers));
+      }
       if (request.url?.startsWith('/api/v1/search')) {
         started();
         if (mode === 'rate-limit') {
@@ -669,6 +861,9 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
           return response.end('private upstream error');
         }
         response.on('close', () => aborted());
+        if (mode === 'aggregate') delayedReply(response, [{
+          guid: 'aggregate-release', indexerId: 1, indexer: 'Fixture', title: 'Aggregate release', age: 1, publishDate: '', protocol: 'torrent',
+        }]);
         return;
       }
       response.statusCode = 404;
@@ -701,8 +896,21 @@ describe('internal Prowlarr Streamable HTTP MCP', () => {
       const timeout = await connect();
       const timedOut = timeout.client.callTool({ name: 'prowlarr_search', arguments: { query: 'slow', timeoutMs: 100 } });
       await within(upstreamStarted, 'timeout request start');
-      expect((await timedOut).isError).toBe(true);
+      const timeoutResult = await timedOut;
+      expect(timeoutResult.isError).toBe(true);
+      expect(JSON.stringify(timeoutResult)).toContain('Prowlarr search timed out.');
       await within(upstreamAborted, 'timeout upstream abort');
+      expect(runtime.store.listCandidates('real-upstream')).toEqual([]);
+
+      // Discovery and search each take 300ms; neither exceeds the 500ms
+      // budget alone. Restarting the timer after discovery would accept a result.
+      begin('aggregate');
+      const aggregateCall = timeout.client.callTool({ name: 'prowlarr_search', arguments: { query: 'aggregate', timeoutMs: 500 } });
+      await within(upstreamStarted, 'aggregate search start after discovery');
+      const aggregateResult = await within(aggregateCall, 'aggregate tool settlement');
+      expect(aggregateResult.isError).toBe(true);
+      expect(JSON.stringify(aggregateResult)).toContain('Prowlarr search timed out.');
+      await within(upstreamAborted, 'aggregate upstream abort');
       expect(runtime.store.listCandidates('real-upstream')).toEqual([]);
 
       begin('rate-limit');

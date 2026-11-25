@@ -105,8 +105,10 @@ the on-demand slots. It does not start a title while the on-demand queue is
 backlogged or its slots are full. Sonarr workloads
 group due missing episodes across seasons; Radarr workloads describe one movie.
 The show prompt includes provider titles as search hints, exact requested episode
-rows, and a preference for healthy, useful packs, including overlapping packs,
-among candidates that satisfy explicit requirements. Preferences are tradeoffs,
+rows, and guidance to search by title and episode identifier first for small
+requests, or by season or batch for larger ones. It still favors healthy, useful
+packs, including overlapping packs, among candidates that satisfy explicit
+requirements. Preferences are tradeoffs,
 not vetoes; coverage preferences never justify a disqualified release. For example,
 if the user requires a subtitle language and prefers a resolution, a qualifying
 lower-resolution episode is preferable to a pack without the required subtitles.

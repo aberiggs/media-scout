@@ -3,6 +3,7 @@ import { episodeRows, type PromptEpisode } from './prompt';
 import { safeText } from './release-observation';
 
 const AUTOMATION_PROMPT_LIMITS = { targets: 200, requestBytes: 48_000 } as const;
+const TV_QUERY_GUIDANCE = 'For small requests, start with title + episode (S01E20, absolute number, or air date). Try aliases or other numbering before title-only. For large lists, use season or batch queries.';
 const PACK_PREFERENCE = 'Prefer complete coverage over too few downloads, even if a pack includes extra episodes. Prefer healthy, high-grab, high-quality season packs to individual episodes when suitable, even for a single episode or subset. Overlapping packs are welcome when they improve coverage or quality (e.g. S1+S2 and S2+S3 for S1–S3); do not sacrifice quality or confidence just to avoid overlap.';
 
 export function buildAutomationPrompt(input: {
@@ -41,7 +42,7 @@ export function buildAutomationPrompt(input: {
     return { prompt, kind: 'movie', selectedTargets: [first], deferredTargets: 0 };
   }
   const prefix = `${intro}\n\n${titleSection}\n\n`;
-  const suffix = `\n\n${PACK_PREFERENCE}${preferenceSection}`;
+  const suffix = `\n\n${TV_QUERY_GUIDANCE}\n\n${PACK_PREFERENCE}${preferenceSection}`;
   const rows: { season: number; episode: number; encoded: string }[] = [], selectedTargets: ArrTarget[] = [];
   let bytes = Buffer.byteLength(prefix + episodeRows([]) + suffix);
   const ordered = [...input.targets].sort((a, b) =>

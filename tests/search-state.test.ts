@@ -16,6 +16,7 @@ describe('search store persistence and ownership', () => {
     store.addCandidate({ searchId: 's1', candidateId: 'c1', safe: { title: 'Release' }, privateData: { guid: 'secret' }, expiresAt: 900 });
     store.appendEvent('s1', { type: 'query', query: 'find', count: 1 });
     store.setSetting('preferences', { resolutions: ['1080p'] });
+    store.saveAiringOffset('sonarr-source', { titleId: 'show-1', title: 'Show', hoursEarly: 72 });
     store.setAutomationAttempt('target-1', { lastAttempt: 100, failCount: 0, deadline: 500, graceUntil: 0 });
     store.setProviderDeadline('indexer-2', 600);
     store.saveObservation('sonarr', { observedAt: 100, complete: false, payload: { items: [] } });
@@ -25,6 +26,8 @@ describe('search store persistence and ownership', () => {
     expect(store.getCandidate('s1', 'c1', 200)?.privateData).toEqual({ guid: 'secret' });
     expect(store.getEvents('s1')).toHaveLength(1);
     expect(store.getSetting('preferences')).toEqual({ resolutions: ['1080p'] });
+    expect(store.airingOffsets('sonarr-source')).toEqual([{ titleId: 'show-1', title: 'Show', hoursEarly: 72 }]);
+    expect(store.airingHours('other-source', 'show-1')).toBe(0);
     expect(store.getAutomationAttempt('target-1')?.deadline).toBe(500);
     expect(store.getProviderDeadline('indexer-2')).toBe(600);
     expect(store.getObservation('sonarr')).toMatchObject({ complete: false });

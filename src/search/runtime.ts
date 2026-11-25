@@ -4,7 +4,8 @@ import { ProwlarrCacheMiss, ProwlarrClient } from '../clients/prowlarr';
 import { SonarrClient } from '../clients/sonarr';
 import { RadarrClient } from '../clients/radarr';
 import { Http } from '../http';
-import { ArrObserver, type ArrProvider, type ArrTarget } from './arr';
+import { ArrObserver, arrFingerprint, type ArrProvider, type ArrTarget, type ProviderObservation } from './arr';
+import { offsetEligibilityTime } from '../core/episode-timing';
 import { buildAutomationPrompt } from './workload';
 import { physicalRelease, safeReleaseObservation, safeText } from './release-observation';
 import type { FinalizationLedger, ReleaseSet } from './agent-contracts';
@@ -52,6 +53,17 @@ interface AutomationAuthorization {
   failureBackoffMinMs:number; failureBackoffMaxMs:number;
 }
 const mediaKey = (target: ArrTarget) => `${target.provider}:${target.sourceFingerprint}:${target.serviceId}:${target.externalId}`;
+const titleId = (key: string) => createHash('sha256').update(`automation-title:${key}`).digest('hex').slice(0, 24);
+const targetTitle = (target: ArrTarget) => typeof target.context.title === 'string' ? target.context.title : 'Unknown item';
+function timingFor(target: ArrTarget, hoursEarly: number, now: number) {
+  const eligibleAt = target.provider === 'sonarr' ? offsetEligibilityTime(target.airAt, hoursEarly) : undefined;
+  const available = target.provider === 'sonarr' ? eligibleAt !== undefined && eligibleAt <= now : target.available;
+  return { available, eligibleAt, eligible: available && target.monitored && !target.hasFile && !target.queued };
+}
+interface AutomationItem {
+  targetId: string; titleId: string; title: string; kind: 'tv' | 'movie'; seasonNumber?: number; episodeNumber?: number;
+  status: string; eligible: boolean; observedAt?: string; metadataAirDate?: string; eligibleAt?: string; nextAttemptAt?: string; lastAttemptAt?: string;
+}
 const automationClientId = (settings: Settings, provider: ArrProvider) =>
   provider === 'sonarr' ? settings.integrations.prowlarr.tvClientId : settings.integrations.prowlarr.movieClientId;
 const AUTOMATION_REVALIDATION_MAX_MS = 15_000;
@@ -88,6 +100,10 @@ const sourceFingerprint = (provider: ArrProvider | 'prowlarr', settings: Setting
   if (!source.url || !source.apiKey) return null;
   return createHash('sha256').update(`${provider}\0${source.url}\0${source.apiKey}`).digest('hex');
 };
+function observationSource(provider: ArrProvider, settings: Settings): string | null {
+  const source = settings.integrations[provider];
+  return source.url && source.apiKey ? arrFingerprint(provider, { id: provider, ...source }) : null;
+}
 type StoredPrompt = { version?: number; prompt?: string; kind?: string; request?: unknown; context?: unknown };
 function readStoredPrompt(value: string): StoredPrompt {
   try {
@@ -682,16 +698,18 @@ export class SearchRuntime {
             const started = this.clock();
             const freshUntil = started + AUTOMATION_REVALIDATION_MAX_MS;
             let provider: 'arr'|'prowlarr' = 'arr';
+            let verifyTiming: (at: number) => boolean;
             try {
-              const checkQueue = await this.checkAutomationScope(automation,bound.candidates.slice(0,i).map(c=>c.release));
-              if (!checkQueue) return stoppedReceipt(i,'Automation pass, source, or Arr target scope changed; remaining releases were not attempted.');
+              const scope = await this.checkAutomationScope(automation,bound.candidates.slice(0,i).map(c=>c.release));
+              if (!scope) return stoppedReceipt(i,'Automation pass, source, or Arr target scope changed; remaining releases were not attempted.');
               provider = 'prowlarr';
               sendClient=await this.validateExecutionSnapshot(input.searchId,input.planId,input.version,bound.snapshot,bound.candidates,authorizedSource);
               if (!this.automationAuthorized(automation)) return stoppedReceipt(i,'Automation pass, source, or routing settings changed; remaining releases were not attempted.');
               if (this.clock()>freshUntil) continue;
               provider = 'arr';
-              if (!await checkQueue()) return stoppedReceipt(i,'Arr queue or source changed; remaining releases were not attempted.');
+              if (!await scope.queueStillClear()) return stoppedReceipt(i,'Arr queue or source changed; remaining releases were not attempted.');
               if (this.clock()>freshUntil) continue;
+              verifyTiming = scope.verifyTiming;
             } catch (error) {
               if(error instanceof Error&&error.message==='execution-ownership-lost')throw error;
               if(provider==='prowlarr' && this.recordProwlarrFailure(error)) return stoppedReceipt(i,'Prowlarr rate-limited verification; remaining releases were not attempted.');
@@ -707,6 +725,7 @@ export class SearchRuntime {
               if(this.closing||this.closed)return 'Runtime is shutting down; remaining releases were not attempted.';
               if(!this.automationAuthorized(automation,at))return 'Automation pass or routing settings changed before submission.';
               if((this.store.getProviderDeadline(automation.provider)??0)>at||(this.store.getProviderDeadline('prowlarr')??0)>at)return 'Provider cooldown prevents submission; remaining releases were not attempted.';
+              if(!verifyTiming(at))return 'Scout airing eligibility changed before submission.';
               if(bound.candidates.some(c=>!this.store.getCandidate(input.searchId,c.candidateId,at)))return 'Candidate expired before submission.';
               return undefined;
             },at=>grace(at)!);
@@ -715,8 +734,10 @@ export class SearchRuntime {
             if('blocked' in marked)return stoppedReceipt(i,marked.blocked);
             // SQLite readers can delay the commit. Undo this intent only here,
             // where this worker knows it has not called grab.
-            if(this.clock()>freshUntil) {
+            const timingValid = verifyTiming(this.clock());
+            if(this.clock()>freshUntil || !timingValid) {
               if(!this.store.resetUnsentAutomationChild(id,owner,i,this.clock,marked.started))throw new Error('execution-ownership-lost');
+              if (!timingValid) return stoppedReceipt(i,'Scout airing eligibility changed before submission.');
               continue;
             }
             verified=true; break;
@@ -813,7 +834,11 @@ export class SearchRuntime {
     if (!this.internalMcpUrl || this.missingSettings(settings).length) return { observedAt: now, ran: false, reason: 'settings-incomplete' };
     if (this.store.activeForegroundSearchCount(now) >= settings.search.concurrentSearches || this.store.hasQueuedForeground()) return { observedAt: now, ran: false, reason: 'capacity' };
     if (['prowlarr','model'].some(provider => (this.store.getProviderDeadline(provider) ?? 0) > now)) return { observedAt: now, ran: false, reason: 'provider-cooldown' };
-    const eligible = snapshot.targets.filter(target => snapshot[target.provider].known && target.eligible && target.available && target.monitored && !target.hasFile && !target.queued
+    const sources = { sonarr: observationSource('sonarr', settings), radarr: observationSource('radarr', settings) };
+    const sonarrSource = sources.sonarr;
+    const offsets = new Map(sonarrSource ? this.store.airingOffsets(sonarrSource).map(offset => [offset.titleId, offset.hoursEarly]) : []);
+    const eligible = snapshot.targets.filter(target => snapshot[target.provider].known && target.sourceFingerprint === sources[target.provider]
+      && timingFor(target, target.provider === 'sonarr' && offsets.size ? offsets.get(titleId(mediaKey(target))) ?? 0 : 0, now).eligible
       && !(target.provider === 'sonarr' && snapshot.sonarr.diagnostics.unknownSeriesIds?.includes(target.serviceId))
       && !observedGrace.has(mediaKey(target)) && !this.store.getMediaGrace(mediaKey(target),now)
       && (this.store.getAutomationAttempt(target.key)?.deadline ?? 0) <= now);
@@ -893,30 +918,61 @@ export class SearchRuntime {
   }
 
 
-  automationStatus(): { enabled: boolean; allowDownloads:boolean; dryRun: boolean; running: boolean; executionBlocked: boolean; executionBlockedReason?: 'automation-disabled'|'downloads-not-activated'|'dry-run'; providers: Array<{ provider: ArrProvider; known: boolean; observedAt: string; error?: string; unidentifiedQueueRows: number; unknownSeriesIds?: string[] }>; items: Array<{ targetId: string; title: string; kind: 'tv' | 'movie'; seriesId?: string; seasonNumber?: number; episodeNumber?: number; status: string; eligible: boolean; observedAt: string; nextAttemptAt?: string; lastAttemptAt?: string }> } {
+  saveAiringOffset(id: string, hoursEarly: number): boolean {
+    const source = observationSource('sonarr', this.getSettings());
+    if (!source) return false;
+    const cached = this.store.getObservation('sonarr');
+    const payload = cached?.payload as ProviderObservation | undefined;
+    const observed = cached?.complete && payload?.targets?.find(target => target.sourceFingerprint === source && titleId(mediaKey(target)) === id);
+    const saved = this.store.airingOffsets(source).find(offset => offset.titleId === id);
+    const title = observed ? safeText(targetTitle(observed)) : saved?.title;
+    if (title === undefined) return false;
+    this.store.saveAiringOffset(source, { titleId: id, title, hoursEarly });
+    return true;
+  }
+
+  automationStatus() {
     const settings = this.getSettings();
-    const providers = (['sonarr', 'radarr'] as const).map((provider) => {
+    const now = this.clock(), items: AutomationItem[] = [];
+    const sonarrSource = observationSource('sonarr', settings);
+    const airingOffsets = sonarrSource ? this.store.airingOffsets(sonarrSource) : [];
+    const offsets = new Map(airingOffsets.map(offset => [offset.titleId, offset.hoursEarly]));
+    const commonDeadline = Math.max(this.store.getProviderDeadline('prowlarr') ?? 0, this.store.getProviderDeadline('model') ?? 0);
+    const providers = (['sonarr', 'radarr'] as const).map(provider => {
       const cached = this.store.getObservation(provider);
-      const payload = cached?.payload as any;
-      return { provider, known: !!cached?.complete, observedAt: iso(cached?.observedAt)!, ...(payload?.error ? { error: String(payload.error) } : {}), unidentifiedQueueRows: Number(payload?.diagnostics?.unidentifiedQueueRows ?? 0), ...(payload?.diagnostics?.unknownSeriesIds ? { unknownSeriesIds: payload.diagnostics.unknownSeriesIds.map(String) } : {}) };
-    });
-    const items: Array<{ targetId: string; title: string; kind: 'tv' | 'movie'; seriesId?: string; seasonNumber?: number; episodeNumber?: number; status: string; eligible: boolean; observedAt: string; nextAttemptAt?: string; lastAttemptAt?: string }> = [];
-    for (const provider of ['sonarr', 'radarr'] as const) {
-      const cached = this.store.getObservation(provider); const payload = cached?.payload as any;
-      for (const target of (payload?.targets ?? []) as Array<Record<string, unknown>>) {
-        const title = typeof target.context === 'object' && target.context !== null && typeof (target.context as any).title === 'string' ? (target.context as any).title : 'Unknown item';
-        const targetId = this.targetId(target as unknown as ArrTarget);
-        const context = target.context as Record<string, unknown> | undefined;
-        if (!cached?.complete || target.hasFile || !target.monitored || target.available !== true) continue;
-        const key = String(target.key), attempt = this.store.getAutomationAttempt(key);
-        const grace = this.store.getMediaGrace(mediaKey(target as unknown as ArrTarget),this.clock())??0;
-        const deadline = Math.max(attempt?.deadline ?? 0, this.store.getProviderDeadline(provider) ?? 0, this.store.getProviderDeadline('prowlarr') ?? 0, this.store.getProviderDeadline('model') ?? 0);
-        const status = target.available && !target.eligible ? 'downloading' : grace ? 'grace' : deadline > this.clock() ? (attempt?.failCount ? 'backoff' : 'cooldown') : 'missing';
-        items.push({ targetId, title: safeText(title), kind: provider === 'sonarr' ? 'tv' : 'movie', ...(target.serviceId === undefined ? {} : { seriesId: String(target.serviceId) }), ...(context?.seasonNumber === undefined ? {} : { seasonNumber: context.seasonNumber as number }), ...(context?.episodeNumber === undefined ? {} : { episodeNumber: context.episodeNumber as number }), status, eligible: !!target.eligible && !grace && deadline <= this.clock(), observedAt: iso(cached?.observedAt)!, ...(Math.max(grace ?? 0, deadline) > this.clock() ? { nextAttemptAt: iso(Math.max(grace ?? 0, deadline)) } : {}), ...(attempt ? { lastAttemptAt: iso(attempt.lastAttempt) } : {}) });
+      const payload = cached?.payload as ProviderObservation | undefined;
+      const source = observationSource(provider, settings);
+      const sourceMatches = payload?.sourceFingerprint === undefined
+        ? !payload?.targets?.some(target => target.sourceFingerprint !== source) : payload.sourceFingerprint === source;
+      const known = !!cached?.complete && sourceMatches;
+      const observedAt = iso(cached?.observedAt);
+      if (known) {
+        const providerDeadline = Math.max(commonDeadline, this.store.getProviderDeadline(provider) ?? 0);
+        for (const target of payload?.targets ?? []) {
+          if (target.hasFile || !target.monitored) continue;
+          const media = mediaKey(target), id = titleId(media);
+          const timing = timingFor(target, offsets.get(id) ?? 0, now);
+          const attempt = this.store.getAutomationAttempt(target.key);
+          const grace = this.store.getMediaGrace(media, now) ?? 0;
+          const deadline = Math.max(attempt?.deadline ?? 0, providerDeadline);
+          const status = target.queued ? 'downloading'
+            : !timing.available ? provider === 'radarr' ? 'waiting-for-radarr' : timing.eligibleAt === undefined ? 'no-air-date' : 'upcoming'
+            : grace ? 'grace' : deadline > now ? attempt?.failCount ? 'backoff' : 'cooldown' : 'missing';
+          items.push({ targetId: this.targetId(target), titleId: id, title: safeText(targetTitle(target)), kind: provider === 'sonarr' ? 'tv' : 'movie',
+            ...(provider === 'sonarr' ? { seasonNumber: target.context.seasonNumber as number, episodeNumber: target.context.episodeNumber as number } : {}),
+            status, eligible: timing.eligible && !grace && deadline <= now, observedAt,
+            metadataAirDate: target.metadataAirDate, eligibleAt: iso(timing.eligibleAt),
+            nextAttemptAt: timing.eligible && Math.max(grace, deadline) > now ? iso(Math.max(grace, deadline)) : undefined,
+            lastAttemptAt: iso(attempt?.lastAttempt) });
+        }
       }
-    }
+      const error = sourceMatches ? payload?.error : 'source-changed';
+      return { provider, known, observedAt, ...(error ? { error } : {}),
+        unidentifiedQueueRows: payload?.diagnostics?.unidentifiedQueueRows ?? 0,
+        ...(payload?.diagnostics?.unknownSeriesIds ? { unknownSeriesIds: payload.diagnostics.unknownSeriesIds.map(String) } : {}) };
+    });
     const executionBlocked=!settings.monitoring.enabled||!settings.monitoring.allowDownloads||settings.safety.dryRun;
-    return { enabled: settings.monitoring.enabled, allowDownloads:settings.monitoring.allowDownloads, dryRun: settings.safety.dryRun, running: !!this.pollJob || this.store.hasLiveLease('automation-pass', this.clock()), executionBlocked, ...(executionBlocked?{executionBlockedReason:!settings.monitoring.enabled?'automation-disabled':!settings.monitoring.allowDownloads?'downloads-not-activated':'dry-run'}:{}), providers, items };
+    return { enabled: settings.monitoring.enabled, allowDownloads:settings.monitoring.allowDownloads, dryRun: settings.safety.dryRun, running: !!this.pollJob || this.store.hasLiveLease('automation-pass', now), executionBlocked, ...(executionBlocked?{executionBlockedReason:!settings.monitoring.enabled?'automation-disabled':!settings.monitoring.allowDownloads?'downloads-not-activated':'dry-run'}:{}), providers, items, airingOffsets };
   }
 
   async drain(): Promise<void> {
@@ -960,7 +1016,7 @@ export class SearchRuntime {
       && automationClientId(settings,auth.provider) === auth.downloadClientId;
   }
 
-  private async checkAutomationScope(auth: AutomationAuthorization, sent: Release[]):Promise<(() => Promise<boolean>) | null> {
+  private async checkAutomationScope(auth: AutomationAuthorization, sent: Release[]) {
     const observer = this.createObserver();
     const ignoreQueue = (row: import('./arr').QueueIdentity) => sent.some(release=>{
       // Do not infer episode coverage from a coarse row. Recognize an earlier
@@ -970,10 +1026,16 @@ export class SearchRuntime {
     });
     const observation = await observer.observeMedia(auth.provider,auth.serviceId,ignoreQueue);
     if(!observation.known||observation.diagnostics.unknownSeriesIds?.includes(auth.serviceId)) return null;
-    const byKey = new Map(observation.targets.filter(target=>target.eligible&&target.available&&target.monitored&&!target.hasFile&&!target.queued).map(target=>[target.key,target]));
+    const byKey = new Map(observation.targets.map(target=>[target.key,target]));
     const targets = auth.targetKeys.flatMap(key => byKey.get(key) ?? []);
-    return targets.length && targets.length === auth.targetKeys.length
-      ? () => observer.queueStillClear(auth.provider,auth.serviceId,targets,ignoreQueue) : null;
+    if (!targets.length || targets.length !== auth.targetKeys.length) return null;
+    const id = titleId(auth.mediaKey), source = targets[0]!.sourceFingerprint;
+    const verifyTiming = (at: number) => {
+      const hoursEarly = auth.provider === 'sonarr' ? this.store.airingHours(source, id) : 0;
+      return targets.every(target => timingFor(target, hoursEarly, at).eligible);
+    };
+    return verifyTiming(observation.observedAt)
+      ? { verifyTiming, queueStillClear: () => observer.queueStillClear(auth.provider,auth.serviceId,targets,ignoreQueue) } : null;
   }
 
   private async executeAutomationPlan(searchId:string,auth:AutomationAuthorization):Promise<ExecutionReceipt|null> {

@@ -8,7 +8,7 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { buildStack, type Stack } from './compose';
 import { loadConfig } from './config';
-import { acquisitionRequestSchema, idempotencyKeySchema, searchRequestSchema, activityStatusSchema } from './search/contracts';
+import { acquisitionRequestSchema, idempotencyKeySchema, searchRequestSchema, activityStatusSchema, airingOffsetSchema } from './search/contracts';
 import { missingSettings, type Settings } from './settings';
 import { createProwlarrMcpServer } from './search/prowlarr-mcp';
 import { LEGACY_DATABASE_ERROR } from './search/store';
@@ -223,6 +223,12 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
   });
   app.post('/api/v2/submissions', async (_request, reply) => reply.code(410).send({ error: 'This endpoint was retired; use release-set execution', code: 'submission-route-retired' }));
   app.get('/api/v2/automation', async () => runtime.automationStatus());
+  app.put('/api/v2/automation/airing-offsets/:id', async (request, reply) => {
+    const id = z.string().regex(/^[a-f0-9]{24}$/).parse((request.params as { id: string }).id);
+    const { hoursEarly } = airingOffsetSchema.parse(request.body);
+    if (!runtime.saveAiringOffset(id, hoursEarly)) return reply.code(404).send({ code: 'title-not-found', error: 'This Sonarr title is no longer observed on the current connection. Refresh Arr observations and try again.' });
+    return runtime.automationStatus();
+  });
   app.post('/api/v2/automation/poll', async () => runtime.poll());
   const webRoot = options.webRoot ?? resolve(process.cwd(), 'web/dist');
   if (existsSync(resolve(webRoot, 'index.html'))) {

@@ -1,11 +1,23 @@
-import { useEffect, useState } from 'react'
-import { Activity as ActivityIcon, ArrowRight, CheckCircle2, Clock3, Database, Film, Radio, RefreshCw, Search as SearchIcon, ShieldCheck, Tv } from 'lucide-react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { Activity as ActivityIcon, ArrowRight, CheckCircle2, ChevronRight, Clock3, Database, Film, Radio, RefreshCw, Search as SearchIcon, Settings as Gear, ShieldCheck, Tv } from 'lucide-react'
 import type { Settings } from './types'
 
 type ActivityItem = { searchId: string; prompt: string; status: string; createdAt: string; source: 'manual' | 'automation'; kind?: 'tv' | 'movie'; counts?: { candidates: number }; submission?: { outcome: string } }
-type AutomationItem = { targetId: string; title: string; kind: 'tv' | 'movie'; seriesId?: string; seasonNumber?: number; episodeNumber?: number; status: string; eligible: boolean; observedAt?: string; nextAttemptAt?: string; lastAttemptAt?: string }
-type Automation = { enabled: boolean; allowDownloads?: boolean; dryRun: boolean; running: boolean; executionBlocked?: boolean; executionBlockedReason?: 'automation-disabled' | 'downloads-not-activated' | 'dry-run' | string; providers: Array<{ provider: string; known: boolean; observedAt?: string; error?: string; unidentifiedQueueRows: number; unknownSeriesIds?: string[] }>; items: AutomationItem[] }
+type AutomationItem = { targetId: string; titleId: string; title: string; kind: 'tv' | 'movie'; seasonNumber?: number; episodeNumber?: number; status: string; eligible: boolean; observedAt?: string; metadataAirDate?: string; eligibleAt?: string; nextAttemptAt?: string; lastAttemptAt?: string }
+type Automation = { enabled: boolean; allowDownloads?: boolean; dryRun: boolean; running: boolean; executionBlocked?: boolean; executionBlockedReason?: 'automation-disabled' | 'downloads-not-activated' | 'dry-run' | string; providers: Array<{ provider: string; known: boolean; observedAt?: string; error?: string; unidentifiedQueueRows: number; unknownSeriesIds?: string[] }>; items: AutomationItem[]; airingOffsets: Array<{ titleId: string; title: string; hoursEarly: number }> }
 const date = (value?: string) => value && Number.isFinite(Date.parse(value)) ? new Date(value).toLocaleString() : 'Not observed yet'
+const watchTimeOptions = { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' } as const
+const watchTime = new Intl.DateTimeFormat(undefined, watchTimeOptions)
+const watchTimeWithYear = new Intl.DateTimeFormat(undefined, { ...watchTimeOptions, year: 'numeric' })
+function shortWatchDate(value: string) {
+  const time = new Date(value)
+  if (!Number.isFinite(time.getTime())) return 'Unknown time'
+  return (time.getFullYear() === new Date().getFullYear() ? watchTime : watchTimeWithYear).format(time)
+}
+const automationStatusLabel: Record<string, string> = {
+  missing: 'Missing', downloading: 'Downloading', grace: 'Waiting for import', cooldown: 'Retry cooldown',
+  backoff: 'Retry backoff', upcoming: 'Upcoming', 'no-air-date': 'No air date', 'waiting-for-radarr': 'Waiting for Radarr',
+}
 
 export function ActivityPage({ onOpenSearch }: { onOpenSearch(id: string): void }) {
   const [items, setItems] = useState<ActivityItem[]>([]), [total, setTotal] = useState<number | null>(null)
@@ -60,9 +72,15 @@ export function AutomationPage({ settings, onOpenSearch }: { settings: Settings;
   const [data, setData] = useState<Automation | null>(null), [error, setError] = useState('')
   const [history, setHistory] = useState<ActivityItem[]>([]), [historyError, setHistoryError] = useState(''), [historyLoading, setHistoryLoading] = useState(true)
   const [busy, setBusy] = useState(false), [notice, setNotice] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [selected, setSelected] = useState<{ id: string; title: string; saved: number; items: AutomationItem[] } | null>(null)
+  const opener = useRef<HTMLButtonElement | null>(null), watchHeading = useRef<HTMLHeadingElement | null>(null)
+  useEffect(() => { if (!selected && opener.current) { (opener.current.isConnected ? opener.current : watchHeading.current)?.focus(); opener.current = null } }, [selected])
+  const viewVersion = useRef(0)
   async function refresh() {
-    try { const response = await fetch('/api/v2/automation'); if (!response.ok) throw new Error('Saved Arr observations are unavailable.'); setData(await response.json()); setError('') }
-    catch (failure) { setError(failure instanceof Error ? failure.message : 'Automation status unavailable.') }
+    const version = ++viewVersion.current
+    try { const response = await fetch('/api/v2/automation'); if (!response.ok) throw new Error('Saved Arr observations are unavailable.'); const result = await response.json(); if (version === viewVersion.current) { setData(result); setError('') } }
+    catch (failure) { if (version === viewVersion.current) setError(failure instanceof Error ? failure.message : 'Automation status unavailable.') }
   }
   useEffect(() => {
     void refresh()
@@ -80,27 +98,133 @@ export function AutomationPage({ settings, onOpenSearch }: { settings: Settings;
     } catch (failure) { setError(failure instanceof Error ? failure.message : 'Poll failed.') }
     finally { setBusy(false) }
   }
-  const groups = new Map<string, AutomationItem[]>()
-  for (const item of data?.items ?? []) { const key = `${item.kind}:${item.seriesId ?? item.targetId}`; groups.set(key, [...(groups.get(key) ?? []), item]) }
-  const observationsComplete = Boolean(data?.providers.length) && data!.providers.every(provider => provider.known && !provider.unknownSeriesIds?.length && provider.unidentifiedQueueRows === 0)
+  async function saveOffset(titleId: string, hoursEarly: number) {
+    ++viewVersion.current
+    setSaving(true)
+    try {
+      const response = await fetch(`/api/v2/automation/airing-offsets/${encodeURIComponent(titleId)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ hoursEarly }) })
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}))
+        throw new Error(typeof body.error === 'string' ? body.error : 'Could not save the airing offset. Try again.')
+      }
+      const result: Automation = await response.json()
+      setData(result)
+    } finally { setSaving(false) }
+  }
+  const groups = new Map<string, { title: string; kind: 'tv' | 'movie'; items: AutomationItem[]; hoursEarly: number }>()
+  for (const item of data?.items ?? []) {
+    const group = groups.get(item.titleId) ?? { title: item.title, kind: item.kind, items: [], hoursEarly: 0 }
+    group.items.push(item); groups.set(item.titleId, group)
+  }
+  for (const offset of data?.airingOffsets ?? []) {
+    const group = groups.get(offset.titleId) ?? { title: offset.title, kind: 'tv' as const, items: [], hoursEarly: 0 }
+    group.hoursEarly = offset.hoursEarly; groups.set(offset.titleId, group)
+  }
+  const orderedGroups = [...groups].sort(([, a], [, b]) => Number(b.items.some(item => item.eligible)) - Number(a.items.some(item => item.eligible)) || a.title.localeCompare(b.title))
+  const configuredProviders = data?.providers.filter(provider => provider.error !== 'not-configured') ?? []
+  const observationsComplete = configuredProviders.length > 0 && configuredProviders.every(provider => provider.known && !provider.unknownSeriesIds?.length && provider.unidentifiedQueueRows === 0)
   return <>
     <Heading title="Automation" intro="Monitor Arr libraries, review observations, and follow automated searches." eyebrow="LIBRARY MONITORING" icon={<Radio size={15}/>}/>
     <div className="automation-layout"><div className="ops-page">
       <div className="ops-page-toolbar"><p className="ops-scope-note"><ShieldCheck size={16}/><span>Monitoring: {data?.enabled ? 'on' : 'off'} · Automatic downloads: {data?.allowDownloads ? 'allowed' : 'not allowed'} · Dry-run: {data?.dryRun ?? settings.safety.dryRun ? 'on' : 'off'}{data?.running ? ' · Cycle running' : ''}{data?.executionBlocked ? ` · Execution paused: ${blockReason(data.executionBlockedReason)}` : ''}</span></p><div>
-      <button className="button button-secondary" onClick={() => void refresh()}><RefreshCw size={15}/> Refresh saved view</button>{' '}<button className="button button-primary" disabled={busy} onClick={() => void poll()}>{busy ? <RefreshCw className="spin" size={15}/> : <ActivityIcon size={15}/>} {busy ? 'Reading…' : 'Refresh Arr observations'}</button><p className="field-hint">Reads Arr observations only. Does not start searches or submit downloads.</p>
+      <button className="button button-secondary" disabled={saving || busy} onClick={() => void refresh()}><RefreshCw size={15}/> Refresh saved view</button>{' '}<button className="button button-primary" disabled={busy || saving} onClick={() => void poll()}>{busy ? <RefreshCw className="spin" size={15}/> : <ActivityIcon size={15}/>} {busy ? 'Reading…' : 'Refresh Arr observations'}</button><p className="field-hint">Reads Arr observations only. Does not start searches or submit downloads.</p>
     </div></div>
     {error && <p role="alert" className="notice notice-error">{error}</p>}{notice && <p role="status" className="notice">{notice}</p>}
      {data && !data.enabled && <p className="field-hint">Item eligibility reflects Arr state. Nothing is scheduled while monitoring is off.</p>}
     {!data ? <p role="status" className="ops-state-panel">Loading saved observations…</p> : <>
       <section className="settings-card"><div className="section-heading"><div className="section-icon"><Database size={17}/></div><div className="section-title"><h2>Arr observations</h2><p>Refresh saved view reads local data. Refresh Arr observations explicitly reads upstream without searching or downloading.</p></div></div><div className="section-body provider-grid">{data.providers.map(provider => { const stale = Boolean(provider.observedAt && Date.now() - Date.parse(provider.observedAt) > 86_400_000); return <article className="provider-card" key={provider.provider}><div className={`provider-icon ${provider.known && !stale ? 'known' : 'unknown'}`}>{provider.provider.toLowerCase().includes('sonarr') ? <Tv size={17}/> : <Film size={17}/>}</div><div className="provider-main"><div className="provider-heading"><h3>{provider.provider}</h3><span className={`ops-status ${!provider.known || stale ? 'status-amber' : 'status-mint'}`}>{!provider.known ? 'Unknown' : stale ? 'Stale' : 'Current'}</span></div><p>Observed {date(provider.observedAt)}</p>{provider.error && <p className="provider-error">{provider.error}</p>}{!!provider.unknownSeriesIds?.length && <p>Some episode inventories are unknown ({provider.unknownSeriesIds.join(', ')}).</p>}<p>{provider.unidentifiedQueueRows} unidentified queue rows</p></div></article> })}</div></section>
-      <section className="settings-card"><div className="section-heading"><div className="section-icon"><Film size={17}/></div><div className="section-title"><h2>Items to watch</h2><p>Arr observation list. Search and download execution follows the saved permissions above.</p></div></div>{!data.items.length ? <div className="ops-state-panel ops-empty"><span className="ops-empty-mark"><CheckCircle2 size={19}/></span><h2>{observationsComplete ? 'No items to watch right now' : 'No items to show'}</h2><p>{observationsComplete ? 'No available missing items or pending checks. Poll again later to refresh.' : 'One or more sources could not be fully checked, so this list may be incomplete. Check Arr observations or Settings, then poll again.'}</p></div> : [...groups].map(([key, items]) => <details className="automation-group" key={key} open><summary><span className="automation-group-title">{items[0]?.kind === 'tv' ? <Tv size={17}/> : <Film size={17}/>}<strong>{items[0]?.title}</strong></span><span className="field-hint">{items.length} {items[0]?.kind === 'tv' ? 'episode(s)' : 'movie'}</span></summary><div className="ops-work-list">{items.map(item => <article className="ops-work-row" key={item.targetId}><div className="ops-media-icon">{item.kind === 'tv' ? <Tv size={16}/> : <Film size={16}/>}</div><div className="ops-work-main"><div className="ops-work-title"><h3>{item.kind === 'tv' ? `Season ${item.seasonNumber ?? '?'} · Episode ${item.episodeNumber ?? '?'}` : item.title}</h3><span className={`ops-status ${item.eligible ? 'status-mint' : 'status-amber'}`}>{item.status}</span></div><p className="ops-work-meta">Observed {date(item.observedAt)} · {item.eligible ? 'Eligible' : 'Not currently eligible'}</p><p className="ops-work-meta">Next attempt: {item.nextAttemptAt ? date(item.nextAttemptAt) : item.eligible ? 'Next eligible poll' : 'Waiting for Arr'}{item.lastAttemptAt && ` · Last attempt ${date(item.lastAttemptAt)}`}</p></div></article>)}</div></details>)}</section>
+      <section className="settings-card automation-watch"><div className="section-heading"><div className="section-icon"><Film size={17}/></div><div className="section-title"><h2 ref={watchHeading} tabIndex={-1}>Items to watch</h2><p>Monitored shows and movies that are missing files.</p></div></div>
+        {!observationsComplete && orderedGroups.length > 0 && <p className="automation-incomplete field-hint">One or more sources could not be fully checked, so this list may be incomplete. Check Arr observations or Settings, then refresh observations.</p>}
+        {!orderedGroups.length ? <div className="ops-state-panel ops-empty"><span className="ops-empty-mark"><CheckCircle2 size={19}/></span><h2>{observationsComplete ? 'No items to watch right now' : 'No items to show'}</h2><p>{observationsComplete ? 'No missing items or pending checks in the saved observations. Refresh observations later.' : 'One or more sources could not be fully checked, so this list may be incomplete. Check Arr observations or Settings, then poll again.'}</p></div> : <>
+          <div className="watch-title-row watch-column-head" aria-hidden="true"><div className="watch-title-grid"><span className="watch-title">Title</span><span className="watch-count">Missing</span><span className="watch-next">Next check</span></div></div>
+          {orderedGroups.map(([id, group]) => <WatchGroup key={id} id={id} group={group} optionsDisabled={saving || busy}
+            onOptions={group.kind === 'tv' ? (button, items) => { opener.current = button; setSelected({ id, title: group.title, saved: group.hoursEarly, items }) } : undefined}/>)}
+        </>}
+      </section>
        <section className="settings-card"><div className="section-heading"><div className="section-icon"><ActivityIcon size={17}/></div><div className="section-title"><h2>Recent automated searches</h2><p>Open a saved search to inspect its plan and durable receipt.</p></div></div>{historyLoading ? <p role="status" className="ops-state-panel">Loading automated search history…</p> : historyError ? <p role="alert" className="ops-state-panel">{historyError}</p> : history.length ? <div className="ops-activity-list">{history.map(item => <article className="ops-activity-row" key={item.searchId}><div className="ops-activity-top"><strong className="prompt-preview">{item.prompt}</strong><span className="ops-status">{item.status}</span></div><button className="text-button activity-open" type="button" onClick={() => onOpenSearch?.(item.searchId)}>View search details</button></article>)}</div> : <p className="ops-state-panel">No automated searches recorded yet.</p>}</section>
     </>}
     </div><aside className="right-rail automation-rail" aria-label="Automation guidance">
       <div className="rail-card"><div className="rail-overline">EXECUTION STATE</div><div className="cycle-title"><strong>{data?.enabled ? 'Monitoring on' : 'Monitoring off'}</strong><span className={data?.executionBlocked ? 'state-off' : 'state-on'}><span className="tiny-dot"/>{data?.executionBlocked ? 'Paused' : 'Available'}</span></div><p>{data?.executionBlocked ? `Execution is paused: ${blockReason(data.executionBlockedReason)}.` : 'Monitoring and permitted execution are active.'} Automatic downloads {data?.allowDownloads ? 'allowed' : 'not allowed'}; dry-run {data?.dryRun ? 'on' : 'off'}.</p></div>
       <div className="rail-card activity-key"><div className="rail-icon"><Clock3 size={17}/></div><strong>Poll is explicit</strong><p>Refresh saved view only rereads local observations. Poll now contacts Sonarr and Radarr.</p></div>
     </aside></div>
+    {selected && <ConfigureShow key={selected.id} show={selected} saving={saving} onClose={() => setSelected(null)} onSave={async hours => { await saveOffset(selected.id, hours); setNotice(hours === 0 ? `Sonarr timing restored for ${selected.title}.` : `Options saved for ${selected.title}.`); setSelected(null) }}/>}
   </>
+}
+
+function WatchGroup({ id, group, optionsDisabled, onOptions }: {
+  id: string; group: { title: string; kind: 'tv' | 'movie'; items: AutomationItem[] }; optionsDisabled: boolean;
+  onOptions?(button: HTMLButtonElement, items: AutomationItem[]): void;
+}) {
+  const [expandedChoice, setExpanded] = useState<boolean>()
+  const ordered = [...group.items].sort((a, b) => Number(b.eligible) - Number(a.eligible) || (a.nextAttemptAt ?? a.eligibleAt ?? '9999').localeCompare(b.nextAttemptAt ?? b.eligibleAt ?? '9999'))
+  const futureOnly = ordered.length > 0 && ordered.every(item => item.status === 'upcoming' || item.status === 'no-air-date')
+  const expanded = expandedChoice ?? !futureOnly
+  const ready = ordered.some(item => item.eligible)
+  const nextAt = ready ? undefined : ordered.map(item => item.nextAttemptAt ?? (item.status === 'upcoming' ? item.eligibleAt : undefined)).filter((value): value is string => !!value).sort()[0]
+  const next = ready ? 'Next eligible poll' : nextAt ? shortWatchDate(nextAt) : futureOnly ? 'Waiting for air date' : undefined
+  const unit = group.kind === 'movie' ? 'movie' : 'episode'
+  const labelId = `watch-title-${id}`, detailsId = `watch-details-${id}`
+  return <article className="automation-group">
+    <div className="watch-title-row">
+      <button type="button" className="watch-title-grid watch-disclosure" aria-labelledby={labelId} aria-describedby={`${labelId}-count${next ? ` ${labelId}-next` : ''}`}
+        aria-controls={detailsId} aria-expanded={expanded} onClick={() => setExpanded(!expanded)}>
+        <ChevronRight className="watch-chevron" aria-hidden="true" size={15}/>
+        <span className="watch-title" id={labelId}>{group.title}</span>
+        <span className="watch-count" id={`${labelId}-count`}>{ordered.length} {unit}{ordered.length === 1 ? '' : 's'}</span>
+        <span className="watch-next" id={`${labelId}-next`} title={nextAt ? date(nextAt) : undefined}>
+          {next ? <>{nextAt && <span className="watch-next-prefix">Next: </span>}{next}</> : <span className="watch-next-empty" aria-hidden="true">—</span>}
+        </span>
+      </button>
+      {onOptions && <button type="button" className="icon-button show-options" aria-haspopup="dialog" aria-label={`Options for ${group.title}`}
+        title="Options" disabled={optionsDisabled} onClick={event => onOptions(event.currentTarget, ordered)}><Gear size={17} aria-hidden="true"/></button>}
+    </div>
+    <div id={detailsId} hidden={!expanded}>
+      {!ordered.length ? <p className="automation-incomplete field-hint">No missing episodes in the saved observations.</p> : <div className="ops-work-list">{ordered.map(item => <article className="ops-work-row" key={item.targetId}><div className="ops-media-icon">{item.kind === 'tv' ? <Tv size={16}/> : <Film size={16}/>}</div><div className="ops-work-main"><div className="ops-work-title"><h3>{item.kind === 'tv' ? `Season ${item.seasonNumber ?? '?'} · Episode ${item.episodeNumber ?? '?'}` : item.title}</h3><span className={`ops-status ${item.eligible ? 'status-mint' : 'status-amber'}`}>{automationStatusLabel[item.status] ?? item.status}</span></div><p className="ops-work-meta">Observed {date(item.observedAt)} · {item.eligible ? 'Eligible' : 'Not currently eligible'}</p>
+        <p className="ops-work-meta">Next attempt: {item.nextAttemptAt ? date(item.nextAttemptAt) : item.eligible ? 'Next eligible poll' : item.status === 'upcoming' && item.eligibleAt ? `After ${date(item.eligibleAt)}` : item.status === 'no-air-date' ? 'Waiting for air date' : item.status === 'waiting-for-radarr' ? 'Waiting for Radarr' : item.status === 'downloading' ? 'In Arr queue' : 'Waiting for next check'}{item.lastAttemptAt && ` · Last attempt ${date(item.lastAttemptAt)}`}</p></div></article>)}</div>}
+    </div>
+  </article>
+}
+
+function ConfigureShow({ show, saving, onClose, onSave }: { show: { title: string; saved: number; items: AutomationItem[] }; saving: boolean; onClose(): void; onSave(hours: number): Promise<void> }) {
+  const [draft, setDraft] = useState(String(show.saved)), [error, setError] = useState('')
+  const dialog = useRef<HTMLDivElement>(null), input = useRef<HTMLInputElement>(null), submitting = useRef(false)
+  useLayoutEffect(() => { (saving ? dialog.current : input.current)?.focus() }, [saving])
+  useEffect(() => {
+    const contain = (event: FocusEvent) => {
+      if (dialog.current && !dialog.current.contains(event.target as Node))
+        (input.current?.disabled ? dialog.current : input.current)?.focus()
+    }
+    document.addEventListener('focusin', contain)
+    return () => document.removeEventListener('focusin', contain)
+  }, [])
+  async function submit(hours: number) {
+    if (submitting.current) return
+    if (!Number.isInteger(hours) || hours < 0 || hours > 168) { setError('Enter a whole number from 0 to 168 hours.'); return }
+    submitting.current = true; setError('')
+    try { await onSave(hours) }
+    catch (failure) { setError(failure instanceof Error ? failure.message : 'Could not save the airing offset. Try again.') }
+    finally { submitting.current = false }
+  }
+  const example = show.items.filter(item => item.metadataAirDate && item.eligibleAt && Number.isFinite(Date.parse(item.metadataAirDate)) && Number.isFinite(Date.parse(item.eligibleAt))).sort ( (a, b) => a.metadataAirDate!.localeCompare(b.metadataAirDate!) )[0]
+  return <div className="ops-dialog-backdrop"><div className="ops-dialog show-dialog" role="dialog" aria-modal="true" aria-labelledby="show-dialog-title" aria-describedby="show-dialog-subject show-dialog-description" tabIndex={-1} ref={dialog} onKeyDown={event => {
+    if (event.key === 'Escape' && !saving && !submitting.current) { event.preventDefault(); onClose() }
+    if (event.key === 'Tab') {
+      const controls = [...event.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled)')]
+      if (!controls.length) { event.preventDefault(); return }
+      const index = controls.indexOf(document.activeElement as HTMLElement)
+      if (event.shiftKey && index <= 0) { event.preventDefault(); controls[controls.length - 1]?.focus() }
+      else if (!event.shiftKey && index === controls.length - 1) { event.preventDefault(); controls[0]?.focus() }
+    }
+  }}>
+    <div className="ops-dialog-head"><div><h2 id="show-dialog-title">Configure show</h2><p id="show-dialog-subject" className="show-dialog-title">{show.title}</p></div></div>
+    <div className="ops-dialog-body"><div><h3>Airing offset</h3><p id="show-dialog-description" className="field-hint">Treat episodes as aired earlier than Sonarr reports. Enter 0 to use Sonarr timing. This changes Scout eligibility only; it does not refresh Arr or start a search.</p></div>
+      <label className="field">Hours early<input ref={input} type="number" min="0" max="168" step="1" value={draft} disabled={saving} onChange={event => setDraft(event.target.value)}/></label>
+      {example && <div className="show-timing"><strong>Season {example.seasonNumber ?? '?'} · Episode {example.episodeNumber ?? '?'}</strong><p>Sonarr air date: {/^\d{4}-\d{2}-\d{2}$/.test(example.metadataAirDate!) ? example.metadataAirDate : date(example.metadataAirDate)}</p><p>Saved Scout eligibility: {date(example.eligibleAt)}</p></div>}
+      {error && <p role="alert" className="notice notice-error">{error}</p>}
+      {show.saved > 0 && <button type="button" className="text-button show-reset" disabled={saving} onClick={() => void submit(0)}>Reset to Sonarr timing</button>}
+      <div className="ops-dialog-actions"><button type="button" className="button button-secondary" disabled={saving} onClick={onClose}>Cancel</button><button type="button" className="button button-primary" disabled={saving} onClick={() => void submit(draft.trim() === '' ? NaN : Number(draft))}>Save</button></div>
+    </div>
+  </div></div>
 }
 function blockReason(reason?: string) { return reason === 'automation-disabled' ? 'monitoring is off' : reason === 'downloads-not-activated' ? 'automatic downloads are not allowed' : reason === 'dry-run' ? 'dry-run is on' : reason ?? 'execution is blocked' }
 function Heading({ title, intro, eyebrow, icon }: { title: string; intro: string; eyebrow: string; icon: React.ReactNode }) { return <div className="page-heading ops-page-heading"><div><div className="eyebrow"><span className="eyebrow-mark"/>{eyebrow}</div><h1>{title}<span className="heading-period">.</span></h1><p className="page-intro">{intro}</p></div><div className="heading-stamp">{icon}<span>LOCAL CONTROL</span></div></div> }

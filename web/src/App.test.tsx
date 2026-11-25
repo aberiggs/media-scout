@@ -435,7 +435,7 @@ it('does not show an old confirmation after selecting another search while prepa
   view.rerender(<SearchPage settings={defaults} searchId="other" searchRevision={2} onSearchStarted={() => {}} />)
   resolvePrepare(Response.json({ ...preparedConfirmation, searchId: 'life' }))
   await waitFor(() => assert.ok(screen.getByText('Selected release set')))
-  assert.equal(screen.queryByRole('dialog'), null)
+  assert.ok(!screen.queryByRole('dialog'))
 })
 
 it('ignores a delayed receipt poll for the previously selected search', async () => {
@@ -492,7 +492,7 @@ it('traps confirmation focus and restores focus to the actual prepare action', a
   fireEvent.keyDown(document, { key: 'Tab', shiftKey: true })
   assert.equal(document.activeElement, confirm)
   fireEvent.keyDown(document, { key: 'Escape' })
-  assert.equal(screen.queryByRole('dialog'), null)
+  assert.ok(!screen.queryByRole('dialog'))
   await new Promise(resolve => window.setTimeout(resolve, 5))
   assert.equal(document.activeElement, prepare)
 })
@@ -938,7 +938,7 @@ it('keeps search available in dry-run and distinguishes a saved refresh from a l
   globalThis.fetch = async (input, init) => {
     const url = String(input); calls.push({ url, method: init?.method })
     if (url === '/api/settings') return Response.json(env)
-    if (url === '/api/v2/automation') return Response.json({ enabled: false, dryRun: true, running: false, providers: [], items: [{ targetId: 'one', title: 'Example', kind: 'tv', seasonNumber: 1, episodeNumber: 1, status: 'missing', eligible: true }] })
+    if (url === '/api/v2/automation') return Response.json({ enabled: false, dryRun: true, running: false, providers: [], airingOffsets: [], items: [{ targetId: 'one', titleId: 'show-one', title: 'Example', kind: 'tv', seasonNumber: 1, episodeNumber: 1, status: 'missing', eligible: true }] })
     if (url === '/api/v2/automation/poll') return Response.json({ ran: false, reason: 'disabled' })
     return Response.json({ searchId: 's1' }, { status: 202 })
   }
@@ -953,6 +953,114 @@ it('keeps search available in dry-run and distinguishes a saved refresh from a l
   await waitFor(() => assert.equal(calls.filter(c => c.url.endsWith('/poll')).length, 1))
 })
 
+it('groups observations by title and saves or resets Sonarr airing policy without polling', async () => {
+  const { AutomationPage } = await import('./Activity')
+  const calls: Array<{ url: string; method?: string; body?: string }> = []
+  let fail = true, hours = 0, caughtHours = 24, undatedReady = false
+  let failSave!: (response: Response) => void
+  const pendingFailure = new Promise<Response>(resolve => { failSave = resolve })
+  const snapshot = () => ({
+    enabled: true, dryRun: true, running: false,
+    providers: [{ provider: 'sonarr', known: false, unidentifiedQueueRows: 0 }, { provider: 'radarr', known: true, unidentifiedQueueRows: 0 }],
+    items: [
+      { targetId: 'future', titleId: 'show', title: 'Shared title', kind: 'tv', seasonNumber: 1, episodeNumber: 2, status: 'upcoming', eligible: false, metadataAirDate: '2026-12-20', eligibleAt: '2026-12-21T00:00:00.000Z' },
+      { targetId: 'movie', titleId: 'movie', title: 'Shared title', kind: 'movie', status: 'waiting-for-radarr', eligible: false },
+      { targetId: 'ready', titleId: 'show', title: 'Shared title', kind: 'tv', seasonNumber: 1, episodeNumber: 1, status: undatedReady ? 'cooldown' : 'missing', eligible: !undatedReady },
+      { targetId: 'undated', titleId: 'undated-show', title: 'Undated', kind: 'tv', status: undatedReady ? 'missing' : 'no-air-date', eligible: undatedReady },
+    ],
+    airingOffsets: [...(caughtHours ? [{ titleId: 'caught', title: 'Saved show', hoursEarly: caughtHours }] : []), ...(hours ? [{ titleId: 'show', title: 'Shared title', hoursEarly: hours }] : [])],
+  })
+  globalThis.fetch = async (input, init) => {
+    const url = String(input); calls.push({ url, method: init?.method, body: init?.body as string | undefined })
+    if (url === '/api/v2/automation') return Response.json(snapshot())
+    if (url.includes('/airing-offsets/')) {
+      if (fail) { fail = false; return pendingFailure }
+      if (url.endsWith('/caught')) caughtHours = JSON.parse(String(init?.body)).hoursEarly
+      else hours = JSON.parse(String(init?.body)).hoursEarly
+      return Response.json(snapshot())
+    }
+    return Response.json({ items: [] })
+  }
+  render(<AutomationPage settings={defaults}/>)
+  await screen.findByText('Items to watch')
+  const groups = [...document.querySelectorAll('.automation-group')]
+  assert.equal(screen.queryAllByRole('spinbutton').length, 0)
+  assert.equal(screen.getByRole('button', { name: 'Options for Undated' }).textContent, '', 'options should be icon-only')
+  assert.equal(groups.length, 4)
+  assert.match(groups[0]!.textContent!, /Shared title/)
+  assert.match(groups[0]!.textContent!, /Season 1 · Episode 1/)
+  assert.ok(screen.getByText('2 episodes'))
+  assert.ok(screen.getByText('1 episode'))
+  assert.equal(screen.queryByText(/Provider air date|Scout eligibility|Airing offset|Hours early/i), null)
+  assert.ok(screen.getByText('Waiting for Radarr'))
+  const undatedButton = screen.getByRole('button', { name: 'Options for Undated' })
+  const undatedDisclosure = screen.getByRole('button', { name: 'Undated' })
+  assert.equal(undatedDisclosure.getAttribute('aria-expanded'), 'false')
+  fireEvent.click(undatedDisclosure)
+  assert.equal(undatedDisclosure.getAttribute('aria-expanded'), 'true')
+  assert.ok(screen.getByText('No air date'))
+  fireEvent.click(undatedDisclosure)
+  const movie = groups.find(group => within(group as HTMLElement).queryByText('1 movie', { exact: true })) as HTMLElement
+  assert.equal(within(movie).queryByRole('button', { name: /Options/ }), null)
+  fireEvent.click(undatedButton)
+  assert.equal(undatedDisclosure.getAttribute('aria-expanded'), 'false', 'the gear must not expand the episode list')
+  let dialog = screen.getByRole('dialog', { name: 'Configure show' })
+  assert.ok(within(dialog).getByText('Undated'))
+  assert.ok(document.activeElement === within(dialog).getByRole('spinbutton', { name: 'Hours early' }))
+  fireEvent.keyDown(dialog, { key: 'Tab', shiftKey: true })
+  assert.ok(document.activeElement === within(dialog).getByRole('button', { name: 'Save' }))
+  fireEvent.keyDown(dialog, { key: 'Tab' })
+  assert.ok(document.activeElement === within(dialog).getByRole('spinbutton', { name: 'Hours early' }))
+  fireEvent.keyDown(dialog, { key: 'Escape' })
+  assert.ok(document.activeElement === undatedButton)
+  fireEvent.click(undatedButton)
+  dialog = screen.getByRole('dialog', { name: 'Configure show' })
+  fireEvent.change(within(dialog).getByRole('spinbutton'), { target: { value: '10' } })
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+  assert.equal(calls.filter(c => c.method === 'PUT').length, 0)
+  undatedReady = true
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh saved view' }))
+  await waitFor(() => assert.equal(document.querySelector('.automation-group .watch-title')?.textContent, 'Undated'))
+  assert.equal(undatedDisclosure.getAttribute('aria-expanded'), 'false', 'a manual choice survives a refresh that reorders the groups')
+  const showButton = screen.getByRole('button', { name: 'Options for Shared title' })
+  fireEvent.click(showButton)
+  dialog = screen.getByRole('dialog', { name: 'Configure show' })
+  assert.ok(within(dialog).getByText(/Sonarr air date: 2026-12-20/))
+  assert.ok(within(dialog).getByText(/Saved Scout eligibility:/))
+  const input = within(dialog).getByRole('spinbutton', { name: 'Hours early' }) as HTMLInputElement
+  fireEvent.change(input, { target: { value: '' } })
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
+  assert.ok(within(dialog).getByRole('alert'))
+  fireEvent.change(input, { target: { value: '169' } })
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
+  assert.equal(calls.filter(c => c.method === 'PUT').length, 0)
+  fireEvent.change(input, { target: { value: '72' } })
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
+  assert.ok(document.activeElement === dialog, 'dialog keeps focus while its controls are disabled')
+  fireEvent.keyDown(dialog, { key: 'Escape' })
+  assert.ok(screen.getByRole('dialog'))
+  failSave(Response.json({ error: 'Try again later' }, { status: 503 }))
+  assert.ok(await within(dialog).findByText('Try again later'))
+  assert.equal(input.value, '72')
+  assert.ok(document.activeElement === input, 'failure returns focus to the editable draft')
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Save' }))
+  await waitFor(() => assert.ok(!screen.queryByRole('dialog')))
+  assert.ok(document.activeElement === showButton)
+  assert.ok(screen.getByRole('status').textContent?.includes('Options saved'))
+  fireEvent.click(showButton)
+  dialog = screen.getByRole('dialog', { name: 'Configure show' })
+  assert.equal((within(dialog).getByRole('spinbutton') as HTMLInputElement).value, '72')
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Reset to Sonarr timing' }))
+  await waitFor(() => assert.ok(!screen.queryByRole('dialog')))
+  fireEvent.click(screen.getByRole('button', { name: 'Options for Saved show' }))
+  dialog = screen.getByRole('dialog', { name: 'Configure show' })
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Reset to Sonarr timing' }))
+  await waitFor(() => assert.ok(!screen.queryByRole('button', { name: 'Options for Saved show' })))
+  assert.ok(document.activeElement === screen.getByRole('heading', { name: 'Items to watch' }))
+  assert.deepEqual(calls.filter(c => c.method === 'PUT').map(c => JSON.parse(c.body!).hoursEarly), [72, 72, 0, 0])
+  assert.equal(calls.some(c => c.url.includes('/poll') || c.url.includes('/search')), false)
+})
+
 it('distinguishes a known empty actionable list from unavailable Arr observations', async () => {
   window.history.replaceState(null, '', '/#automation')
   let known = true
@@ -960,7 +1068,7 @@ it('distinguishes a known empty actionable list from unavailable Arr observation
   globalThis.fetch = async input => {
     const url = String(input)
     if (url === '/api/settings') return Response.json(env)
-    if (url === '/api/v2/automation') return Response.json({ enabled: false, dryRun: true, running: false, providers: ['sonarr', 'radarr'].map(provider => ({ provider, known, observedAt: '2026-11-15T00:00:00Z', unidentifiedQueueRows: 0, ...(partialInventory && provider === 'sonarr' ? { unknownSeriesIds: ['42'] } : {}) })), items: [] })
+    if (url === '/api/v2/automation') return Response.json({ enabled: false, dryRun: true, running: false, providers: ['sonarr', 'radarr'].map(provider => ({ provider, known, observedAt: '2026-11-15T00:00:00Z', unidentifiedQueueRows: 0, ...(partialInventory && provider === 'sonarr' ? { unknownSeriesIds: ['42'] } : {}) })), items: [], airingOffsets: [] })
     return Response.json({ items: [] })
   }
   render(<App />)
@@ -976,6 +1084,22 @@ it('distinguishes a known empty actionable list from unavailable Arr observation
   render(<App />)
   assert.ok(await screen.findByRole('heading', { name: 'No items to show' }))
   assert.ok(screen.getByText(/list may be incomplete/i))
+})
+
+it('does not mark a healthy Sonarr-only watch list as incomplete', async () => {
+  const { AutomationPage } = await import('./Activity')
+  globalThis.fetch = async input => String(input) === '/api/v2/automation'
+    ? Response.json({ enabled: false, dryRun: true, running: false, airingOffsets: [],
+      providers: [
+        { provider: 'sonarr', known: true, observedAt: new Date().toISOString(), unidentifiedQueueRows: 0 },
+        { provider: 'radarr', known: false, error: 'not-configured', unidentifiedQueueRows: 0 },
+      ],
+      items: [{ targetId: 'episode-one', titleId: 'show-one', title: 'Example', kind: 'tv', seasonNumber: 1, episodeNumber: 1, status: 'missing', eligible: true }],
+    })
+    : Response.json({ items: [] })
+  render(<AutomationPage settings={defaults}/>)
+  assert.ok(await screen.findByText('Season 1 · Episode 1'))
+  assert.ok(!screen.queryByText(/list may be incomplete/i), 'unconfigured Radarr should not imply missing observations')
 })
 
 it('keeps Settings sections scannable and distinguishes required from optional services', async () => {

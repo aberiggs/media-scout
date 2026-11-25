@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { SonarrClient } from '../clients/sonarr';
 import type { RadarrClient } from '../clients/radarr';
-import { episodeEligibilityTime } from '../core/episode-timing';
+import { episodeAiring } from '../core/episode-timing';
 import type { Episode, SonarrQueueRecord } from '../types/sonarr';
 import type { Movie } from '../types/radarr';
 import { safeText } from './release-observation';
@@ -13,12 +13,12 @@ export type ArrProvider = 'sonarr' | 'radarr';
 export interface ArrTarget {
   key: string; provider: ArrProvider; sourceFingerprint: string; serviceId: number; externalId: number;
   episodeId?: number; movieId?: number; monitored: boolean; hasFile: boolean; eligible: boolean;
-  available: boolean; airAt?: number; queued?: boolean; queueReason?: string; context: Record<string, unknown>;
+  available: boolean; airAt?: number; metadataAirDate?: string; queued?: boolean; queueReason?: string; context: Record<string, unknown>;
   showContext?: Record<string, unknown>; episodeContext?: Record<string, unknown>;
 }
 export interface SafeQueueRecord { serviceId?: number; itemId?: number; seasonNumber?: number; status?: string; trackedStatus?: string; trackedState?: string }
 export interface ProviderObservation {
-  known: boolean; observedAt: number; error?: string; targets: ArrTarget[]; queue: SafeQueueRecord[];
+  known: boolean; observedAt: number; error?: string; sourceFingerprint?: string; targets: ArrTarget[]; queue: SafeQueueRecord[];
   diagnostics: { unidentifiedQueueRows: number; unknownSeriesIds?: number[] };
 }
 export interface ArrSnapshot {
@@ -35,7 +35,7 @@ export interface ArrObserverDeps {
   clock?: () => number;
 }
 
-const fingerprint = (p: ArrProvider, source: { id: string; url: string; apiKey: string }): string =>
+export const arrFingerprint = (p: ArrProvider, source: { id: string; url: string; apiKey: string }): string =>
   createHash('sha256').update(`${p}\0${source.id}\0${source.url}\0${source.apiKey}`).digest('hex');
 const targetKey = (provider: ArrProvider, fp: string, serviceId: number, externalId: number, itemId: number): string =>
   `${provider}:${fp}:${serviceId}:${externalId}:${itemId}`;
@@ -68,7 +68,7 @@ export class ArrObserver {
 
   sourceFingerprint(provider: ArrProvider): string | null {
     const sources = typeof this.deps.source === 'function' ? this.deps.source() : this.deps.source;
-    return sources[provider] ? fingerprint(provider, sources[provider]!) : null;
+    return sources[provider] ? arrFingerprint(provider, sources[provider]!) : null;
   }
 
   async observe(signal?: AbortSignal): Promise<ArrSnapshot> {
@@ -125,7 +125,7 @@ export class ArrObserver {
     const client = this.deps.sonarr, sources = typeof this.deps.source === 'function' ? this.deps.source() : this.deps.source, src = sources.sonarr;
     if (!client || !src) return unknown(at, 'not-configured');
     if (Math.max(this.throttledUntil.sonarr ?? 0, this.deps.store?.getProviderDeadline('sonarr') ?? 0) > at) return unknown(at, 'source-throttled');
-    const fp = fingerprint('sonarr', src);
+    const fp = arrFingerprint('sonarr', src);
     try {
       const seriesList = await client.getSeries();
       if (signal?.aborted) return unknown(at, 'observation-interrupted');
@@ -146,10 +146,10 @@ export class ArrObserver {
       for (const {series,episodes} of inventories) {
         const episodeIds = queuedEpisodeIds(queue, series.id, -1);
         for (const episode of episodes) {
-          const airing = episodeEligibilityTime(episode)?.getTime();
+          const airing = episodeAiring(episode);
           const seasonQueue = queue.some(row => row.seriesId === series.id && row.seasonNumber === episode.seasonNumber && row.episodeId == null && !isTerminal(row));
           const queueCovered = episodeIds.direct.has(episode.id) || seasonQueue || episodeIds.series;
-          const available = airing !== undefined && airing <= at;
+          const available = airing !== null && airing.airAt <= at;
           const eligible = series.monitored && episode.monitored && !episode.hasFile && available && !queueCovered;
           const key = targetKey('sonarr', fp, series.id, series.tvdbId, episode.id);
           const profile = profiles?.find(p => p.id === series.qualityProfileId);
@@ -158,11 +158,11 @@ export class ArrObserver {
             overview: series.overview ?? undefined, originalLanguage: languageName(series.originalLanguage), seriesType: series.seriesType, profileContext: summarizeProfile(client.getQualityProfiles ? profile : series.qualityProfile), externalIds: { tvdb: series.tvdbId } });
           const episodeContext = safeContext({ seasonNumber: episode.seasonNumber, episodeNumber: episode.episodeNumber, absoluteEpisodeNumber: episode.absoluteEpisodeNumber, episodeTitle: episode.title, airDate: series.seriesType === 'daily' && /^\d{4}-\d{2}-\d{2}$/u.test(episode.airDate ?? '') ? episode.airDate : undefined });
           targets.push({ key, provider: 'sonarr', sourceFingerprint: fp, serviceId: series.id, externalId: series.tvdbId, episodeId: episode.id, monitored: series.monitored && episode.monitored, hasFile: episode.hasFile, available, queued: queueCovered, ...(queueCovered ? { queueReason: 'observed-in-queue' } : {}), eligible,
-            ...(airing === undefined ? {} : { airAt: airing }), showContext, episodeContext, context: safeContext({ ...showContext, ...episodeContext, overview: episode.overview ?? series.overview ?? undefined }) });
+            ...airing, showContext, episodeContext, context: safeContext({ ...showContext, ...episodeContext, overview: episode.overview ?? series.overview ?? undefined }) });
         }
       }
       if (this.sourceFingerprint('sonarr') !== fp) return unknown(at, 'source-changed');
-      return { known: true, observedAt: at, targets, queue: queue.map(row => ({ ...(row.seriesId == null ? {} : { serviceId: row.seriesId }), ...(row.episodeId == null ? {} : { itemId: row.episodeId }), ...(row.seasonNumber == null ? {} : { seasonNumber: row.seasonNumber }), ...(row.status ? { status: safeText(row.status) } : {}), ...(row.trackedDownloadStatus ? { trackedStatus: safeText(row.trackedDownloadStatus) } : {}), ...(row.trackedDownloadState ? { trackedState: safeText(row.trackedDownloadState) } : {}) })), diagnostics: { unidentifiedQueueRows: queue.filter(row => row.seriesId == null).length, ...(unknownSeriesIds.length ? { unknownSeriesIds } : {}) } };
+      return { known: true, sourceFingerprint: fp, observedAt: at, targets, queue: queue.map(row => ({ ...(row.seriesId == null ? {} : { serviceId: row.seriesId }), ...(row.episodeId == null ? {} : { itemId: row.episodeId }), ...(row.seasonNumber == null ? {} : { seasonNumber: row.seasonNumber }), ...(row.status ? { status: safeText(row.status) } : {}), ...(row.trackedDownloadStatus ? { trackedStatus: safeText(row.trackedDownloadStatus) } : {}), ...(row.trackedDownloadState ? { trackedState: safeText(row.trackedDownloadState) } : {}) })), diagnostics: { unidentifiedQueueRows: queue.filter(row => row.seriesId == null).length, ...(unknownSeriesIds.length ? { unknownSeriesIds } : {}) } };
     } catch (error) { this.reportRetry('sonarr', error); if (focused) throw error; return unknown(at); }
   }
 
@@ -170,7 +170,7 @@ export class ArrObserver {
     const client = this.deps.radarr, sources = typeof this.deps.source === 'function' ? this.deps.source() : this.deps.source, src = sources.radarr;
     if (!client || !src) return unknown(at, 'not-configured');
     if (Math.max(this.throttledUntil.radarr ?? 0, this.deps.store?.getProviderDeadline('radarr') ?? 0) > at) return unknown(at, 'source-throttled');
-    const fp = fingerprint('radarr', src);
+    const fp = arrFingerprint('radarr', src);
     try {
       const movies = await client.getMovies();
       const profiles = serviceId === undefined && client.getQualityProfiles ? await client.getQualityProfiles().catch(error => { this.reportRetry('radarr', error); return null; }) : null;
@@ -184,7 +184,7 @@ export class ArrObserver {
           context: safeContext({ title: movie.title, titles: [movie.title], year: movie.year, overview: movie.overview ?? undefined, originalLanguage: languageName(movie.originalLanguage), profileContext: summarizeProfile(client.getQualityProfiles ? profiles?.find(p => p.id === movie.qualityProfileId) : movie.qualityProfile), externalIds: { tmdb: movie.tmdbId } }) };
       });
       if (this.sourceFingerprint('radarr') !== fp) return unknown(at, 'source-changed');
-      return { known: true, observedAt: at, targets, queue: queue.map(row => ({ ...(row.movieId == null ? {} : { itemId: row.movieId }), ...(row.status ? { status: safeText(row.status) } : {}), ...(row.trackedDownloadStatus ? { trackedStatus: safeText(row.trackedDownloadStatus) } : {}), ...(row.trackedDownloadState ? { trackedState: safeText(row.trackedDownloadState) } : {}) })), diagnostics: { unidentifiedQueueRows: queue.filter(row => row.movieId == null).length } };
+      return { known: true, sourceFingerprint: fp, observedAt: at, targets, queue: queue.map(row => ({ ...(row.movieId == null ? {} : { itemId: row.movieId }), ...(row.status ? { status: safeText(row.status) } : {}), ...(row.trackedDownloadStatus ? { trackedStatus: safeText(row.trackedDownloadStatus) } : {}), ...(row.trackedDownloadState ? { trackedState: safeText(row.trackedDownloadState) } : {}) })), diagnostics: { unidentifiedQueueRows: queue.filter(row => row.movieId == null).length } };
     } catch (error) { this.reportRetry('radarr', error); if (focused) throw error; return unknown(at); }
   }
 

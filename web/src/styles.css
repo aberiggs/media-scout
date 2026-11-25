@@ -805,15 +805,21 @@ h1 { color: #f0f2ef; font-family: var(--display); font-size: clamp(1.875rem, 3vw
 .provider-error { color: #e0a194; overflow-wrap: break-word; }
 .automation-group { border-top: 1px solid #292e2a; }
 .automation-group:last-child { border-bottom: 1px solid #292e2a; }
-.automation-group > summary { display: flex; min-height: 52px; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 10px 18px; color: #dce4dd; cursor: pointer; list-style: none; }
-.automation-group > summary::-webkit-details-marker { display: none; }
-.automation-group > summary::after { width: 7px; height: 7px; flex: none; border-right: 1px solid #a1ada4; border-bottom: 1px solid #a1ada4; content: ""; transform: rotate(45deg); }
-.automation-group[open] > summary::after { transform: rotate(225deg); }
+.automation-group > details > summary { display: flex; min-height: 52px; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 10px 18px; color: #dce4dd; cursor: pointer; list-style: none; }
+.automation-group > details > summary::-webkit-details-marker { display: none; }
+.automation-group > details > summary::after { width: 7px; height: 7px; flex: none; border-right: 1px solid #a1ada4; border-bottom: 1px solid #a1ada4; content: ""; transform: rotate(45deg); }
+.automation-group > details[open] > summary::after { transform: rotate(225deg); }
 .automation-group-title { display: flex; min-width: 0; align-items: center; gap: 9px; }
 .automation-group-title > svg { flex: none; color: var(--mint); }
 .automation-group-title > strong { min-width: 0; overflow-wrap: break-word; }
 .automation-group .ops-work-row { align-items: center; }
 .automation-group .ops-work-title h3 { overflow-wrap: break-word; word-break: normal; }
+.automation-incomplete { padding: 12px 18px; }
+.airing-offset { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; padding: 12px 18px 16px; background: #1a201c; }
+.airing-offset .field { flex: 1 1 220px; }
+.airing-offset input { max-width: 110px; }
+.airing-offset-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.airing-offset > .field-hint, .airing-offset > .notice { flex-basis: 100%; }
 .automation-rail { position: sticky; top: 84px; }
 .automation-rail .cycle-title { flex-wrap: wrap; }
 .automation-rail .activity-key { margin-top: 0; }

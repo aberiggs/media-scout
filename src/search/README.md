@@ -117,12 +117,23 @@ A useful partial set can be selected with its gaps named. Connected research is
 optional and can happen before, between, or after indexer queries. If no useful
 indexer query is possible, the result should explain why without claiming a search ran.
 A movie prompt uses the title and year when known. Saved automation preferences
-default to blank and are appended only to scheduled searches. Owned, unmonitored, queued and future
-episodes are not dumped into the prompt. The size limit applies to the rendered
+default to blank and are appended only to scheduled searches. Owned, unmonitored,
+queued and not-yet-eligible episodes are not dumped into the prompt. The size limit applies to the rendered
 prompt, and oversized workloads defer whole episodes and rotate by last attempt.
 Unknown inventories are not empty. No additional batch
 API or release-to-episode assignment is involved. The explicit poll endpoint only
 refreshes observations and returns promptly when another pass owns the lease.
+
+The Automation view lists monitored missing targets regardless of timing.
+`PUT /api/v2/automation/airing-offsets/:titleId` accepts `{"hoursEarly":72}`
+(integer 0–168, with 0 removing the override) and returns refreshed local
+automation status, without reading Arr or dispatching work. Use the opaque
+`titleId` from that view. An override is scoped to the observed Sonarr connection
+and series, persists across restarts, and remains visible and resettable while
+the show is caught up. It subtracts hours from the ordinary eligibility time
+(exact UTC airtime, or following UTC midnight for date-only metadata) and is
+checked again at submission. It neither invents an air date nor changes the
+metadata used to identify the episode. Radarr eligibility and retries are unchanged.
 
 The scheduler may execute only its own selected set, with monitoring enabled,
 automatic downloads allowed, and dry-run off. Before each release it revalidates

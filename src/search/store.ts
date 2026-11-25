@@ -35,6 +35,7 @@ const parse = <T>(s: string): T => JSON.parse(s) as T;
 export interface SearchRecord { searchId: string; prompt: string; status: SearchStatus; createdAt: number; finishedAt?: number; result?: unknown }
 export interface SearchWork { searchId: string; prompt: string; source: 'manual' | 'automation' | 'arr'|'acquisition'; context: unknown; owner: string }
 export interface CandidateRecord { searchId: string; candidateId: string; safe: unknown; privateData: unknown; expiresAt: number }
+export interface AiringOffset { titleId: string; title: string; hoursEarly: number }
 export interface ExecutionChild { candidateId: string; physicalKey: string; state: 'prepared'|'sending'|'submitted'|'rejected'|'uncertain'|'not-attempted'|'dry-run'; effectiveCategory?:string|null; categoryRouting?:'direct'|'configured-mapping'|'default-category'; categoryNote?:string; releaseCategoryIds?:number[]; message?: string }
 export interface ExecutionRecord { id:string; key:string; hash:string; searchId:string; planId:string; version:number; outcome:string; owner:string; leaseUntil:number; children:ExecutionChild[]; receipt:unknown; payload:unknown; updatedAt:number }
 type AutomationGrace = { mediaKey:string; graceUntil:number; passOwner?:string; attempt?:{startedAt:number;targetKeys:string[];failureBackoffMinMs:number;failureBackoffMaxMs:number} };
@@ -311,6 +312,18 @@ export class SearchStore {
   getEvents(searchId:string):unknown[] { return (this.db.prepare('SELECT event_json,created_at FROM search_events WHERE search_id=? ORDER BY id').all(searchId) as Array<{event_json:string;created_at:number}>).map(r=>({...parse<Record<string,unknown>>(r.event_json),recordedAt:r.created_at})); }
   setSetting(key:string,value:unknown):void { this.db.prepare('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json').run(key,json(value)); }
   getSetting(key:string):unknown|null { const r=this.db.prepare('SELECT value_json FROM settings WHERE key=?').get(key) as {value_json:string}|undefined; return r?parse(r.value_json):null; }
+  airingOffsets(source: string): AiringOffset[] {
+    const rows = this.db.prepare('SELECT value_json FROM settings WHERE key GLOB ?').all(`automation-airing:${source}:*`) as Array<{ value_json: string }>;
+    return rows.map(row => parse<AiringOffset>(row.value_json));
+  }
+  airingHours(source: string, titleId: string): number {
+    return (this.getSetting(`automation-airing:${source}:${titleId}`) as AiringOffset | null)?.hoursEarly ?? 0;
+  }
+  saveAiringOffset(source: string, offset: AiringOffset): void {
+    const key = `automation-airing:${source}:${offset.titleId}`;
+    if (offset.hoursEarly === 0) this.db.prepare('DELETE FROM settings WHERE key=?').run(key);
+    else this.setSetting(key, offset);
+  }
   setProviderDeadline(provider:string,deadline:number):void { this.db.prepare('INSERT INTO provider_deadlines VALUES(?,?) ON CONFLICT(provider) DO UPDATE SET deadline=MAX(deadline,excluded.deadline)').run(provider,deadline); }
   getProviderDeadline(provider:string):number|null { return (this.db.prepare('SELECT deadline FROM provider_deadlines WHERE provider=?').get(provider) as {deadline:number}|undefined)?.deadline ?? null; }
   getMediaGrace(identity: string, now: number): number | null { return (this.db.prepare("SELECT expires_at FROM grace WHERE kind='media' AND identity=? AND expires_at>?").get(identity, now) as { expires_at: number } | undefined)?.expires_at ?? null; }

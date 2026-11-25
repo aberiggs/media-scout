@@ -6,16 +6,17 @@ import { openSearchStore } from '../src/search/store';
 import { SearchRuntime } from '../src/search/runtime';
 import { defaultSettings, type Settings } from '../src/search/settings';
 import { releaseSchema } from '../src/types/prowlarr';
+import { arrFingerprint } from '../src/search/arr';
 
 const stores: ReturnType<typeof openSearchStore>[] = [];
 afterEach(() => { for (const store of stores.splice(0)) store.close(); });
 function setup() {
   const store = openSearchStore(':memory:'); stores.push(store);
-  const settings = { ...defaultSettings, integrations: { ...defaultSettings.integrations, prowlarr: { ...defaultSettings.integrations.prowlarr, url: 'http://localhost:9696', apiKey: 'private' } }, ai: { apiKey: 'private-ai', model: 'test/model', baseUrl: 'https://example.test/v1', preferences: '' }, search: { maxDecisions: 20, maxSearches: 12, deadlineMinutes: 10, concurrentSearches: 3 } } satisfies Settings;
+  const settings = { ...defaultSettings, integrations: { ...defaultSettings.integrations, prowlarr: { ...defaultSettings.integrations.prowlarr, url: 'http://localhost:9696', apiKey: 'private' }, sonarr: { url: 'http://sonarr.test', apiKey: 'fixture' } }, ai: { apiKey: 'private-ai', model: 'test/model', baseUrl: 'https://example.test/v1', preferences: '' }, search: { maxDecisions: 20, maxSearches: 12, deadlineMinutes: 10, concurrentSearches: 3 } } satisfies Settings;
   let indexerReads = 0;
   let now = 1_800_000_000_000;
   const runtime = new SearchRuntime({ store, now: () => now, clients: () => ({ prowlarr: { getIndexers: async () => { indexerReads++; return [{ id: 1, name: 'Test', enable: true }]; }, getIndexerStatuses: async () => [], search: async () => [], getDownloadClients: async () => [{ id: 7, name: 'TV', enable: true, protocol: 'torrent', supportsCategories: false, categories: [] }], grab: async () => {} } }), initialSettings: settings });
-  return { runtime, store, settings, reads: () => indexerReads, get now() { return now; }, set now(value: number) { now = value; } };
+  return { runtime, store, settings, sonarrSource: arrFingerprint('sonarr', { id: 'sonarr', ...settings.integrations.sonarr }), reads: () => indexerReads, get now() { return now; }, set now(value: number) { now = value; } };
 }
 function matched(f: ReturnType<typeof setup>, expires: number) {
   f.store.createSearch({ searchId: 'matched', prompt: '{"request":{"prompt":"Find Example"}}', status: 'matched', createdAt: f.now, finishedAt: f.now, result: { version: 1, plan: { version: 2 } } });
@@ -38,9 +39,9 @@ describe('search runtime', () => {
   });
   it('does not apply the retired show-wide cooldown to an individual actionable target', () => {
     const f = setup();
-    const deadline = f.now + 120_000, target = { key: 'sonarr:fp:7:20:2', provider: 'sonarr', sourceFingerprint: 'fp', serviceId: 7, externalId: 20, episodeId: 2, monitored: true, hasFile: false, available: true, eligible: true, context: { title: 'Show', seasonNumber: 3, episodeNumber: 2 } };
+    const deadline = f.now + 120_000, target = { key: `sonarr:${f.sonarrSource}:7:20:2`, provider: 'sonarr', sourceFingerprint: f.sonarrSource, serviceId: 7, externalId: 20, episodeId: 2, monitored: true, hasFile: false, airAt: f.now - 1000, queued: false, context: { title: 'Show', seasonNumber: 3, episodeNumber: 2 } };
     f.store.saveObservation('sonarr', { observedAt: f.now, complete: true, payload: { targets: [target] } });
-    f.store.setSetting(`automation:show-cooldown:fp:7`, deadline);
+    f.store.setSetting(`automation:show-cooldown:${f.sonarrSource}:7`, deadline);
     expect(f.runtime.automationStatus().items[0]).toMatchObject({ status: 'missing', eligible: true });
   });
   it('rejects former preference fields from the public search contract', async () => {
@@ -168,28 +169,27 @@ describe('search runtime', () => {
     expect(calls).toEqual(['http://old-source', 'http://old-source']);
     expect(runtime.automationStatus().providers.find(p => p.provider === 'sonarr')?.known).toBe(false);
   });
-  it('shows only available missing work while retaining available queued and cooldown items', () => {
+  it('shows monitored missing work while preserving timing, queued and cooldown states', () => {
     const f = setup();
-    const target = (key: string, available: boolean, eligible: boolean, overrides: Record<string, unknown> = {}) => ({
-      key, provider: 'sonarr' as const, sourceFingerprint: 'source', serviceId: 1, externalId: 20, episodeId: 1,
-      monitored: true, hasFile: false, available, eligible,
-      context: { title: key, seasonNumber: 1, episodeNumber: 1 }, ...overrides,
+    const target = (key: string, airAt: number | undefined, queued = false) => ({
+      key, provider: 'sonarr' as const, sourceFingerprint: f.sonarrSource, serviceId: 1, externalId: 20, episodeId: 1,
+      monitored: true, hasFile: false, airAt, queued, context: { title: key, seasonNumber: 1, episodeNumber: 1 },
     });
     const targets = [
-      target('future', false, false),
-      target('unknown-airtime', false, false),
-      target('available', true, true),
-      target('queued', true, false),
-      target('cooldown', true, true),
+      target('future', f.now + 1000),
+      target('unknown-airtime', undefined),
+      target('available', f.now - 1000),
+      target('queued', f.now - 1000, true),
+      target('cooldown', f.now - 1000),
     ];
     f.store.saveObservation('sonarr', { observedAt: f.now, complete: true, payload: { observedAt: f.now, targets, queue: [], diagnostics: { unidentifiedQueueRows: 0 } } });
     f.store.saveObservation('radarr', { observedAt: f.now, complete: true, payload: { observedAt: f.now, targets: [], queue: [], diagnostics: { unidentifiedQueueRows: 0 } } });
     f.store.setAutomationAttempt('cooldown', { lastAttempt: f.now, failCount: 0, deadline: f.now + 60_000, graceUntil: 0 });
 
     const items = f.runtime.automationStatus().items;
-    expect(items.map(item => item.title).sort()).toEqual(['available', 'cooldown', 'queued']);
-    expect(items.find(item => item.title === 'queued')?.status).toBe('downloading');
-    expect(items.find(item => item.title === 'cooldown')?.status).toBe('cooldown');
+    expect(Object.fromEntries(items.map(item => [item.title, item.status]))).toEqual({
+      future: 'upcoming', 'unknown-airtime': 'no-air-date', available: 'missing', queued: 'downloading', cooldown: 'cooldown',
+    });
   });
   it('actually removes expired private material and old history', () => {
     const f = setup(); matched(f, f.now - 1);

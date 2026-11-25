@@ -938,7 +938,7 @@ it('keeps search available in dry-run and distinguishes a saved refresh from a l
   globalThis.fetch = async (input, init) => {
     const url = String(input); calls.push({ url, method: init?.method })
     if (url === '/api/settings') return Response.json(env)
-    if (url === '/api/v2/automation') return Response.json({ enabled: false, dryRun: true, running: false, providers: [], items: [{ targetId: 'one', title: 'Example', kind: 'tv', seasonNumber: 1, episodeNumber: 1, status: 'missing', eligible: true }] })
+    if (url === '/api/v2/automation') return Response.json({ enabled: false, dryRun: true, running: false, providers: [], airingOffsets: [], items: [{ targetId: 'one', titleId: 'show-one', title: 'Example', kind: 'tv', seasonNumber: 1, episodeNumber: 1, status: 'missing', eligible: true }] })
     if (url === '/api/v2/automation/poll') return Response.json({ ran: false, reason: 'disabled' })
     return Response.json({ searchId: 's1' }, { status: 202 })
   }
@@ -953,6 +953,68 @@ it('keeps search available in dry-run and distinguishes a saved refresh from a l
   await waitFor(() => assert.equal(calls.filter(c => c.url.endsWith('/poll')).length, 1))
 })
 
+it('groups observations by title and saves or resets Sonarr airing policy without polling', async () => {
+  const { AutomationPage } = await import('./Activity')
+  const calls: Array<{ url: string; method?: string; body?: string }> = []
+  let fail = true, hours = 0
+  const snapshot = () => ({
+    enabled: true, dryRun: true, running: false,
+    providers: [{ provider: 'sonarr', known: false, unidentifiedQueueRows: 0 }, { provider: 'radarr', known: true, unidentifiedQueueRows: 0 }],
+    items: [
+      { targetId: 'future', titleId: 'show', title: 'Shared title', kind: 'tv', seasonNumber: 1, episodeNumber: 2, status: 'upcoming', eligible: false, metadataAirDate: '2026-12-20', eligibleAt: '2026-12-21T00:00:00.000Z' },
+      { targetId: 'movie', titleId: 'movie', title: 'Shared title', kind: 'movie', status: 'waiting-for-radarr', eligible: false },
+      { targetId: 'ready', titleId: 'show', title: 'Shared title', kind: 'tv', seasonNumber: 1, episodeNumber: 1, status: 'missing', eligible: true },
+      { targetId: 'undated', titleId: 'undated-show', title: 'Undated', kind: 'tv', status: 'no-air-date', eligible: false },
+    ],
+    airingOffsets: [{ titleId: 'caught', title: 'Saved show', hoursEarly: 24 }, ...(hours ? [{ titleId: 'show', title: 'Shared title', hoursEarly: hours }] : [])],
+  })
+  globalThis.fetch = async (input, init) => {
+    const url = String(input); calls.push({ url, method: init?.method, body: init?.body as string | undefined })
+    if (url === '/api/v2/automation') return Response.json(snapshot())
+    if (url.includes('/airing-offsets/')) {
+      if (fail) { fail = false; return Response.json({ error: 'Try again later' }, { status: 503 }) }
+      hours = JSON.parse(String(init?.body)).hoursEarly
+      return Response.json(snapshot())
+    }
+    return Response.json({ items: [] })
+  }
+  render(<AutomationPage settings={defaults}/>)
+  await screen.findByText('Items to watch')
+  const groups = [...document.querySelectorAll('.automation-group')]
+  assert.equal(groups.length, 4)
+  assert.match(groups[0]!.textContent!, /Shared title/)
+  assert.match(groups[0]!.textContent!, /Season 1 · Episode 1/)
+  assert.ok(screen.getByText(/Provider air date: 2026-12-20/))
+  assert.ok(screen.getByText(/Scout eligibility:/))
+  assert.ok(screen.getByText('Waiting for Radarr'))
+  assert.ok(screen.getByText(/No missing episodes in the saved observations/))
+  assert.equal(screen.getAllByRole('spinbutton').length, 3)
+  const undated = screen.getByRole('spinbutton', { name: /Treat episodes as aired.*Undated/i }).closest('.automation-group') as HTMLElement
+  const undatedDetails = undated.querySelector('details')!
+  assert.equal(undatedDetails.open, false)
+  fireEvent.click(within(undated).getByText('Undated'))
+  assert.equal(undatedDetails.open, true)
+  assert.ok(within(undated).getByText('No air date'))
+  const input = screen.getByRole('spinbutton', { name: /Treat episodes as aired.*Shared title/i }) as HTMLInputElement
+  const show = within(input.closest('.automation-group') as HTMLElement)
+  fireEvent.change(input, { target: { value: '169' } })
+  fireEvent.click(screen.getByRole('button', { name: /Save.*Shared title/i }))
+  assert.ok(show.getByText('Enter a whole number from 0 to 168 hours.'))
+  assert.equal(calls.filter(c => c.method === 'PUT').length, 0)
+  fireEvent.change(input, { target: { value: '72' } })
+  fireEvent.click(screen.getByRole('button', { name: /Save.*Shared title/i }))
+  assert.ok(await screen.findByText('Try again later'))
+  assert.equal(input.value, '72')
+  assert.ok(show.getByText(/Saved: 0 hours early/))
+  fireEvent.click(screen.getByRole('button', { name: /Save.*Shared title/i }))
+  await waitFor(() => assert.ok(show.getByText(/Saved: 72 hours early/)))
+  fireEvent.click(screen.getByRole('button', { name: /Reset.*Shared title/i }))
+  await waitFor(() => assert.ok(show.getByText(/Saved: 0 hours early/)))
+  assert.equal(input.value, '0')
+  assert.deepEqual(calls.filter(c => c.method === 'PUT').map(c => JSON.parse(c.body!).hoursEarly), [72, 72, 0])
+  assert.equal(calls.some(c => c.url.includes('/poll') || c.url.includes('/search')), false)
+})
+
 it('distinguishes a known empty actionable list from unavailable Arr observations', async () => {
   window.history.replaceState(null, '', '/#automation')
   let known = true
@@ -960,7 +1022,7 @@ it('distinguishes a known empty actionable list from unavailable Arr observation
   globalThis.fetch = async input => {
     const url = String(input)
     if (url === '/api/settings') return Response.json(env)
-    if (url === '/api/v2/automation') return Response.json({ enabled: false, dryRun: true, running: false, providers: ['sonarr', 'radarr'].map(provider => ({ provider, known, observedAt: '2026-11-15T00:00:00Z', unidentifiedQueueRows: 0, ...(partialInventory && provider === 'sonarr' ? { unknownSeriesIds: ['42'] } : {}) })), items: [] })
+    if (url === '/api/v2/automation') return Response.json({ enabled: false, dryRun: true, running: false, providers: ['sonarr', 'radarr'].map(provider => ({ provider, known, observedAt: '2026-11-15T00:00:00Z', unidentifiedQueueRows: 0, ...(partialInventory && provider === 'sonarr' ? { unknownSeriesIds: ['42'] } : {}) })), items: [], airingOffsets: [] })
     return Response.json({ items: [] })
   }
   render(<App />)
@@ -976,6 +1038,22 @@ it('distinguishes a known empty actionable list from unavailable Arr observation
   render(<App />)
   assert.ok(await screen.findByRole('heading', { name: 'No items to show' }))
   assert.ok(screen.getByText(/list may be incomplete/i))
+})
+
+it('does not mark a healthy Sonarr-only watch list as incomplete', async () => {
+  const { AutomationPage } = await import('./Activity')
+  globalThis.fetch = async input => String(input) === '/api/v2/automation'
+    ? Response.json({ enabled: false, dryRun: true, running: false, airingOffsets: [],
+      providers: [
+        { provider: 'sonarr', known: true, observedAt: new Date().toISOString(), unidentifiedQueueRows: 0 },
+        { provider: 'radarr', known: false, error: 'not-configured', unidentifiedQueueRows: 0 },
+      ],
+      items: [{ targetId: 'episode-one', titleId: 'show-one', title: 'Example', kind: 'tv', seasonNumber: 1, episodeNumber: 1, status: 'missing', eligible: true }],
+    })
+    : Response.json({ items: [] })
+  render(<AutomationPage settings={defaults}/>)
+  assert.ok(await screen.findByText('Season 1 · Episode 1'))
+  assert.ok(!screen.queryByText(/list may be incomplete/i), 'unconfigured Radarr should not imply missing observations')
 })
 
 it('keeps Settings sections scannable and distinguishes required from optional services', async () => {

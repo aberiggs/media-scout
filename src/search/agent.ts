@@ -1,7 +1,22 @@
 import { callModel, stepCountIs, tool } from '@openrouter/agent';
-import { createMCPTools } from '@openrouter/agent/mcp';
+import { Client, SdkError, SdkErrorCode, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { finalizeReleaseSetInputSchema, type FinalizationLedger, type ReleaseSet, finalizeReleaseSet } from './agent-contracts';
-import { connectResearchTools, type enabledResearchServerConfigs } from './research-mcp';
+import { connectResearchTools } from './research-mcp';
+import { PROWLARR_INDEXERS_TIMEOUT_MS, PROWLARR_SEARCH_TIMEOUT_MS, prowlarrIndexerTool, prowlarrSearchTool } from './prowlarr-tools';
+
+const CONNECT_TIMEOUT_MS = 15_000;
+const SEARCH_TIMEOUT_MS = PROWLARR_SEARCH_TIMEOUT_MS + 10_000;
+const INDEXERS_TIMEOUT_MS = PROWLARR_INDEXERS_TIMEOUT_MS + 5_000;
+const safeProwlarrErrors = new Set([
+  'Prowlarr search timed out.', 'Prowlarr indexer discovery timed out.',
+  'Prowlarr search unavailable.', 'Prowlarr indexer discovery unavailable.',
+  'provider-cooldown', 'no-healthy-indexers', 'prowlarr-unavailable',
+]);
+export class ProwlarrConnectionError extends Error {
+  constructor(timedOut: boolean) {
+    super(timedOut ? 'Prowlarr MCP connection timed out.' : 'Prowlarr MCP connection failed.');
+  }
+}
 
 export interface AgentSearchOptions {
   client: Parameters<typeof callModel>[0];
@@ -10,8 +25,11 @@ export interface AgentSearchOptions {
   instructions?: string;
   mcpUrl: string;
   capability: string;
-  researchServers?: ReturnType<typeof enabledResearchServerConfigs>;
-  researchSecrets?: readonly string[];
+  research?: {
+    servers: Parameters<typeof connectResearchTools>[0];
+    privateValues: readonly string[];
+    remainingJobMs: () => number;
+  };
   signal: AbortSignal;
   maxSteps: number;
   requestTimeoutMs: number;
@@ -22,6 +40,8 @@ export interface AgentSearchOptions {
   onModelTurn?: (turn: number) => void;
   onUsage?: (usage: { inputTokens?: number; outputTokens?: number; totalTokens?: number; cost?: number }) => void;
   onResearchWarning?: (message: string) => void;
+  onProwlarrTransportFailure?: () => void;
+  onProwlarrSearchResult?: () => void;
 }
 export class AgentBudgetExhaustedError extends Error {
   constructor() { super('Agent step budget exhausted without a validated release set'); this.name = 'AgentBudgetExhaustedError'; }
@@ -29,13 +49,54 @@ export class AgentBudgetExhaustedError extends Error {
 
 /** SDK-managed Responses tool loop; only the validated finalizer can accept a plan. */
 export async function runAgentSearch(options: AgentSearchOptions): Promise<ReleaseSet> {
-  const handle = await createMCPTools({
-    url: options.mcpUrl,
-    transport: 'streamableHttp',
-    auth: { kind: 'bearer', token: options.capability },
-    signal: options.signal,
-    resources: false,
+  const client = new Client({ name: 'media-scout-agent', version: '1.0.0' });
+  const connectTimeout = new AbortController();
+  const connectSignal = AbortSignal.any([options.signal, connectTimeout.signal]);
+  let connecting = true;
+  const transport = new StreamableHTTPClientTransport(new URL(options.mcpUrl), {
+    requestInit: { headers: { authorization: `Bearer ${options.capability}` } },
+    // The SDK's initialized notification awaits HTTP but does not inherit
+    // connect() request options. Cover the entire handshake, not later calls.
+    fetch: (input, init) => {
+      if (!connecting) return fetch(input, init);
+      const transportSignal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+      return fetch(input, { ...init, signal: transportSignal ? AbortSignal.any([connectSignal, transportSignal]) : connectSignal });
+    },
   });
+  // The SDK sends cancellation as an asynchronous JSON-RPC notification.
+  // Do not close its HTTP transport before that notification has been sent.
+  const cancellationSends = new Set<Promise<void>>();
+  const send = transport.send.bind(transport);
+  transport.send = (message, sendOptions) => {
+    const sent = send(message, sendOptions);
+    if ('method' in message && message.method === 'notifications/cancelled') {
+      cancellationSends.add(sent);
+      void sent.finally(() => cancellationSends.delete(sent)).catch(() => {});
+    }
+    return sent;
+  };
+  const closeClient = async () => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        Promise.allSettled([...cancellationSends]),
+        new Promise<void>(resolve => { timer = setTimeout(resolve, 1_000); }),
+      ]);
+      clearTimeout(timer);
+      await Promise.race([client.close(), new Promise<void>(resolve => { timer = setTimeout(resolve, 1_000); })]);
+    }
+    catch { /* Preserve the run's actual outcome. */ }
+    finally { clearTimeout(timer); }
+  };
+  const connectTimer = setTimeout(() => connectTimeout.abort(), CONNECT_TIMEOUT_MS);
+  try {
+    await client.connect(transport, { timeout: CONNECT_TIMEOUT_MS, signal: connectSignal });
+    connectSignal.throwIfAborted();
+  } catch (error) {
+    await closeClient();
+    if (options.signal.aborted) throw options.signal.reason;
+    throw new ProwlarrConnectionError(connectTimeout.signal.aborted || (error instanceof SdkError && error.code === SdkErrorCode.RequestTimeout));
+  } finally { connecting = false; clearTimeout(connectTimer); }
   let external: Awaited<ReturnType<typeof connectResearchTools>> | undefined;
   let finalized: ReleaseSet | undefined;
   let finalizing = false;
@@ -46,8 +107,53 @@ export async function runAgentSearch(options: AgentSearchOptions): Promise<Relea
   else options.signal.addEventListener('abort', abort, { once: true });
   try {
     if (options.signal.aborted) throw options.signal.reason ?? new Error('aborted');
-    if (options.researchServers?.length) {
-      external = await connectResearchTools(options.researchServers, controller.signal, options.researchSecrets ?? [], options.onResearchWarning);
+    const invoke = async (name: string, args: Record<string, unknown>, contextSignal: AbortSignal | undefined, timeoutMs: number) => {
+      const timeout = new AbortController();
+      const timer = setTimeout(() => timeout.abort(), timeoutMs);
+      const sources = [controller.signal, ...(contextSignal ? [contextSignal] : []), timeout.signal];
+      const callController = new AbortController();
+      const cancelCall = () => callController.abort('cancelled');
+      for (const source of sources) {
+        if (source.aborted) cancelCall();
+        else source.addEventListener('abort', cancelCall, { once: true });
+      }
+      const signal = callController.signal;
+      let result: Awaited<ReturnType<Client['callTool']>>;
+      try {
+        signal.throwIfAborted();
+        result = await client.callTool({ name, arguments: args }, { timeout: timeoutMs, signal });
+        signal.throwIfAborted();
+      } catch (error) {
+        if (controller.signal.aborted) throw controller.signal.reason;
+        options.onProwlarrTransportFailure?.();
+        const contextTimedOut = contextSignal?.reason instanceof Error
+          && contextSignal.reason.message === `Tool "${name}" timed out after ${timeoutMs + 1_000}ms`;
+        const sdkTimedOut = !contextSignal?.aborted && error instanceof SdkError && error.code === SdkErrorCode.RequestTimeout;
+        const message = timeout.signal.aborted || contextTimedOut || sdkTimedOut ? 'Prowlarr tool invocation timed out.' : 'Prowlarr tool invocation failed.';
+        options.onResearchWarning?.(message);
+        throw new Error(message);
+      } finally { clearTimeout(timer); for (const source of sources) source.removeEventListener('abort', cancelCall); }
+      const text = result.content.flatMap(item => item.type === 'text' ? [item.text] : []).join('\n');
+      if (result.isError) {
+        options.onProwlarrTransportFailure?.();
+        const timedOut = text === 'Prowlarr search timed out.' || text === 'Prowlarr indexer discovery timed out.';
+        const message = timedOut ? 'Prowlarr tool invocation timed out.' : 'Prowlarr tool invocation failed.';
+        options.onResearchWarning?.(message);
+        throw new Error(safeProwlarrErrors.has(text) ? text : message);
+      }
+      // Preserve the wrapper's JSON-text result for these internal tools.
+      if (name === prowlarrSearchTool.name) options.onProwlarrSearchResult?.();
+      return text;
+    };
+    const prowlarrTools = [
+      tool({ ...prowlarrIndexerTool, timeoutMs: INDEXERS_TIMEOUT_MS + 1_000,
+        execute: (args, context) => invoke(prowlarrIndexerTool.name, args, context?.signal, INDEXERS_TIMEOUT_MS) }),
+      tool({ ...prowlarrSearchTool, timeoutMs: SEARCH_TIMEOUT_MS + 1_000,
+        execute: (args, context) => invoke(prowlarrSearchTool.name, args, context?.signal, SEARCH_TIMEOUT_MS) }),
+    ];
+    if (options.research?.servers.length) {
+      const { servers, privateValues, remainingJobMs } = options.research;
+      external = await connectResearchTools(servers, controller.signal, privateValues, remainingJobMs, options.onResearchWarning);
     }
     const finalizer = tool({
       name: 'finalize_release_set',
@@ -74,7 +180,7 @@ export async function runAgentSearch(options: AgentSearchOptions): Promise<Relea
       model: options.model,
       input: options.input,
       ...(options.instructions ? { instructions: options.instructions } : {}),
-      tools: [...handle.tools, ...(external?.tools ?? []), finalizer] as const,
+      tools: [...prowlarrTools, ...(external?.tools ?? []), finalizer] as const,
       stopWhen: [stepCountIs(options.maxSteps), () => !!finalized],
       allowFinalResponse: false,
       signal: controller.signal,
@@ -105,6 +211,6 @@ export async function runAgentSearch(options: AgentSearchOptions): Promise<Relea
     options.signal.removeEventListener('abort', abort);
     controller.abort();
     try { await external?.close(); } catch { /* Preserve the run's actual outcome. */ }
-    try { await handle.close(); } catch { /* Preserve the run's actual outcome. */ }
+    await closeClient();
   }
 }

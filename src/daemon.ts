@@ -111,7 +111,7 @@ export async function buildApp(stack: Stack, options: { webRoot?: string } = {})
       'research-auth-failed':'The MCP server rejected the connection. Check its credential and permissions.',
       'research-redirect-denied':'MCP redirects are not followed. Configure the final Streamable HTTP endpoint.',
       'research-settings-changed':'The saved connection changed while it was connecting. Review current settings and connect again.',
-      'research-timeout':'The MCP server took too long to respond. Check its address or try again.',
+      'research-timeout':'The MCP connection and tool discovery timed out. Check its address or try again.',
       'research-metadata-endpoint-denied':'This address resolves to a blocked metadata or link-local network.',
       'research-endpoint-unavailable':'The endpoint hostname could not be resolved.',
       'research-no-usable-tools':'The server connected but exposed no supported tools.',

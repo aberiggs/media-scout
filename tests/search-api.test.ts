@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import pino from 'pino';
 import { buildApp } from '../src/daemon';
 import type { Stack } from '../src/compose';
@@ -757,8 +757,9 @@ describe('search-first HTTP contract', () => {
       await new Promise<void>(resolve => { sentinel.close(() => resolve()); sentinel.closeAllConnections(); });
     }
   });
-  it.each(['empty', 'outage', 'cooldown'] as const)('distinguishes successful empty results from unavailable Prowlarr research (%s)', async (scenario) => {
-    let responseCalls = 0;
+  it.each(['empty', 'outage', 'cooldown', 'transport-timeout', 'transport-failure', 'transport-result-lost', 'transport-recovers'] as const)('distinguishes successful empty results from unavailable Prowlarr research (%s)', async (scenario) => {
+    const dropsSuccessfulResult = scenario === 'transport-result-lost' || scenario === 'transport-recovers';
+    let responseCalls = 0, prowlarrCalls = 0, lostResults = 0;
     const modelInputs: Array<{ input: unknown; instructions: unknown; tools: unknown }> = [];
     const responses = createServer(async (request, response) => {
       const parts: Buffer[] = [];
@@ -766,7 +767,8 @@ describe('search-first HTTP contract', () => {
       const body = JSON.parse(Buffer.concat(parts).toString()) as { tools?: Array<{ name?: string }>; input?: unknown; instructions?: unknown };
       modelInputs.push({ input: body.input, instructions: body.instructions, tools: body.tools });
       responseCalls++;
-      const name = (responseCalls === 1 ? body.tools?.find(tool => tool.name?.includes(scenario === 'cooldown' ? 'prowlarr_indexers' : 'prowlarr_search'))?.name : undefined) ?? 'finalize_release_set';
+      const name = (responseCalls === 1 || (scenario === 'transport-recovers' && responseCalls === 2)
+        ? body.tools?.find(tool => tool.name?.includes(scenario === 'cooldown' ? 'prowlarr_indexers' : 'prowlarr_search'))?.name : undefined) ?? 'finalize_release_set';
       response.writeHead(200, { 'content-type': 'application/json' });
       response.end(JSON.stringify({
         id: `fixture-${Date.now()}`, object: 'response', created_at: 1, completed_at: 1, status: 'completed',
@@ -785,12 +787,55 @@ describe('search-first HTTP contract', () => {
       prowlarr: {
         getIndexers: async () => [{ id: 1, name: 'Fixture', enable: true, implementation: 'Fixture', protocol: 'torrent' }],
         getIndexerStatuses: async () => scenario === 'cooldown' ? [{ indexerId: 1, disabledTill: '2099-01-01T00:00:00Z', mostRecentFailure: null, initialFailure: null }] : [],
-        search: async () => { throw new Error('PRIVATE-UPSTREAM-CANARY'); },
+        search: async (_input, options) => {
+          if (dropsSuccessfulResult) return ++prowlarrCalls === 1 ? [releaseSchema.parse({
+            guid: 'lost-release', indexerId: 1, indexer: 'Fixture', title: 'LostResponseRelease.1080p', age: 1, publishDate: '', protocol: 'torrent',
+          })] : [];
+          if (scenario === 'transport-timeout') await new Promise<void>((_resolve, reject) => options?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
+          throw new Error('PRIVATE-UPSTREAM-CANARY');
+        },
       },
     } : undefined);
+    const nativeSetTimeout = globalThis.setTimeout;
+    const timer = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: (...args: never[]) => void, delay?: number, ...args: never[]) =>
+      nativeSetTimeout(fn, scenario === 'transport-timeout' && delay === 250_000 ? 300 : delay, ...args)) as unknown as typeof setTimeout);
+    let proxy: ReturnType<typeof createServer> | undefined;
     try {
       runtime.saveSettings({ ...runtime.getSettings(), ai: { ...runtime.getSettings().ai, baseUrl: `http://127.0.0.1:${upstream.port}` } });
       await app.listen({ host: '127.0.0.1', port: 0 });
+      if (scenario === 'transport-failure' || dropsSuccessfulResult) {
+        const daemonAddress = app.server.address();
+        if (!daemonAddress || typeof daemonAddress === 'string') throw new Error('Missing daemon listener');
+        proxy = createServer(async (request, response) => {
+          const parts: Buffer[] = [];
+          for await (const part of request) parts.push(Buffer.from(part));
+          const body = Buffer.concat(parts);
+          const toolCall = request.method === 'POST' && JSON.parse(body.toString()).method === 'tools/call';
+          if (toolCall && scenario === 'transport-failure') {
+            response.writeHead(503).end('PRIVATE-TRANSPORT-CANARY');
+            return;
+          }
+          const headers = new Headers();
+          for (const [key, value] of Object.entries(request.headers)) if (value !== undefined && key !== 'host' && key !== 'content-length') headers.set(key, Array.isArray(value) ? value.join(', ') : value);
+          try {
+            const result = await fetch(`http://127.0.0.1:${daemonAddress.port}/internal/mcp/prowlarr`, {
+              method: request.method, headers, ...(body.length ? { body } : {}),
+            });
+            const output = Buffer.from(await result.arrayBuffer());
+            if (toolCall && dropsSuccessfulResult && output.includes('LostResponseRelease')) {
+              lostResults++;
+              response.writeHead(503).end('PRIVATE-TRANSPORT-CANARY');
+              return;
+            }
+            response.writeHead(result.status, Object.fromEntries(result.headers));
+            response.end(output);
+          } catch { response.writeHead(502).end(); }
+        });
+        await new Promise<void>(resolve => proxy!.listen(0, '127.0.0.1', resolve));
+        const proxyAddress = proxy.address();
+        if (!proxyAddress || typeof proxyAddress === 'string') throw new Error('Missing MCP proxy listener');
+        runtime.setInternalMcpUrl(`http://127.0.0.1:${proxyAddress.port}/internal/mcp/prowlarr`);
+      }
       const exactPrompt = '  {"version":1,\n"request":{"prompt":"Find a film"}}  ';
       const start = await app.inject({ method: 'POST', url: '/api/v2/searches', payload: { prompt: exactPrompt } });
       expect(start.statusCode).toBe(202);
@@ -804,7 +849,7 @@ describe('search-first HTTP contract', () => {
       expect(instruction).toContain('Extras are not gaps');
       expect(instruction).toContain('plain language, not IDs');
       expect(JSON.stringify(modelInputs.flatMap(request => request.tools)).match(/targetIds/g)).toBeNull();
-      expect(modelInputs).toHaveLength(2);
+      expect(modelInputs).toHaveLength(scenario === 'transport-recovers' ? 3 : 2);
       for (const request of modelInputs) {
         expect(request.instructions).toEqual(expect.stringContaining('Treat clear, internally consistent release names and indexer metadata as sufficient working evidence'));
         expect(request.instructions).toEqual(expect.stringContaining('Do not add boilerplate uncertainty solely because file contents were not inspected'));
@@ -814,11 +859,29 @@ describe('search-first HTTP contract', () => {
       expect(status.statusCode).toBe(200);
       expect(modelInputs[0]?.input).toBe(status.json().prompt);
       expect(modelInputs[0]?.input).toBe(exactPrompt);
+      if (dropsSuccessfulResult) {
+        expect(lostResults).toBe(1);
+        expect(runtime.store.listCandidates(searchId)).toHaveLength(1);
+        expect(instruction).not.toContain('LostResponseRelease');
+        expect(instruction).toContain('Prowlarr tool invocation failed.');
+        expect(status.json().researchWarnings).toEqual(['Prowlarr tool invocation failed.']);
+      }
+      if (scenario === 'transport-recovers') {
+        expect(prowlarrCalls).toBe(2);
+        expect(status.json()).toMatchObject({ status: 'no-match', counts: { searches: 2 } });
+        return;
+      }
       if (scenario !== 'empty') {
-        expect(instruction).toContain(scenario === 'outage' ? 'Prowlarr search unavailable' : 'coolingUntil');
+        expect(instruction).toContain(scenario === 'outage' ? 'Prowlarr search unavailable'
+          : scenario === 'transport-timeout' ? 'Prowlarr tool invocation timed out.'
+            : scenario === 'transport-failure' || scenario === 'transport-result-lost' ? 'Prowlarr tool invocation failed.' : 'coolingUntil');
         expect(status.json()).toMatchObject({ searchId, status: 'failed', message: 'Prowlarr research failed before a search could complete' });
+        if (scenario === 'transport-timeout') expect(status.json().researchWarnings).toEqual(['Prowlarr tool invocation timed out.']);
+        if (scenario === 'transport-failure' || scenario === 'outage') expect(status.json().researchWarnings).toEqual(['Prowlarr tool invocation failed.']);
         expect(status.json()).not.toHaveProperty('plan');
         expect(status.body).not.toContain('PRIVATE-UPSTREAM-CANARY');
+        expect(status.body).not.toContain('PRIVATE-TRANSPORT-CANARY');
+        expect(instruction).not.toContain('PRIVATE-TRANSPORT-CANARY');
         return;
       }
       expect(status.json(), JSON.stringify(status.json())).toMatchObject({
@@ -829,6 +892,9 @@ describe('search-first HTTP contract', () => {
       expect(status.body).not.toContain('private-model');
       expect(grabs()).toBe(0);
     } finally {
+      timer.mockRestore();
+      proxy?.closeAllConnections();
+      if (proxy) await new Promise<void>(resolve => proxy!.close(() => resolve()));
       await app.close();
       await runtime.close();
       await new Promise<void>((resolve, reject) => responses.close(error => error ? reject(error) : resolve()));

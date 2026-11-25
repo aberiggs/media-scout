@@ -13,8 +13,10 @@ const forbiddenHeaders = new Set([
   'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding',
   'upgrade', 'expect', 'x-original-url', 'x-rewrite-url', 'x-http-method-override',
 ]);
-const connectTimeoutMs = 10_000;
-const researchRequestTimeoutMs = 18_000;
+const connectTimeoutMs = 25_000;
+// The OpenRouter wrapper does not override the MCP SDK's 60-second request deadline.
+const researchRequestTimeoutMs = 50_000;
+const primaryResearchReserveMs = 25_000;
 const maxToolsPerServer = 50;
 const maxToolDefinitionsBytes = 512 * 1024;
 // The adapter's tool wrapper only forwards its connection-level signal to the
@@ -183,20 +185,27 @@ async function resolveResearchEndpoint(endpoint: string) {
 export async function assertResearchEndpointSafe(endpoint: string): Promise<void> {
   await resolveResearchEndpoint(endpoint);
 }
+async function waitForResearchSetup<T>(operation: Promise<T>, signal: AbortSignal, closeLate?: (value: T) => Promise<void>): Promise<T> {
+  let onAbort!: () => void;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(signal.reason);
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  });
+  try {
+    const result = await Promise.race([aborted, operation]);
+    signal.throwIfAborted();
+    return result;
+  } catch (error) {
+    if (signal.aborted && closeLate) void operation.then(closeLate).catch(() => {});
+    throw error;
+  } finally { signal.removeEventListener('abort', onAbort); }
+}
+
 async function openResearchMcp(server: StoredServer, includeTools: string[], parent?: AbortSignal, deadlineMs = connectTimeoutMs) {
   const timeout = new AbortController();
   const signal = parent ? AbortSignal.any([parent, timeout.signal]) : timeout.signal;
   const timer = setTimeout(() => timeout.abort(), deadlineMs);
-  const resolveWithinDeadline = async () => {
-    signal.throwIfAborted();
-    let onAbort!: () => void;
-    const aborted = new Promise<never>((_, reject) => {
-      onAbort = () => reject(signal.reason ?? new Error('research-timeout'));
-      signal.addEventListener('abort', onAbort, { once: true });
-    });
-    try { return await Promise.race([resolveResearchEndpoint(server.url), aborted]); }
-    finally { signal.removeEventListener('abort', onAbort); }
-  };
   let lastPostStatus: number | undefined;
   let redirected = false;
   let dispatcher: Agent | undefined;
@@ -222,18 +231,22 @@ async function openResearchMcp(server: StoredServer, includeTools: string[], par
   try {
     // Pin the validated DNS answers for this SDK connection. Passing only the
     // original hostname to fetch would resolve it again between check and use.
-    const addresses = await resolveWithinDeadline();
-    dispatcher = new Agent({ connect: { lookup: (_hostname, options, callback) => {
+    signal.throwIfAborted();
+    const addresses = await waitForResearchSetup(resolveResearchEndpoint(server.url), signal);
+    dispatcher = new Agent({ connect: { timeout: deadlineMs, lookup: (_hostname, options, callback) => {
       const matching = typeof options.family === 'number' && options.family ? addresses.filter(address => address.family === options.family) : addresses;
       if (options.all) callback(null, matching);
       else if (matching[0]) callback(null, matching[0].address, matching[0].family);
       else callback(Object.assign(new Error('No matching endpoint address'), { code: 'ENOTFOUND' }), '');
     } } });
     const ownedDispatcher = dispatcher;
-    const handle = await createMCPTools({
+    const setup = createMCPTools({
       url: server.url, transport: 'streamableHttp', auth, fetch: restrictedFetch, signal, includeTools,
       toolNamePrefix: toolPrefix(server), resources: false, emitProgress: false, autoRefreshOnListChanged: false,
     });
+    // Aborting a discovery SSE stream doesn't necessarily settle the SDK's
+    // negotiation probe. Stop waiting independently and dispose any late handle.
+    const handle = await waitForResearchSetup(setup, signal, late => late.close());
     return { ...handle, close: async () => { try { await handle.close(); } finally { await ownedDispatcher.destroy(); } } };
   } catch (error) {
     await dispatcher?.destroy().catch(() => {});
@@ -265,9 +278,9 @@ export function enabledResearchServerConfigs(store: SearchStore) {
   return records(store).filter(row => row.enabled && row.discoveredTools?.length);
 }
 
-async function openResearchMcpForJob(server: StoredServer, signal: AbortSignal, secrets: readonly string[]) {
+async function openResearchMcpForJob(server: StoredServer, signal: AbortSignal, secrets: readonly string[], budgetMs: number) {
   const names = (server.discoveredTools ?? []).map(tool => tool.name);
-  const deadline = Date.now() + connectTimeoutMs;
+  const deadline = Date.now() + budgetMs;
   const timeLeft = () => {
     const remaining = deadline - Date.now();
     if (remaining <= 0) throw new Error('research-timeout');
@@ -288,9 +301,12 @@ async function openResearchMcpForJob(server: StoredServer, signal: AbortSignal, 
   return openResearchMcp(server, names.filter(name => unique.includes(name)), signal, timeLeft());
 }
 
-async function runResearchCall<T>(parent: AbortSignal, run: () => T | Promise<T>): Promise<T> {
-  const signal = AbortSignal.any([parent, AbortSignal.timeout(researchRequestTimeoutMs)]);
-  signal.throwIfAborted();
+class ResearchInvocationTimeout extends Error {}
+async function runResearchCall<T>(parent: AbortSignal, timeoutMs: number, run: () => T | Promise<T>): Promise<T> {
+  parent.throwIfAborted();
+  const timeout = new AbortController();
+  const signal = AbortSignal.any([parent, timeout.signal]);
+  const timer = setTimeout(() => timeout.abort(new ResearchInvocationTimeout()), timeoutMs);
   let abort!: () => void;
   const deadline = new Promise<never>((_, reject) => {
     abort = () => reject(signal.reason);
@@ -300,17 +316,19 @@ async function runResearchCall<T>(parent: AbortSignal, run: () => T | Promise<T>
     // An SSE body can be interrupted without the SDK rejecting the pending
     // JSON-RPC result. Settle the tool at our deadline independently of fetch.
     return await Promise.race([deadline, researchCall.run(signal, async () => run())]);
-  } finally { signal.removeEventListener('abort', abort); }
+  } finally { clearTimeout(timer); signal.removeEventListener('abort', abort); }
 }
 
 export async function connectResearchTools(
   servers: ReturnType<typeof enabledResearchServerConfigs>,
   signal: AbortSignal,
   privateValues: readonly string[],
+  remainingJobMs: () => number,
   warn?: (message: string) => void,
 ): Promise<{ tools: Tool[]; close(): Promise<void> }> {
   const handles: MCPToolsHandle[] = [];
   const close = async () => { await Promise.allSettled(handles.map(handle => handle.close())); };
+  const optionalTimeLeft = () => Math.floor(remainingJobMs() - primaryResearchReserveMs);
   const groups = await Promise.all(servers.map(async server => {
     const secrets = [...privateValues, ...credentialValues(server.credential)].filter(Boolean);
     const redactText = (value: string) => secrets.reduce((text, secret) => text.replaceAll(secret, '[redacted]'), value)
@@ -323,7 +341,13 @@ export async function connectResearchTools(
     };
     const label = redactText(server.name);
     try {
-      const handle = await openResearchMcpForJob(server, signal, secrets);
+      signal.throwIfAborted();
+      const budgetMs = Math.min(connectTimeoutMs, optionalTimeLeft());
+      if (budgetMs <= 0) {
+        warn?.(`Research MCP ${label} was skipped because of the time remaining in the job.`);
+        return [];
+      }
+      const handle = await openResearchMcpForJob(server, signal, secrets, budgetMs);
       handles.push(handle);
       const { tools: definitions } = await handle.serialize();
       const snapshot = new Map((server.discoveredTools ?? []).map(item => [item.name, item.fingerprint]));
@@ -337,17 +361,28 @@ export async function connectResearchTools(
         tools.push({ name: fn.name, tool: { ...wrapped, function: { ...fn, timeoutMs: researchRequestTimeoutMs + 2_000, execute: async (args, context) => {
           if (containsSecret(args, secrets) || /magnet:\?/i.test(JSON.stringify(args)))
             throw new Error('Private data is not accepted by research tools.');
-          try { return redact(await runResearchCall(context?.signal ?? signal, () => fn.execute(args, context))); }
-          catch {
-            if (!signal.aborted) warn?.(`A research tool from ${label} failed. The search can continue without it.`);
-            throw new Error('Optional research tool failed.');
+          const callParent = context ? AbortSignal.any([signal, context.signal]) : signal;
+          callParent.throwIfAborted();
+          const timeoutMs = Math.min(researchRequestTimeoutMs, optionalTimeLeft());
+          if (timeoutMs <= 0) {
+            warn?.(`A research tool from ${label} was skipped because of the time remaining in the job.`);
+            throw new Error('Optional research tool skipped due to the remaining search time.');
+          }
+          try { return redact(await runResearchCall(callParent, timeoutMs, () => fn.execute(args, context))); }
+          catch (error) {
+            callParent.throwIfAborted();
+            const timedOut = error instanceof ResearchInvocationTimeout;
+            const detail = timedOut ? 'invocation timed out' : 'invocation failed';
+            warn?.(`Research MCP ${label} tool ${detail}. The search can continue without it.`);
+            throw new Error(`Optional research tool ${detail}.`);
           }
         } } } });
       }
       if (tools.length !== snapshot.size) warn?.(`Some connected tools from ${label} are missing or changed. Reconnect this server in Settings.`);
       return tools;
-    } catch {
-      if (!signal.aborted) warn?.(`Research MCP ${label} is unavailable. The search can continue without it.`);
+    } catch (error) {
+      const detail = error instanceof Error && error.message === 'research-timeout' ? 'connection timed out' : 'connection failed';
+      if (!signal.aborted) warn?.(`Research MCP ${label} ${detail}. The search can continue without it.`);
       return [];
     }
   }));

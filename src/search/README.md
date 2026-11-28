@@ -125,8 +125,9 @@ Unknown inventories are not empty. No additional batch
 API or release-to-episode assignment is involved. The explicit poll endpoint only
 refreshes observations and returns promptly when another pass owns the lease.
 
-The Automation view lists monitored missing targets regardless of timing.
-`PUT /api/v2/automation/airing-offsets/:titleId` accepts `{"hoursEarly":72}`
+**Automation → Items to watch** lists monitored missing targets regardless of timing.
+For a Sonarr show that airs earlier than listed, use the gear next to the show to
+set **Hours early**. `PUT /api/v2/automation/airing-offsets/:titleId` accepts `{"hoursEarly":72}`
 (integer 0–168, with 0 removing the override) and returns refreshed local
 automation status, without reading Arr or dispatching work. Use the opaque
 `titleId` from that view. An override is scoped to the observed Sonarr connection
@@ -196,7 +197,7 @@ The daemon registers its actual bound loopback origin before dispatching work. T
 
 If Scout reaches the Prowlarr API through a reverse proxy, configure at least **5 minutes** of read/response timeout there. The daemon's internal MCP hop is direct by default; apply the same headroom if that hop is separately proxied. Scout cannot extend a shorter proxy timeout or a timeout enforced by Prowlarr or an indexer.
 
-This release requires a fresh `DB_PATH` when migrating from the retired database. External research MCPs are an additive setting on the current database; they are not required for Prowlarr searches. The retired `/api/v2/submissions` mutation route returns `410`; release-set execution uses `/api/v2/executions/*`.
+The retired `/api/v2/submissions` mutation route returns `410`; release-set execution uses `/api/v2/executions/*`. For an unsupported older database format, see the [upgrade warning](../../README.md#install).
 
 The public Media Scout stdio adapter remains available and uses SDK v2. It is separate from this read-only internal server and does not expose recursive agent tools.
 
@@ -227,8 +228,13 @@ settings. Connecting trusts the endpoint: all usable tools it exposes are
 available to the model, and arguments can include search context. Tool output is
 untrusted. Enabled connections are attempted in parallel at job start, with
 up to 25 seconds for connection and discovery and up to 50 seconds per tool
-call. Optional work stops waiting when only 25 seconds remain in the search
-job, leaving time for Prowlarr and finalization. Safe job warnings distinguish
+call. In Settings, **Connect** discovers tools with no separate per-tool approval.
+Use the exact URL from the daemon's network (for example `http://crw:3000/mcp` on
+a shared container network) and configure static authorization headers separately.
+Stdio, OAuth, and URLs containing credentials are not supported. A research
+server failure does not block Prowlarr searches. Optional work stops waiting
+when only 25 seconds remain in the search job, leaving time for Prowlarr and
+finalization. Safe job warnings distinguish
 connection timeouts, invocation timeouts and other failures. The SDK exposes tools in the
 existing agent loop under a readable server label plus stable unique ID prefix.
 Redirects and metadata/link-local targets are blocked; localhost and private

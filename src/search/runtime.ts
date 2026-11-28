@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { OpenRouter } from '@openrouter/sdk';
+import { HTTPClient, OpenRouter } from '@openrouter/sdk';
 import { ProwlarrCacheMiss, ProwlarrClient } from '../clients/prowlarr';
 import { SonarrClient } from '../clients/sonarr';
 import { RadarrClient } from '../clients/radarr';
@@ -1173,7 +1173,20 @@ export class SearchRuntime {
       capability = this.createProwlarrMcpCapability(work.searchId, ttl, work.owner);
       let searches = 0;
       const plan = await runAgentSearch({
-        client: new OpenRouter({ apiKey: settings.ai.apiKey, serverURL: settings.ai.baseUrl, retryConfig: { strategy: 'none' } }),
+        client: new OpenRouter({
+          apiKey: settings.ai.apiKey,
+          serverURL: settings.ai.baseUrl,
+          retryConfig: { strategy: 'none' },
+          httpClient: new HTTPClient().addHook('beforeRequest', request => {
+            if (new URL(request.url).origin !== 'https://openrouter.ai') return;
+            // The Responses SDK has no app visibility option. Do not let Fetch
+            // forward app attribution if the official endpoint redirects.
+            request.headers.set('HTTP-Referer', 'https://github.com/aberiggs/media-scout');
+            request.headers.set('X-OpenRouter-Title', 'Media Scout');
+            request.headers.set('X-OpenRouter-App-Visibility', 'hidden'); // Applies only to new apps.
+            return new Request(request, { redirect: 'error' });
+          }),
+        }),
         model: settings.ai.model,
         input: modelInput,
         instructions: RESEARCH_INSTRUCTIONS,

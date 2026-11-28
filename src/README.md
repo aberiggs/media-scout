@@ -26,6 +26,6 @@ npm --prefix web run dev -- --host 127.0.0.1
 
 Open <http://127.0.0.1:5173/>; Vite proxies `/api` and `/health` to the backend at port 7877. The explicit loopback host overrides Vite's default `0.0.0.0` binding. For a production-style local run, `npm run build` creates `web/dist`, which the daemon serves.
 
-The default database is under `data/`. Use a disposable `DB_PATH` for experiments; MCP can use the same configured database as the daemon when desired.
+The default database is under `data/`. Use a disposable `DB_PATH` for experiments. The stdio MCP adapter proxies calls to the running daemon and does not open SQLite itself.
 
 See [search boundaries and implementation pointers](search/README.md) and [MCP stdio](mcp/README.md).

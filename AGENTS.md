@@ -9,3 +9,8 @@ Before staging, keep plans, audits, and work logs in the issue, PR, or local
 scratch; do not commit them. Keep the top-level README reader-facing: install,
 configure, and use the app safely. Put durable technical details in existing
 subsystem references.
+
+Starting the app or handing off a preview? Read [Run locally and preview](src/README.md#run-locally-and-preview) first.
+Use a disposable database for UI-only work and a full production snapshot for
+a live trial of the user's setup. Never point a second daemon at the active
+production database.
